@@ -1,0 +1,58 @@
+# career-hunter configuration TEMPLATE.
+#
+# This file is committed with generic sample values only. Your real config lives at
+#   $CAREERHUNTER_DATA_DIR/config.yaml
+# (`careerhunter init` copies this template there). Never put personal values here.
+#
+# Phase 1 validates this file (`careerhunter doctor`). Later phases use it to decide
+# which postings to surface and when to notify you.
+
+search:
+  # Job titles you are targeting. Matched loosely against posting titles.
+  target_titles:
+    - Operations Coordinator
+    - Customer Success Specialist
+    - Project Coordinator
+  # Places you would work from or commute to.
+  locations:
+    - Example City, ON
+    - Remote (Canada)
+  # Which work models you are open to: onsite, hybrid, remote.
+  work_models: [remote, hybrid, onsite]
+
+# Hard gates: a posting failing any of these is skipped, with the reason recorded.
+hard_gates:
+  min_salary: 55000            # in your local currency, per year
+  max_commute_km: 40
+  exclude_work_models: []      # e.g. [onsite]
+
+# How postings are scored (0-10). Weights are relative; Phase 3 uses them.
+fit_rubric:
+  weights:
+    title_match: 3
+    skills_match: 3
+    location_match: 2
+    seniority_match: 2
+  thresholds:
+    strong: 8                  # notify right away
+    worth_a_look: 5            # include in the daily digest
+
+schedule:
+  timezone: America/Toronto
+  watcher_interval_minutes: 60
+  quiet_hours:
+    start: "21:00"
+    end: "07:00"
+
+# Companies to watch directly. ats_type is one of:
+# greenhouse, lever, ashby, workday, successfactors, icims, taleo, smartrecruiters,
+# jobvite, bamboohr, other
+watchlist:
+  - name: Example Robotics
+    ats_type: greenhouse
+    ats_slug: examplerobotics
+    careers_url: https://example.com/careers
+  - name: Sample Logistics
+    ats_type: lever
+    ats_slug: samplelogistics
+    careers_url: https://example.org/jobs
