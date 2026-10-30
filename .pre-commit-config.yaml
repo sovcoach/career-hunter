@@ -41,5 +41,6 @@ repos:
         name: Block private career-hunter data
         entry: python3 scripts/check_no_datadir_paths.py
         language: system
-        pass_filenames: false
+        # Scans the files pre-commit passes (all of them with --all-files); with none,
+        # it falls back to every staged file.
         always_run: true
