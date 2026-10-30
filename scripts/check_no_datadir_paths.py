@@ -56,7 +56,9 @@ def _within(path: Path, parent: Path) -> bool:
 
 def check(repo: Path, entries: list[tuple[str, str]], dirs: list[Path]) -> list[str]:
     problems: list[str] = []
-    patterns = [re.compile(re.escape(str(d)).encode() + rb"/[^\s'\"`)>]+") for d in dirs]
+    # A path ends at whitespace, a quote, a closing bracket, or a backslash (so an escape
+    # like the "\n" in source code isn't reported as part of the path).
+    patterns = [re.compile(re.escape(str(d)).encode() + rb"/[^\s'\"`)>\\]+") for d in dirs]
     for mode, rel in entries:
         name = Path(rel).name
         if name in REAL_CONFIG_NAMES or name == ".env" or name.startswith(".env."):
