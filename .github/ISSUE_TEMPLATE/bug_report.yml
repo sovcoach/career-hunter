@@ -1,0 +1,40 @@
+name: Bug report
+description: Something doesn't work the way the docs say it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste real job-search data, file paths from your data folder, or secrets.**
+        Use made-up companies and redact anything personal.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. careerhunter init
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Command output (redacted)
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `careerhunter --version`
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: macOS version, Python version, how the data drive is connected.
