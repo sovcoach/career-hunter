@@ -1,0 +1,57 @@
+# Synthetic test data only. Every company and posting here is fictional.
+companies:
+  - name: Acme Widgets
+    ats_type: greenhouse
+    ats_slug: acmewidgets
+    careers_url: https://acme.example.com/careers
+    watchlist: true
+  - name: Globex Corporation
+    ats_type: lever
+    ats_slug: globex
+    watchlist: false
+
+applications:
+  - company: Acme Widgets
+    title: Operations Coordinator
+    location: Springfield, ON
+    work_model: hybrid
+    method: company site
+    date_precision: exact
+    date_applied: 2026-09-15
+    url: https://acme.example.com/careers/1001
+    notes: Synthetic application one.
+  - company: Globex Corporation
+    title: Customer Success Specialist
+    location: Remote (Canada)
+    work_model: remote
+    method: LinkedIn Easy Apply
+    date_precision: week
+    week_of: 2026-09-09          # a Wednesday; stored as Monday 2026-09-07
+  - company: Initech
+    title: Project Coordinator
+    location: Shelbyville, ON
+    work_model: onsite
+    method: agency
+    date_precision: unknown
+    notes: Synthetic undated application.
+  - company: Umbrella Analytics
+    title: Data Clerk
+    location: Ogdenville, ON
+    work_model: onsite
+    method: email
+    date_precision: exact
+    date_applied: 2026-07-01
+
+activities:
+  - date_precision: exact
+    date: 2026-09-20
+    type: job_fair
+    description: Synthetic career fair.
+  - date_precision: week
+    week_of: 2026-09-14
+    type: agency_registration
+    description: Registered with Synthetic Staffing.
+    related_company: Synthetic Staffing
+  - date_precision: unknown
+    type: course
+    description: Synthetic spreadsheet course.
