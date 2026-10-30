@@ -1,0 +1,41 @@
+# --- Private data: second layer of defence. ---------------------------------------
+# The real data lives in $CAREERHUNTER_DATA_DIR, outside this repo, and the app refuses
+# to start if that path is inside the repo. These rules catch anything that slips in.
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+data/
+exports/
+snapshots/
+logs/
+backups/
+.env
+.env.*
+config.yaml
+exclusions.yaml
+seed.yaml
+# Templates ARE committed:
+!config.example.yaml
+!exclusions.example.yaml
+!seed.example.yaml
+
+# --- Claude Code: local permission grants are personal. -----------------------------
+.claude/settings.local.json
+
+# --- Python / tooling. --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.DS_Store
