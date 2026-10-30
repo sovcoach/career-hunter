@@ -1,0 +1,65 @@
+[project]
+name = "career-hunter"
+version = "0.1.0"
+description = "Self-hosted job-search tracker that doubles as an EI job-search record."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "PyYAML>=6.0.2",
+    "keyring>=25.6",
+    "reportlab>=4.4",
+]
+
+[project.scripts]
+careerhunter = "careerhunter.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-cov>=7.0",
+    "mypy>=1.18",
+    "types-PyYAML>=6.0",
+    "ruff>=0.14",
+    "pre-commit>=4.3",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/careerhunter"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = ["S603", "S607"]  # subprocess calls use fixed argv lists of system tools
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108"]
+"scripts/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["keyring.*", "reportlab.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["careerhunter"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
