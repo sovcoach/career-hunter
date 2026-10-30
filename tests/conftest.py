@@ -120,6 +120,32 @@ class InMemoryKeyring(KeyringBackend):
         raise AssertionError("career-hunter never deletes secrets in Phase 1")
 
 
+SYNTHETIC_GIT_NAME = "Synthetic Test"
+SYNTHETIC_GIT_EMAIL = "test@example.invalid"
+
+
+@pytest.fixture(autouse=True)
+def hermetic_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every git call in the tests sees the same config, on any machine.
+
+    The developer's global and system git config are hidden, the identity is a fixed
+    synthetic one, and user.useConfigOnly stops git guessing an identity from the
+    username and hostname (which macOS can do and a CI runner can't).
+    """
+    for key, value in {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_AUTHOR_NAME": SYNTHETIC_GIT_NAME,
+        "GIT_AUTHOR_EMAIL": SYNTHETIC_GIT_EMAIL,
+        "GIT_COMMITTER_NAME": SYNTHETIC_GIT_NAME,
+        "GIT_COMMITTER_EMAIL": SYNTHETIC_GIT_EMAIL,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "user.useConfigOnly",
+        "GIT_CONFIG_VALUE_0": "true",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+
 @pytest.fixture(autouse=True)
 def memory_keyring() -> Iterator[InMemoryKeyring]:
     """Every test gets an in-memory keyring, so no test can ever touch the real Keychain."""

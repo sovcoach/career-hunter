@@ -204,3 +204,27 @@ def test_clean_passed_files_pass(setup: tuple[Path, Path]) -> None:
     (repo / "a.md").write_text(f"The data folder is {data} (naming the folder is fine).\n")
     (repo / "b.md").write_text("hello\n")
     assert run_check(repo, data, ["a.md", "b.md"]).returncode == 0
+
+
+def test_git_is_hermetic(setup: tuple[Path, Path]) -> None:
+    """The autouse hermetic_git fixture hides real git config and fixes the identity."""
+    repo, _ = setup
+    origins = subprocess.run(
+        ["git", "config", "--show-origin", "--list"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "global" not in origins
+    assert "user.name" not in origins
+    ident = subprocess.run(
+        ["git", "var", "GIT_COMMITTER_IDENT"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert ident.startswith("Synthetic Test <test@example.invalid>")
+    stage(repo, "a.md")
+    git(repo, "commit", "-q", "-m", "synthetic", "--no-verify")  # works with no real config
