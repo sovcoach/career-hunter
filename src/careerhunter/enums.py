@@ -1,13 +1,13 @@
 """Allowed values for enumerated columns.
 
-These mirror the CHECK constraints in migrations/0001_init.sql. The database is the
-source of truth; these tuples exist so the seed importer can give friendly errors
-before anything is written.
+These mirror the CHECK constraints in the migrations under migrations/search/ and
+migrations/ei_record/. The databases are the source of truth; these tuples exist so the
+seed importer can give friendly errors before anything is written.
 """
 
 from __future__ import annotations
 
-SOURCES = ("grok", "watcher", "discovery", "manual")
+SOURCES = ("grok", "watcher", "discovery", "manual", "self_sourced")
 ATS_TYPES = (
     "greenhouse",
     "lever",
@@ -32,12 +32,14 @@ METHODS = (
     "recruiter_inbound",
     "other",
 )
+# The status pipeline, shared by the EI status history and the search decision history.
 STATUSES = (
     "applied",
     "screening",
-    "assessment",
-    "interview",
+    "assessment_submitted",
+    "interview_scheduled",
     "offer",
+    "hired",  # offer accepted
     "rejected",
     "no_response",
     "withdrawn",

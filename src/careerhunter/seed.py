@@ -1,14 +1,29 @@
 """Import an initial history from $CAREERHUNTER_DATA_DIR/seed.yaml.
 
-The format is documented in seed.example.yaml at the repo root. The import is
-idempotent: rows are matched on natural keys, so re-running it never duplicates
-anything. Those keys are company name; for a posting, its url, else company +
-requisition id, else company + title + location + month first seen; an application
-is one posting on one date; an activity is type + description + date. Existing rows
-are left as they are; the seed never edits or deletes.
+The format is documented in seed.example.yaml at the repo root. Each record goes to its
+layer:
 
-The whole file is validated before anything is written, and the write happens in one
-transaction: either everything new goes in, or nothing does.
+- companies and postings: search.db only;
+- applications: both layers. The EI record of the active claim gets the sanitized copy
+  and an `applied` status; search.db gets the full entry, notes included, and an
+  `applied` decision. Both share a new correlation id;
+- activities: the active claim's EI record only.
+
+Every application and activity must belong to the active claim, by the rule for its date
+precision (see claims.check_dating). An exact date outside the claim is refused, which
+catches typos. `route_out_of_claim=True` instead sends such applications to search.db
+only, and lists each one in the result. Activities outside the claim are always refused.
+With no active claim, applications go to search.db only and activities are refused.
+
+The import is idempotent: rows are matched on natural keys, so re-running it never
+duplicates anything. A re-run also fills in a side that is missing: an application in the
+EI record but not in search.db, or the other way round, is completed with the same
+correlation id. Existing rows are otherwise left as they are; the seed never edits or
+deletes.
+
+The whole file is validated before anything is written, and the write follows the
+ledger's order: search.db's rows are written but held uncommitted, the EI record commits,
+then search.db commits.
 """
 
 from __future__ import annotations
@@ -21,8 +36,11 @@ from typing import Any
 
 import yaml
 
-from careerhunter import enums
-from careerhunter.db import transaction
+from careerhunter import ei_store, enums, search_store
+from careerhunter.claims import ActiveClaim, Verdict, check_dating
+from careerhunter.ei_store import EiApplication
+from careerhunter.ledger import ei_first, new_correlation_id, sanitize
+from careerhunter.models import Activity, Application, Dating, Posting
 
 
 class SeedError(Exception):
@@ -33,13 +51,9 @@ class SeedError(Exception):
 
 
 @dataclass
-class SeedResult:
+class Tally:
     inserted: dict[str, int] = field(default_factory=dict)
     existing: dict[str, int] = field(default_factory=dict)
-    # Company ids already counted this run, so a company named by several applications
-    # is reported once.
-    companies_seen: set[int] = field(default_factory=set)
-    postings_seen: set[int] = field(default_factory=set)
 
     def bump(self, table: str, was_inserted: bool) -> None:
         bucket = self.inserted if was_inserted else self.existing
@@ -48,6 +62,30 @@ class SeedResult:
     @property
     def total_inserted(self) -> int:
         return sum(self.inserted.values())
+
+
+@dataclass
+class SeedResult:
+    search: Tally = field(default_factory=Tally)
+    ei: Tally = field(default_factory=Tally)
+    claim: str | None = None
+    warnings: list[str] = field(default_factory=list)
+    # Applications recorded in search.db only, each with the reason.
+    search_only: list[str] = field(default_factory=list)
+    # Company and posting ids already counted this run, so each is reported once.
+    companies_seen: set[int] = field(default_factory=set)
+    postings_seen: set[int] = field(default_factory=set)
+
+    @property
+    def total_inserted(self) -> int:
+        return self.search.total_inserted + self.ei.total_inserted
+
+
+@dataclass(frozen=True)
+class SeedRows:
+    companies: list[dict[str, Any]]
+    applications: list[Application]
+    activities: list[Activity]
 
 
 def monday_of(day: dt.date) -> dt.date:
@@ -97,31 +135,29 @@ def _required(item: dict[str, Any], key: str, where: str, problems: list[str]) -
     return value
 
 
-def _dating(
-    item: dict[str, Any], date_key: str, where: str, problems: list[str]
-) -> tuple[str, str | None, str | None]:
-    """Validate the precision trio. Returns (precision, date, week_of) as ISO strings."""
+def _dating(item: dict[str, Any], date_key: str, where: str, problems: list[str]) -> Dating:
+    """Validate the precision trio and return it with ISO date strings."""
     precision = _enum(item.get("date_precision"), enums.DATE_PRECISIONS, where, problems)
     if precision is None:
         if item.get("date_precision") is None:
             problems.append(f"{where}.date_precision is required (exact, week, unknown)")
-        return "unknown", None, None
+        return Dating("unknown")
     day = _as_date(item.get(date_key), f"{where}.{date_key}", problems)
     week = _as_date(item.get("week_of"), f"{where}.week_of", problems)
     if precision == "exact":
         if day is None:
             problems.append(f"{where}: date_precision exact needs {date_key}")
-            return precision, None, None
-        return precision, day.isoformat(), None
+            return Dating("unknown")
+        return Dating(precision, day=day.isoformat())
     if precision == "week":
         if week is None:
             problems.append(f"{where}: date_precision week needs week_of")
-            return precision, None, None
+            return Dating("unknown")
         # "week of" means the week containing that day; store its Monday.
-        return precision, None, monday_of(week).isoformat()
+        return Dating(precision, week_of=monday_of(week).isoformat())
     if day is not None or week is not None:
         problems.append(f"{where}: date_precision unknown must not have {date_key} or week_of")
-    return precision, None, None
+    return Dating(precision)
 
 
 def _company_row(item: dict[str, Any], where: str, problems: list[str]) -> dict[str, Any]:
@@ -137,7 +173,7 @@ def _company_row(item: dict[str, Any], where: str, problems: list[str]) -> dict[
     }
 
 
-def parse(doc: Any, today: dt.date) -> dict[str, list[dict[str, Any]]]:
+def parse(doc: Any, today: dt.date) -> SeedRows:
     """Validate a loaded seed document and return normalized rows, or raise SeedError."""
     problems: list[str] = []
     if doc is None:
@@ -161,203 +197,238 @@ def parse(doc: Any, today: dt.date) -> dict[str, list[dict[str, Any]]]:
         for i, item in enumerate(sections["companies"])
     ]
 
-    applications: list[dict[str, Any]] = []
+    applications: list[Application] = []
     for i, item in enumerate(sections["applications"]):
         where = f"applications[{i}]"
-        precision, applied, week = _dating(item, "date_applied", where, problems)
+        dating = _dating(item, "date_applied", where, problems)
         method = _enum(item.get("method"), enums.METHODS, f"{where}.method", problems)
         if item.get("method") is None:
             problems.append(f"{where}.method is required")
+        posting = Posting(
+            company=_required(item, "company", where, problems),
+            title=_required(item, "title", where, problems),
+            first_seen=dating.sort_date or today.isoformat(),
+            location=_text(item, "location", where, problems) or "",
+            work_model=_enum(
+                item.get("work_model"), enums.WORK_MODELS, f"{where}.work_model", problems
+            ),
+            schedule=_text(item, "schedule", where, problems),
+            url=_text(item, "url", where, problems),
+            requisition_id=_text(item, "requisition_id", where, problems),
+        )
         applications.append(
-            {
-                "company": _required(item, "company", where, problems),
-                "title": _required(item, "title", where, problems),
-                "location": _text(item, "location", where, problems) or "",
-                "work_model": _enum(
-                    item.get("work_model"), enums.WORK_MODELS, f"{where}.work_model", problems
-                ),
-                "schedule": _text(item, "schedule", where, problems),
-                "url": _text(item, "url", where, problems),
-                "requisition_id": _text(item, "requisition_id", where, problems),
-                "method": method,
-                "date_precision": precision,
-                "date_applied": applied,
-                "week_of": week,
-                "resume_file": _text(item, "resume_file", where, problems),
-                "notes": _text(item, "notes", where, problems),
-                "first_seen": applied or week or today.isoformat(),
-            }
+            Application(
+                posting=posting,
+                dating=dating,
+                method=method or "other",
+                resume_file=_text(item, "resume_file", where, problems),
+                notes=_text(item, "notes", where, problems),
+            )
         )
 
-    activities: list[dict[str, Any]] = []
+    activities: list[Activity] = []
     for i, item in enumerate(sections["activities"]):
         where = f"activities[{i}]"
-        precision, day, week = _dating(item, "date", where, problems)
+        dating = _dating(item, "date", where, problems)
         kind = _enum(item.get("type"), enums.ACTIVITY_TYPES, f"{where}.type", problems)
         if item.get("type") is None:
             problems.append(f"{where}.type is required")
         activities.append(
-            {
-                "date": day,
-                "date_precision": precision,
-                "week_of": week,
-                "type": kind,
-                "description": _required(item, "description", where, problems),
-                "related_company": _text(item, "related_company", where, problems),
-            }
+            Activity(
+                dating=dating,
+                type=kind or "other",
+                description=_required(item, "description", where, problems),
+                related_company=_text(item, "related_company", where, problems),
+            )
         )
 
     if problems:
         raise SeedError(problems)
-    return {"companies": companies, "applications": applications, "activities": activities}
+    return SeedRows(companies, applications, activities)
 
 
-def _upsert_company(conn: sqlite3.Connection, row: dict[str, Any], result: SeedResult) -> int:
-    cur = conn.execute(
-        "INSERT INTO companies (name, ats_type, ats_slug, careers_url, watchlist, source) "
-        "VALUES (:name, :ats_type, :ats_slug, :careers_url, :watchlist, 'manual') "
-        "ON CONFLICT DO NOTHING",
-        row,
-    )
-    found = conn.execute("SELECT id FROM companies WHERE name = ?", (row["name"],)).fetchone()
-    company_id = int(found["id"])
+def _describe(i: int, app: Application) -> str:
+    return f"applications[{i}] ({app.posting.company} / {app.posting.title})"
+
+
+def _route(
+    rows: SeedRows, active: ActiveClaim | None, route_out_of_claim: bool, result: SeedResult
+) -> list[bool]:
+    """Apply the claim check. Returns, per application, whether it goes to the EI record."""
+    problems: list[str] = []
+    to_ei: list[bool] = []
+    for i, app in enumerate(rows.applications):
+        if active is None:
+            to_ei.append(False)
+            continue
+        verdict, message = check_dating(active.claim, app.dating)
+        if verdict is Verdict.REFUSE:
+            if route_out_of_claim:
+                result.search_only.append(f"{_describe(i, app)}: {message}")
+            else:
+                problems.append(
+                    f"{_describe(i, app)}: {message}. Fix the date, or re-run with "
+                    "--route-out-of-claim-to-search to record it in search.db only"
+                )
+            to_ei.append(False)
+            continue
+        if verdict is Verdict.WARN:
+            result.warnings.append(f"{_describe(i, app)}: {message}")
+        to_ei.append(True)
+    for i, act in enumerate(rows.activities):
+        where = f"activities[{i}] ({act.description})"
+        if active is None:
+            problems.append(
+                f"{where}: no EI claim is active, so there is no record to put it in. Set "
+                "ei.active_claim in config.yaml, or remove the activity"
+            )
+            continue
+        verdict, message = check_dating(active.claim, act.dating)
+        if verdict is Verdict.REFUSE:
+            problems.append(f"{where}: {message}")
+        elif verdict is Verdict.WARN:
+            result.warnings.append(f"{where}: {message}")
+    if problems:
+        raise SeedError(problems)
+    return to_ei
+
+
+def _count_posting(
+    result: SeedResult, company_id: int, posting_id: int, company_new: bool, posting_new: bool
+) -> None:
     if company_id not in result.companies_seen:
         result.companies_seen.add(company_id)
-        result.bump("companies", cur.rowcount == 1)
-    return company_id
-
-
-def _find_posting(conn: sqlite3.Connection, company_id: int, app: dict[str, Any]) -> int | None:
-    """Match an existing posting using the schema's identity rules, strongest first."""
-    if app["url"]:
-        row = conn.execute(
-            "SELECT id, company_id FROM postings WHERE url = ?", (app["url"],)
-        ).fetchone()
-        if row:
-            if row["company_id"] != company_id:
-                raise SeedError(
-                    [
-                        f"{app['company']} / {app['title']}: url {app['url']!r} is already "
-                        "recorded for a posting at a different company"
-                    ]
-                )
-            return int(row["id"])
-    if app["requisition_id"]:
-        row = conn.execute(
-            "SELECT id FROM postings WHERE company_id = ? AND requisition_id = ?",
-            (company_id, app["requisition_id"]),
-        ).fetchone()
-        if row:
-            return int(row["id"])
-    if app["url"] or app["requisition_id"]:
-        return None
-    fallback = (
-        "SELECT p.id FROM postings p {join} WHERE p.company_id = ? AND p.title = ? "
-        "AND p.location = ? AND p.url IS NULL AND p.requisition_id IS NULL {extra} LIMIT 1"
-    )
-    key = (company_id, app["title"], app["location"])
-    row = conn.execute(
-        fallback.format(join="", extra="AND substr(p.first_seen, 1, 7) = substr(?, 1, 7)"),
-        (*key, app["first_seen"]),
-    ).fetchone()
-    if row is None and app["date_precision"] == "unknown":
-        # An undated entry's first_seen is the import date, which moves between runs.
-        # Match the earlier import of the same undated application instead.
-        row = conn.execute(
-            fallback.format(
-                join="JOIN applications a ON a.posting_id = p.id",
-                extra="AND a.date_precision = 'unknown'",
-            ),
-            key,
-        ).fetchone()
-    return int(row["id"]) if row else None
-
-
-def _find_or_create_posting(
-    conn: sqlite3.Connection, company_id: int, app: dict[str, Any], result: SeedResult
-) -> int:
-    posting_id = _find_posting(conn, company_id, app)
-    inserted = posting_id is None
-    if posting_id is None:
-        cur = conn.execute(
-            "INSERT INTO postings (company_id, title, location, work_model, schedule, url, "
-            "requisition_id, first_seen, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual')",
-            (
-                company_id,
-                app["title"],
-                app["location"],
-                app["work_model"],
-                app["schedule"],
-                app["url"],
-                app["requisition_id"],
-                app["first_seen"],
-            ),
-        )
-        posting_id = int(cur.lastrowid or 0)
+        result.search.bump("companies", company_new)
     if posting_id not in result.postings_seen:
         result.postings_seen.add(posting_id)
-        result.bump("postings", inserted)
-    return posting_id
+        result.search.bump("postings", posting_new)
 
 
-def import_rows(conn: sqlite3.Connection, rows: dict[str, list[dict[str, Any]]]) -> SeedResult:
-    result = SeedResult()
-    with transaction(conn):
-        for company in rows["companies"]:
-            _upsert_company(conn, company, result)
+def import_rows(
+    search: sqlite3.Connection,
+    active: ActiveClaim | None,
+    rows: SeedRows,
+    *,
+    route_out_of_claim: bool = False,
+) -> SeedResult:
+    result = SeedResult(claim=active.claim.label if active else None)
+    to_ei = _route(rows, active, route_out_of_claim, result)
+    label = result.claim
+    problems: list[str] = []
+    # Sanitized copies for the EI record, by correlation id, in seed order.
+    pending: dict[str, EiApplication] = {}
+    pending_keys: dict[tuple[Any, ...], int] = {}
 
-        for app in rows["applications"]:
-            company_id = _upsert_company(
-                conn,
-                {
-                    "name": app["company"],
-                    "ats_type": None,
-                    "ats_slug": None,
-                    "careers_url": None,
-                    "watchlist": 0,
-                },
-                result,
-            )
-            posting_id = _find_or_create_posting(conn, company_id, app, result)
+    with ei_first(search, active):
+        for company in rows.companies:
+            company_id, new = search_store.upsert_company(search, **company)
+            if company_id not in result.companies_seen:
+                result.companies_seen.add(company_id)
+                result.search.bump("companies", new)
 
-            cur = conn.execute(
-                "INSERT INTO applications (posting_id, date_applied, date_precision, week_of, "
-                "method, resume_file, notes) VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT DO NOTHING",
-                (
-                    posting_id,
-                    app["date_applied"],
-                    app["date_precision"],
-                    app["week_of"],
-                    app["method"],
-                    app["resume_file"],
-                    app["notes"],
-                ),
-            )
-            inserted = cur.rowcount == 1
-            result.bump("applications", inserted)
-            if inserted:
-                conn.execute(
-                    "INSERT INTO status_history (application_id, status, status_date, note) "
-                    "VALUES (?, 'applied', ?, 'imported from seed')",
-                    (cur.lastrowid, app["date_applied"] or app["week_of"]),
+        for i, (app, goes_to_ei) in enumerate(zip(rows.applications, to_ei, strict=True)):
+            try:
+                company_id, posting_id, company_new, posting_new = (
+                    search_store.find_or_create_posting(search, app.posting, app.dating)
                 )
-                result.bump("status_history", True)
+            except search_store.IdentityConflict as exc:
+                problems.append(str(exc))
+                continue
+            _count_posting(result, company_id, posting_id, company_new, posting_new)
 
-        for act in rows["activities"]:
-            cur = conn.execute(
-                "INSERT INTO activities (date, date_precision, week_of, type, description, "
-                "related_company) VALUES (:date, :date_precision, :week_of, :type, "
-                ":description, :related_company) ON CONFLICT DO NOTHING",
-                act,
+            found = search_store.find_application(search, posting_id, app.dating)
+            in_ei = None
+            if goes_to_ei and active is not None:
+                in_ei = ei_store.find_application(
+                    active.conn,
+                    app.posting.company,
+                    app.posting.title,
+                    app.posting.location,
+                    app.posting.url,
+                    app.dating,
+                )
+                if found is not None and in_ei is not None and found["correlation_id"] != in_ei:
+                    problems.append(
+                        f"{_describe(i, app)}: the EI record and search.db hold it under "
+                        "different correlation ids. Run `careerhunter doctor`"
+                    )
+                    continue
+                if found is not None and found["ei_claim"] not in (None, label):
+                    problems.append(
+                        f"{_describe(i, app)}: search.db already links it to claim "
+                        f"{found['ei_claim']}"
+                    )
+                    continue
+
+            correlation_id = (
+                found["correlation_id"] if found is not None else in_ei or new_correlation_id()
             )
-            result.bump("activities", cur.rowcount == 1)
+            if found is None:
+                app_id = search_store.insert_application(
+                    search, posting_id, app, correlation_id, label if goes_to_ei else None
+                )
+                search_store.add_decision(
+                    search, app_id, "applied", app.dating.sort_date, "imported from seed"
+                )
+                result.search.bump("applications", True)
+                result.search.bump("decision_history", True)
+            else:
+                result.search.bump("applications", False)
+                if goes_to_ei and found["ei_claim"] is None:
+                    search_store.link_to_claim(search, int(found["id"]), str(label))
+
+            if not goes_to_ei:
+                continue
+            if in_ei is not None or correlation_id in pending:
+                result.ei.bump("applications", False)
+                continue
+            ei_app = sanitize(app, correlation_id)
+            key = (
+                ei_app.employer.casefold(),
+                ei_app.role.casefold(),
+                ei_app.location.casefold(),
+                ei_app.posting_url or "",
+                ei_app.date_precision,
+                ei_app.date_applied,
+                ei_app.week_of,
+            )
+            if key in pending_keys:
+                problems.append(
+                    f"{_describe(pending_keys[key], app)} and {_describe(i, app)} are different "
+                    "postings, but the EI record can't tell them apart (same employer, role, "
+                    "location, url and date). Add each posting's url"
+                )
+                continue
+            pending_keys[key] = i
+            pending[correlation_id] = ei_app
+
+        if problems:
+            raise SeedError(problems)
+
+        if active is not None:
+            for ei_app in pending.values():
+                ei_id = ei_store.insert_application(active.conn, ei_app)
+                ei_store.add_status(
+                    active.conn, ei_id, "applied", ei_app.date_applied or ei_app.week_of
+                )
+                result.ei.bump("applications", True)
+                result.ei.bump("status_history", True)
+            for act in rows.activities:
+                result.ei.bump("activities", ei_store.insert_activity(active.conn, act))
     return result
 
 
-def import_seed(conn: sqlite3.Connection, path: Path, today: dt.date | None = None) -> SeedResult:
+def import_seed(
+    search: sqlite3.Connection,
+    active: ActiveClaim | None,
+    path: Path,
+    today: dt.date | None = None,
+    *,
+    route_out_of_claim: bool = False,
+) -> SeedResult:
     if not path.is_file():
         raise SeedError([f"{path} not found. Copy seed.example.yaml there and fill it in."])
     with path.open(encoding="utf-8") as fh:
         doc = yaml.safe_load(fh)
-    return import_rows(conn, parse(doc, today or dt.date.today()))
+    rows = parse(doc, today or dt.date.today())
+    return import_rows(search, active, rows, route_out_of_claim=route_out_of_claim)

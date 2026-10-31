@@ -3,7 +3,9 @@
 **In plain language:** career-hunter has two halves that never mix.
 
 - **The code** lives in this git repository and contains nothing personal.
-- **Your data** lives in one folder on an encrypted external drive: the database, your real settings, saved copies of job ads, and exported reports.
+- **Your data** lives in one folder on an encrypted external drive: the databases, your real settings, saved copies of job ads, and exported reports.
+
+Inside that folder, the data itself has two layers that never mix either. `search.db` holds everything career-hunter learns from: postings, fit ratings, skip reasons and the like. Each EI claim gets its own small record file, holding only what Service Canada may ask for. The two are linked by a random ID that means nothing on its own.
 
 A small "storage guard" runs before every command and checks that the data folder is somewhere safe. Secrets, such as the future Telegram bot token, sit in the macOS Keychain, separate from both halves.
 
@@ -18,18 +20,25 @@ A small "storage guard" runs before every command and checks that the data folde
 | `platform_checks.py` | `SystemProbe`: read-only wrappers around `diskutil info -plist`, `fdesetup status`, `git rev-parse` and `os.stat`. Tests swap in a fake. |
 | `secrets_store.py` | Keychain access through `keyring`. Allowlisted names only, plaintext backends refused, and values never printed. |
 | `config.py` | Validates `config.yaml` and `exclusions.yaml` and reports every problem at once. |
-| `db.py` | SQLite connection (WAL, `busy_timeout=5000`, foreign keys on), the versioned migration runner, and a transaction helper. |
-| `migrations/NNNN_*.sql` | Schema history. Each file is applied once, and its checksum is recorded so edits are detected. `schema_migrations` and its two triggers (`no_delete_schema_migrations`, `no_update_schema_migrations`) are created by the migration runner in `db.py`, not by `0001`. A fresh database therefore has 23 triggers: 21 from `0001_init.sql` plus those 2. |
-| `seed.py` | Validates, then imports `seed.yaml` in one transaction. Idempotent by natural keys. |
-| `export.py` | Builds the EI record for a date range as CSV and PDF. |
+| `db.py` | SQLite connections (WAL, `busy_timeout=5000`, foreign keys on; or read-only), the migration runner with one track per kind of file, and a transaction helper. |
+| `migrations/search/`, `migrations/ei_record/` | Schema history, one track per kind of file. Each migration is applied once, and its checksum is recorded so edits are detected. The runner in `db.py` also creates `schema_migrations` and `db_identity`, and their four no-update and no-delete triggers. A fresh `search.db` therefore has 6 triggers (2 from its `0001_init.sql`), and a fresh EI record has 32 (28 from its `0001_init.sql`). |
+| `models.py` | Plain record values: `Posting`, `Application`, `Activity`, `Dating`. |
+| `claims.py` | The `ei` config section, the per-precision claim check, creating each claim's file, the refusal to write while an earlier claim is unsealed, and sealing. |
+| `ledger.py` | Writes decisions to both layers in a fixed order, builds the sanitized EI copy, and reconciles the two layers. |
+| `ei_store.py` | Reads and writes on one EI record file. It imports no search code and opens nothing itself. |
+| `search_store.py` | Reads and writes on `search.db`, including the posting identity rules. |
+| `seed.py` | Validates `seed.yaml`, runs the claim check, then imports each record into its layer. Idempotent by natural keys. |
+| `export.py` | Builds one claim's EI record for a date range as CSV and PDF, from that claim's file alone. |
 | `scripts/check_no_datadir_paths.py` | Pre-commit hook that blocks staged content pointing into the data folder. |
 
 ## Where data lives, and why
 
 ```
 /Volumes/X10-Pro/CareerHunterData/        ← CAREERHUNTER_DATA_DIR (mode 0700)
-├── careerhunter.db (+ -wal, -shm)        ← the record
-├── config.yaml                           ← your search settings (from config.example.yaml)
+├── search.db (+ -wal, -shm)              ← search and learning layer (0600)
+├── ei_record_2026-27.db (+ -wal, -shm)   ← the active claim's EI record (0600)
+├── ei_record_2025-26.db                  ← an earlier claim, sealed (0400, no -wal/-shm)
+├── config.yaml                           ← your search settings and EI claims (from config.example.yaml)
 ├── exclusions.yaml                       ← companies/keywords to skip
 ├── seed.yaml                             ← one-off import of past history
 ├── exports/                              ← EI reports, timestamped, never overwritten
@@ -40,7 +49,8 @@ A small "storage guard" runs before every command and checks that the data folde
 
 - **Outside the repo:** a git mistake can't leak data that isn't there. See DECISIONS ADR-001.
 - **On an encrypted external volume:** the record is personal. The guard requires encrypted APFS and refuses anything else. See ADR-001 and ADR-002.
-- **Paths inside the DB are relative** to the data folder (`snapshot_path` can't start with `/`), so renaming the drive doesn't break the record.
+- **Paths inside the databases are relative** to the data folder (`snapshot_path` can't start with `/`), so renaming the drive doesn't break the record.
+- **One EI file per claim**, so an earlier claim can be sealed read-only on its own and kept for 6 years from its own end date. See ADR-014.
 
 ## Storage guard sequence
 
@@ -63,42 +73,75 @@ FileVault on boot disk?                            ── no ──▶ loud warn
 
 ## Data model
 
+**`search.db`**, the search and learning layer. It is editable, with no retention triggers:
+
 ```
-companies 1──* postings 1──* applications 1──* status_history
-                    │
-                    └──* skips
-activities  (independent; related_company is free text)
-edits       (audit log of every permitted UPDATE, written by triggers)
+companies 1──* postings 1──* applications 1──* decision_history
+                    │              │
+                    └──* skips     └── correlation_id, ei_claim ──▶ an EI record file
 ```
 
+- Postings carry the learning fields: `fit_rating`, `gaps`, `llm_output`, `scout_metadata`. Applications carry `reasoning` and `notes`, and skips carry their `reason`.
+- **Posting identity:** the URL, else company + requisition ID, else company + title + location + month first seen.
+- An application's `correlation_id` never changes. Its `ei_claim` can be set once, and is NULL when no claim was active or the application fell outside the claim.
+
+**`ei_record_<label>.db`**, one per EI claim. It is sanitized and append-only:
+
+```
+claim (one row: label, start, end, sealed_at)
+applications 1──* status_history          activities
+edits        (audit log of every permitted UPDATE, written by triggers)
+```
+
+- **Only EI fields:** employer, role, location, work model, posting URL, date and precision, method, the snapshot and resume references, and the void columns. There is no fit, gap, LLM, skip, scout or notes column anywhere, and tests hold the schema to an exact allowlist.
 - **Dates:** ISO text. Applications and activities carry a `date_precision`:
   - `exact`: a real date;
   - `week`: `week_of`, always a Monday;
   - `unknown`: neither.
-  A CHECK constraint enforces the right combination.
-- **Enumerations** (source, work model, method, status, activity type, ATS type) are CHECK-constrained in SQL. `enums.py` mirrors them for friendly validation messages.
+  A CHECK constraint enforces the right combination, and triggers refuse dates outside the claim period, by the same per-precision rule as the app.
+- **Enumerations** (source, work model, method, status, activity type, ATS type) are CHECK-constrained in SQL. `enums.py` mirrors them for friendly validation messages. The status pipeline is shared by both layers: `applied`, `screening`, `assessment_submitted`, `interview_scheduled`, `offer`, `hired`, `rejected`, `no_response`, `withdrawn`.
 - **Idempotency keys:**
-  - company name (case-insensitive);
-  - posting: URL, else company + requisition ID, else company + title + location + month first seen;
-  - application: posting + date, so re-applying on another date is a new row;
-  - activity (type, description, date or week).
-- **Retention and corrections:**
+  - in `search.db`: company name (case-insensitive), the posting identity above, and an application as posting + date;
+  - in an EI record: an application as employer + role + location + posting URL + date, and an activity as type + description + date or week.
+- **Retention and corrections** (EI records):
   - Every table has a `BEFORE DELETE` trigger that aborts, and nothing cascades.
   - `status_history` and `edits` are append-only. Status changes are new rows, and the current status is the latest row.
-  - Mistaken applications and activities are **voided**: they need a reason, stay in the database, are left out of exports, and are frozen afterwards.
+  - Mistaken applications and activities are **voided**: they need a reason, stay in the file, are left out of exports, and are frozen afterwards.
   - Every permitted UPDATE is written column-by-column to `edits` by triggers, so nothing can change without a trail.
-  - `id` and `created_at` never change.
+  - `id`, `correlation_id` and `created_at` never change. The claim's label and start never change.
+  - Once a claim is **sealed**, triggers refuse every INSERT and UPDATE, and the file is read-only.
 
-## Data flow (Phase 1)
+## Writing to both layers
 
 ```
-seed.yaml ──validate──▶ seed.py ──one transaction──▶ SQLite
-                                                       │
-                       export --from --to  ◀───────────┘
-                             │
-                             ├─▶ exports/ei_<from>_<to>_<ts>_applications.csv
-                             ├─▶ exports/ei_<from>_<to>_<ts>_activities.csv
-                             └─▶ exports/ei_<from>_<to>_<ts>.pdf
+             1. open search.db's transaction and write its rows (not committed yet)
+search.db ◀──────────────────────────────────────────────────── ledger / seed
+                                                                    │
+ei_record_<active>.db ◀── 2. write the sanitized copy and COMMIT ───┤
+                                                                    │
+search.db ◀────────────── 3. COMMIT ────────────────────────────────┘
+```
+
+- A problem on the search side stops everything before the EI record is touched.
+- If step 3 fails, the EI record stands and the command reports a partial write. `doctor` then shows the gap.
+- A skip writes `search.db` only. With no active claim, applications go to `search.db` only.
+- Before any of this, `init`, `migrate` and `seed` refuse to run while an earlier claim's file is unsealed, or a claim file isn't in config.
+
+`doctor` reconciles the two layers in both directions. It opens each file on its own connection, read-only, and never attaches one to another.
+
+## Data flow
+
+```
+seed.yaml ──validate + claim check──▶ seed.py ──▶ search.db             (companies, postings,
+                                         │                               applications, decisions)
+                                         └─────▶ ei_record_<active>.db  (sanitized applications,
+                                                                         statuses, activities)
+
+ei_record_<label>.db ──read-only──▶ export --claim <label> --from --to
+                                         │
+                                         ├─▶ exports/ei_<label>_<from>_<to>_<ts>_applications.csv
+                                         ├─▶ exports/ei_<label>_<from>_<to>_<ts>_activities.csv
+                                         └─▶ exports/ei_<label>_<from>_<to>_<ts>.pdf
 ```
 
 Export inclusion rules:
@@ -112,7 +155,8 @@ CSV cells starting with `= + - @` are prefixed with `'` to stop spreadsheet form
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1, Foundation (v0.1.0) | Storage guards, Keychain helper, schema and migrations, seed import, EI export, CI, docs | **this release** |
+| 1, Foundation (v0.1.0) | Storage guards, Keychain helper, schema and migrations, seed import, EI export, CI, docs | done |
+| 1.5, Data layer split (v0.2.0) | `search.db` and one EI record file per claim, a correlation ID, write order and reconciliation, claim config and sealing | **this release** |
 | 2, Notifications | Dedicated Telegram bot; token read from Keychain; daily digest and alerts | planned |
 | 3, Watcher | Fetch watchlisted companies' ATS boards; job-ad snapshots for the EI record; fit rating against the config rubric; skips with reasons | planned |
 | 4, Discovery | Find new companies and postings beyond the watchlist | planned |

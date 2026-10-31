@@ -4,7 +4,7 @@
 
 Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 1 (foundation), version 0.1.0. Tracking, import and export work. Watching and notifications are not built yet.
+> **Status:** Phase 1.5 (data layer split), version 0.2.0. Tracking, import and export work, with one EI record per claim kept apart from everything else. Watching and notifications are not built yet.
 
 ---
 
@@ -14,13 +14,14 @@ Your information never leaves your machine and is never stored in this code repo
 - **Developers and reviewers** looking at how a small personal-data tool can be built carefully: fail-closed storage guards, secrets in the OS keychain, append-only records, CI and decision records.
 - **Friends** who want to run their own copy. Everything personal lives in config, so you can clone it and use it for your own search.
 
-## What it does (Phase 1)
+## What it does (Phase 1.5)
 
 | Command | What it does |
 |---|---|
-| `careerhunter init` | Creates your private data folder on the encrypted drive, copies in starter config files, and creates the database |
-| `careerhunter seed` | Imports your existing applications and activities from a simple YAML file. Re-running is safe: nothing is duplicated |
-| `careerhunter export --from … --to …` | Writes your EI job-search record for a date range as a PDF plus two CSV spreadsheets |
+| `careerhunter init` | Creates your private data folder on the encrypted drive, copies in starter config files, and creates the databases |
+| `careerhunter seed` | Imports your existing applications and activities from a simple YAML file, each into the right place. Re-running is safe: nothing is duplicated |
+| `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
+| `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
 
@@ -37,12 +38,14 @@ Your information never leaves your machine and is never stored in this code repo
   ┌──────────────────────────────┐          ┌───────────────────────────────────────┐
   │ careerhunter CLI             │  guard   │ /Volumes/<encrypted drive>/            │
   │  ├─ storage guard  ──────────┼──checks──▶   CareerHunterData/                   │
-  │  ├─ seed import              │          │     careerhunter.db (SQLite, WAL)     │
+  │  ├─ seed import              │          │     search.db  ei_record_<claim>.db   │
   │  ├─ EI export (PDF + CSV)    │          │     config.yaml  exclusions.yaml      │
   │  └─ Keychain helper ─────┐   │          │     seed.yaml   exports/  snapshots/  │
   └──────────────────────────┼───┘          └───────────────────────────────────────┘
                              └──▶ macOS Keychain (secrets)
 ```
+
+Inside the data folder, `search.db` keeps everything career-hunter learns from (postings, fit ratings, skip reasons). Each EI claim has its own record file holding only what Service Canada may ask for. The two are linked by a random ID that means nothing on its own, and the EI record never reads `search.db`.
 
 Every command starts with the **storage guard**. It refuses to run unless:
 
@@ -56,7 +59,7 @@ If something isn't right, it stops and explains why rather than guessing.
 ### Data separation, in brief
 
 1. The app fails closed on the data location, as described above.
-2. Only templates (`*.example.yaml`) are committed. Real config, database, exports and snapshots live in the data folder.
+2. Only templates (`*.example.yaml`) are committed. Real config, databases, exports and snapshots live in the data folder.
 3. `.gitignore` blocks databases, env files, data folders and real config names, as a second layer.
 4. Pre-commit hooks run **gitleaks** (secret scanning) and a custom check. The custom check blocks any commit containing a file, symlink or path that resolves into the data folder.
 5. CI repeats the secret scan across the full git history on every pull request.

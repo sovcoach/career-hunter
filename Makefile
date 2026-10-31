@@ -37,9 +37,9 @@ check: lint typecheck cov ## Everything CI runs, except the full-history secret 
 seed: ## Import seed.yaml from your data folder (safe to re-run)
 	uv run careerhunter seed
 
-export: ## EI export, e.g. make export FROM=2026-09-01 TO=2026-09-30
-	@test -n "$(FROM)" -a -n "$(TO)" || (echo "usage: make export FROM=YYYY-MM-DD TO=YYYY-MM-DD"; exit 1)
-	uv run careerhunter export --from $(FROM) --to $(TO)
+export: ## EI export, e.g. make export CLAIM=2026-27 FROM=2026-09-01 TO=2026-09-30
+	@test -n "$(CLAIM)" -a -n "$(FROM)" -a -n "$(TO)" || (echo "usage: make export CLAIM=YYYY-YY FROM=YYYY-MM-DD TO=YYYY-MM-DD"; exit 1)
+	uv run careerhunter export --claim $(CLAIM) --from $(FROM) --to $(TO)
 
 doctor: ## Check the setup and report what is missing
 	uv run careerhunter doctor
