@@ -1,0 +1,9 @@
+# gitleaks configuration: the default ruleset plus a career-hunter-specific rule.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram bot token (belongs in the macOS Keychain, never in the repo)"
+regex = '''\b[0-9]{8,10}:[A-Za-z0-9_-]{35}\b'''
+keywords = [":"]

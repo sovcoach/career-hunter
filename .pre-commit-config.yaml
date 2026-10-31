@@ -1,0 +1,46 @@
+# Hooks run on every commit. Install once with: make hooks
+# Revs are exact release tags, each at least two weeks old when pinned.
+default_install_hook_types: [pre-commit]
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.4.0
+    hooks:
+      - id: mypy
+        files: ^src/
+        args: [--strict]
+        additional_dependencies: [types-PyYAML, keyring, PyYAML]
+
+  # Upstream hook; pre-commit builds gitleaks with a Go toolchain it manages itself.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: check-no-datadir-paths
+        name: Block private career-hunter data
+        entry: python3 scripts/check_no_datadir_paths.py
+        language: system
+        # Scans the files pre-commit passes (all of them with --all-files); with none,
+        # it falls back to every staged file.
+        always_run: true
