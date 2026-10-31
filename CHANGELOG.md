@@ -7,7 +7,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.2.0] - Phase 1.5: data layer split
+## [0.2.0] - 2026-10-31
 
 ### Added
 - Two data layers in the data folder (ADR-014):
@@ -16,7 +16,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An opaque, random correlation ID links each application across the two layers. The EI record never reads or attaches `search.db`, and `export` reads only the claim's file.
 - One migration track per kind of file, each with checksums, and a permanent identity recorded in every file, so one kind can't be migrated as the other.
 - EI claims in `config.yaml` (`ei.active_claim` and `ei.claims`), validated for label format, dates and overlap. The active claim is set, never computed. With no active claim, nothing is written to any EI record and `search.db` keeps learning.
-- A fixed write order (EI record first, then `search.db`). A failure between the two commits is reported as a partial write.
+- **Consistent dual writes.** Every application and status update is written to both layers in a fixed order: the search database's changes are staged first but held uncommitted, the EI record then commits as the source of truth, and the search database commits last. If anything fails before the EI commit, nothing is saved anywhere. If only the final search commit fails, the EI record stands and doctor flags the gap so it can be repaired.
 - `careerhunter claim seal <label>`: prints what it will do, asks for the label again, then permanently closes an earlier claim's record and makes it read-only (0400). Sealing is never automatic. `init`, `migrate` and `seed` refuse to run while an earlier claim is unsealed, and name the command to run.
 - `seed` routes each record to its layer, and checks every application and activity against the active claim by date precision: an exact date must fall within the claim, a week must overlap it, and an unknown date is accepted with a warning. Re-running `seed` fills in a side that is missing.
 - `seed --route-out-of-claim-to-search` records out-of-claim applications in `search.db` only, and lists each one. Activities outside the claim are always refused.
