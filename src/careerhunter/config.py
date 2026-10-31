@@ -1,8 +1,8 @@
 """Load and validate the user's config.yaml and exclusions.yaml.
 
 Everything personal about a search (target titles, locations, fit rubric, hard gates,
-schedule rules, watchlist) lives in these files in the data directory, never in code.
-Phase 1 validates the structure; later phases consume it.
+schedule rules, watchlist, EI claims) lives in these files in the data directory, never
+in code. The EI claim section is checked by claims.validate_section.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 
+from careerhunter.claims import validate_section
 from careerhunter.enums import ATS_TYPES, WORK_MODELS
 
 
@@ -105,6 +106,8 @@ def validate_config(doc: Any) -> list[str]:
             ats = item.get("ats_type")
             if ats is not None and ats not in ATS_TYPES:
                 problems.append(f"{where}.ats_type must be one of {list(ATS_TYPES)}")
+
+    problems.extend(validate_section(doc.get("ei")))
     return problems
 
 

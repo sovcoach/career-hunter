@@ -56,3 +56,16 @@ watchlist:
     ats_type: lever
     ats_slug: samplelogistics
     careers_url: https://example.org/jobs
+
+# EI claims. career-hunter keeps one EI job-search record file per claim,
+# ei_record_<label>.db. Set the active claim here: it is never worked out for you.
+# A label names the two years a claim spans, like 2026-27, and the claim must start
+# in the first of them. Every claim that isn't the active one needs its end date.
+# See docs/SETUP.md, "Your EI claim".
+ei:
+  active_claim: null           # e.g. "2026-27" while you are claiming; null otherwise
+  claims: []
+  # claims:
+  #   - label: "2026-27"
+  #     start: 2026-08-02      # the start date Service Canada gave you
+  #     end: 2027-07-31        # optional while the claim is active
