@@ -213,10 +213,12 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 
 **Decision.**
 - `.claude/settings.json` (committed) puts `git add/commit/push/rm/tag/merge/rebase/reset` on **ask**.
+- It puts `gh api`, `gh pr merge`, `gh repo edit` and `gh release` on **ask**, so branch-protection changes, merges, repo settings and releases always need a human yes.
 - It **denies** `rm -rf` (and flag-order variants), `sudo`, `docker run`, and force pushes (`--force`, `-f`, `--force-with-lease`).
+- It **denies** any push whose refspec targets `main` (`main`, `HEAD:main`, `<ref>:main`, `refs/heads/main`, including `git -C <dir> push …`). Administrators may bypass branch protection on GitHub (ADR-012); this rule keeps agents from using that bypass.
 - `.claude/settings.local.json` is gitignored, so personal grants never get committed.
 
-**Trade-offs.** This is a guard-rail, not a security boundary: prefix rules can be sidestepped by unusual command shapes. The real protections are branch protection, pre-commit hooks and review.
+**Trade-offs.** This is a guard-rail, not a security boundary: prefix rules can be sidestepped by unusual command shapes. For example, a bare `git push` on a branch that tracks `main` names no refspec, so no rule can tell where it goes; it still needs a yes under the `git push` ask rule. The real protections are branch protection, pre-commit hooks and review.
 
 ## ADR-012: The repo goes public after Phase 1 verification; `main` is protected then
 
@@ -229,7 +231,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 1. Bootstrap `main` with one commit and push it, without branch protection.
 2. Land Phase 1 through a pull request, with CI green, including the full-history gitleaks scan.
 3. Once the operator has verified Phase 1, make the repo **public**.
-4. **Immediately afterwards**, protect `main`: require pull requests and passing CI, and block force pushes and deletion.
+4. **Immediately afterwards**, protect `main`: require pull requests (no approvals required, as this is a solo project) and the `Lint, types, tests` and `gitleaks (full history)` checks, and block force pushes and deletion. Administrators may bypass, so the operator can push to `main` directly when needed. Agents can't, because ADR-011 denies pushes that target `main`.
 
 Until step 4, no direct pushes to `main` is a convention, not something GitHub enforces.
 
