@@ -23,8 +23,16 @@ def example() -> dict[str, object]:
 
 
 def test_example_templates_are_valid() -> None:
-    assert load_config(ROOT / "config.example.yaml")["schedule"]["timezone"]
+    config = load_config(ROOT / "config.example.yaml")
+    assert config["schedule"]["timezone"]
+    assert config["ei"] == {"active_claim": None, "claims": []}
     assert load_exclusions(ROOT / "exclusions.example.yaml")["companies"]
+
+
+def test_config_without_an_ei_section_is_valid() -> None:
+    doc = example()
+    doc.pop("ei")
+    assert validate_config(doc) == []
 
 
 @pytest.mark.parametrize(
@@ -43,6 +51,12 @@ def test_example_templates_are_valid() -> None:
         (lambda d: d.update(watchlist=[{"ats_type": "lever"}]), "needs a name"),
         (lambda d: d.update(watchlist=[{"name": "X", "ats_type": "taleo9"}]), "ats_type"),
         (lambda d: d.update(watchlist="Acme"), "watchlist must be a list"),
+        (lambda d: d.update(ei="2026-27"), "ei must be a mapping"),
+        (lambda d: d["ei"].update(active_claim="2026-27"), "is not one of the claims listed"),
+        (
+            lambda d: d["ei"].update(claims=[{"label": "2026-27", "start": "2026-08-05"}]),
+            "needs an end date",
+        ),
     ],
 )
 def test_config_problems_reported(mutate: object, message: str) -> None:

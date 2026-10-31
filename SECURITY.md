@@ -11,8 +11,9 @@
   2. `.gitignore` rules for databases, env files and real config names;
   3. a pre-commit check that blocks any staged file, symlink or content pointing into the data folder;
   4. gitleaks secret scanning on every commit and over full history in CI.
-- **Permissions.** The database and its WAL/SHM files are `0600`, and `careerhunter doctor` checks this.
-- **Retention.** The database refuses deletes, to preserve a 6-year EI record. Mistakes are voided with a reason rather than removed, and every edit is logged in an append-only audit table. Exports are written next to the data and never overwritten.
+- **Separation.** Learning data (fit ratings, gaps, LLM output, skip reasons, notes) lives in `search.db`. Each EI claim's record is a separate file that holds only what EI needs and never reads `search.db`. See ADR-014.
+- **Permissions.** `search.db`, the active claim's record and their WAL/SHM files are `0600`. A sealed earlier claim is `0400`. `careerhunter doctor` checks all of them.
+- **Retention.** EI record files refuse deletes, to preserve a 6-year record for each claim. Mistakes are voided with a reason rather than removed, every edit is logged in an append-only audit table, and a sealed claim refuses every change. Exports are written next to the data and never overwritten.
 - **Tests and CI** use synthetic fixtures only (fictional companies and postings).
 
 ## How secrets are handled

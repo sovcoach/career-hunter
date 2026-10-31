@@ -17,6 +17,7 @@ to skip these checks.
 from __future__ import annotations
 
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,10 @@ from careerhunter.platform_checks import SystemProbe
 ENV_VAR = "CAREERHUNTER_DATA_DIR"
 SUBDIRS = ("exports", "snapshots", "logs", "backups")
 BOOT_PATHS = (Path("/"), Path("/System/Volumes/Data"))
+EI_RECORD_PREFIX = "ei_record_"
+# The shape of a claim label. It becomes part of a file name, so nothing else is allowed
+# through; claims.py adds the rule that the two years are consecutive.
+CLAIM_LABEL_SHAPE = re.compile(r"^[0-9]{4}-[0-9]{2}$")
 
 
 class StorageGuardError(Exception):
@@ -38,8 +43,21 @@ class DataDir:
     mount_point: Path
 
     @property
-    def db_path(self) -> Path:
+    def search_db_path(self) -> Path:
+        return self.root / "search.db"
+
+    @property
+    def legacy_db_path(self) -> Path:
+        """The single database of v0.1.0, which this version never opens for writing."""
         return self.root / "careerhunter.db"
+
+    def ei_record_path(self, label: str) -> Path:
+        if not CLAIM_LABEL_SHAPE.match(label):
+            raise ValueError(f"{label!r} is not a claim label like 2026-27")
+        return self.root / f"{EI_RECORD_PREFIX}{label}.db"
+
+    def ei_record_files(self) -> list[Path]:
+        return sorted(self.root.glob(f"{EI_RECORD_PREFIX}*.db"))
 
     @property
     def config_path(self) -> Path:

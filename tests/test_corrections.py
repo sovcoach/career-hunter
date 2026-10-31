@@ -1,4 +1,4 @@
-"""Voiding and the edits audit log: corrections never destroy history."""
+"""Voiding and the edits audit log in an EI record: corrections never destroy history."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from careerhunter import records
+from careerhunter.claims import ActiveClaim
 from careerhunter.export import collect_activities, collect_applications, export
 from careerhunter.seed import import_seed
 from tests.conftest import FIXTURES
@@ -17,19 +18,13 @@ SEPT = (dt.date(2026, 9, 1), dt.date(2026, 9, 30))
 
 
 @pytest.fixture
-def seeded(conn: sqlite3.Connection) -> sqlite3.Connection:
-    import_seed(conn, FIXTURES / "seed_synthetic.yaml", today=dt.date(2026, 10, 1))
-    return conn
+def seeded(search: sqlite3.Connection, active: ActiveClaim) -> sqlite3.Connection:
+    import_seed(search, active, FIXTURES / "seed_synthetic.yaml", today=dt.date(2026, 10, 1))
+    return active.conn
 
 
 def app_id(conn: sqlite3.Connection, title: str) -> int:
-    return int(
-        conn.execute(
-            "SELECT a.id FROM applications a JOIN postings p ON p.id = a.posting_id "
-            "WHERE p.title = ?",
-            (title,),
-        ).fetchone()["id"]
-    )
+    return int(conn.execute("SELECT id FROM applications WHERE role = ?", (title,)).fetchone()[0])
 
 
 def edits(conn: sqlite3.Connection, table: str, row_id: int) -> dict[str, tuple[str, str]]:
@@ -81,7 +76,7 @@ def test_voided_rows_are_frozen_and_cannot_be_unvoided(seeded: sqlite3.Connectio
             (acme,),
         )
     with pytest.raises(sqlite3.IntegrityError, match="frozen"):
-        seeded.execute("UPDATE applications SET notes = 'x' WHERE id = ?", (acme,))
+        seeded.execute("UPDATE applications SET resume_file = 'x' WHERE id = ?", (acme,))
     with pytest.raises(records.RecordError, match="already voided"):
         records.void_application(seeded, acme, "Again")
 
@@ -102,26 +97,18 @@ def test_void_needs_reason_and_valid_target(seeded: sqlite3.Connection) -> None:
     ("sql", "table", "column", "old", "new"),
     [
         (
-            "UPDATE companies SET careers_url = 'https://new.example.com' WHERE name = 'Initech'",
-            "companies",
-            "careers_url",
-            None,
-            "https://new.example.com",
-        ),
-        (
-            "UPDATE postings SET fit_rating = 7 WHERE title = 'Data Clerk'",
-            "postings",
-            "fit_rating",
-            None,
-            "7",
-        ),
-        (
-            "UPDATE applications SET notes = 'Follow-up sent' "
-            "WHERE notes = 'Synthetic application one.'",
+            "UPDATE applications SET resume_file = 'resume-v3.pdf' WHERE role = 'Data Clerk'",
             "applications",
-            "notes",
-            "Synthetic application one.",
-            "Follow-up sent",
+            "resume_file",
+            None,
+            "resume-v3.pdf",
+        ),
+        (
+            "UPDATE applications SET location = 'Shelbyville, ON' WHERE role = 'Data Clerk'",
+            "applications",
+            "location",
+            "Ogdenville, ON",
+            "Shelbyville, ON",
         ),
         (
             "UPDATE activities SET related_company = 'Synthetic Expo' WHERE type = 'job_fair'",
@@ -129,6 +116,13 @@ def test_void_needs_reason_and_valid_target(seeded: sqlite3.Connection) -> None:
             "related_company",
             None,
             "Synthetic Expo",
+        ),
+        (
+            "UPDATE claim SET end_date = '2027-08-04'",
+            "claim",
+            "end_date",
+            None,
+            "2027-08-04",
         ),
     ],
 )
@@ -151,36 +145,22 @@ def test_every_permitted_update_is_audited(
     assert row["edited_at"]
 
 
-def test_skips_updates_audited(seeded: sqlite3.Connection) -> None:
-    posting = int(seeded.execute("SELECT id FROM postings LIMIT 1").fetchone()["id"])
-    seeded.execute(
-        "INSERT INTO skips (posting_id, date, reason) VALUES (?, '2026-09-01', 'a')", (posting,)
-    )
-    seeded.execute("UPDATE skips SET reason = 'b'")
-    assert edits(seeded, "skips", 1) == {"reason": ("a", "b")}
-
-
 def test_no_op_update_writes_nothing(seeded: sqlite3.Connection) -> None:
-    seeded.execute("UPDATE companies SET name = name")
+    seeded.execute("UPDATE applications SET employer = employer")
     assert seeded.execute("SELECT count(*) FROM edits").fetchone()[0] == 0
 
 
 def test_edits_log_is_append_only(seeded: sqlite3.Connection) -> None:
-    seeded.execute("UPDATE companies SET watchlist = 1 WHERE name = 'Initech'")
+    seeded.execute("UPDATE applications SET resume_file = 'cv.pdf' WHERE role = 'Data Clerk'")
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         seeded.execute("UPDATE edits SET new_value = 'tampered'")
     with pytest.raises(sqlite3.IntegrityError, match="disabled"):
         seeded.execute("DELETE FROM edits")
 
 
-@pytest.mark.parametrize("table", ["companies", "postings", "applications", "activities"])
+@pytest.mark.parametrize("table", ["applications", "activities"])
 def test_identity_and_created_at_are_fixed(seeded: sqlite3.Connection, table: str) -> None:
     with pytest.raises(sqlite3.IntegrityError, match="can not be changed"):
         seeded.execute(f"UPDATE {table} SET id = id + 100")  # noqa: S608
     with pytest.raises(sqlite3.IntegrityError, match="can not be changed"):
         seeded.execute(f"UPDATE {table} SET created_at = '2000-01-01T00:00:00Z'")  # noqa: S608
-
-
-def test_schema_migrations_cannot_be_edited(seeded: sqlite3.Connection) -> None:
-    with pytest.raises(sqlite3.IntegrityError, match="permanent"):
-        seeded.execute("UPDATE schema_migrations SET checksum = 'x'")

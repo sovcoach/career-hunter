@@ -1,4 +1,5 @@
 # Synthetic test data only. Every company and posting here is fictional.
+# Every date falls inside the synthetic claim 2026-27, which starts 2026-08-05.
 companies:
   - name: Acme Widgets
     ats_type: greenhouse
@@ -40,7 +41,7 @@ applications:
     work_model: onsite
     method: email
     date_precision: exact
-    date_applied: 2026-07-01
+    date_applied: 2026-08-17       # in the synthetic claim, outside September
 
 activities:
   - date_precision: exact
