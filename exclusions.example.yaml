@@ -1,0 +1,12 @@
+# career-hunter exclusions TEMPLATE (generic sample values only).
+# Your real file lives at $CAREERHUNTER_DATA_DIR/exclusions.yaml.
+#
+# Postings matching any of these are skipped, and the skip is recorded with a reason.
+
+companies:
+  - Example Staffing Mill
+title_keywords:
+  - Senior Director
+  - Commission Only
+description_keywords:
+  - unpaid

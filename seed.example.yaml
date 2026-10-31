@@ -1,0 +1,66 @@
+# career-hunter seed TEMPLATE: a starting history to import once.
+# Your real file lives at $CAREERHUNTER_DATA_DIR/seed.yaml. Import it with:
+#   careerhunter seed
+# Re-running is safe: anything already imported is recognized and skipped.
+#
+# A posting is recognized by its url, else its requisition_id, else company + title +
+# location + the month you applied. Applying to the same role again later? Add a
+# second entry with the new date: both applications are kept.
+#
+# Dates: YYYY-MM-DD. date_precision says how sure you are of the date:
+#   exact   -> give date_applied (applications) or date (activities)
+#   week    -> give week_of (any day that week; stored as that week's Monday)
+#   unknown -> give neither
+#
+# method:     company site | LinkedIn Easy Apply | email | referral | agency |
+#             recruiter inbound | other
+# work_model: onsite | hybrid | remote
+
+companies:                    # optional: details for companies you also want to watch
+  - name: Example Robotics
+    ats_type: greenhouse
+    ats_slug: examplerobotics
+    careers_url: https://example.com/careers
+    watchlist: true
+
+applications:
+  - company: Example Robotics
+    title: Operations Coordinator
+    location: Example City, ON
+    work_model: hybrid
+    method: company site
+    date_precision: exact
+    date_applied: 2026-09-15
+    url: https://example.com/careers/123      # optional; best way to identify a posting
+    requisition_id: OPS-2026-014               # optional; used when there's no url
+    resume_file: resume-ops-v2.pdf             # optional, a name only
+    notes: Tailored the summary for logistics.
+
+  - company: Sample Logistics
+    title: Customer Success Specialist
+    location: Remote (Canada)
+    work_model: remote
+    method: LinkedIn Easy Apply
+    date_precision: week
+    week_of: 2026-09-08
+    notes: ""
+
+  - company: Placeholder Foods
+    title: Project Coordinator
+    location: Example City, ON
+    work_model: onsite
+    method: agency
+    date_precision: unknown
+    notes: Applied through a staffing agency; exact date not recorded.
+
+activities:
+  - date_precision: exact
+    date: 2026-09-20
+    type: job_fair             # recruiter_contact | networking | agency_registration |
+                               # job_fair | workshop | course | other
+    description: Attended the Example City career fair.
+  - date_precision: week
+    week_of: 2026-09-08
+    type: agency_registration
+    description: Registered with Example Staffing.
+    related_company: Example Staffing
