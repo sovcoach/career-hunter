@@ -136,8 +136,13 @@ created  $CAREERHUNTER_DATA_DIR/backups
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/careerhunter.db at schema version 1
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 1
+no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
+
+`search.db` is where career-hunter keeps everything it learns from. Your EI record gets its own file once you set your claim in the next step.
+
+**Upgrading from 0.1.0?** Your folder may still hold `careerhunter.db`. Version 0.2.0 doesn't use it. `doctor` reports it, and if it's empty you can delete it.
 
 Running `init` again is safe. It keeps existing files and says `kept`.
 
@@ -151,9 +156,39 @@ open "$CAREERHUNTER_DATA_DIR"
 
 Edit these with TextEdit, or any plain-text editor:
 
-- **`config.yaml`**: your target job titles, locations, work models, salary floor, fit rubric, schedule and the companies you want to watch.
+- **`config.yaml`**: your target job titles, locations, work models, salary floor, fit rubric, schedule, the companies you want to watch, and your EI claim (see below).
 - **`exclusions.yaml`**: companies and keywords to skip.
 - **`seed.yaml`**: the applications and activities you've *already* done. Delete the example entries and add your own. The comments at the top explain each field. If you only remember roughly when you applied, use `date_precision: week` with `week_of`. If you don't remember at all, use `date_precision: unknown`. Don't guess an exact date. Include the job ad's `url` (or `requisition_id`) whenever you have it: it's how career-hunter tells a re-posted role apart from the original.
+
+### Your EI claim
+
+career-hunter keeps one EI job-search record per claim, in its own file. It never works out your claim for you: you set it in the `ei` section at the end of `config.yaml`, using the start date Service Canada gave you.
+
+```yaml
+ei:
+  active_claim: "2026-27"
+  claims:
+    - label: "2026-27"
+      start: 2026-08-02
+```
+
+- **`label`** names the two years the claim spans, like `2026-27`. The claim must start in the first of those years.
+- **`end`** is optional while the claim is active. Add it if you know it.
+- **Not claiming right now** (for example, while employed)? Set `active_claim: null`. Nothing is written to any EI record then, but career-hunter keeps learning from your search.
+
+Then create the claim's record file:
+
+```bash
+uv run careerhunter migrate
+```
+
+Expected output (the label and date will be yours):
+
+```text
+search.db: applied nothing; schema version 1
+ei_record_2026-27.db: created; schema version 1
+EI claim 2026-27 (from 2026-08-02)
+```
 
 Then check your files:
 
@@ -161,14 +196,19 @@ Then check your files:
 uv run careerhunter doctor
 ```
 
-Expected output:
+Expected output. Again, your real output shows the full folder path in place of `$CAREERHUNTER_DATA_DIR`:
 
 ```text
-data dir        OK  /Volumes/X10-Pro/CareerHunterData (volume /Volumes/X10-Pro, encrypted)
-database        OK  schema version 1
-db permissions  OK  0600
+data dir        OK  $CAREERHUNTER_DATA_DIR (volume /Volumes/X10-Pro, encrypted)
 config.yaml     OK
 exclusions.yaml OK
+ei claim        OK  2026-27 active (from 2026-08-02)
+search.db       OK  schema version 1
+search.db       OK  0600
+claim 2026-27   OK  schema version 1
+claim 2026-27   OK  active, from 2026-08-02
+claim 2026-27   OK  0600
+reconcile       OK  search.db and 1 claim record agree
 secret          telegram_bot_token: missing
 ```
 
@@ -183,12 +223,27 @@ uv run careerhunter seed
 Expected output (your numbers will differ):
 
 ```text
-companies          4 inserted     0 already present
-postings           4 inserted     0 already present
-applications       4 inserted     0 already present
-status_history     4 inserted     0 already present
-activities         3 inserted     0 already present
+EI claim 2026-27 (from 2026-08-02)
+search.db
+  companies            4 inserted     0 already present
+  postings             4 inserted     0 already present
+  applications         4 inserted     0 already present
+  decision_history     4 inserted     0 already present
+ei_record_2026-27.db
+  applications         4 inserted     0 already present
+  status_history       4 inserted     0 already present
+  activities           3 inserted     0 already present
 ```
+
+Each application goes into both files: your EI record gets what Service Canada may ask for, and `search.db` gets the rest, including your notes. Activities go into the EI record only.
+
+Every entry must belong to your claim, by how sure you are of its date:
+
+- **`exact`**: the date must fall within the claim. A date outside it is refused, because it's usually a typo.
+- **`week`**: the week must overlap the claim.
+- **`unknown`**: always accepted, with a `warning:` line. It appears in the **Date unknown** section of every report.
+
+If you really did apply to some jobs before the claim started, and want career-hunter to learn from them without putting them in the EI record, run `uv run careerhunter seed --route-out-of-claim-to-search`. Each one it sends to `search.db` only is listed as `search.db only: …`. Activities outside the claim are always refused.
 
 You can fix `seed.yaml` and run this again at any time. Entries already imported are recognized and skipped, so nothing is duplicated. Existing entries aren't changed by re-running: the record is permanent by design. A mistaken entry is *voided* with a reason rather than deleted. The record keeps it, but reports leave it out.
 
@@ -197,19 +252,47 @@ You can fix `seed.yaml` and run this again at any time. Entries already imported
 Pick the period you need, in `YYYY-MM-DD` format:
 
 ```bash
-uv run careerhunter export --from 2026-09-01 --to 2026-09-30
+uv run careerhunter export --claim 2026-27 --from 2026-09-01 --to 2026-09-30
 ```
 
-Expected output. Again, your real output shows the full folder path in place of `$CAREERHUNTER_DATA_DIR`:
+Expected output:
 
 ```text
-3 applications, 3 activities
-wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-09-01_2026-09-30_<time>.pdf
-wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-09-01_2026-09-30_<time>_applications.csv
-wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-09-01_2026-09-30_<time>_activities.csv
+EI claim 2026-27: 3 applications, 3 activities
+wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-27_2026-09-01_2026-09-30_<time>.pdf
+wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-27_2026-09-01_2026-09-30_<time>_applications.csv
+wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-27_2026-09-01_2026-09-30_<time>_activities.csv
 ```
 
-The PDF is the readable report. The CSV files open in Numbers or Excel. Applications and activities without a known date appear in a separate **Date unknown** section of every report, so nothing is left out.
+The report is built from that claim's record file alone. Nothing from `search.db` can appear in it. The PDF is the readable report. The CSV files open in Numbers or Excel. Applications and activities without a known date appear in a separate **Date unknown** section of every report, so nothing is left out.
+
+## When a claim ends
+
+When you start a new claim, or stop claiming, update `config.yaml`:
+
+1. Give the old claim its `end` date.
+2. Add the new claim, and point `active_claim` at it (or set `active_claim: null`).
+
+career-hunter then refuses to write anything until you **seal** the old claim's record. Sealing makes it permanent and read-only:
+
+```bash
+uv run careerhunter claim seal 2025-26
+```
+
+It explains what it will do, then asks you to type the label again:
+
+```text
+This will permanently close the record for EI claim 2025-26 (2025-06-04 to 2026-06-02):
+  - record 2026-06-02 as the claim's end date;
+  - mark ei_record_2025-26.db sealed, so the database refuses every further change;
+  - fold its write-ahead log into the main file;
+  - make the file read-only (0400).
+It stays readable for `careerhunter export --claim 2025-26`. Keep it until at least 2032-06-02. This can't be undone.
+Type the claim label again to confirm: 2025-26
+sealed   $CAREERHUNTER_DATA_DIR/ei_record_2025-26.db (read-only; keep until 2032-06-02)
+```
+
+Sealing never happens on its own, and the claim you are on can't be sealed. If `active_claim` has a typo, `config.yaml` fails its checks, so nothing can be sealed by mistake. You can still export a sealed claim at any time.
 
 ## Step 10 (Phase 2 onward): Store the Telegram bot token
 
@@ -244,6 +327,10 @@ telegram_bot_token: present (46 chars)   ← the number is the token length
 | `… is inside the code repository` / `… inside a git work tree` | The data folder points somewhere inside a git project | Point `CAREERHUNTER_DATA_DIR` at the external drive |
 | `… is readable by other users … chmod 700` | Folder permissions are too open | Run the `chmod` command it prints |
 | `seed file has N problem(s)` | Something in `seed.yaml` needs fixing | Each line names the entry and field. Fix them and re-run |
+| `… is before claim 2026-27 started` | A seed date falls outside your claim | Fix the date, or see `--route-out-of-claim-to-search` in Step 8 |
+| `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
+| `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
+| `config.yaml BAD … needs an end date` | A claim that isn't active has no `end` | Add its end date, or check `active_claim` for a typo |
 | `WARNING: FileVault is OFF` | The Mac's own disk isn't encrypted | Step 1 |
 | `uv: command not found` | Terminal hasn't picked up uv yet | Close and reopen Terminal, or re-run the Step 3 installer |
 
