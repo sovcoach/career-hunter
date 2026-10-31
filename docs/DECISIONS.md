@@ -9,8 +9,8 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 001 | Data lives outside the repo, on an encrypted external volume | Accepted (Phase 1) |
 | 002 | A mount guard verifies the data volume, not just the path | Accepted (Phase 1) |
 | 003 | Secrets live in the macOS Keychain | Accepted (Phase 1) |
-| 004 | SQLite is the record store | Accepted (Phase 1) |
-| 005 | The schema is designed around EI record-keeping | Accepted (Phase 1) |
+| 004 | SQLite is the record store | Accepted (Phase 1); amended by 014 |
+| 005 | The schema is designed around EI record-keeping | Accepted (Phase 1); amended by 014 |
 | 006 | gitleaks via the pinned upstream pre-commit hook, not brew | Accepted (Phase 1) |
 | 007 | A dedicated Telegram bot for notifications | Accepted (for Phase 2) |
 | 008 | An always-on Mac mini as the host | Accepted (Phase 1) |
@@ -19,6 +19,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 011 | Claude Code permission rules as a guard-rail | Accepted (Phase 1) |
 | 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1) |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
+| 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
 
 ---
 
@@ -83,6 +84,8 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 
 ## ADR-004: SQLite is the record store
 
+> **Amended by [ADR-014](#adr-014-two-data-layers-searchdb-and-one-ei-record-file-per-claim) (Phase 1.5).** There are now two kinds of SQLite file, each with its own migration track: `search.db`, and one `ei_record_<label>.db` per EI claim. Everything below still applies to each file.
+
 **Context.** One user, one machine, a few thousand rows over years. The record must survive for 6+ years and be easy to back up.
 
 **Decision.**
@@ -98,6 +101,8 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 - Enum values are duplicated in `enums.py` for friendly validation. The database stays the source of truth.
 
 ## ADR-005: The schema is designed around EI record-keeping
+
+> **Amended by [ADR-014](#adr-014-two-data-layers-searchdb-and-one-ei-record-file-per-claim) (Phase 1.5).** This record now lives in one file per EI claim, without the learning fields: fit ratings, gaps, notes and skips moved to `search.db`. Companies and postings, and so the posting identity rules, are in `search.db` too. Retention, voiding, the audit log and honest dates are unchanged in the EI files.
 
 **Context.**
 - EI claimants can be asked by Service Canada for a detailed record of their job search: employers contacted, dates, how they applied, and outcomes, plus other activities such as job fairs, networking and agency registrations.
@@ -269,3 +274,59 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 **Trade-offs.**
 - Tests and docs that need such a path must build it at runtime, or describe it in words (as this entry does). That's a small inconvenience, accepted as the cost of a rail with no holes.
+
+## ADR-014: Two data layers: `search.db`, and one EI record file per claim
+
+**Context.**
+- Phase 1 kept everything in one `careerhunter.db`. Postings with fit ratings and gaps sat beside the applications that Service Canada may ask for.
+- From Phase 2 on, the bots will store fit ratings, gaps, LLM output, scout metadata and skip reasons. None of that belongs in a record EI can request.
+- In one file, "the EI record contains only what EI needs" is a rule every query has to remember. In separate files, it is a property of the storage.
+- Each EI claim has its own period, and its record is kept for 6 years from the end of that claim.
+
+**Decision.**
+- **Two kinds of file**, both in `CAREERHUNTER_DATA_DIR` under the existing storage guard:
+  - `search.db`, the search and learning layer: every posting from any source, posting identity, fit ratings, gaps, LLM output, scout metadata, applied and skipped decisions (with skip reasons), and the full decision history. It is editable and has no retention triggers, so a later retention policy can compact it.
+  - `ei_record_<label>.db`, one per claim, such as `ei_record_2026-27.db`. It holds employer, role, location, work model, posting URL, date and precision, method, the status history, activities, and the job-ad snapshot and resume references. It keeps every ADR-005 protection: no deletes, append-only history, voiding, and the audit log.
+- **Each kind has its own migration track** (`migrations/search/` and `migrations/ei_record/`), with checksums as before. Each file records its track in a permanent one-row `db_identity` table, checked on every open, so one kind can never be migrated as the other. A file without an identity is refused.
+- **The two layers are linked only by an opaque correlation ID**: 128 random bits from `secrets.token_hex(16)`, never derived from content, time or hardware. `search.db` also records the label of the claim each application went to (NULL when none). An application's link can't change once set.
+- **Sanitizing works by construction.** The EI writer accepts only an `EiApplication`, whose fields are exactly the EI columns, and the ledger builds it field by field. Tests compare the EI schema against an explicit allowlist, check that no learning column exists, and push a sentinel value through every learning field to prove none of them reach an EI file on disk.
+- **The EI side never reads the search side.** `ei_store` imports no search code and never opens or attaches a database. Export opens only the claim's file, read-only, and works with `search.db` missing.
+- **The active claim is set in config, never computed:** `ei.active_claim` plus a list of claims with a label, a start and an end. The end is optional only for the active claim. A label names two consecutive years (`2026-27`) and must start in the first one. Labels become file names, so nothing else is accepted. Claims may not overlap. With no active claim, nothing is written to any EI file, and `search.db` keeps learning.
+- **Write order:** `search.db`'s transaction is opened and its rows written first, but not committed. The EI record then commits, as the source of truth, and `search.db` commits last. A search-side problem (for example a URL already owned by another company) therefore stops everything before the EI record is touched, and the only gap left is a failure of the final commit. That is reported as a partial write.
+- **Consistency is reconciled, not made atomic.** `doctor` compares the two layers in both directions:
+  - correlation IDs in an EI file but not in `search.db`;
+  - IDs in `search.db` but missing from their claim's file;
+  - links to a claim that has no file;
+  - status histories that differ.
+
+  Re-running `seed` repairs seed rows in either direction, reusing the correlation ID already on the surviving side.
+- **The claim check depends on date precision:**
+  - `exact`: the day must fall in the claim;
+  - `week`: the week must overlap it;
+  - `unknown`: always accepted, with a warning, and listed under "Date unknown".
+
+  The EI schema enforces the same rule with triggers. In `seed`, an out-of-claim application is refused by default, because it is usually a typo. `--route-out-of-claim-to-search` sends such applications to `search.db` only and lists each one. Activities outside the claim are always refused.
+- **The status pipeline is shared by both layers:** `applied`, `screening`, `assessment_submitted`, `interview_scheduled`, `offer`, `hired` (offer accepted), `rejected`, `no_response`, `withdrawn`. EI status rows carry no notes; notes stay in `search.db`.
+- **Sealing is explicit, never automatic.** `careerhunter claim seal <label>`:
+  - prints what it will do;
+  - requires the label to be typed again;
+  - refuses the active claim, a claim whose end date hasn't passed, and a claim not in config.
+
+  Sealing records the end date and sets `sealed_at`, after which triggers refuse every change. It also folds the WAL into the main file, switches to a rollback journal so the file can be read with no companion files, and makes it read-only (0400). Until every earlier claim is sealed, `init`, `migrate` and `seed` refuse to run and name the exact seal command, and `doctor` reports it as BAD. A status that arrives after its claim is sealed is recorded in `search.db` only.
+- **`doctor` only reads.** It never migrates, creates or seals, apart from tightening database file modes as before.
+- **The v0.1.0 `careerhunter.db` is retired without migration**, because no real data was ever seeded into it. The new code never opens it for writing. `doctor` warns if it is empty, and reports BAD if it holds rows.
+
+**Alternatives.**
+- One database, with views or careful queries for EI. Rejected: the separation would be a rule, not a property.
+- `ATTACH` both files and commit them in one transaction. Rejected: SQLite makes multi-file commits atomic only in rollback-journal mode, not in WAL mode. It would also break "the EI record never reads `search.db`".
+- Two-phase commit or an outbox table. Rejected: a lot of machinery for a single-user tool, when a fixed order plus reconciliation covers the failure case.
+- One EI file for all claims, with a claim column. Rejected: an earlier claim couldn't be made read-only on its own, and each claim's 6-year clock starts at a different time.
+- Working out the active claim from dates. Rejected: a wrong guess would silently file records under the wrong claim.
+- Sealing automatically when config moves on. Rejected: an irreversible step would hang on a config typo. With explicit sealing, a mistyped `active_claim` fails validation (the real current claim then has no end date) before anything can be sealed.
+- A correlation ID derived from the record, such as a hash. Rejected: it could be recomputed from either side.
+
+**Trade-offs.**
+- A crash between the two commits leaves a gap until it is noticed. `doctor` reports it, and `seed` repairs seed rows, but there is no general repair command yet.
+- A sealed file stays at the schema version it had when it was sealed, because migrations can't run on it. Export must keep reading older EI versions, so `ei_record` migrations should only ever add.
+- The EI natural key (employer, role, location, URL, date) has no requisition ID. Two postings with the same title, at the same employer and location, applied to on the same day without URLs can't be told apart, so `seed` refuses them and asks for the URLs.
+- There are more files to back up: `search.db` plus one file per claim.
