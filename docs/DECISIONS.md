@@ -217,13 +217,15 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 **Context.** AI coding assistants are used on this repo. History-changing git commands should always need a human yes.
 
 **Decision.**
-- `.claude/settings.json` (committed) puts `git add/commit/push/rm/tag/merge/rebase/reset` on **ask**.
+- `.claude/settings.json` (committed) puts `git add/commit/push/rm/tag/merge/rebase/reset` on **ask**, in all three spellings: plain (`git add`), with a working directory (`git -C <dir> add`), and with a config override (`git -c <key=val> add`). `tests/test_claude_settings.py` loads the file and fails if any guarded subcommand loses a form. The `-C` and `-c` forms were added in Phase 1.5; before that, only the plain forms asked.
 - It puts `gh api`, `gh pr merge`, `gh repo edit` and `gh release` on **ask**, so branch-protection changes, merges, repo settings and releases always need a human yes.
 - It **denies** `rm -rf` (and flag-order variants), `sudo`, `docker run`, and force pushes (`--force`, `-f`, `--force-with-lease`).
 - It **denies** any push whose refspec targets `main` (`main`, `HEAD:main`, `<ref>:main`, `refs/heads/main`, including `git -C <dir> push …`). Administrators may bypass branch protection on GitHub (ADR-012); this rule keeps agents from using that bypass.
 - `.claude/settings.local.json` is gitignored, so personal grants never get committed.
 
 **Trade-offs.** This is a guard-rail, not a security boundary: prefix rules can be sidestepped by unusual command shapes. For example, a bare `git push` on a branch that tracks `main` names no refspec, so no rule can tell where it goes; it still needs a yes under the `git push` ask rule. The real protections are branch protection, pre-commit hooks and review.
+
+During Phase 1.5, an agent ran `git add -N .` and `git reset -q` as parts of one compound command (after `cd <repo> &&`, joined with `;`), and no approval prompt appeared. Neither used `-C` or `-c`, so the change above would not have caught it. The agent now runs guarded git commands on their own, with no `cd` prefix and no chaining.
 
 ## ADR-012: The repo goes public after Phase 1 verification; `main` is protected then
 
