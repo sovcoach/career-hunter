@@ -1,11 +1,19 @@
+"""search.db's schema: posting identity, enums, and the fixed link to the EI record."""
+
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
+from itertools import count
 
 import pytest
 
-from careerhunter import db
+from careerhunter import enums
+
+_ids = count(1)
+
+
+def _corr() -> str:
+    return f"{next(_ids):032x}"
 
 
 def _company(conn: sqlite3.Connection, name: str = "Acme Widgets") -> int:
@@ -30,9 +38,10 @@ def _application(conn: sqlite3.Connection, posting_id: int, **cols: object) -> i
         "method": "email",
     } | cols
     cur = conn.execute(
-        "INSERT INTO applications (posting_id, date_applied, date_precision, week_of, method) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO applications (correlation_id, posting_id, date_applied, date_precision, "
+        "week_of, method) VALUES (?, ?, ?, ?, ?, ?)",
         (
+            _corr(),
             posting_id,
             values["date_applied"],
             values["date_precision"],
@@ -41,52 +50,6 @@ def _application(conn: sqlite3.Connection, posting_id: int, **cols: object) -> i
         ),
     )
     return int(cur.lastrowid or 0)
-
-
-def test_pragmas(conn: sqlite3.Connection) -> None:
-    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == db.BUSY_TIMEOUT_MS
-    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-
-
-def test_all_tables_exist_and_version(conn: sqlite3.Connection) -> None:
-    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {
-        "companies",
-        "postings",
-        "applications",
-        "status_history",
-        "activities",
-        "skips",
-        "edits",
-        "schema_migrations",
-    } <= tables
-    assert db.schema_version(conn) == 1
-
-
-def test_migrate_is_idempotent(conn: sqlite3.Connection) -> None:
-    assert db.migrate(conn) == []
-
-
-def test_edited_migration_is_refused(conn: sqlite3.Connection) -> None:
-    original = db.load_migrations()[0]
-    tampered = db.Migration(original.version, original.name, original.sql + "\n-- edit")
-    with pytest.raises(db.MigrationError, match="edited after it was applied"):
-        db.migrate(conn, [tampered])
-
-
-def test_failed_migration_rolls_back(tmp_path: Path) -> None:
-    c = db.connect(tmp_path / "x.db")
-    bad = db.Migration(1, "bad", "CREATE TABLE t (x INTEGER); INSERT INTO nope VALUES (1);")
-    with pytest.raises(sqlite3.OperationalError):
-        db.migrate(c, [bad])
-    assert db.schema_version(c) == 0
-    assert c.execute("SELECT count(*) FROM sqlite_master WHERE name='t'").fetchone()[0] == 0
-    c.close()
-
-
-def test_packaged_migrations_are_contiguous() -> None:
-    assert [m.version for m in db.load_migrations()] == [1]
 
 
 @pytest.mark.parametrize(
@@ -101,27 +64,31 @@ def test_packaged_migrations_are_contiguous() -> None:
         ({"date_precision": "sometime"}, "bad precision"),
     ],
 )
-def test_application_checks(conn: sqlite3.Connection, cols: dict[str, object], why: str) -> None:
-    posting = _posting(conn, _company(conn))
+def test_application_checks(search: sqlite3.Connection, cols: dict[str, object], why: str) -> None:
+    posting = _posting(search, _company(search))
     with pytest.raises(sqlite3.IntegrityError):
-        _application(conn, posting, **cols)
+        _application(search, posting, **cols)
 
 
-def test_application_precisions_accepted(conn: sqlite3.Connection) -> None:
-    c = _company(conn)
-    _application(conn, _posting(conn, c, "A"))
+def test_application_precisions_accepted(search: sqlite3.Connection) -> None:
+    c = _company(search)
+    _application(search, _posting(search, c, "A"))
     _application(
-        conn, _posting(conn, c, "B"), date_precision="week", date_applied=None, week_of="2026-09-07"
+        search,
+        _posting(search, c, "B"),
+        date_precision="week",
+        date_applied=None,
+        week_of="2026-09-07",
     )
-    _application(conn, _posting(conn, c, "C"), date_precision="unknown", date_applied=None)
+    _application(search, _posting(search, c, "C"), date_precision="unknown", date_applied=None)
 
 
-def test_reapplying_to_a_posting_on_another_date(conn: sqlite3.Connection) -> None:
-    posting = _posting(conn, _company(conn))
-    _application(conn, posting, date_applied="2026-03-10")
-    _application(conn, posting, date_applied="2026-07-15")
+def test_reapplying_to_a_posting_on_another_date(search: sqlite3.Connection) -> None:
+    posting = _posting(search, _company(search))
+    _application(search, posting, date_applied="2026-03-10")
+    _application(search, posting, date_applied="2026-07-15")
     with pytest.raises(sqlite3.IntegrityError):
-        _application(conn, posting, date_applied="2026-07-15")
+        _application(search, posting, date_applied="2026-07-15")
 
 
 def _raw_posting(conn: sqlite3.Connection, company_id: int, **cols: object) -> None:
@@ -139,25 +106,25 @@ def _raw_posting(conn: sqlite3.Connection, company_id: int, **cols: object) -> N
     )
 
 
-def test_posting_fallback_key_is_per_month(conn: sqlite3.Connection) -> None:
-    c = _company(conn)
-    _raw_posting(conn, c, first_seen="2026-03-02")
+def test_posting_fallback_key_is_per_month(search: sqlite3.Connection) -> None:
+    c = _company(search)
+    _raw_posting(search, c, first_seen="2026-03-02")
     with pytest.raises(sqlite3.IntegrityError):
-        _raw_posting(conn, c, first_seen="2026-03-28", title="CLERK")  # same month, any case
-    _raw_posting(conn, c, first_seen="2026-07-01")  # re-posted later: a new posting
+        _raw_posting(search, c, first_seen="2026-03-28", title="CLERK")  # same month, any case
+    _raw_posting(search, c, first_seen="2026-07-01")  # re-posted later: a new posting
 
 
-def test_posting_url_and_requisition_keys(conn: sqlite3.Connection) -> None:
-    c = _company(conn)
-    other = _company(conn, "Globex Corporation")
-    _raw_posting(conn, c, url="https://acme.example.com/jobs/1")
-    _raw_posting(conn, c, url="https://acme.example.com/jobs/2")  # same title, other url
+def test_posting_url_and_requisition_keys(search: sqlite3.Connection) -> None:
+    c = _company(search)
+    other = _company(search, "Globex Corporation")
+    _raw_posting(search, c, url="https://acme.example.com/jobs/1")
+    _raw_posting(search, c, url="https://acme.example.com/jobs/2")  # same title, other url
     with pytest.raises(sqlite3.IntegrityError):
-        _raw_posting(conn, c, url="https://acme.example.com/jobs/1", title="Other")
-    _raw_posting(conn, c, requisition_id="REQ-7")
-    _raw_posting(conn, other, requisition_id="REQ-7")  # requisition ids are per company
+        _raw_posting(search, c, url="https://acme.example.com/jobs/1", title="Other")
+    _raw_posting(search, c, requisition_id="REQ-7")
+    _raw_posting(search, other, requisition_id="REQ-7")  # requisition ids are per company
     with pytest.raises(sqlite3.IntegrityError):
-        _raw_posting(conn, c, requisition_id="REQ-7", first_seen="2026-08-01")
+        _raw_posting(search, c, requisition_id="REQ-7", first_seen="2026-08-01")
 
 
 @pytest.mark.parametrize(
@@ -176,8 +143,10 @@ def test_posting_url_and_requisition_keys(conn: sqlite3.Connection) -> None:
         "other",
     ],
 )
-def test_ats_types_accepted(conn: sqlite3.Connection, ats: str) -> None:
-    conn.execute("INSERT INTO companies (name, source, ats_type) VALUES ('X', 'manual', ?)", (ats,))
+def test_ats_types_accepted(search: sqlite3.Connection, ats: str) -> None:
+    search.execute(
+        "INSERT INTO companies (name, source, ats_type) VALUES ('X', 'manual', ?)", (ats,)
+    )
 
 
 @pytest.mark.parametrize(
@@ -192,27 +161,29 @@ def test_ats_types_accepted(conn: sqlite3.Connection, ats: str) -> None:
         "other",
     ],
 )
-def test_methods_accepted(conn: sqlite3.Connection, method: str) -> None:
-    _application(conn, _posting(conn, _company(conn)), method=method)
+def test_methods_accepted(search: sqlite3.Connection, method: str) -> None:
+    _application(search, _posting(search, _company(search)), method=method)
 
 
-def test_schema_enums_match_python(conn: sqlite3.Connection) -> None:
-    from careerhunter import enums
-
+def test_schema_enums_match_python(search: sqlite3.Connection) -> None:
+    for source in enums.SOURCES:
+        search.execute(
+            "INSERT INTO companies (name, source) VALUES (?, ?)", (f"Source {source}", source)
+        )
     for ats in enums.ATS_TYPES:
-        conn.execute(
+        search.execute(
             "INSERT INTO companies (name, source, ats_type) VALUES (?, 'manual', ?)",
             (f"Co {ats}", ats),
         )
-    c = _company(conn, "Method Co")
+    c = _company(search, "Method Co")
     for i, method in enumerate(enums.METHODS):
-        _application(conn, _posting(conn, c, f"Role {i}"), method=method)
+        _application(search, _posting(search, c, f"Role {i}"), method=method)
 
 
-def test_company_names_unique_case_insensitively(conn: sqlite3.Connection) -> None:
-    _company(conn, "Acme Widgets")
+def test_company_names_unique_case_insensitively(search: sqlite3.Connection) -> None:
+    _company(search, "Acme Widgets")
     with pytest.raises(sqlite3.IntegrityError):
-        _company(conn, "ACME widgets")
+        _company(search, "ACME widgets")
 
 
 @pytest.mark.parametrize(
@@ -243,82 +214,86 @@ def test_company_names_unique_case_insensitively(conn: sqlite3.Connection) -> No
             ("c",),
         ),
         (
-            "INSERT INTO activities (date_precision, type, description) "
-            "VALUES ('unknown', 'party', 'x')",
-            (),
-        ),
-        (
-            "INSERT INTO activities (date_precision, date, type, description) "
-            "VALUES ('week', '2026-09-07', 'course', 'x')",
-            (),
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (:c, 'T', '2026-09-01', 'linkedin')",
+            ("c",),
         ),
         ("INSERT INTO skips (posting_id, date, reason) VALUES (999, '2026-09-01', 'x')", ()),
     ],
 )
-def test_constraints_reject(conn: sqlite3.Connection, sql: str, params: tuple[str, ...]) -> None:
-    c = _company(conn, "Base Co")
+def test_constraints_reject(search: sqlite3.Connection, sql: str, params: tuple[str, ...]) -> None:
+    c = _company(search, "Base Co")
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(sql, {"c": c} if params else ())
+        search.execute(sql, {"c": c} if params else ())
 
 
-def test_status_values_checked(conn: sqlite3.Connection) -> None:
-    app = _application(conn, _posting(conn, _company(conn)))
-    conn.execute(
-        "INSERT INTO status_history (application_id, status, status_date) "
-        "VALUES (?, 'screening', '2026-09-02')",
-        (app,),
-    )
+def test_status_values_checked(search: sqlite3.Connection) -> None:
+    app = _application(search, _posting(search, _company(search)))
+    for status in enums.STATUSES:
+        search.execute(
+            "INSERT INTO decision_history (application_id, status, status_date) "
+            "VALUES (?, ?, '2026-09-02')",
+            (app, status),
+        )
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(
-            "INSERT INTO status_history (application_id, status) VALUES (?, 'ghosted')", (app,)
+        search.execute(
+            "INSERT INTO decision_history (application_id, status) VALUES (?, 'ghosted')", (app,)
         )
 
 
-@pytest.mark.parametrize(
-    "table",
-    [
-        "companies",
-        "postings",
-        "applications",
-        "status_history",
-        "activities",
-        "skips",
-        "edits",
-        "schema_migrations",
-    ],
-)
-def test_deletes_are_refused_everywhere(conn: sqlite3.Connection, table: str) -> None:
-    c = _company(conn)
-    p = _posting(conn, c)
-    a = _application(conn, p)
-    conn.execute(
-        "INSERT INTO status_history (application_id, status, status_date) "
-        "VALUES (?, 'applied', '2026-09-01')",
-        (a,),
+def test_search_is_editable(search: sqlite3.Connection) -> None:
+    """No retention triggers here, so a later retention policy can compact this layer."""
+    p = _posting(search, _company(search))
+    a = _application(search, p)
+    search.execute(
+        "INSERT INTO decision_history (application_id, status) VALUES (?, 'applied')", (a,)
     )
-    conn.execute(
-        "INSERT INTO activities (date_precision, type, description) "
-        "VALUES ('unknown', 'course', 'Synthetic course')"
+    search.execute(
+        "INSERT INTO skips (posting_id, date, reason) VALUES (?, '2026-09-01', 'x')", (p,)
     )
-    conn.execute("INSERT INTO skips (posting_id, date, reason) VALUES (?, '2026-09-01', 'x')", (p,))
-    conn.execute("UPDATE companies SET watchlist = 1")  # gives `edits` a row to protect
-    with pytest.raises(sqlite3.IntegrityError, match=r"disabled|permanent"):
-        conn.execute(f"DELETE FROM {table}")  # noqa: S608 - table names are fixed above
+    search.execute("UPDATE postings SET fit_rating = 4, gaps = 'none'")
+    search.execute("UPDATE decision_history SET status = 'rejected'")
+    for table in ("decision_history", "skips", "applications", "postings", "companies"):
+        search.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed names
 
 
-def test_status_history_is_append_only(conn: sqlite3.Connection) -> None:
-    a = _application(conn, _posting(conn, _company(conn)))
-    conn.execute(
-        "INSERT INTO status_history (application_id, status, status_date) "
-        "VALUES (?, 'applied', '2026-09-01')",
-        (a,),
+def test_correlation_id_is_fixed_and_opaque(search: sqlite3.Connection) -> None:
+    a = _application(search, _posting(search, _company(search)))
+    with pytest.raises(sqlite3.IntegrityError, match="can not be changed"):
+        search.execute("UPDATE applications SET correlation_id = ? WHERE id = ?", (_corr(), a))
+    search.execute("UPDATE applications SET notes = 'x' WHERE id = ?", (a,))  # others can change
+    p = _posting(search, _company(search, "Other Co"))
+    for bad in ("short", "G" * 32, "A" * 32):
+        with pytest.raises(sqlite3.IntegrityError):
+            search.execute(
+                "INSERT INTO applications (correlation_id, posting_id, date_precision, method) "
+                "VALUES (?, ?, 'unknown', 'email')",
+                (bad, p),
+            )
+
+
+def test_ei_claim_is_set_once(search: sqlite3.Connection) -> None:
+    a = _application(search, _posting(search, _company(search)))
+    with pytest.raises(sqlite3.IntegrityError):
+        search.execute("UPDATE applications SET ei_claim = '../x' WHERE id = ?", (a,))
+    search.execute("UPDATE applications SET ei_claim = '2026-27' WHERE id = ?", (a,))
+    search.execute("UPDATE applications SET ei_claim = '2026-27' WHERE id = ?", (a,))
+    with pytest.raises(sqlite3.IntegrityError, match="set once"):
+        search.execute("UPDATE applications SET ei_claim = '2027-28' WHERE id = ?", (a,))
+    with pytest.raises(sqlite3.IntegrityError, match="set once"):
+        search.execute("UPDATE applications SET ei_claim = NULL WHERE id = ?", (a,))
+
+
+def test_scout_metadata_must_be_json(search: sqlite3.Connection) -> None:
+    c = _company(search)
+    search.execute(
+        "INSERT INTO postings (company_id, title, first_seen, source, scout_metadata) "
+        "VALUES (?, 'A', '2026-09-01', 'watcher', '{\"board\": \"greenhouse\"}')",
+        (c,),
     )
-    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-        conn.execute("UPDATE status_history SET status = 'offer'")
-
-
-def test_transaction_rolls_back_on_error(conn: sqlite3.Connection) -> None:
-    with pytest.raises(RuntimeError), db.transaction(conn):
-        _company(conn, "Rolled Back Inc")
-        raise RuntimeError("boom")
-    assert conn.execute("SELECT count(*) FROM companies").fetchone()[0] == 0
+    with pytest.raises(sqlite3.IntegrityError):
+        search.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source, scout_metadata) "
+            "VALUES (?, 'B', '2026-09-01', 'watcher', 'not json')",
+            (c,),
+        )
