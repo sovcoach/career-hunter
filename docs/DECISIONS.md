@@ -227,6 +227,8 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 
 During Phase 1.5, an agent ran `git add -N .` and `git reset -q` as parts of one compound command (after `cd <repo> &&`, joined with `;`), and no approval prompt appeared. Neither used `-C` or `-c`, so the change above would not have caught it. The agent now runs guarded git commands on their own, with no `cd` prefix and no chaining.
 
+Ask rules only work while Claude Code's auto mode is off, so anything that must never happen unattended belongs in **deny**, not ask.
+
 ## ADR-012: The repo goes public after Phase 1 verification; `main` is protected then
 
 **Context.**
