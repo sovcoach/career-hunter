@@ -1,8 +1,11 @@
-"""EI job-search record export: CSV + PDF for a date range.
+"""EI job-search record export: CSV + PDF for one claim and a date range.
 
 Service Canada can ask for a detailed record of the job search: who you applied to,
 for what, when, how, and what happened next, plus other job-search activities. This
 writes that record for a chosen date range into $CAREERHUNTER_DATA_DIR/exports/.
+
+The export reads one file only: the claim's ei_record_<label>.db, opened read-only by
+the caller. It never opens search.db, so nothing from the search layer can appear.
 
 Which records fall in the range:
 - exact dates: from <= date <= to
@@ -27,6 +30,7 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
+from careerhunter.claims import read_file_claim
 from careerhunter.enums import METHOD_LABELS
 
 APPLICATION_COLUMNS = (
@@ -46,6 +50,7 @@ ACTIVITY_COLUMNS = ("date", "date_precision", "type", "description", "related_co
 
 @dataclass(frozen=True)
 class ExportResult:
+    claim: str
     applications_csv: Path
     activities_csv: Path
     pdf: Path
@@ -85,18 +90,12 @@ def collect_applications(
     conn: sqlite3.Connection, start: dt.date, end: dt.date
 ) -> list[dict[str, Any]]:
     apps = conn.execute(
-        """
-        SELECT a.id, c.name AS employer, p.title AS role, p.location, p.work_model,
-               a.date_applied, a.date_precision, a.week_of, a.method, p.url AS posting_url
-        FROM applications a
-        JOIN postings p ON p.id = a.posting_id
-        JOIN companies c ON c.id = p.company_id
-        WHERE a.voided = 0
-        """
+        "SELECT id, employer, role, location, work_model, date_applied, date_precision, "
+        "week_of, method, posting_url FROM applications WHERE voided = 0"
     ).fetchall()
     history: dict[int, list[sqlite3.Row]] = {}
     for h in conn.execute(
-        "SELECT application_id, status, status_date, note FROM status_history ORDER BY id"
+        "SELECT application_id, status, status_date FROM status_history ORDER BY id"
     ):
         history.setdefault(int(h["application_id"]), []).append(h)
 
@@ -114,10 +113,9 @@ def collect_applications(
                 "date_applied": display_date(a["date_precision"], a["date_applied"], a["week_of"]),
                 "date_precision": a["date_precision"],
                 "method": METHOD_LABELS.get(a["method"], a["method"]),
-                "current_status": events[-1]["status"] if events else "",
+                "current_status": events[-1]["status"].replace("_", " ") if events else "",
                 "status_history": "; ".join(
-                    f"{e['status_date'] or 'date unknown'} {e['status']}"
-                    + (f" ({e['note']})" if e["note"] else "")
+                    f"{e['status_date'] or 'date unknown'} {e['status'].replace('_', ' ')}"
                     for e in events
                 ),
                 "posting_url": a["posting_url"] or "",
@@ -170,6 +168,7 @@ def _write_csv(path: Path, columns: tuple[str, ...], rows: list[dict[str, Any]])
 
 def _write_pdf(
     path: Path,
+    claim: str,
     start: dt.date,
     end: dt.date,
     generated: dt.datetime,
@@ -227,7 +226,7 @@ def _write_pdf(
         Paragraph("Job search record", styles["Title"]),
         Paragraph(
             escape(
-                f"Period: {start.isoformat()} to {end.isoformat()}  ·  "
+                f"{claim}  ·  Period: {start.isoformat()} to {end.isoformat()}  ·  "
                 f"Generated {generated.strftime('%Y-%m-%d %H:%M')}  ·  "
                 f"{plural(len(apps), 'application', 'applications')}, "
                 f"{plural(len(acts), 'other activity', 'other activities')}"
@@ -270,14 +269,24 @@ def export(
     end: dt.date,
     now: dt.datetime | None = None,
 ) -> ExportResult:
+    """Export the EI record on `conn` (one claim's file) for the range start..end."""
     if start > end:
         raise ValueError(f"--from {start} is after --to {end}")
+    file_claim = read_file_claim(conn)
+    if file_claim is None:
+        raise ValueError("this file is not a complete EI record (no claim row)")
     now = now or dt.datetime.now()
     apps = collect_applications(conn, start, end)
     acts = collect_activities(conn, start, end)
 
-    stem = f"ei_{start.isoformat()}_{end.isoformat()}_{now.strftime('%Y%m%dT%H%M%S')}"
+    period = f"from {file_claim.start}" + (f" to {file_claim.end}" if file_claim.end else "")
+    heading = f"EI claim {file_claim.label} ({period})"
+    stem = (
+        f"ei_{file_claim.label}_{start.isoformat()}_{end.isoformat()}_"
+        f"{now.strftime('%Y%m%dT%H%M%S')}"
+    )
     result = ExportResult(
+        claim=file_claim.label,
         applications_csv=exports_dir / f"{stem}_applications.csv",
         activities_csv=exports_dir / f"{stem}_activities.csv",
         pdf=exports_dir / f"{stem}.pdf",
@@ -286,5 +295,5 @@ def export(
     )
     _write_csv(result.applications_csv, APPLICATION_COLUMNS, apps)
     _write_csv(result.activities_csv, ACTIVITY_COLUMNS, acts)
-    _write_pdf(result.pdf, start, end, now, apps, acts)
+    _write_pdf(result.pdf, heading, start, end, now, apps, acts)
     return result
