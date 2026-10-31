@@ -7,7 +7,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.1.0] - Phase 1: Foundation
+## [0.1.0] - 2026-10-31
 
 ### Added
 - Fail-closed storage guard. It refuses to start unless `CAREERHUNTER_DATA_DIR` is set, outside any git repository, on a mounted external volume separate from the boot disk, and that volume is encrypted, unlocked APFS. It warns loudly if FileVault is off on the boot disk.
