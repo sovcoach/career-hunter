@@ -41,7 +41,7 @@ def application(
             company=posting.pop("company", "Acme Widgets"),
             title=title,
             first_seen=day,
-            location="Springfield, ON",
+            location="Springfield",
             work_model="hybrid",
             url=posting.pop("url", f"https://acme.example.com/jobs/{title.replace(' ', '-')}"),
             snapshot_path="snapshots/acme-1001.html",

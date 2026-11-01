@@ -42,7 +42,7 @@ def _app(**fields: object) -> dict[str, object]:
     return {
         "company": "A Co",
         "title": "Analyst",
-        "location": "Springfield, ON",
+        "location": "Springfield",
         "method": "email",
         "date_precision": "exact",
         "date_applied": "2026-09-10",
