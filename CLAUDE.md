@@ -4,6 +4,8 @@ These rules apply to every AI agent session in this repo, Claude Code or otherwi
 
 ## Approval
 
+- Plan first. Every phase and every non-trivial step starts with a written plan. No code, config writes, commits, or pushes until that plan is explicitly approved. An approval covers only the step that was approved.
+- Sessions start from the repo directory so project permission rules load. Merges are done by the owner on GitHub with “Create a merge commit”. Public commits are authored as Daniel with the GitHub noreply address.
 - Commit, push, tag, publish a release or open a PR only after the operator explicitly approves that step. An approval covers only the step it was given for.
 - Before every commit, show the staged file list and the commit message, then wait.
 - Stop on any hook failure. Report it and fix the cause. Never skip a hook, bypass it, point git at other hooks, or use the push guard's override.
