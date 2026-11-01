@@ -2,17 +2,19 @@
 # seed/export/doctor need CAREERHUNTER_DATA_DIR set (see docs/SETUP.md).
 
 .DEFAULT_GOAL := help
-.PHONY: help setup hooks test cov lint format typecheck check seed export doctor
+.PHONY: help setup hooks test cov lint format typecheck check verify-tree seed export doctor
 
 help: ## List the available commands
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  make %-10s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  make %-11s %s\n", $$1, $$2}'
 
 setup: ## Install Python, dependencies and the git hooks
 	uv sync --locked
-	uv run pre-commit install
+	$(MAKE) hooks
 
-hooks: ## (Re)install the pre-commit hooks
+hooks: ## (Re)install the git hooks, the pre-push guard and push.default=current
 	uv run pre-commit install
+	git config push.default current
+	ln -sf "$(CURDIR)/scripts/pre_push_guard.py" "$$(git rev-parse --git-path hooks)/pre-push"
 
 test: ## Run the test suite (synthetic data only)
 	uv run pytest -q
@@ -33,6 +35,9 @@ typecheck: ## Static type check
 
 check: lint typecheck cov ## Everything CI runs, except the full-history secret scan
 	uv run pre-commit run --all-files
+
+verify-tree: ## Every hook and gitleaks over every file, tracked and untracked
+	uv run python scripts/verify_tree.py
 
 seed: ## Import seed.yaml from your data folder (safe to re-run)
 	uv run careerhunter seed

@@ -9,8 +9,11 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import getpass
+import os
 import shutil
 import sqlite3
+import stat
+import subprocess
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -272,6 +275,54 @@ def _doctor_permissions(report: _Report, name: str, loose: list[str]) -> None:
         report.line(name, "OK", "0600")
 
 
+def repo_push_checks(repo: Path) -> list[tuple[str, str]]:
+    """(status, detail) for the checkout's push safety settings (ADR-011): `push.default`
+    and the pre-push guard. Problems are warnings: they concern the code, not the data."""
+
+    def git(*args: str) -> str:
+        result = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+        return result.stdout.strip()
+
+    found = []
+    push_default = git("config", "--get", "push.default")
+    if push_default == "current":
+        found.append(("OK", "push.default is current"))
+    else:
+        shown = push_default or "unset"
+        found.append(("WARN", f"push.default is {shown}, not current; run: make hooks"))
+    hook = (repo / git("rev-parse", "--git-path", "hooks") / "pre-push").resolve()
+    guard = (repo / "scripts" / "pre_push_guard.py").resolve()
+    if hook == guard:
+        found.append(("OK", "pre-push guard installed"))
+    else:
+        found.append(("WARN", "the pre-push guard isn't installed; run: make hooks"))
+    return found
+
+
+def _doctor_private_folder(report: _Report, name: str, folder: Path) -> None:
+    """Tighten anything in `folder` that others could read: files to 0600, folders to 0700.
+
+    Symlinks are left alone and not followed, so a link can't point the fix elsewhere.
+    """
+    if not folder.is_dir():
+        report.line(name, "--", "missing (run: careerhunter init)")
+        return
+    files, loose = 0, []
+    for path in sorted(folder.rglob("*")):
+        if path.is_symlink():
+            continue
+        wanted = 0o700 if path.is_dir() else 0o600
+        files += not path.is_dir()
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode & 0o077:
+            os.chmod(path, wanted)
+            loose.append(f"{path.relative_to(folder)} ({oct(mode)})")
+    if loose:
+        report.line(name, "FIXED", f"{', '.join(loose)} -> owner-only")
+    else:
+        report.line(name, "OK", f"{plural(files, 'file', 'files')}, all owner-only")
+
+
 def _doctor_legacy(report: _Report, path: Path) -> None:
     try:
         conn = db.connect_read_only(path)
@@ -372,7 +423,7 @@ def _doctor_earlier_claim(
 
 
 def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
-    """Check everything and report. Reads only, apart from tightening database modes."""
+    """Check everything and report. Reads only, apart from tightening file modes."""
     report = _Report()
     report.line("data dir", "OK", f"{datadir.root} (volume {datadir.mount_point}, encrypted)")
 
@@ -455,6 +506,14 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
             conn.close()
         if search is not None:
             search.close()
+
+    _doctor_private_folder(report, "exports/", datadir.exports)
+    _doctor_private_folder(report, "snapshots/", datadir.snapshots)
+
+    repo = storage_guard.repo_root()
+    if repo is not None and (repo / ".git").exists():
+        for status, detail in repo_push_checks(repo):
+            report.line("git push", status, detail)
 
     for name in sorted(secrets_store.ALLOWED_NAMES):
         print(f"secret          {name}: {secrets_store.describe_secret(name)}")
