@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,23 @@ def test_export_never_overwrites(seeded: sqlite3.Connection, tmp_path: Path) -> 
     export(seeded, tmp_path, *SEPT, now=NOW)
     with pytest.raises(FileExistsError):
         export(seeded, tmp_path, *SEPT, now=NOW)
+
+
+@pytest.fixture
+def permissive_umask() -> Any:
+    previous = os.umask(0)  # anything the process creates could be world-writable
+    yield
+    os.umask(previous)
+
+
+def test_export_files_are_owner_only_whatever_the_umask(
+    seeded: sqlite3.Connection, tmp_path: Path, permissive_umask: None
+) -> None:
+    result = export(seeded, tmp_path, *SEPT, now=NOW)
+    for path in (result.pdf, result.applications_csv, result.activities_csv):
+        assert path.stat().st_mode & 0o777 == 0o600, path.name
+    (tmp_path / "control").write_text("")  # proves the umask really is wide open
+    assert (tmp_path / "control").stat().st_mode & 0o777 == 0o666
 
 
 def test_reversed_range_rejected(seeded: sqlite3.Connection, tmp_path: Path) -> None:

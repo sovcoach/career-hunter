@@ -17,13 +17,15 @@ Voided applications and activities are left out. They stay in the database, with
 void reason, but they are not part of the job-search record.
 
 Files are named with a timestamp and opened in exclusive-create mode, so an export
-never overwrites an earlier one.
+never overwrites an earlier one. They are created owner-only (0600) whatever the umask,
+like every other file in the data directory.
 """
 
 from __future__ import annotations
 
 import csv
 import datetime as dt
+import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,8 +160,17 @@ def csv_safe(value: Any) -> str:
     return text
 
 
+def create_private(path: Path) -> int:
+    """Create `path` owner-only (0600), failing if it exists. Returns the open descriptor.
+
+    The mode is given to the create call itself, so the file is never readable by others,
+    even for a moment.
+    """
+    return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+
+
 def _write_csv(path: Path, columns: tuple[str, ...], rows: list[dict[str, Any]]) -> None:
-    with path.open("x", newline="", encoding="utf-8") as fh:
+    with os.fdopen(create_private(path), "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(columns)
         for row in rows:
@@ -250,7 +261,7 @@ def _write_pdf(
     section("Applications", app_cols, apps)
     section("Other job-search activities", act_cols, acts)
 
-    with path.open("xb") as fh:
+    with os.fdopen(create_private(path), "wb") as fh:
         SimpleDocTemplate(
             fh,
             pagesize=landscape(letter),
