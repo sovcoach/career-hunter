@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from careerhunter import __version__, bot, claims, db, secrets_store, service, storage_guard
+from careerhunter import __version__, bot, claims, db, secrets_store, service, storage_guard, watch
 from careerhunter.bot import BotStartupError
 from careerhunter.claims import ActiveClaim, ClaimError, ClaimSettings, settings_from_config
 from careerhunter.config import (
@@ -33,6 +33,7 @@ from careerhunter.config import (
 )
 from careerhunter.config import today as config_today
 from careerhunter.export import export, plural
+from careerhunter.fetch import fetch as fetch_url
 from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.seed import SeedError, Tally, import_seed
@@ -510,6 +511,29 @@ def _doctor_earlier_claim(
         )
 
 
+def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
+    """Fetch Greenhouse, Lever and Ashby boards once, then exit."""
+    if not datadir.config_path.is_file():
+        _err("error: config.yaml is missing")
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    doc = load_config(datadir.config_path)
+    entries = doc.get("watchlist", [])
+    if not isinstance(entries, list):
+        raise ConfigError(datadir.config_path, ["watchlist must be a list"])
+    conn = db.connect(datadir.search_db_path)
+    try:
+        db.migrate(conn, "search")
+        lines = watch.run(conn, entries, today=config_today(doc).isoformat(), fetcher=fetch_url)
+    finally:
+        conn.close()
+    for line in lines:
+        _err(line)
+    return EXIT_OK
+
+
 def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
     """Check everything and report. Reads only, apart from tightening file modes."""
     report = _Report()
@@ -660,6 +684,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p = sub.add_parser("service", help="run the bot as a launchd service on this Mac")
     p.add_argument("service_action", choices=("install", "uninstall", "status"))
+    sub.add_parser(
+        "watch",
+        help="fetch Greenhouse, Lever and Ashby boards on the watchlist once and exit",
+    )
     sub.add_parser("doctor", help="check the setup and report what is missing")
     return parser
 
@@ -673,6 +701,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "secret": cmd_secret,
     "bot": cmd_bot,
     "service": cmd_service,
+    "watch": cmd_watch,
     "doctor": cmd_doctor,
 }
 

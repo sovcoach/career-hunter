@@ -71,10 +71,30 @@ def test_a_public_page_is_fetched_through_the_checked_address() -> None:
         resolver=resolver({"jobs.example.com": [PUBLIC]}),
         connector=web.connector,
     )
-    assert got.status == 200 and got.content_type == "text/html"
+    assert got.status == 200 and got.content_type == "text/html" and got.retry_after is None
     # Dialled the checked address, while the request still names the original host.
     assert web.dialled == [("https", "jobs.example.com", PUBLIC, 443)]
     assert web.requests == [("jobs.example.com", "/ad/1")]
+
+
+def test_a_429_keeps_the_retry_after_header() -> None:
+    web = FakeWeb(
+        {
+            "https://jobs.example.com/board": FakeResponse(
+                status=429,
+                headers={"Content-Type": "text/plain", "Retry-After": "120"},
+                body=b"slow down",
+            )
+        }
+    )
+    got = f.fetch(
+        "https://jobs.example.com/board",
+        resolver=resolver({"jobs.example.com": [PUBLIC]}),
+        connector=web.connector,
+    )
+    assert got.status == 429
+    assert got.retry_after == "120"
+    assert got.body == b"slow down"
 
 
 def test_dns_rebinding_cannot_swap_in_a_private_address() -> None:
