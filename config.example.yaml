@@ -15,16 +15,43 @@ search:
     - Project Coordinator
   # Places you would work from or commute to.
   locations:
-    - Example City, ON
+    - Example City
     - Remote (Canada)
   # Which work models you are open to: onsite, hybrid, remote.
   work_models: [remote, hybrid, onsite]
+  # Optional (validated now, used for scoring from Phase 3): target titles grouped into
+  # lanes by priority. A title may be a list of variants that count as one title. A
+  # fallback lane ranks below an equally good fit in any other lane.
+  lanes:
+    - name: operations
+      priority: 1
+      titles:
+        - Operations Coordinator
+        - [Project Coordinator, Project Assistant]
+    - name: customer_success
+      priority: 2
+      fallback: true
+      titles:
+        - Customer Success Specialist
+  # Optional: where each work model is acceptable.
+  location_rules:
+    onsite_hybrid: ["Example City"]  # on-site and hybrid only here
+    remote: [Canada]                    # fully remote only within these regions
+    allow_travel_outside: false         # refuse roles needing office days elsewhere
 
 # Hard gates: a posting failing any of these is skipped, with the reason recorded.
 hard_gates:
   min_salary: 55000            # in your local currency, per year
   max_commute_km: 40
   exclude_work_models: []      # e.g. [onsite]
+  # Optional gates; a posting that trips one is skipped with that reason (Phase 3).
+  required_languages: []       # skip postings that require any of these languages
+  credentials: []              # licences, clearances or designations you can't get
+  shift_patterns: [overnight]  # e.g. rotating, overnight, 24/7
+  pay_structures: [commission_only]
+  seniority_words: [Senior, Director]
+  title_exceptions: []         # titles allowed despite containing a seniority word
+  never_gated_families: []     # title families gated only when explicitly senior
 
 # How postings are scored (0-10). Weights are relative; Phase 3 uses them.
 fit_rubric:
@@ -36,13 +63,32 @@ fit_rubric:
   thresholds:
     strong: 8                  # notify right away
     worth_a_look: 5            # include in the daily digest
+  # Optional: rate by the number of missing requirements instead of weights. With
+  # gap_tiers set, weights and thresholds can be left out.
+  gap_tiers:
+    tiers:                     # best first, by the most gaps the tier allows
+      - {name: strong, max_gaps: 1}
+      - {name: possible, max_gaps: 2}
+    exclude_from_gaps: 3       # this many gaps or more: skip
+    boundary:                  # at exactly this many gaps, decide by the kind of gap
+      at_gaps: 1
+      all_minor: strong        # every gap learnable or nice-to-have
+      any_core: possible       # any gap core to the job
+    exempt_requirements: []    # requirement types that never count as a gap
 
 schedule:
-  timezone: America/Toronto
-  watcher_interval_minutes: 60
+  # A zone name (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); UTC if unset.
+  timezone: UTC
+  watcher_interval_minutes: 60    # optional
   quiet_hours:
     start: "21:00"
     end: "07:00"
+
+# Optional: limits on the work schedule. Anything above a limit is flagged (or
+# excluded, with over_limit: exclude).
+schedule_limits:
+  weekend_days_per_month: 2
+  over_limit: flag
 
 # Companies to watch directly. ats_type is one of:
 # greenhouse, lever, ashby, workday, successfactors, icims, taleo, smartrecruiters,
@@ -56,6 +102,11 @@ watchlist:
     ats_type: lever
     ats_slug: samplelogistics
     careers_url: https://example.org/jobs
+    role_filters:              # optional: only these roles at this company
+      role_families: [support, operations]
+      work_models: [remote, hybrid]
+  - name: Example Staffing
+    agency: true               # optional: a staffing agency, labelled as such
 
 # EI claims. career-hunter keeps one EI job-search record file per claim,
 # ei_record_<label>.db. Set the active claim here: it is never worked out for you.
@@ -69,3 +120,8 @@ ei:
   #   - label: "2026-27"
   #     start: 2026-08-02      # the start date Service Canada gave you
   #     end: 2027-07-31        # optional while the claim is active
+
+# Telegram (Phase 2). The bot only ever talks to this one private chat. Find the id
+# with `careerhunter bot discover` (see docs/SETUP.md).
+telegram:
+  chat_id: null                # e.g. 123456789

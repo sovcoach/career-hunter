@@ -19,10 +19,19 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from careerhunter import __version__, claims, db, secrets_store, storage_guard
+from careerhunter import __version__, bot, claims, db, secrets_store, service, storage_guard
+from careerhunter.bot import BotStartupError
 from careerhunter.claims import ActiveClaim, ClaimError, ClaimSettings, settings_from_config
-from careerhunter.config import ConfigError, load_config, load_exclusions
+from careerhunter.config import (
+    ConfigError,
+    load_config,
+    load_exclusions,
+    telegram_chat_id,
+    timezone_name,
+)
+from careerhunter.config import today as config_today
 from careerhunter.export import export, plural
 from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.platform_checks import SystemProbe
@@ -65,11 +74,17 @@ def _date(value: str) -> dt.date:
         raise argparse.ArgumentTypeError(f"{value!r} is not a YYYY-MM-DD date") from exc
 
 
+def _config_doc(datadir: DataDir) -> dict[str, Any] | None:
+    """The validated config.yaml, or None if there isn't one yet."""
+    if not datadir.config_path.exists():
+        return None
+    return load_config(datadir.config_path)
+
+
 def _claim_settings(datadir: DataDir) -> ClaimSettings:
     """The EI claim settings from config.yaml. No config file means no active claim."""
-    if not datadir.config_path.exists():
-        return ClaimSettings()
-    return settings_from_config(load_config(datadir.config_path))
+    doc = _config_doc(datadir)
+    return settings_from_config(doc) if doc else ClaimSettings()
 
 
 @dataclass
@@ -77,6 +92,7 @@ class Writable:
     search: sqlite3.Connection
     search_applied: list[int]
     active: ActiveClaim | None
+    today: dt.date
 
 
 @contextmanager
@@ -85,9 +101,11 @@ def _writable(datadir: DataDir) -> Iterator[Writable]:
 
     Refuses while any earlier claim's record is unsealed, or a claim file is unknown.
     """
-    settings = _claim_settings(datadir)
+    doc = _config_doc(datadir)
+    settings = settings_from_config(doc) if doc else ClaimSettings()
+    today = config_today(doc)
     claims.require_write_ready(datadir, settings)
-    for warning in claims.warnings(settings, dt.date.today()):
+    for warning in claims.warnings(settings, today):
         _err(f"warning: {warning}")
     search = db.connect(datadir.search_db_path)
     try:
@@ -95,7 +113,7 @@ def _writable(datadir: DataDir) -> Iterator[Writable]:
         with claims.active_claim(datadir, settings) as active:
             for message in active.messages if active else []:
                 print(message)
-            yield Writable(search, applied, active)
+            yield Writable(search, applied, active, today)
     finally:
         search.close()
 
@@ -156,7 +174,11 @@ def _print_tally(title: str, tally: Tally, tables: tuple[str, ...]) -> None:
 def cmd_seed(datadir: DataDir, args: argparse.Namespace) -> int:
     with _writable(datadir) as w:
         result = import_seed(
-            w.search, w.active, datadir.seed_path, route_out_of_claim=args.route_out_of_claim
+            w.search,
+            w.active,
+            datadir.seed_path,
+            w.today,
+            route_out_of_claim=args.route_out_of_claim,
         )
         print(_describe_active(w.active))
         _print_tally(
@@ -198,8 +220,9 @@ def cmd_export(datadir: DataDir, args: argparse.Namespace) -> int:
 
 
 def cmd_claim(datadir: DataDir, args: argparse.Namespace) -> int:
-    settings = _claim_settings(datadir)
-    plan = claims.plan_seal(datadir, settings, args.label, dt.date.today())
+    doc = _config_doc(datadir)
+    settings = settings_from_config(doc) if doc else ClaimSettings()
+    plan = claims.plan_seal(datadir, settings, args.label, config_today(doc))
     print(plan.describe())
     try:
         typed = input("Type the claim label again to confirm: ").strip()
@@ -224,6 +247,36 @@ def cmd_secret(datadir: DataDir, args: argparse.Namespace) -> int:
         return EXIT_ERROR
     secrets_store.set_secret(args.name, first)
     print(f"{args.name}: stored in Keychain, {secrets_store.describe_secret(args.name)}")
+    return EXIT_OK
+
+
+def cmd_bot(datadir: DataDir, args: argparse.Namespace) -> int:
+    if args.bot_action == "discover":
+        chats = bot.discover(datadir)
+        if not chats:
+            print("No messages waiting. Send the bot any message from your phone, then retry.")
+        for chat_id, kind in chats:
+            print(f"chat {chat_id} ({kind})")
+        print("Put your private chat's id in config.yaml as telegram.chat_id.")
+        return EXIT_OK
+    return bot.run(datadir)
+
+
+def cmd_service(datadir: DataDir, args: argparse.Namespace) -> int:
+    if args.service_action == "install":
+        path = service.install(datadir.root)
+        print(f"installed {path}; the bot starts now and at every login")
+    elif args.service_action == "uninstall":
+        removed = service.uninstall()
+        print("uninstalled" if removed else "not installed")
+    else:
+        current = service.status()
+        if not current.installed:
+            print("not installed (run: careerhunter service install)")
+        elif current.running:
+            print(f"running (pid {current.pid})")
+        else:
+            print(f"installed but not running (last exit {current.last_exit or 'unknown'})")
     return EXIT_OK
 
 
@@ -297,6 +350,41 @@ def repo_push_checks(repo: Path) -> list[tuple[str, str]]:
     else:
         found.append(("WARN", "the pre-push guard isn't installed; run: make hooks"))
     return found
+
+
+HEARTBEAT_STALE = dt.timedelta(minutes=5)
+
+
+def _doctor_bot(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
+    """The Telegram chat setting, and whether the bot service is up and polling."""
+    if config_doc is not None:
+        if telegram_chat_id(config_doc) is None:
+            report.line(
+                "telegram", "--", "telegram.chat_id not set (see: careerhunter bot discover)"
+            )
+        else:
+            report.line("telegram", "OK", "chat set")
+    current = service.status()
+    if not current.installed:
+        report.line("bot service", "--", "not installed (run: careerhunter service install)")
+        return
+    if current.running:
+        report.line("bot service", "OK", f"running (pid {current.pid})")
+    else:
+        detail = f"installed but not running (last exit {current.last_exit or 'unknown'})"
+        report.line("bot service", "BAD", f"{detail}; see logs/bot.log")
+    heartbeat = datadir.logs / "bot.heartbeat"
+    try:
+        beat = dt.datetime.fromisoformat(heartbeat.read_text().strip())
+    except (OSError, ValueError):
+        report.line("bot heartbeat", "BAD", "none yet; the bot hasn't completed a poll")
+        return
+    age = dt.datetime.now(dt.UTC) - beat
+    if age > HEARTBEAT_STALE:
+        minutes = int(age.total_seconds() // 60)
+        report.line("bot heartbeat", "BAD", f"last poll {minutes} min ago; see logs/bot.log")
+    else:
+        report.line("bot heartbeat", "OK", "polled within the last 5 minutes")
 
 
 def _doctor_private_folder(report: _Report, name: str, folder: Path) -> None:
@@ -428,6 +516,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
     report.line("data dir", "OK", f"{datadir.root} (volume {datadir.mount_point}, encrypted)")
 
     settings: ClaimSettings | None = None
+    config_doc: dict[str, Any] | None = None
     for path, loader in (
         (datadir.config_path, load_config),
         (datadir.exclusions_path, load_exclusions),
@@ -449,6 +538,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
         report.line(path.name, "OK")
         if path == datadir.config_path:
             settings = settings_from_config(doc)
+            config_doc = doc
 
     if settings is None:
         report.line("ei claim", "--", "unknown until config.yaml is valid")
@@ -457,8 +547,19 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
         report.line("ei claim", "OK", f"{settings.active.label} active ({settings.active.period})")
     else:
         report.line("ei claim", "--", "none active (set ei.active_claim in config.yaml)")
-    for warning in claims.warnings(settings, dt.date.today()):
+    for warning in claims.warnings(settings, config_today(config_doc)):
         report.line("ei claim", "WARN", warning)
+    if config_doc is not None:
+        zone = timezone_name(config_doc)
+        if zone is None:
+            report.line(
+                "timezone",
+                "WARN",
+                "schedule.timezone isn't set, so dates use UTC. Set yours in config.yaml, "
+                "e.g. Europe/Berlin or UTC+05:30",
+            )
+        else:
+            report.line("timezone", "OK", zone)
 
     if datadir.legacy_db_path.exists():
         _doctor_legacy(report, datadir.legacy_db_path)
@@ -509,6 +610,8 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
 
     _doctor_private_folder(report, "exports/", datadir.exports)
     _doctor_private_folder(report, "snapshots/", datadir.snapshots)
+    _doctor_private_folder(report, "logs/", datadir.logs)
+    _doctor_bot(report, datadir, config_doc)
 
     repo = storage_guard.repo_root()
     if repo is not None and (repo / ".git").exists():
@@ -549,6 +652,14 @@ def build_parser() -> argparse.ArgumentParser:
     claim_sub = p.add_subparsers(dest="claim_action", required=True)
     p = claim_sub.add_parser("seal", help="permanently close an earlier claim's record")
     p.add_argument("label", help="the claim to seal, e.g. 2025-26")
+    p = sub.add_parser("bot", help="the Telegram bot")
+    p.add_argument(
+        "bot_action",
+        choices=("run", "discover"),
+        help="run: poll Telegram until stopped; discover: list chats that messaged the bot",
+    )
+    p = sub.add_parser("service", help="run the bot as a launchd service on this Mac")
+    p.add_argument("service_action", choices=("install", "uninstall", "status"))
     sub.add_parser("doctor", help="check the setup and report what is missing")
     return parser
 
@@ -560,6 +671,8 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "export": cmd_export,
     "claim": cmd_claim,
     "secret": cmd_secret,
+    "bot": cmd_bot,
+    "service": cmd_service,
     "doctor": cmd_doctor,
 }
 
@@ -579,6 +692,8 @@ def main(argv: Sequence[str] | None = None, probe: SystemProbe | None = None) ->
         SeedError,
         ClaimError,
         PartialWriteError,
+        BotStartupError,
+        service.ServiceError,
         ConfigError,
         secrets_store.SecretError,
         db.MigrationError,

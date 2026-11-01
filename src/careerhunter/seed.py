@@ -38,6 +38,7 @@ import yaml
 
 from careerhunter import ei_store, enums, search_store
 from careerhunter.claims import ActiveClaim, Verdict, check_dating
+from careerhunter.config import today as config_today
 from careerhunter.ei_store import EiApplication
 from careerhunter.ledger import ei_first, new_correlation_id, sanitize
 from careerhunter.models import Activity, Application, Dating, Posting
@@ -430,5 +431,5 @@ def import_seed(
         raise SeedError([f"{path} not found. Copy seed.example.yaml there and fill it in."])
     with path.open(encoding="utf-8") as fh:
         doc = yaml.safe_load(fh)
-    rows = parse(doc, today or dt.date.today())
+    rows = parse(doc, today or config_today(None))  # the CLI passes the configured zone
     return import_rows(search, active, rows, route_out_of_claim=route_out_of_claim)

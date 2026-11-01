@@ -29,6 +29,16 @@ The first `make check` also builds gitleaks, which takes a minute or two.
 
 `careerhunter doctor` warns if either is missing.
 
+The data-path hook needs `CAREERHUNTER_DATA_DIR` set in the shell you commit from (the same value career-hunter uses). No path is built into the hook, so without it every commit is refused with a message saying so.
+
+**Privacy tip:** git records your time zone offset in every commit and tag. If you'd rather not publish it, commit and tag with UTC timestamps:
+
+```bash
+TZ=UTC git commit
+```
+
+Existing history keeps whatever offsets it was made with.
+
 Tests never need a real data folder or Keychain: the storage guard and Keychain are replaced with fakes. To try the CLI by hand without your real drive, create a throwaway encrypted disk image (see "Testing the CLI safely" in [docs/SETUP.md](docs/SETUP.md#testing-the-cli-safely)).
 
 ## Workflow

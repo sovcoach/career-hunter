@@ -1,8 +1,9 @@
 """The committed Claude Code permission rules (ADR-011) cover every form of a guarded command.
 
 The rules match command text, so a guarded git subcommand needs a rule for each way it can
-be spelled: plain (`git add`), with a working directory (`git -C <dir> add`), and with a
-config override (`git -c <key=val> add`). This test applies the rules the way Claude Code
+be spelled: plain (`git add`), with a working directory (`git -C <dir> add`), with a
+config override (`git -c <key=val> add`), and after environment assignments
+(`TZ=UTC git add`). This test applies the rules the way Claude Code
 does: `Bash(x:*)` matches `x` and anything after it, and in any other rule `*` matches any
 run of characters.
 """
@@ -22,6 +23,9 @@ FORMS = {
     "-C": "git -C /tmp/other-checkout {cmd}",
     "-c": "git -c core.hooksPath=/dev/null {cmd}",
     "-C and -c": "git -C /tmp/other-checkout -c user.name=x {cmd}",
+    "env prefix": "TZ=UTC git {cmd}",
+    "two env prefixes": "CAREERHUNTER_DATA_DIR=/Volumes/ExampleDrive/x TZ=UTC git {cmd}",
+    "env command": "env TZ=UTC git {cmd}",
 }
 
 
@@ -61,6 +65,8 @@ def test_each_form_has_its_own_rule(cmd: str) -> None:
     for flag in ("-C", "-c"):
         assert f"Bash(git {flag} * {cmd})" in ask
         assert f"Bash(git {flag} * {cmd} *)" in ask
+    assert f"Bash(*=* git {cmd})" in ask  # any VAR=value prefix, such as TZ=UTC
+    assert f"Bash(*=* git {cmd} *)" in ask
 
 
 @pytest.mark.parametrize(

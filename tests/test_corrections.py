@@ -104,11 +104,11 @@ def test_void_needs_reason_and_valid_target(seeded: sqlite3.Connection) -> None:
             "resume-v3.pdf",
         ),
         (
-            "UPDATE applications SET location = 'Shelbyville, ON' WHERE role = 'Data Clerk'",
+            "UPDATE applications SET location = 'Shelbyville' WHERE role = 'Data Clerk'",
             "applications",
             "location",
-            "Ogdenville, ON",
-            "Shelbyville, ON",
+            "Ogdenville",
+            "Shelbyville",
         ),
         (
             "UPDATE activities SET related_company = 'Synthetic Expo' WHERE type = 'job_fair'",
