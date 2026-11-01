@@ -35,7 +35,7 @@ from careerhunter import ei_store, enums, search_store
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating, read_file_claim
 from careerhunter.db import transaction
 from careerhunter.ei_store import EiApplication
-from careerhunter.models import Application, Dating, Posting
+from careerhunter.models import Activity, Application, Dating, Posting
 
 
 class PartialWriteError(Exception):
@@ -158,6 +158,46 @@ def record_skip(search: sqlite3.Connection, posting: Posting, date: str, reason:
             search, posting, Dating("exact", date)
         )
         return search_store.insert_skip(search, posting_id, date, reason)
+
+
+def record_activity(active: ActiveClaim | None, activity: Activity) -> bool:
+    """Record a job-search activity in the active claim's EI record (its only home).
+
+    Returns False if the same activity (type, description, date) was already there.
+    """
+    if active is None:
+        raise ClaimError("no EI claim is active, so there is no record to add an activity to")
+    verdict, message = check_dating(active.claim, activity.dating)
+    if verdict is Verdict.REFUSE:
+        raise ClaimError(message)
+    with transaction(active.conn):
+        return ei_store.insert_activity(active.conn, activity)
+
+
+def attach_snapshot(
+    search: sqlite3.Connection, active: ActiveClaim | None, correlation_id: str, path: str
+) -> bool:
+    """Record a job-ad snapshot taken after the application. Returns True if the EI
+    record got it too.
+
+    Both layers are updated, EI first (ADR-014); in the EI record it is an audited
+    update. An application whose claim is sealed gets it in search.db only.
+    """
+    row = search.execute(
+        "SELECT posting_id, ei_claim FROM applications WHERE correlation_id = ?",
+        (correlation_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no application with correlation id {correlation_id}")
+    to_ei = active if active is not None and row["ei_claim"] == active.claim.label else None
+    with ei_first(search, to_ei):
+        search_store.set_posting_snapshot(search, int(row["posting_id"]), path)
+        if to_ei is not None:
+            to_ei.conn.execute(
+                "UPDATE applications SET snapshot_path = ? WHERE correlation_id = ?",
+                (path, correlation_id),
+            )
+    return to_ei is not None
 
 
 # --- Reconciliation -------------------------------------------------------------------

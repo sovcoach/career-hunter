@@ -202,3 +202,61 @@ def decision_sequences(conn: sqlite3.Connection) -> dict[str, list[tuple[str, st
     ):
         sequences[r["correlation_id"]].append((r["status"], r["status_date"]))
     return sequences
+
+
+def posting_by_id(conn: sqlite3.Connection, posting_id: int) -> Posting | None:
+    """Rebuild a Posting from search.db, so it can be recorded through the ledger."""
+    row = conn.execute(
+        "SELECT c.name AS company, p.* FROM postings p JOIN companies c ON c.id = p.company_id "
+        "WHERE p.id = ?",
+        (posting_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return Posting(
+        company=row["company"],
+        title=row["title"],
+        first_seen=row["first_seen"],
+        location=row["location"],
+        work_model=row["work_model"],
+        schedule=row["schedule"],
+        url=row["url"],
+        requisition_id=row["requisition_id"],
+        source=row["source"],
+        fit_rating=row["fit_rating"],
+        gaps=row["gaps"],
+        llm_output=row["llm_output"],
+        scout_metadata=row["scout_metadata"],
+        snapshot_path=row["snapshot_path"],
+    )
+
+
+def set_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -> None:
+    conn.execute("UPDATE postings SET snapshot_path = ? WHERE id = ?", (path, posting_id))
+
+
+def recent_applications(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row]:
+    """The latest applications, newest first, with company, title and current status."""
+    rows: list[sqlite3.Row] = conn.execute(
+        """
+        SELECT a.id, a.correlation_id, a.ei_claim, c.name AS company, p.title, p.url,
+               (SELECT d.status FROM decision_history d WHERE d.application_id = a.id
+                ORDER BY d.id DESC LIMIT 1) AS status
+        FROM applications a
+        JOIN postings p ON p.id = a.posting_id
+        JOIN companies c ON c.id = p.company_id
+        ORDER BY a.id DESC LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return rows
+
+
+def application_summary(conn: sqlite3.Connection, application_id: int) -> sqlite3.Row | None:
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT a.id, a.correlation_id, a.ei_claim, a.posting_id, c.name AS company, p.title "
+        "FROM applications a JOIN postings p ON p.id = a.posting_id "
+        "JOIN companies c ON c.id = p.company_id WHERE a.id = ?",
+        (application_id,),
+    ).fetchone()
+    return row
