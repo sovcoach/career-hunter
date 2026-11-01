@@ -1,14 +1,14 @@
-"""Fetch Greenhouse, Lever and Ashby boards, then filter the new postings.
+"""Fetch Greenhouse, Lever and Ashby boards, filter the new postings, then score them.
 
 One `careerhunter watch` run reads the watchlist and fetches those three boards, one
-company after another, through `fetch.py`. It writes companies, postings and skip
-reasons in `search.db`. It does not score, alert, write applications, EI rows or
+company after another, through `fetch.py`. It writes companies, postings, skip reasons
+and local scores in `search.db`. It does not alert, write applications, EI rows or
 snapshots. `run` returns the log lines; the CLI prints them to stderr.
 
-A posting that is already stored is not inserted again. Watcher rows that still have
-no skip are checked again before the fetch, so a config change can record a skip
-without waiting for the board to list the job a second time. A network error, a parse
-error, or HTTP 429 is a log line, not a skip.
+A posting that is already stored is not inserted again. Before the fetch, watcher rows
+that still have no skip are filtered again, and rows that are still unscored are
+scored. A network error, a parse error, HTTP 429, or a model that does not answer is
+a log line, not a skip.
 
 The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
 one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
@@ -29,8 +29,10 @@ from careerhunter import db, filters, search_store
 from careerhunter.fetch import Fetched, FetchError
 from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
+from careerhunter.score import Score, ScoreError
 
 Fetcher = Callable[[str], Fetched]
+Scorer = Callable[[PostingText], Score | None]
 
 _BOARDS = ("greenhouse", "lever", "ashby")
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -102,6 +104,7 @@ def run(
     fetcher: Fetcher,
     config: Mapping[str, Any] | None = None,
     exclusions: Mapping[str, Any] | None = None,
+    scorer: Scorer | None = None,
 ) -> list[str]:
     """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`."""
     dt.date.fromisoformat(today)
@@ -109,6 +112,7 @@ def run(
     skipped = exclusions or {}
     lines: list[str] = []
     _recheck(conn, watchlist, rules, skipped, today, lines)
+    _score_waiting(conn, scorer, today, lines)
     blocked: set[str] = set()
     for item in watchlist:
         entry = _entry(item)
@@ -117,7 +121,18 @@ def run(
             continue
         name, ats, slug, role_filters = entry
         _watch_one(
-            conn, lines, blocked, name, ats, slug, role_filters, rules, skipped, today, fetcher
+            conn,
+            lines,
+            blocked,
+            name,
+            ats,
+            slug,
+            role_filters,
+            rules,
+            skipped,
+            today,
+            fetcher,
+            scorer,
         )
     return lines
 
@@ -151,6 +166,7 @@ def _watch_one(
     exclusions: Mapping[str, Any],
     today: str,
     fetcher: Fetcher,
+    scorer: Scorer | None,
 ) -> None:
     if ats is None:
         lines.append(_line(name, None, "no ats_type; skipped"))
@@ -190,7 +206,7 @@ def _watch_one(
             )
         )
         return
-    _record_jobs(conn, lines, name, ats, jobs, role_filters, config, exclusions, today)
+    _record_jobs(conn, lines, name, ats, jobs, role_filters, config, exclusions, today, scorer)
 
 
 def _fetch_jobs(
@@ -240,6 +256,7 @@ def _record_jobs(
     config: Mapping[str, Any],
     exclusions: Mapping[str, Any],
     today: str,
+    scorer: Scorer | None,
 ) -> None:
     new = 0
     existing = 0
@@ -311,6 +328,16 @@ def _record_jobs(
         new += 1
         if verdict.reason:
             lines.append(_line(name, ats, f"{item.title!r} skipped ({verdict.reason})"))
+            continue
+        seen = PostingText(
+            company=company,
+            title=item.title,
+            location=item.location,
+            work_model=item.work_model,
+            description=item.description,
+            requisition_id=item.requisition_id,
+        )
+        _score_one(conn, posting_id, seen, scorer, today, lines, name, ats)
     lines.append(_line(name, ats, f"{new} new, {existing} already recorded"))
 
 
@@ -322,7 +349,7 @@ def _recheck(
     today: str,
     lines: list[str],
 ) -> None:
-    """Filter watcher postings that have no skip yet. Scoring has not run, so none are scored."""
+    """Filter watcher postings that have no skip and no score yet."""
     roles = {
         entry[0].casefold(): entry[3] for item in watchlist if (entry := _entry(item)) is not None
     }
@@ -357,6 +384,74 @@ def _recheck(
             lines.append(
                 _line(str(row["company"]), None, f"{row['title']!r} skipped ({verdict.reason})")
             )
+
+
+def _score_waiting(
+    conn: sqlite3.Connection,
+    scorer: Scorer | None,
+    today: str,
+    lines: list[str],
+) -> None:
+    """Score watcher postings that passed the filter and have no model text yet."""
+    if scorer is None:
+        return
+    rows = conn.execute(
+        "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
+        "FROM postings p JOIN companies c ON c.id = p.company_id "
+        "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
+    ).fetchall()
+    for row in rows:
+        _score_one(
+            conn,
+            int(row["id"]),
+            PostingText(
+                company=row["company"],
+                title=row["title"],
+                location=row["location"],
+                work_model=row["work_model"],
+                requisition_id=row["requisition_id"],
+            ),
+            scorer,
+            today,
+            lines,
+            str(row["company"]),
+            None,
+        )
+
+
+def _score_one(
+    conn: sqlite3.Connection,
+    posting_id: int,
+    posting: PostingText,
+    scorer: Scorer | None,
+    today: str,
+    lines: list[str],
+    name: str,
+    ats: str | None,
+) -> None:
+    if scorer is None:
+        return
+    try:
+        result = scorer(posting)
+    except (ScoreError, OSError):
+        result = None
+    if result is None:
+        lines.append(_line(name, ats, f"{posting.title!r} left unscored"))
+        return
+    metadata = None if result.tier is None else json.dumps({"tier": result.tier})
+    with db.transaction(conn):
+        search_store.set_posting_score(
+            conn,
+            posting_id,
+            gaps=result.gaps,
+            llm_output=result.llm_output,
+            scout_metadata=metadata,
+        )
+        if result.excluded and not search_store.posting_has_skip(conn, posting_id):
+            search_store.insert_skip(conn, posting_id, today, "gap_tier")
+    if result.excluded:
+        lines.append(_line(name, ats, f"{posting.title!r} skipped (gap_tier)"))
 
 
 def _align(conn: sqlite3.Connection, name: str, ats_type: str, ats_slug: str) -> _Aligned:
