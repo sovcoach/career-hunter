@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import subprocess
 import sys
@@ -11,19 +10,6 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "check_no_datadir_paths.py"
-
-
-def _default_data_dir() -> str:
-    """Read DEFAULT_DATA_DIR from the hook itself.
-
-    Paths to files inside the data directory are built at runtime, never written out in
-    full here: the hook scans this file too, and it should keep catching them.
-    """
-    spec = importlib.util.spec_from_file_location("check_no_datadir_paths", SCRIPT)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return str(module.DEFAULT_DATA_DIR)
 
 
 def git(repo: Path, *args: str) -> None:
@@ -115,10 +101,25 @@ def test_content_mentioning_data_file_blocked(setup: tuple[Path, Path]) -> None:
     assert "mentions a file inside the data directory" in result.stderr
 
 
-def test_unset_env_falls_back_to_default(setup: tuple[Path, Path]) -> None:
+@pytest.mark.parametrize("files", [None, ["clean.md"]], ids=["staged", "passed"])
+def test_unset_env_fails_with_a_clear_message(
+    setup: tuple[Path, Path], files: list[str] | None
+) -> None:
+    """No path is built into the hook, so without the variable it refuses, not guesses."""
     repo, _ = setup
-    stage(repo, "notes.md", "see " + _default_data_dir() + "/seed.yaml\n")
-    assert run_check(repo, None).returncode == 1
+    stage(repo, "clean.md", "nothing private here\n")
+    result = run_check(repo, None, files)
+    assert result.returncode == 1
+    assert "CAREERHUNTER_DATA_DIR isn't set" in result.stderr
+    assert "/Volumes/ExampleDrive/ExampleFolder" in result.stderr  # only a placeholder
+
+
+def test_the_hook_holds_no_real_path() -> None:
+    source = SCRIPT.read_text()
+    assert "DEFAULT_DATA_DIR" not in source
+    assert [line for line in source.splitlines() if "/Volumes/" in line] == [
+        "  export CAREERHUNTER_DATA_DIR=/Volumes/ExampleDrive/ExampleFolder   (see docs/SETUP.md)"
+    ]
 
 
 def test_reported_path_stops_at_backslash(setup: tuple[Path, Path]) -> None:
