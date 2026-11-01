@@ -7,6 +7,16 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `make verify-tree` runs every pre-commit hook and the pinned gitleaks over every tracked **and untracked** file. It fails on an empty file list or a missing gitleaks build instead of passing (#1).
+- A pre-push guard (`scripts/pre_push_guard.py`) refuses any push that would update or delete `main`, read from the refs git actually pushes. It has a manual-only override (#4).
+- `make setup` and `make hooks` set `push.default=current` and install the guard. `doctor` warns if either is missing (#4).
+- `doctor` checks `exports/` and `snapshots/` and tightens anything others could read: files to 0600, folders to 0700 (#8).
+- Claude Code deny rules for the guard's override variable, `--no-verify` and `core.hooksPath` (#4).
+
+### Fixed
+- EI export files are created 0600 whatever the umask; they were 0644 under the usual one (#8).
+
 ## [0.2.0] - 2026-10-31
 
 ### Added
