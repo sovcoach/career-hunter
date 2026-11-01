@@ -90,7 +90,9 @@ schedule_limits:
   weekend_days_per_month: 2
   over_limit: flag
 
-# Companies to watch directly. ats_type is one of:
+# Companies to watch directly. `careerhunter watch` fetches greenhouse, lever and
+# ashby from ats_slug (one path segment) and ignores careers_url. Other ats_type
+# values are kept here and not fetched yet. ats_type is one of:
 # greenhouse, lever, ashby, workday, successfactors, icims, taleo, smartrecruiters,
 # jobvite, bamboohr, other
 watchlist:
