@@ -194,6 +194,21 @@ def set_posting_schedule(conn: sqlite3.Connection, posting_id: int, schedule: st
     conn.execute("UPDATE postings SET schedule = ? WHERE id = ?", (schedule, posting_id))
 
 
+def set_posting_score(
+    conn: sqlite3.Connection,
+    posting_id: int,
+    *,
+    gaps: str,
+    llm_output: str,
+    scout_metadata: str | None,
+) -> None:
+    """Store parsed gaps, model text and the tier. Does not set fit_rating."""
+    conn.execute(
+        "UPDATE postings SET gaps = ?, llm_output = ?, scout_metadata = ? WHERE id = ?",
+        (gaps, llm_output, scout_metadata, posting_id),
+    )
+
+
 def insert_skip(conn: sqlite3.Connection, posting_id: int, date: str, reason: str) -> int:
     cur = conn.execute(
         "INSERT INTO skips (posting_id, date, reason) VALUES (?, ?, ?)",
