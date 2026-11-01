@@ -34,7 +34,7 @@ def test_unset_env_refuses(probe: FakeProbe, repo: Path) -> None:
 
 def test_relative_path_refuses(probe: FakeProbe, repo: Path) -> None:
     with pytest.raises(StorageGuardError, match="absolute"):
-        check(env_for("CareerHunterData"), probe=probe, repo=repo)
+        check(env_for("ExampleFolder"), probe=probe, repo=repo)
 
 
 def test_data_inside_repo_refuses(repo: Path) -> None:
@@ -44,7 +44,7 @@ def test_data_inside_repo_refuses(repo: Path) -> None:
 
 
 def test_repo_inside_data_refuses(fake_volume: Path) -> None:
-    data = fake_volume / "CareerHunterData"
+    data = fake_volume / "ExampleFolder"
     inner_repo = data / "career-hunter"
     with pytest.raises(StorageGuardError, match="inside the data directory"):
         guard(data, FakeProbe(fake_volume), inner_repo)
@@ -52,7 +52,7 @@ def test_repo_inside_data_refuses(fake_volume: Path) -> None:
 
 def test_symlink_into_repo_refuses(fake_volume: Path, repo: Path) -> None:
     (repo / "data").mkdir()
-    link = fake_volume / "CareerHunterData"
+    link = fake_volume / "ExampleFolder"
     link.symlink_to(repo / "data")
     with pytest.raises(StorageGuardError, match="inside the code repository"):
         guard(link, FakeProbe(fake_volume), repo)
@@ -61,7 +61,7 @@ def test_symlink_into_repo_refuses(fake_volume: Path, repo: Path) -> None:
 def test_any_git_work_tree_refuses(fake_volume: Path, repo: Path) -> None:
     probe = FakeProbe(fake_volume, git_top=fake_volume)
     with pytest.raises(StorageGuardError, match="git work tree"):
-        guard(fake_volume / "CareerHunterData", probe, repo)
+        guard(fake_volume / "ExampleFolder", probe, repo)
 
 
 def test_non_macos_refuses(fake_volume: Path, repo: Path) -> None:
@@ -72,7 +72,7 @@ def test_non_macos_refuses(fake_volume: Path, repo: Path) -> None:
 def test_unmounted_volume_refuses_and_names_boot(fake_volume: Path, repo: Path) -> None:
     probe = FakeProbe(fake_volume, mounted=False)
     with pytest.raises(StorageGuardError, match="boot volume"):
-        guard(fake_volume / "CareerHunterData", probe, repo)
+        guard(fake_volume / "ExampleFolder", probe, repo)
 
 
 def test_same_device_as_boot_refuses(fake_volume: Path, repo: Path) -> None:
@@ -117,7 +117,7 @@ def test_unreadable_diskutil_refuses(fake_volume: Path, repo: Path) -> None:
 
 
 def test_happy_path_and_missing_dir(fake_volume: Path, repo: Path, probe: FakeProbe) -> None:
-    data = fake_volume / "CareerHunterData"
+    data = fake_volume / "ExampleFolder"
     result = guard(data, probe, repo)
     assert result.root == data
     assert result.mount_point == fake_volume
@@ -126,7 +126,7 @@ def test_happy_path_and_missing_dir(fake_volume: Path, repo: Path, probe: FakePr
 
 
 def test_create_makes_private_dirs(fake_volume: Path, repo: Path, probe: FakeProbe) -> None:
-    datadir = guard(fake_volume / "CareerHunterData", probe, repo)
+    datadir = guard(fake_volume / "ExampleFolder", probe, repo)
     created = create(datadir)
     assert datadir.root in created
     assert os.stat(datadir.root).st_mode & 0o777 == 0o700
@@ -139,14 +139,14 @@ def test_create_makes_private_dirs(fake_volume: Path, repo: Path, probe: FakePro
 def test_create_never_builds_missing_parents(
     fake_volume: Path, repo: Path, probe: FakeProbe
 ) -> None:
-    datadir = guard(fake_volume / "missing" / "CareerHunterData", probe, repo)
+    datadir = guard(fake_volume / "missing" / "ExampleFolder", probe, repo)
     with pytest.raises(StorageGuardError, match="refusing to create"):
         create(datadir)
     assert not (fake_volume / "missing").exists()
 
 
 def test_loose_permissions_refuse(fake_volume: Path, repo: Path, probe: FakeProbe) -> None:
-    data = fake_volume / "CareerHunterData"
+    data = fake_volume / "ExampleFolder"
     data.mkdir(mode=0o755)
     os.chmod(data, 0o755)  # noqa: S103 - deliberately too loose
     with pytest.raises(StorageGuardError, match="chmod 700"):

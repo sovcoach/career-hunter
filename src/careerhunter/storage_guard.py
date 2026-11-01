@@ -218,7 +218,7 @@ def check(
     if not raw:
         raise StorageGuardError(
             f"{ENV_VAR} is not set. Point it at your data folder on the encrypted external "
-            "drive, e.g. export CAREERHUNTER_DATA_DIR=/Volumes/X10-Pro/CareerHunterData"
+            "drive, e.g. export CAREERHUNTER_DATA_DIR=/Volumes/ExampleDrive/ExampleFolder"
         )
     given = Path(raw).expanduser()
     if not given.is_absolute():

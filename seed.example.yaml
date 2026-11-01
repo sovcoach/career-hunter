@@ -26,7 +26,7 @@ companies:                    # optional: details for companies you also want to
 applications:
   - company: Example Robotics
     title: Operations Coordinator
-    location: Example City, ON
+    location: Example City
     work_model: hybrid
     method: company site
     date_precision: exact
@@ -47,7 +47,7 @@ applications:
 
   - company: Placeholder Foods
     title: Project Coordinator
-    location: Example City, ON
+    location: Example City
     work_model: onsite
     method: agency
     date_precision: unknown
