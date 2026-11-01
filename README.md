@@ -4,7 +4,7 @@
 
 Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 1.5 (data layer split), version 0.2.0. Tracking, import and export work, with one EI record per claim kept apart from everything else. Watching and notifications are not built yet.
+> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. Watching companies' career pages is not built yet.
 
 ---
 
@@ -14,7 +14,7 @@ Your information never leaves your machine and is never stored in this code repo
 - **Developers and reviewers** looking at how a small personal-data tool can be built carefully: fail-closed storage guards, secrets in the OS keychain, append-only records, CI and decision records.
 - **Friends** who want to run their own copy. Everything personal lives in config, so you can clone it and use it for your own search.
 
-## What it does (Phase 1.5)
+## What it does (Phase 2)
 
 | Command | What it does |
 |---|---|
@@ -23,11 +23,12 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
 | `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
+| `careerhunter bot run` / `service install` | Runs the Telegram bot, by hand or as a background service on the Mac |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
 
 ## What it does *not* do (yet)
 
-- No internet access of any kind in Phase 1: no job-board scraping and no Telegram.
+- No job-board scraping or watching yet (Phase 3). The only internet access is the bot calling Telegram, and fetching the job-ad links you send it, to save a copy.
 - No automatic deletes, ever. Records are kept for at least the 6 years EI requires.
 - No cloud sync and no accounts. It is a local tool.
 
@@ -37,7 +38,7 @@ Your information never leaves your machine and is never stored in this code repo
            code (this repo)                          your data (never in git)
   ┌──────────────────────────────┐          ┌───────────────────────────────────────┐
   │ careerhunter CLI             │  guard   │ /Volumes/<encrypted drive>/            │
-  │  ├─ storage guard  ──────────┼──checks──▶   CareerHunterData/                   │
+  │  ├─ storage guard  ──────────┼──checks──▶   ExampleFolder/                      │
   │  ├─ seed import              │          │     search.db  ei_record_<claim>.db   │
   │  ├─ EI export (PDF + CSV)    │          │     config.yaml  exclusions.yaml      │
   │  └─ Keychain helper ─────┐   │          │     seed.yaml   exports/  snapshots/  │

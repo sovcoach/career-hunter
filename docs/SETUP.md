@@ -9,7 +9,7 @@ It takes about 20 minutes, plus however long your drive takes to encrypt.
 ## What you need
 
 - A Mac running a recent macOS. The steps were tested on macOS 26.
-- An **external drive** that will hold your data, formatted as **APFS**. This guide calls it `X10-Pro`; use your own drive's name wherever you see that.
+- An **external drive** that will hold your data, formatted as **APFS**. This guide calls it `ExampleDrive`; use your own drive's name wherever you see that.
 - Your Mac's admin password (for installing developer tools).
 
 ## Step 1: Turn on FileVault for the Mac itself
@@ -34,14 +34,14 @@ If it's off, career-hunter still runs, but prints a large warning every time.
 
 ## Step 2: Encrypt the data drive
 
-career-hunter **refuses to write to an unencrypted drive**. In Finder, right-click the drive in the sidebar and choose **Encrypt "X10-Pro"…**. Pick a strong password and store it in your password manager.
+career-hunter **refuses to write to an unencrypted drive**. In Finder, right-click the drive in the sidebar and choose **Encrypt "ExampleDrive"…**. Pick a strong password and store it in your password manager.
 
 Encryption runs in the background, and the drive stays usable while it does.
 
 Check it:
 
 ```bash
-diskutil info /Volumes/X10-Pro | grep -E "FileVault|Encrypted|Locked"
+diskutil info /Volumes/ExampleDrive | grep -E "FileVault|Encrypted|Locked"
 ```
 
 Expected output, once encryption is on:
@@ -101,10 +101,10 @@ pre-commit installed at .git/hooks/pre-commit
 
 ## Step 5: Tell career-hunter where your data lives
 
-This adds one line to your shell settings so every new Terminal window knows where the data folder is. Change `X10-Pro` if your drive has another name.
+This adds one line to your shell settings so every new Terminal window knows where the data folder is. Change `ExampleDrive` if your drive has another name.
 
 ```bash
-echo 'export CAREERHUNTER_DATA_DIR=/Volumes/X10-Pro/CareerHunterData' >> ~/.zshrc && source ~/.zshrc
+echo 'export CAREERHUNTER_DATA_DIR=/Volumes/ExampleDrive/ExampleFolder' >> ~/.zshrc && source ~/.zshrc
 ```
 
 Check it:
@@ -116,7 +116,7 @@ echo $CAREERHUNTER_DATA_DIR
 Expected output:
 
 ```text
-/Volumes/X10-Pro/CareerHunterData
+/Volumes/ExampleDrive/ExampleFolder
 ```
 
 ## Step 6: Create your data folder
@@ -199,7 +199,7 @@ uv run careerhunter doctor
 Expected output. Again, your real output shows the full folder path in place of `$CAREERHUNTER_DATA_DIR`:
 
 ```text
-data dir        OK  $CAREERHUNTER_DATA_DIR (volume /Volumes/X10-Pro, encrypted)
+data dir        OK  $CAREERHUNTER_DATA_DIR (volume /Volumes/ExampleDrive, encrypted)
 config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
@@ -294,9 +294,15 @@ sealed   $CAREERHUNTER_DATA_DIR/ei_record_2025-26.db (read-only; keep until 2032
 
 Sealing never happens on its own, and the claim you are on can't be sealed. If `active_claim` has a typo, `config.yaml` fails its checks, so nothing can be sealed by mistake. You can still export a sealed claim at any time.
 
-## Step 10 (Phase 2 onward): Store the Telegram bot token
+## Step 10: The Telegram bot
 
-You don't need this yet. When the time comes:
+The bot lets you record applications, statuses and activities from your phone. It only ever talks to your own private chat with it, and it has no open ports: it calls Telegram, never the other way round.
+
+**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal: company, title, link, status words and short references like `a7`. It never sends your notes, fit details or EI record details. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
+
+### 10a. Create the bot and store its token
+
+In Telegram, message **@BotFather**, send `/newbot`, and follow the prompts. It gives you a token. Store it in the Keychain:
 
 ```bash
 uv run careerhunter secret set telegram_bot_token
@@ -313,6 +319,65 @@ Expected output:
 ```text
 telegram_bot_token: present (46 chars)   ← the number is the token length
 ```
+
+### 10b. Tell career-hunter which chat is yours
+
+Send your new bot any message from your phone, for example `hi`. Then:
+
+```bash
+uv run careerhunter bot discover
+```
+
+Expected output (your number will differ):
+
+```text
+chat 123456789 (private)
+Put your private chat's id in config.yaml as telegram.chat_id.
+```
+
+`discover` doesn't reply to anyone and doesn't show message content. Put the number in `config.yaml`:
+
+```yaml
+telegram:
+  chat_id: 123456789
+```
+
+Only that chat can use the bot. Messages from anyone else get no reply at all.
+
+### 10c. Run it as a service
+
+```bash
+uv run careerhunter service install
+```
+
+Expected output:
+
+```text
+installed ~/Library/LaunchAgents/org.careerhunter.bot.plist; the bot starts now and at every login
+```
+
+It restarts if it stops, retrying once a minute (for example, while the data drive is still locked after a restart). Check it with `uv run careerhunter doctor`:
+
+```text
+telegram        OK  chat set
+bot service     OK  running (pid 4242)
+bot heartbeat   OK  polled within the last 5 minutes
+```
+
+Its log is `logs/bot.log` in your data folder. It records events only, never message text or the token. To stop it: `uv run careerhunter service uninstall`.
+
+### 10d. Using it
+
+| Send | What happens |
+|---|---|
+| `/log <link>` | Records a posting you found and shows it with **Applied** and **Skipped** buttons. If the page doesn't show the company and title, send `/log <link> \| Company \| Title`. |
+| **Applied** | The bot asks how you applied, then when: **Today**, **Yesterday**, **This week**, **Last week** or **Other date** (reply with YYYY-MM-DD). It saves a copy of the job ad. If it can't, it asks you to reply with a PDF or screenshot of the ad. |
+| **Skipped** | Asks why, then records the skip. Skips never go into the EI record. |
+| `/status a7 interview_scheduled` | Updates an application. References like `a7` come from `/recent` and last 7 days. Send just `/status` to choose with buttons. |
+| `/activity networking 2026-10-27 Coffee with a recruiter` | Records a job-search activity. Leave out the date to choose it with buttons. |
+| `/recent` | Your latest applications, their references and current statuses. |
+
+Every date must fall inside your active EI claim, as with `seed`, and future dates are refused. Buttons work once: tap a button twice, or use an old one, and the bot says it has expired.
 
 ---
 
@@ -347,7 +412,7 @@ diskutil apfs addVolume "$(diskutil info -plist /Volumes/CHBase | plutil -extrac
 ```
 
 ```bash
-CAREERHUNTER_DATA_DIR=/Volumes/CHTest/CareerHunterData uv run careerhunter init
+CAREERHUNTER_DATA_DIR=/Volumes/CHTest/ExampleFolder uv run careerhunter init
 ```
 
 When you're done, eject `CHBase` and `CHTest` in Finder, then move `~/ch-test.sparseimage` to the Trash.

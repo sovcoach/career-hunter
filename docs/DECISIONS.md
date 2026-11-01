@@ -20,6 +20,10 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1) |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
 | 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
+| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2) |
+| 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2) |
+| 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
+| 018 | One setting for the time zone | Accepted (Phase 2) |
 
 ---
 
@@ -31,13 +35,13 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 - Putting data in a gitignored folder inside the repo is common, but one wrong `git add -f`, a mis-edited `.gitignore`, or a tool that ignores ignore files can publish it.
 
 **Decision.**
-- All personal data lives in one folder named by `CAREERHUNTER_DATA_DIR`, on the encrypted external drive (`/Volumes/X10-Pro/CareerHunterData`).
+- All personal data lives in one folder named by `CAREERHUNTER_DATA_DIR`, on the encrypted external drive (`/Volumes/ExampleDrive/ExampleFolder`).
 - The repo commits only `*.example.yaml` templates with generic values.
 - `.gitignore`, gitleaks, and a custom pre-commit check are extra layers, not the primary defence.
 
 **Alternatives.**
 - A gitignored `data/` folder in the repo. Rejected: a single mistake leaks it.
-- `~/CareerHunterData` on the internal disk. FileVault protects it, but the operator wants the record on the dedicated external drive alongside other large data.
+- `~/ExampleFolder` on the internal disk. FileVault protects it, but the operator wants the record on the dedicated external drive alongside other large data.
 - An encrypted sparse bundle. More moving parts for the same result.
 
 **Trade-offs.**
@@ -46,7 +50,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 
 ## ADR-002: A mount guard verifies the data volume, not just the path
 
-**Context.** If an external drive isn't mounted, `/Volumes/X10-Pro` is just a path. A naive `mkdir -p` would silently create it on the **boot disk**. Data would then be written to the wrong, possibly unencrypted, place, and would appear to vanish when the drive comes back.
+**Context.** If an external drive isn't mounted, `/Volumes/ExampleDrive` is just a path. A naive `mkdir -p` would silently create it on the **boot disk**. Data would then be written to the wrong, possibly unencrypted, place, and would appear to vanish when the drive comes back.
 
 **Decision.** Before every command, the guard:
 - walks up to the data folder's real mount point and refuses if that is `/`;
@@ -166,6 +170,8 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 
 **Trade-offs.** One more token to manage, which is revocable on its own without affecting anything else.
 
+Phase 2 built it: see ADR-015 (what the bot sends), ADR-016 (how it decides what to trust) and ADR-017 (job-ad snapshots).
+
 ## ADR-008: An always-on Mac mini as the host
 
 **Context.** The watcher (Phase 3) needs to run on a schedule, and the data needs to stay local.
@@ -222,6 +228,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 - It **denies** `rm -rf` (and flag-order variants), `sudo`, `docker run`, and force pushes (`--force`, `-f`, `--force-with-lease`).
 - It **denies** any push whose refspec targets `main` (`main`, `HEAD:main`, `<ref>:main`, `refs/heads/main`, including `git -C <dir> push …`). Administrators may bypass branch protection on GitHub (ADR-012); this rule keeps agents from using that bypass.
 - `.claude/settings.local.json` is gitignored, so personal grants never get committed.
+- The same ask rules also cover a guarded command run after environment assignments, such as `TZ=UTC git commit` (Phase 2). `tests/test_claude_settings.py` checks this form too.
 - **Pushes to `main` have three layers** (Phase 2, issue #4), because the deny rules above only see command text:
   1. `push.default=current`, set by `make setup` / `make hooks`. A bare `git push` then always targets a branch of the same name, never the upstream, so a branch that tracks `origin/main` can't push there by accident. `doctor` warns if it isn't set.
   2. A **pre-push hook** (`scripts/pre_push_guard.py`), installed by the same targets. It reads the refs git passes on stdin and refuses any push that would update or delete `refs/heads/main`, whatever the command looked like: a bare push, `HEAD:main`, an alias, a script, `git -C`, or a push of several refs at once. `doctor` warns if it isn't installed.
@@ -258,6 +265,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - Until a license is added in Phase 5, the code is visible but **all rights reserved**: others can read it, but have no grant to reuse it.
 
 ## ADR-013: No exemptions in the data-path hook, not even for its own tests
+
+> **Amended in Phase 2.** The hook no longer has a built-in default path. With `CAREERHUNTER_DATA_DIR` unset it refuses the commit and says how to set it, so no real path is written anywhere in the repo. Its tests use a synthetic data folder.
 
 **Context.**
 - During the Phase 1 commits, the `check-no-datadir-paths` hook blocked the test-suite commit.
@@ -338,3 +347,101 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A sealed file stays at the schema version it had when it was sealed, because migrations can't run on it. Export must keep reading older EI versions, so `ei_record` migrations should only ever add.
 - The EI natural key (employer, role, location, URL, date) has no requisition ID. Two postings with the same title, at the same employer and location, applied to on the same day without URLs can't be told apart, so `seed` refuses them and asks for the URLs.
 - There are more files to back up: `search.db` plus one file per claim.
+
+## ADR-015: Telegram is a cloud service: bot messages are kept minimal
+
+**Context.**
+- The bot (Phase 2) talks to the operator through Telegram. Bot chats are not end-to-end encrypted: every message, both ways, passes through and is stored on Telegram's servers.
+- Telegram also holds updates the bot hasn't fetched yet for up to 24 hours, and keeps the chat history.
+- The EI record (ADR-014) and the learning layer hold personal details that don't need to leave the Mac.
+
+**Decision.**
+- **What the bot sends** is limited to company, title and link for a posting; the status words of the pipeline; short references such as `a7`; and fixed prompts and confirmations.
+- **It never sends** notes, fit ratings, gaps, LLM output, skip reasons recorded earlier, EI record details, dates of other applications, or the claim label and its dates. When a write is refused because of the claim, the reply says only that the date is outside the active EI claim.
+- **Confirmations don't echo** what was typed: `/activity` replies `Recorded activity: <type>`, without the description.
+- **The bot keeps no message log.** Its own log (`logs/bot.log`) records events only: what kind of update was handled, and the outcome.
+- Tests scan every message and button label the bot sends for sentinels planted in the learning fields, and for the claim label.
+
+**Alternatives.**
+- Signal or Matrix, for end-to-end encryption. Rejected for now: no simple, maintained bot API that fits a single-user tool on a Mac. Worth revisiting if the threat model changes.
+- Email. Rejected in ADR-007.
+- Richer alerts, with the fit rating and gaps. Rejected: they are exactly the learning data ADR-014 keeps apart. The operator reads them on the Mac.
+
+**Trade-offs.**
+- Whatever the operator types goes to Telegram: activity descriptions, typed skip reasons, typed dates, and any PDF or screenshot sent as a job-ad snapshot. That is accepted, and SETUP.md advises against typing anything sensitive.
+- Company names, titles and links of the postings acted on are visible to Telegram.
+
+## ADR-016: The bot's trust boundary
+
+**Context.**
+- Anyone can find and message a Telegram bot. Restricting it when creating it in BotFather doesn't stop strangers from sending it messages or button presses.
+- Everything in an update (text, button data, reply ids) is chosen by whoever sent it.
+- The bot writes to the EI record, so a forged or replayed update must not be able to write anything.
+
+**Decision.**
+- **Long polling only** (`getUpdates`). There is no webhook, and the bot listens on no port.
+- **The allowlist is enforced in code.** An update is handled only if the chat is private, its id is `telegram.chat_id` from config.yaml, and the sender's id matches too. Anything else gets no reply at all, not even a callback answer. The log records only an 8-character hash of the chat id. Forwarded messages are ignored.
+- **Nothing in a message is used as an identifier.**
+  - Buttons carry random 16-byte tokens (`bot_tokens`, search migration 0002). Each is checked against its chat, the message it was sent on, an expiry, and whether it was used; using one button spends its whole keyboard.
+  - Replies are matched to the bot's own prompt by its message id (`bot_prompts`), with an expiry and single use.
+  - `/status` takes short references the bot issued (`bot_refs`): scoped to the chat, expiring after 7 days, never a database id.
+  - Status values, activity types and methods are checked against the enums.
+- **Fail closed at startup.** The storage guard, a valid config.yaml with a chat id, every earlier claim sealed, the token in the Keychain (plaintext keyrings refused, ADR-003), and a working `getMe` are all required before the first poll. Before every write, the bot re-reads config and re-checks the claims, as the CLI does.
+- **The token never reaches a log.** It is part of every API URL, so client errors are re-raised with the token redacted and the original exception suppressed, and the log handler redacts anything token-shaped.
+- **Dates are asked for, not guessed.** After Applied and a method, the bot offers today, yesterday, this week, last week, or a date typed as YYYY-MM-DD. Exact days record `exact` precision; the week choices record `week`. Future dates are refused, and every date passes the claim check (ADR-014).
+- **Links are fetched safely** (`fetch.py`). Only http and https, with no user name or password. Every address a host resolves to must be public. The connection then goes to that checked address, with the original Host header and SNI, so DNS rebinding can't swap in a private address between the check and the connect. The same applies to every redirect hop (at most five), and bodies are capped at 5 MB.
+- **It runs as a user LaunchAgent** (`careerhunter service install`) with restart on failure, throttled to once a minute. launchd's own output goes to /dev/null, so it never creates log files under an unmounted /Volumes. `doctor` checks that the service runs and that its heartbeat is recent.
+
+**Alternatives.**
+- A webhook. Rejected: it needs an inbound port and a public endpoint.
+- HMAC-signed button data instead of stored tokens. Rejected: stateless data can be replayed. Stored tokens are single-use, and expire.
+- A Telegram framework library. Rejected: a large dependency tree for about eight API methods. The client is the standard library plus `truststore`.
+
+**Trade-offs.**
+- Updates are acknowledged before they are handled, so an update that crashes the handler is not retried. Buttons are single-use, so a replay could do nothing anyway.
+- Token, reference and prompt rows accumulate in `search.db`. They are small, and expired rows can be compacted later along with the rest of the search layer.
+- A message from a stranger still reaches Telegram, and costs one poll. It is dropped before any parsing beyond the allowlist check.
+
+## ADR-017: A snapshot of every job ad applied to
+
+**Context.**
+- ADR-005 planned job-ad copies for the EI record, and the schema has had `snapshot_path` since Phase 1.
+- Many ATS pages (Workday, SuccessFactors) are a JavaScript shell: fetching the page returns no ad.
+
+**Decision.**
+- When a posting is marked Applied, the bot takes the snapshot before recording the application, so its path goes into both layers in the same write:
+  1. **The page itself**, fetched safely (ADR-016). It is kept if it carries a schema.org `JobPosting` (JSON-LD), or enough readable text to be the ad.
+  2. **The ATS's public JSON**, for JavaScript pages: Workday's `/wday/cxs/...` endpoint, and the documented Greenhouse, Lever and Ashby APIs. It is saved as a small HTML page that embeds the JSON.
+  3. **Otherwise, the operator sends a PDF or screenshot**, as a reply to the bot's request. It is checked by its bytes to really be a PDF, PNG or JPEG, then attached to both layers: EI first, and as an audited update in the EI record.
+- Files are `snapshots/<YYYY>/<random>.<ext>`, owner-only (0600, folders 0700), never overwritten, with paths stored relative to the data folder. `doctor` checks the folder's modes.
+
+**Alternatives.**
+- A headless browser (Playwright) for JavaScript pages. Deferred to Phase 3 as an option: it is a dependency of several hundred megabytes, for a case the manual fallback already covers.
+- Printing every page to PDF. Rejected for the same reason.
+
+**Trade-offs.**
+- SuccessFactors has no public JSON endpoint that works across tenants, so its ads usually need the manual fallback until the browser option exists.
+- A snapshot taken when the operator applies may differ from the ad as first posted.
+
+## ADR-018: One setting for the time zone
+
+**Context.**
+- career-hunter turns "now" into a date in several places: the date of an application or activity recorded through the bot, the claim checks, and whether a claim has ended before it can be sealed.
+- If each of those used the computer's own zone, the answer would depend on how the machine happens to be set up.
+
+**Decision.**
+- **One field, `schedule.timezone`, is the only place a zone is set.** Nothing in the code hardcodes one, and nothing reads the system zone; every "today" goes through `config.today()`.
+- **It takes either form:**
+  - an IANA zone name, such as `Europe/Berlin`;
+  - a fixed offset from UTC: `UTC`, `UTC-03:00`, `UTC+05:30` (at most 14 hours).
+
+  A fixed offset doesn't depend on the system's time zone database being current.
+- **If it's missing, dates use UTC**, and `doctor` shows a warning suggesting it be set. A missing zone doesn't stop anything from running.
+- Dates are recorded to the day (ADR-005), so the zone only decides which day "today" is.
+
+**Alternatives.**
+- The system zone. Rejected: it makes the record depend on the machine.
+- Requiring the field, and failing closed without it. Rejected: a wrong day is a small, visible error that the warning covers, unlike the storage and claim checks.
+
+**Trade-offs.**
+- A fixed offset doesn't follow any daylight-saving changes. Choosing between a name and an offset is left to the operator.
