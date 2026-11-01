@@ -31,7 +31,8 @@ A small "storage guard" runs before every command and checks that the data folde
 | `export.py` | Builds one claim's EI record for a date range as CSV and PDF, from that claim's file alone. |
 | `bot.py` | The Telegram bot: the chat allowlist, commands, buttons and replies, writing through the ledger; fail-closed startup and the polling loop. |
 | `telegram.py` | A minimal Bot API client (standard library plus `truststore`) whose errors never carry the token. |
-| `fetch.py` | Fetches a link safely: public addresses only, pinned to the checked address on every redirect hop. |
+| `fetch.py` | Fetches a link safely: public addresses only, pinned to the checked address on every redirect hop. Keeps a `Retry-After` header when the server sends one. |
+| `watch.py` | One run of `careerhunter watch`: Greenhouse, Lever and Ashby boards from the watchlist, written to `search.db` as new postings. No filtering, scoring, alerts or other ATS types. |
 | `snapshots.py` | Job-ad snapshots: the page, an ATS's public JSON, or a PDF or screenshot sent to the bot. |
 | `service.py` | The launchd LaunchAgent that keeps the bot running. |
 | `scripts/check_no_datadir_paths.py` | Pre-commit hook that blocks staged content pointing into the data folder. |

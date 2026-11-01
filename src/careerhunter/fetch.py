@@ -45,6 +45,7 @@ class Fetched:
     status: int
     content_type: str
     body: bytes
+    retry_after: str | None = None
 
 
 class Response(Protocol):
@@ -169,7 +170,9 @@ def fetch(
             if len(body) > max_bytes:
                 raise FetchError(f"the page is larger than {max_bytes // (1024 * 1024)} MB")
             content_type = response.getheader("Content-Type") or ""
-            return Fetched(url, response.status, content_type, body)
+            return Fetched(
+                url, response.status, content_type, body, response.getheader("Retry-After")
+            )
         except (OSError, http.client.HTTPException) as exc:
             raise FetchError(f"couldn't fetch {host}: {type(exc).__name__}") from exc
         finally:
