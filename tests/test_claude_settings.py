@@ -82,3 +82,21 @@ def test_read_only_git_commands_are_not_asked(command: str) -> None:
 )
 def test_pushes_to_main_and_force_pushes_stay_denied(command: str) -> None:
     assert any(matches(rule, command) for rule in rules("deny"))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The pre-push guard's manual override, however it is set.
+        "CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push origin main",
+        "env CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push",
+        "export CAREERHUNTER_ALLOW_PUSH_MAIN=1",
+        # Skipping hooks altogether.
+        "git push --no-verify origin feat",
+        "git commit --no-verify -m x",
+        "git -c core.hooksPath=/dev/null push origin feat",
+        "git config core.hooksPath /tmp/empty",
+    ],
+)
+def test_ways_around_the_git_hooks_are_denied(command: str) -> None:
+    assert any(matches(rule, command) for rule in rules("deny"))
