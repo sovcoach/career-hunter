@@ -317,13 +317,12 @@ def test_lever_board_normalizes_including_a_missing_work_model(
         {"text": "   "},
         "not-a-job",
     ]
-    # role_filters are validated on the watchlist and not applied by this command.
+    # Role filters are applied when the run is given config. This test is normalization.
     item = company(
         "Sample Logistics",
         "lever",
         "samplelogistics",
         careers_url="https://example.org/jobs",
-        role_filters={"role_families": ["support"], "work_models": ["remote"]},
     )
     fetcher = Scripted({url("lever", "samplelogistics"): fetched(payload)})
     lines = watched(search, datadir, [item], fetcher)
@@ -925,9 +924,9 @@ def test_watch_command_records_the_example_boards_without_a_socket(
                 [
                     {
                         "id": "abc-123",
-                        "text": "Warehouse Clerk",
+                        "text": "Operations Coordinator",
                         "hostedUrl": "https://jobs.lever.co/samplelogistics/abc-123",
-                        "categories": {"location": "Example City"},
+                        "categories": {"location": "Canada"},
                         "workplaceType": "remote",
                     }
                 ]
@@ -951,7 +950,7 @@ def test_watch_command_records_the_example_boards_without_a_socket(
         rows = postings(conn)
         assert [(row["company"], row["title"], row["first_seen"]) for row in rows] == [
             ("Example Robotics", "Operations Coordinator", DAY),
-            ("Sample Logistics", "Warehouse Clerk", DAY),
+            ("Sample Logistics", "Operations Coordinator", DAY),
         ]
         for row in rows:
             assert_watcher(row)

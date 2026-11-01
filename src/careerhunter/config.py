@@ -6,7 +6,8 @@ data directory, never in code. The EI claim section is checked by
 claims.validate_section.
 
 The structured fit criteria (issue #9) are optional sections alongside the original
-fields, and are validated here only; scoring them is Phase 3:
+fields. Validation lives here. `careerhunter watch` applies exclusions, hard gates,
+location rules, role filters and schedule limits. Scoring them is a later step.
 
 - search.lanes: named groups of target titles, by priority, optionally a fallback;
 - search.location_rules: places for on-site and hybrid work, regions for remote;

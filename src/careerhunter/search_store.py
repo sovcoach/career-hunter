@@ -178,6 +178,22 @@ def add_decision(
     )
 
 
+def posting_has_application(conn: sqlite3.Connection, posting_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM applications WHERE posting_id = ? LIMIT 1", (posting_id,)
+    ).fetchone()
+    return row is not None
+
+
+def posting_has_skip(conn: sqlite3.Connection, posting_id: int) -> bool:
+    row = conn.execute("SELECT 1 FROM skips WHERE posting_id = ? LIMIT 1", (posting_id,)).fetchone()
+    return row is not None
+
+
+def set_posting_schedule(conn: sqlite3.Connection, posting_id: int, schedule: str | None) -> None:
+    conn.execute("UPDATE postings SET schedule = ? WHERE id = ?", (schedule, posting_id))
+
+
 def insert_skip(conn: sqlite3.Connection, posting_id: int, date: str, reason: str) -> int:
     cur = conn.execute(
         "INSERT INTO skips (posting_id, date, reason) VALUES (?, ?, ?)",

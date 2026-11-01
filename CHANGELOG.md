@@ -8,7 +8,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- `careerhunter watch` reads the watchlist once and records new postings from public Greenhouse, Lever and Ashby boards into `search.db`. A board that fails, including HTTP 429, is logged and left for the next run; the other boards still run. The command does not filter, score, alert, or write applications, skips or EI records. Workday and the other ATS types are not fetched.
+- `careerhunter watch` reads the watchlist once and records new postings from public Greenhouse, Lever and Ashby boards into `search.db`. A board that fails, including HTTP 429, is logged and left for the next run; the other boards still run. Workday and the other ATS types are not fetched.
+- The same run filters each posting. Exclusions, hard gates (language, credential, shift, pay, seniority, and a minimum salary when one is set), location rules, the watchlist entry's role filters and schedule limits run in that order. A decision not to surface a posting is one `skips` row with a reason. A stated weekend-day count above the cap is flagged on `postings.schedule` or skipped, following `over_limit`. An on-call mention is flagged and kept. The word "weekends" on its own does neither. `min_salary: null` leaves that gate off. The command does not score, alert, or write applications or EI records.
 - `CLAUDE.md`: the working rules for AI agent sessions. They cover approval before every commit, push or PR, guarded git commands run on their own, UTC timestamps, no attribution lines, synthetic test data, and placeholder paths with no personal details in public files.
 
 ## [0.3.0] - 2026-11-01

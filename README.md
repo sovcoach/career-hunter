@@ -4,7 +4,7 @@
 
 Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards. Filtering, scoring and alerts are not built yet.
+> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards and filters them. Scoring and alerts for those postings are not built yet.
 
 ---
 
@@ -25,11 +25,11 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
 | `careerhunter bot run` / `service install` | Runs the Telegram bot, by hand or as a background service on the Mac |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
-| `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist once, and records new postings in `search.db`. It does not score, filter or send alerts |
+| `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist once, records new postings in `search.db`, and skips or flags them from the config. It does not score or send alerts |
 
 ## What it does *not* do (yet)
 
-- Filtering, scoring and Telegram alerts for new postings are not built yet. `careerhunter watch` only records new postings from Greenhouse, Lever and Ashby. The bot still calls Telegram, and it still fetches job-ad links you send it.
+- Scoring and Telegram alerts for watched postings are not built yet. The bot still calls Telegram, and it still fetches job-ad links you send it. `careerhunter watch` does not.
 - No automatic deletes, ever. Records are kept for at least the 6 years EI requires.
 - No cloud sync and no accounts. It is a local tool.
 
