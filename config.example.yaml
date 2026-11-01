@@ -41,7 +41,7 @@ search:
 
 # Hard gates: a posting failing any of these is skipped, with the reason recorded.
 hard_gates:
-  min_salary: 55000            # in your local currency, per year
+  min_salary: null             # yearly pay below this is skipped; null turns the gate off
   max_commute_km: 40
   exclude_work_models: []      # e.g. [onsite]
   # Optional gates; a posting that trips one is skipped with that reason (Phase 3).

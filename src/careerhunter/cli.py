@@ -523,10 +523,20 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
     entries = doc.get("watchlist", [])
     if not isinstance(entries, list):
         raise ConfigError(datadir.config_path, ["watchlist must be a list"])
+    exclusions: dict[str, Any] = {}
+    if datadir.exclusions_path.is_file():
+        exclusions = load_exclusions(datadir.exclusions_path)
     conn = db.connect(datadir.search_db_path)
     try:
         db.migrate(conn, "search")
-        lines = watch.run(conn, entries, today=config_today(doc).isoformat(), fetcher=fetch_url)
+        lines = watch.run(
+            conn,
+            entries,
+            today=config_today(doc).isoformat(),
+            fetcher=fetch_url,
+            config=doc,
+            exclusions=exclusions,
+        )
     finally:
         conn.close()
     for line in lines:

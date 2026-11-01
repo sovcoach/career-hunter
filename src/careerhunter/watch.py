@@ -1,12 +1,17 @@
-"""Fetch Greenhouse, Lever and Ashby boards and record new postings.
+"""Fetch Greenhouse, Lever and Ashby boards, then filter the new postings.
 
 One `careerhunter watch` run reads the watchlist and fetches those three boards, one
-company after another, through `fetch.py`. It writes companies and postings in
-`search.db` and nothing else: no applications, skips, EI rows, snapshots or alerts.
-`run` returns the log lines; the CLI prints them to stderr.
+company after another, through `fetch.py`. It writes companies, postings and skip
+reasons in `search.db`. It does not score, alert, write applications, EI rows or
+snapshots. `run` returns the log lines; the CLI prints them to stderr.
+
+A posting that is already stored is not inserted again. Watcher rows that still have
+no skip are checked again before the fetch, so a config change can record a skip
+without waiting for the board to list the job a second time. A network error, a parse
+error, or HTTP 429 is a log line, not a skip.
 
 The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
-one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are skipped.
+one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
 """
 
 from __future__ import annotations
@@ -16,12 +21,13 @@ import json
 import re
 import sqlite3
 import urllib.parse
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from careerhunter import db, search_store
+from careerhunter import db, filters, search_store
 from careerhunter.fetch import Fetched, FetchError
+from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
 
 Fetcher = Callable[[str], Fetched]
@@ -62,6 +68,7 @@ class _Job:
     url: str | None
     requisition_id: str | None
     company_field: str | None
+    description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,22 +100,29 @@ def run(
     *,
     today: str,
     fetcher: Fetcher,
+    config: Mapping[str, Any] | None = None,
+    exclusions: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`."""
     dt.date.fromisoformat(today)
+    rules = config or {}
+    skipped = exclusions or {}
     lines: list[str] = []
+    _recheck(conn, watchlist, rules, skipped, today, lines)
     blocked: set[str] = set()
     for item in watchlist:
         entry = _entry(item)
         if entry is None:
             lines.append("watch: a watchlist entry has no name; skipped")
             continue
-        name, ats, slug = entry
-        _watch_one(conn, lines, blocked, name, ats, slug, today, fetcher)
+        name, ats, slug, role_filters = entry
+        _watch_one(
+            conn, lines, blocked, name, ats, slug, role_filters, rules, skipped, today, fetcher
+        )
     return lines
 
 
-def _entry(item: object) -> tuple[str, str | None, str | None] | None:
+def _entry(item: object) -> tuple[str, str | None, str | None, Mapping[str, Any] | None] | None:
     if not isinstance(item, dict):
         return None
     name = item.get("name")
@@ -116,10 +130,12 @@ def _entry(item: object) -> tuple[str, str | None, str | None] | None:
         return None
     ats = item.get("ats_type")
     slug = item.get("ats_slug")
+    role_filters = item.get("role_filters")
     return (
         name.strip(),
         ats if isinstance(ats, str) else None,
         slug.strip() if isinstance(slug, str) else None,
+        role_filters if isinstance(role_filters, dict) else None,
     )
 
 
@@ -130,6 +146,9 @@ def _watch_one(
     name: str,
     ats: str | None,
     slug: str | None,
+    role_filters: Mapping[str, Any] | None,
+    config: Mapping[str, Any],
+    exclusions: Mapping[str, Any],
     today: str,
     fetcher: Fetcher,
 ) -> None:
@@ -171,7 +190,7 @@ def _watch_one(
             )
         )
         return
-    _record_jobs(conn, lines, name, ats, jobs, today)
+    _record_jobs(conn, lines, name, ats, jobs, role_filters, config, exclusions, today)
 
 
 def _fetch_jobs(
@@ -217,6 +236,9 @@ def _record_jobs(
     name: str,
     ats: str,
     jobs: list[_Job | _Skip],
+    role_filters: Mapping[str, Any] | None,
+    config: Mapping[str, Any],
+    exclusions: Mapping[str, Any],
     today: str,
 ) -> None:
     new = 0
@@ -243,29 +265,98 @@ def _record_jobs(
                     f"posting company {differed!r} differs from watchlist name {name!r}",
                 )
             )
+        verdict = filters.decide(
+            PostingText(
+                company=company,
+                title=item.title,
+                location=item.location,
+                work_model=item.work_model,
+                description=item.description,
+                requisition_id=item.requisition_id,
+            ),
+            config=config,
+            exclusions=exclusions,
+            role_filters=role_filters,
+            applied=False,
+        )
         posting = Posting(
             company=company,
             title=item.title,
             first_seen=today,
             location=item.location,
             work_model=item.work_model,
+            schedule=None if verdict.reason else verdict.schedule,
             url=item.url,
             requisition_id=item.requisition_id,
             source="watcher",
         )
         try:
             with db.transaction(conn):
-                inserted = search_store.find_or_create_posting(conn, posting, dating)[3]
+                found = search_store.find_or_create_posting(conn, posting, dating)
+                posting_id, inserted = found[1], found[3]
+                if (
+                    inserted
+                    and verdict.reason
+                    and not search_store.posting_has_skip(conn, posting_id)
+                ):
+                    search_store.insert_skip(conn, posting_id, today, verdict.reason)
         except search_store.IdentityConflict as exc:
             lines.append(
                 _line(name, ats, f"identity conflict on {item.title!r}; continuing: {exc}")
             )
             continue
-        if inserted:
-            new += 1
-        else:
+        if not inserted:
             existing += 1
+            continue
+        new += 1
+        if verdict.reason:
+            lines.append(_line(name, ats, f"{item.title!r} skipped ({verdict.reason})"))
     lines.append(_line(name, ats, f"{new} new, {existing} already recorded"))
+
+
+def _recheck(
+    conn: sqlite3.Connection,
+    watchlist: Sequence[Any],
+    config: Mapping[str, Any],
+    exclusions: Mapping[str, Any],
+    today: str,
+    lines: list[str],
+) -> None:
+    """Filter watcher postings that have no skip yet. Scoring has not run, so none are scored."""
+    roles = {
+        entry[0].casefold(): entry[3] for item in watchlist if (entry := _entry(item)) is not None
+    }
+    rows = conn.execute(
+        "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, "
+        "p.requisition_id, p.schedule FROM postings p "
+        "JOIN companies c ON c.id = p.company_id "
+        "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
+    ).fetchall()
+    for row in rows:
+        verdict = filters.decide(
+            PostingText(
+                company=row["company"],
+                title=row["title"],
+                location=row["location"],
+                work_model=row["work_model"],
+                requisition_id=row["requisition_id"],
+            ),
+            config=config,
+            exclusions=exclusions,
+            role_filters=roles.get(str(row["company"]).casefold()),
+            applied=search_store.posting_has_application(conn, int(row["id"])),
+        )
+        with db.transaction(conn):
+            if verdict.reason:
+                if not search_store.posting_has_skip(conn, int(row["id"])):
+                    search_store.insert_skip(conn, int(row["id"]), today, verdict.reason)
+            elif verdict.schedule != row["schedule"]:
+                search_store.set_posting_schedule(conn, int(row["id"]), verdict.schedule)
+        if verdict.reason:
+            lines.append(
+                _line(str(row["company"]), None, f"{row['title']!r} skipped ({verdict.reason})")
+            )
 
 
 def _align(conn: sqlite3.Connection, name: str, ats_type: str, ats_slug: str) -> _Aligned:
@@ -355,6 +446,7 @@ def _lever_job(item: object, slug: str) -> _Job | _Skip:
         or _built(f"https://jobs.lever.co/{slug}/", job.get("id")),
         requisition_id=_id_text(job.get("id")),
         company_field=None,
+        description=_text(job.get("descriptionPlain")),
     )
 
 
@@ -373,6 +465,7 @@ def _ashby_job(item: object, slug: str) -> _Job | _Skip:
         or _built(f"https://jobs.ashbyhq.com/{slug}/", job.get("id")),
         requisition_id=_id_text(job.get("id")),
         company_field=None,
+        description=_text(job.get("descriptionPlain")),
     )
 
 

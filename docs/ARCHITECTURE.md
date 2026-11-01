@@ -32,7 +32,8 @@ A small "storage guard" runs before every command and checks that the data folde
 | `bot.py` | The Telegram bot: the chat allowlist, commands, buttons and replies, writing through the ledger; fail-closed startup and the polling loop. |
 | `telegram.py` | A minimal Bot API client (standard library plus `truststore`) whose errors never carry the token. |
 | `fetch.py` | Fetches a link safely: public addresses only, pinned to the checked address on every redirect hop. Keeps a `Retry-After` header when the server sends one. |
-| `watch.py` | One run of `careerhunter watch`: Greenhouse, Lever and Ashby boards from the watchlist, written to `search.db` as new postings. No filtering, scoring, alerts or other ATS types. |
+| `filters.py` | The decision to keep, skip or flag a posting: exclusions, hard gates, location rules, role filters and schedule limits. A skip reason is a string. No fetching, scoring or alerts. |
+| `watch.py` | One run of `careerhunter watch`: Greenhouse, Lever and Ashby boards, then the filters. New postings and skip reasons go to `search.db`. No scoring, alerts or other ATS types. |
 | `snapshots.py` | Job-ad snapshots: the page, an ATS's public JSON, or a PDF or screenshot sent to the bot. |
 | `service.py` | The launchd LaunchAgent that keeps the bot running. |
 | `scripts/check_no_datadir_paths.py` | Pre-commit hook that blocks staged content pointing into the data folder. |
@@ -158,6 +159,22 @@ Export inclusion rules:
 - undated records always listed, in a labelled "Date unknown" group so nothing silently drops out.
 
 CSV cells starting with `= + - @` are prefixed with `'` to stop spreadsheet formula injection.
+
+## The watch pipeline
+
+`careerhunter watch` reads the watchlist once, then:
+
+1. **Recheck.** Watcher postings that have no skip and no score are filtered again, so a config change can record a skip before any board is fetched.
+2. **Fetch.** Greenhouse, Lever and Ashby list URLs are built from `ats_slug` and read through `fetch.py` (public addresses only). A failed board is a log line. Workday and the other ATS types are not fetched.
+3. **Filter.** Each new posting is kept, skipped or flagged. The description is used only for that decision, and only when the list payload included one. It is not stored.
+
+A skip is one `skips` row: `excluded_company`, `excluded_title`, `excluded_description`, `excluded_role`, `exclude_applied`, `required_language`, `credential`, `shift_pattern`, `pay_structure`, `seniority`, `min_salary`, `location_rule`, `role_filter` or `schedule_limit`. Seniority honors `title_exceptions` and `never_gated_families`. `min_salary` applies only when it is a number, and only when the posting states a yearly figure. `max_commute_km` and `exclude_work_models` are validated and not applied.
+
+`over_limit: flag` keeps a posting whose stated weekend-day count is above the cap and sets `postings.schedule` to `over_weekend_limit`. `exclude` writes `schedule_limit` instead. An on-call mention sets `on_call` on that same column and keeps the posting, unless the weekend count already excluded it. The word "weekends" on its own does neither.
+
+One `role_filters` block is AND only. It cannot express "this work model, or else that place." A missing work model does not fail `work_models`.
+
+Scoring and alerts are not part of this run yet. The run does not open an EI record.
 
 ## The Telegram bot (Phase 2)
 
