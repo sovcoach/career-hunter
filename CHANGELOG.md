@@ -7,6 +7,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `CLAUDE.md`: the working rules for AI agent sessions. They cover approval before every commit, push or PR, guarded git commands run on their own, UTC timestamps, no attribution lines, synthetic test data, and placeholder paths with no personal details in public files.
+
 ## [0.3.0] - Phase 2: Telegram bot
 
 ### Added
