@@ -247,5 +247,38 @@ def test_reconciliation_gaps_are_reported(
     ) in out
 
 
+def test_loose_exports_and_snapshots_are_fixed(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["export", "--claim", "2026-27", "--from", "2026-09-01", "--to", "2026-09-30"]
+    assert cli.main(argv, probe=probe) == 0
+    code, out = doctor(probe, capsys)
+    assert "exports/        OK  3 files, all owner-only" in out
+    assert "snapshots/      OK  0 files, all owner-only" in out
+
+    loose = next((ready / "exports").glob("*.pdf"))
+    os.chmod(loose, 0o644)
+    year = ready / "snapshots" / "2026"
+    year.mkdir(mode=0o755)
+    (year / "synthetic-ad.html").write_text("<p>synthetic</p>")
+    os.chmod(year / "synthetic-ad.html", 0o644)
+    elsewhere = ready / "elsewhere.txt"
+    elsewhere.write_text("synthetic")
+    os.chmod(elsewhere, 0o644)
+    (ready / "snapshots" / "link").symlink_to(elsewhere)
+
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert f"exports/        FIXED {loose.name} (0o644) -> owner-only" in out
+    assert "snapshots/      FIXED 2026 (0o755), 2026/synthetic-ad.html (0o644)" in out
+    assert loose.stat().st_mode & 0o777 == 0o600
+    assert year.stat().st_mode & 0o777 == 0o700
+    assert elsewhere.stat().st_mode & 0o777 == 0o644  # a symlink is never followed
+
+    code, out = doctor(probe, capsys)
+    assert "exports/        OK  3 files, all owner-only" in out
+    assert "snapshots/      OK  1 file, all owner-only" in out
+
+
 def _datadir(root: Path) -> claims.DataDir:
     return claims.DataDir(root=root, mount_point=root.parent)
