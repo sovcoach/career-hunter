@@ -170,9 +170,13 @@ def test_the_repo_pins_the_gitleaks_rev() -> None:
 def test_a_planted_data_folder_path_in_an_untracked_file_fails(
     repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    data_dir = load("check_no_datadir_paths").DEFAULT_DATA_DIR
-    (repo / "notes.md").write_text(f"see {data_dir}/seed.yaml\n")  # built here, never in source
-    env = {**os.environ, "PRE_COMMIT_HOME": str(tmp_path / "pc-home")}
+    data_dir = tmp_path / "SyntheticData"  # a synthetic data folder, named for the hook
+    (repo / "notes.md").write_text(f"see {data_dir}/seed.yaml\n")
+    env = {
+        **os.environ,
+        "PRE_COMMIT_HOME": str(tmp_path / "pc-home"),
+        "CAREERHUNTER_DATA_DIR": str(data_dir),
+    }
     assert vt.verify(repo, hooks_only(env), no_gitleaks_lookup) == 1
     assert "FAILED: pre-commit hooks" in capsys.readouterr().err
 
