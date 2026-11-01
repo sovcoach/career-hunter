@@ -90,7 +90,7 @@ class FakeProbe(SystemProbe):
 
 @pytest.fixture
 def fake_volume(tmp_path: Path) -> Path:
-    mount = tmp_path.resolve() / "Volumes" / "FakeX10"
+    mount = tmp_path.resolve() / "Volumes" / "FakeDrive"
     mount.mkdir(parents=True)
     return mount
 
@@ -102,7 +102,7 @@ def probe(fake_volume: Path) -> FakeProbe:
 
 @pytest.fixture
 def data_env(fake_volume: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    data = fake_volume / "CareerHunterData"
+    data = fake_volume / "ExampleFolder"
     monkeypatch.setenv(storage_guard.ENV_VAR, str(data))
     return data
 
@@ -243,3 +243,39 @@ def memory_keyring() -> Iterator[InMemoryKeyring]:
     keyring.set_keyring(backend)
     yield backend
     keyring.set_keyring(previous)
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may open a network connection or resolve a name. Fakes stand in for both."""
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a test tried to use the network")
+
+    import socket
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    monkeypatch.setattr(socket, "getaddrinfo", refuse)
+
+
+@pytest.fixture(autouse=True)
+def launch_agents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The bot service's plist lives under a temporary home, never ~/Library."""
+    from careerhunter import service
+
+    home = tmp_path / "home"
+    real = service.plist_path
+    monkeypatch.setattr(service, "plist_path", lambda h=None: real(h or home))
+    return home
+
+
+@pytest.fixture
+def keep_umask() -> Iterator[None]:
+    """Restore the process umask after a test that changes it (bot.run sets 0o077)."""
+    import os
+
+    previous = os.umask(0o022)
+    os.umask(previous)
+    yield
+    os.umask(previous)

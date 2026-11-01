@@ -38,7 +38,7 @@ def test_a_clean_setup(ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixt
         "config.yaml     OK",
         "exclusions.yaml OK",
         "ei claim        OK  2026-27 active (from 2026-08-05)",
-        "search.db       OK  schema version 1",
+        "search.db       OK  schema version 2",
         "search.db       OK  0600",
         "claim 2026-27   OK  schema version 1",
         "claim 2026-27   OK  active, from 2026-08-05",
@@ -120,7 +120,7 @@ def test_schema_behind_is_reported_not_migrated(
     conn.close()
     code, out = doctor(probe, capsys)
     assert code == cli.EXIT_ERROR
-    assert "search.db       BAD schema version 0, expected 1; run: careerhunter migrate" in out
+    assert "search.db       BAD schema version 0, expected 2; run: careerhunter migrate" in out
     assert "reconcile       --  skipped until the problems above are fixed" in out
     conn = db.connect_read_only(path)
     assert db.schema_version(conn) == 0
@@ -282,3 +282,19 @@ def test_loose_exports_and_snapshots_are_fixed(
 
 def _datadir(root: Path) -> claims.DataDir:
     return claims.DataDir(root=root, mount_point=root.parent)
+
+
+def test_a_missing_timezone_is_a_warning_not_a_failure(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import yaml
+
+    code, out = doctor(probe, capsys)
+    assert "timezone        OK  UTC" in out
+    path = ready / "config.yaml"
+    doc = yaml.safe_load(path.read_text())
+    del doc["schedule"]["timezone"]
+    path.write_text(yaml.safe_dump(doc))
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "timezone        WARN schedule.timezone isn't set, so dates use UTC" in out
