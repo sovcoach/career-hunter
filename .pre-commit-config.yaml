@@ -27,7 +27,7 @@ repos:
       - id: mypy
         files: ^src/
         args: [--strict]
-        additional_dependencies: [types-PyYAML, keyring, PyYAML]
+        additional_dependencies: [types-PyYAML, keyring, PyYAML, "truststore>=0.10"]
 
   # Upstream hook; pre-commit builds gitleaks with a Go toolchain it manages itself.
   - repo: https://github.com/gitleaks/gitleaks
