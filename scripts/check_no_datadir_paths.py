@@ -19,8 +19,9 @@ A file is blocked if:
 3. it is a database, an env file, or one of the real (non-example) config filenames,
    which only ever belong in the data directory.
 
-The data directory is $CAREERHUNTER_DATA_DIR, or the documented default if unset, so
-the hook still protects a shell where the variable isn't exported.
+The data directory is $CAREERHUNTER_DATA_DIR. There is no default: no path is written
+into this repo, so if the variable isn't set the hook can't know what to block, and it
+fails with a message saying how to set it, rather than guessing.
 
 Standard library only, so it runs before any project dependencies are installed.
 """
@@ -34,7 +35,11 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-DEFAULT_DATA_DIR = "/Volumes/X10-Pro/CareerHunterData"
+UNSET_MESSAGE = """\
+BLOCKED: CAREERHUNTER_DATA_DIR isn't set, so this check can't tell which paths are
+private. Set it to your data folder, the same value career-hunter itself uses:
+  export CAREERHUNTER_DATA_DIR=/Volumes/ExampleDrive/ExampleFolder   (see docs/SETUP.md)
+"""
 REAL_CONFIG_NAMES = frozenset({"config.yaml", "exclusions.yaml", "seed.yaml"})
 BLOCKED_SUFFIXES = (".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm", ".db-journal")
 
@@ -83,8 +88,11 @@ def select_entries(repo: Path, argv: list[str], staged: dict[str, Entry]) -> lis
     return entries
 
 
-def data_dirs() -> list[Path]:
-    raw = os.environ.get("CAREERHUNTER_DATA_DIR", "").strip() or DEFAULT_DATA_DIR
+def data_dirs() -> list[Path] | None:
+    """The data directory, as given and resolved; None if CAREERHUNTER_DATA_DIR is unset."""
+    raw = os.environ.get("CAREERHUNTER_DATA_DIR", "").strip()
+    if not raw:
+        return None
     given = Path(raw).expanduser()
     return sorted({given, given.resolve()})
 
@@ -130,8 +138,12 @@ def check(repo: Path, entries: list[Entry], dirs: list[Path]) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    dirs = data_dirs()
+    if dirs is None:
+        print(UNSET_MESSAGE, end="", file=sys.stderr)
+        return 1
     repo = Path(_git("rev-parse", "--show-toplevel").decode().strip())
-    problems = check(repo, select_entries(repo, argv, staged_entries()), data_dirs())
+    problems = check(repo, select_entries(repo, argv, staged_entries()), dirs)
     if problems:
         print("BLOCKED: this commit would expose private career-hunter data:", file=sys.stderr)
         for p in problems:

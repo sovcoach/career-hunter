@@ -12,6 +12,7 @@
   3. a pre-commit check that blocks any staged file, symlink or content pointing into the data folder;
   4. gitleaks secret scanning on every commit and over full history in CI.
 - **Separation.** Learning data (fit ratings, gaps, LLM output, skip reasons, notes) lives in `search.db`. Each EI claim's record is a separate file that holds only what EI needs and never reads `search.db`. See ADR-014.
+- **The Telegram bot** answers one private chat only, enforced in code, and ignores everything else without replying. Its buttons are random single-use tokens, it polls (no open ports), and it refuses to start unless every check passes. Telegram isn't end-to-end encrypted, so what the bot sends is limited to company, title, link and status words. The links you send it are fetched only from public addresses, pinned against DNS rebinding. See ADR-015, ADR-016 and ADR-017.
 - **Permissions.** `search.db`, the active claim's record and their WAL/SHM files are `0600`. A sealed earlier claim is `0400`. `careerhunter doctor` checks all of them.
 - **Retention.** EI record files refuse deletes, to preserve a 6-year record for each claim. Mistakes are voided with a reason rather than removed, every edit is logged in an append-only audit table, and a sealed claim refuses every change. Exports are written next to the data and never overwritten.
 - **Tests and CI** use synthetic fixtures only (fictional companies and postings).

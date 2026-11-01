@@ -30,10 +30,13 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    assert [m.version for m in migrations] == [1]
-    assert db.schema_version(fresh) == db.latest_version(track) == 1
-    recorded = fresh.execute("SELECT checksum FROM schema_migrations").fetchone()[0]
-    assert recorded == migrations[0].checksum
+    expected = {"search": [1, 2], "ei_record": [1]}[track]
+    assert [m.version for m in migrations] == expected
+    assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
+    recorded = [
+        r[0] for r in fresh.execute("SELECT checksum FROM schema_migrations ORDER BY version")
+    ]
+    assert recorded == [m.checksum for m in migrations]
 
 
 def test_migrate_is_idempotent(fresh: sqlite3.Connection, track: str) -> None:

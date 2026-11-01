@@ -10,3 +10,10 @@ title_keywords:
   - Commission Only
 description_keywords:
   - unpaid
+# Optional: exclude one role at one company, without excluding the company or a
+# keyword. location and requisition_id narrow it further.
+roles:
+  - company: Example Robotics
+    title: Night Shift Supervisor
+# Optional: never resurface roles you have already applied to (from search.db).
+exclude_applied: true

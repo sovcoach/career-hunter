@@ -29,12 +29,19 @@ A small "storage guard" runs before every command and checks that the data folde
 | `search_store.py` | Reads and writes on `search.db`, including the posting identity rules. |
 | `seed.py` | Validates `seed.yaml`, runs the claim check, then imports each record into its layer. Idempotent by natural keys. |
 | `export.py` | Builds one claim's EI record for a date range as CSV and PDF, from that claim's file alone. |
+| `bot.py` | The Telegram bot: the chat allowlist, commands, buttons and replies, writing through the ledger; fail-closed startup and the polling loop. |
+| `telegram.py` | A minimal Bot API client (standard library plus `truststore`) whose errors never carry the token. |
+| `fetch.py` | Fetches a link safely: public addresses only, pinned to the checked address on every redirect hop. |
+| `snapshots.py` | Job-ad snapshots: the page, an ATS's public JSON, or a PDF or screenshot sent to the bot. |
+| `service.py` | The launchd LaunchAgent that keeps the bot running. |
 | `scripts/check_no_datadir_paths.py` | Pre-commit hook that blocks staged content pointing into the data folder. |
+| `scripts/pre_push_guard.py` | Pre-push hook that refuses any push updating or deleting `main` (ADR-011). |
+| `scripts/verify_tree.py` | `make verify-tree`: every hook and gitleaks over every tracked and untracked file. |
 
 ## Where data lives, and why
 
 ```
-/Volumes/X10-Pro/CareerHunterData/        ← CAREERHUNTER_DATA_DIR (mode 0700)
+/Volumes/ExampleDrive/ExampleFolder/        ← CAREERHUNTER_DATA_DIR (mode 0700)
 ├── search.db (+ -wal, -shm)              ← search and learning layer (0600)
 ├── ei_record_2026-27.db (+ -wal, -shm)   ← the active claim's EI record (0600)
 ├── ei_record_2025-26.db                  ← an earlier claim, sealed (0400, no -wal/-shm)
@@ -42,8 +49,8 @@ A small "storage guard" runs before every command and checks that the data folde
 ├── exclusions.yaml                       ← companies/keywords to skip
 ├── seed.yaml                             ← one-off import of past history
 ├── exports/                              ← EI reports, timestamped, never overwritten
-├── snapshots/                            ← copies of job ads (Phase 3+)
-├── logs/
+├── snapshots/<YYYY>/                     ← copies of job ads (0600; ADR-017)
+├── logs/                                 ← bot.log and bot.heartbeat (0600; events only)
 └── backups/
 ```
 
@@ -69,7 +76,7 @@ folder exists with mode 0700? (except `init`)      ── no ──▶ refuse
 FileVault on boot disk?                            ── no ──▶ loud warning
 ```
 
-`init` creates the data folder **without** creating missing parents. If `/Volumes/X10-Pro` isn't mounted, the path would sit on the boot disk; the guard already refuses that, and the non-recursive `mkdir` is a second stop.
+`init` creates the data folder **without** creating missing parents. If `/Volumes/ExampleDrive` isn't mounted, the path would sit on the boot disk; the guard already refuses that, and the non-recursive `mkdir` is a second stop.
 
 ## Data model
 
@@ -151,13 +158,29 @@ Export inclusion rules:
 
 CSV cells starting with `= + - @` are prefixed with `'` to stop spreadsheet formula injection.
 
+## The Telegram bot (Phase 2)
+
+```
+your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── careerhunter bot run   (LaunchAgent)
+                                                                  │  allowlist: one private chat
+                                                                  │  buttons: single-use tokens (search.db)
+                                                                  ├─▶ ledger ─▶ ei_record_<active>.db, then search.db
+                                                                  ├─▶ fetch.py (public, pinned) ─▶ snapshots/
+                                                                  └─▶ logs/bot.log, logs/bot.heartbeat
+```
+
+- No inbound port and no webhook: the bot only ever calls out to Telegram, and to the job-ad links it is given.
+- Every write goes through the same ledger functions as the CLI, after the same claim checks (ADR-014). The bot re-reads config.yaml before each write.
+- What it sends is minimal (ADR-015); what it trusts is limited (ADR-016); how it saves job ads is in ADR-017.
+- `doctor` reports the chat setting, whether the service is running, and how recent its heartbeat is.
+
 ## Phase roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1, Foundation (v0.1.0) | Storage guards, Keychain helper, schema and migrations, seed import, EI export, CI, docs | done |
-| 1.5, Data layer split (v0.2.0) | `search.db` and one EI record file per claim, a correlation ID, write order and reconciliation, claim config and sealing | **this release** |
-| 2, Notifications | Dedicated Telegram bot; token read from Keychain; daily digest and alerts | planned |
+| 1.5, Data layer split (v0.2.0) | `search.db` and one EI record file per claim, a correlation ID, write order and reconciliation, claim config and sealing | done |
+| 2, Telegram bot (v0.3.0) | The bot (alerts with Applied/Skipped, `/log`, `/status`, `/activity`, `/recent`), job-ad snapshots, the launchd service, the fit-criteria schema (validation only), and repo hygiene | **this release** |
 | 3, Watcher | Fetch watchlisted companies' ATS boards; job-ad snapshots for the EI record; fit rating against the config rubric; skips with reasons | planned |
 | 4, Discovery | Find new companies and postings beyond the watchlist | planned |
 | 5, Release | License, polish | planned |
