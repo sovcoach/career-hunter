@@ -33,6 +33,8 @@ def test_the_template_uses_every_new_field_and_is_valid() -> None:
     assert {"lanes", "location_rules"} <= set(d["search"])
     assert d["search"]["resume"] is None
     assert d["fit_rubric"]["embedding_weight"] is None
+    assert d["discovery"]["searxng_url"] is None
+    assert d["discovery"]["career_hosts"] == []
     assert "gap_tiers" in d["fit_rubric"]
     assert {"seniority_words", "title_exceptions", "shift_patterns"} <= set(d["hard_gates"])
     assert "schedule_limits" in d
@@ -69,6 +71,21 @@ def test_watcher_interval_is_optional() -> None:
     d = doc()
     del d["schedule"]["watcher_interval_minutes"]
     assert validate_config(d) == []
+
+
+def test_discovery_settings_are_optional() -> None:
+    d = doc()
+    del d["discovery"]
+    assert validate_config(d) == []
+    d["discovery"] = {"searxng_url": None, "career_hosts": None}
+    assert validate_config(d) == []
+    for url in (
+        "http://127.0.0.1:8888/search",
+        "http://localhost:8888/search",
+        "http://[::1]:8888/search",
+    ):
+        d["discovery"] = {"searxng_url": url, "career_hosts": ["jobs.example.com"]}
+        assert validate_config(d) == [], url
 
 
 def test_resume_and_embedding_weight_are_optional() -> None:
@@ -145,6 +162,26 @@ def _set(path: str, value: Any) -> Any:
         (_set("search.resume", ""), "search.resume must be a relative path"),
         (_set("search.resume", "  "), "search.resume must be a relative path"),
         (_set("search.resume", 3), "search.resume must be a relative path"),
+        (_set("discovery.searxng_url", "https://127.0.0.1/search"), "http loopback URL"),
+        (_set("discovery.searxng_url", "http://example.com/search"), "http loopback URL"),
+        (_set("discovery.searxng_url", "http://user@127.0.0.1/search"), "http loopback URL"),
+        (_set("discovery.searxng_url", "http://10.0.0.1/search"), "http loopback URL"),
+        (_set("discovery.searxng_url", "http://127.0.0.1/search?q=1"), "http loopback URL"),
+        (_set("discovery.searxng_url", ""), "http loopback URL"),
+        (_set("discovery.searxng_url", "  "), "http loopback URL"),
+        (_set("discovery.searxng_url", 3), "http loopback URL"),
+        (_set("discovery.career_hosts", "jobs.example.com"), "list of hostnames"),
+        (_set("discovery.career_hosts", ["https://jobs.example.com"]), "must be a hostname"),
+        (_set("discovery.career_hosts", ["jobs.example.com/careers"]), "must be a hostname"),
+        (_set("discovery.career_hosts", ["*.example.com"]), "must be a hostname"),
+        (_set("discovery.career_hosts", ["jobs..example.com"]), "must be a hostname"),
+        (_set("discovery.career_hosts", ["localhost"]), "must be a hostname"),
+        (
+            _set("discovery.career_hosts", ["jobs.example.com", "Jobs.Example.com"]),
+            "names must be unique",
+        ),
+        (_set("discovery", "on"), "discovery must be a mapping"),
+        (_set("discovery.token", "x"), "unknown keys"),
         (_set("telegram.chat_id", "me"), "telegram.chat_id"),
         (_set("telegram.chat_id", -100123), "positive numeric id"),
         (_set("telegram.token", "x"), "unknown keys"),
