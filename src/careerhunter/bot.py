@@ -16,10 +16,11 @@ Trust boundary (ADR-016):
   every earlier EI claim is sealed, the token is in the Keychain, and getMe works.
   Before every write the bot re-reads config and re-checks the claims, as the CLI does.
 
-Privacy (ADR-015): messages the bot sends carry only company, title, link, status
-words and references. A watchlist agency with no separate employer stored is
-labelled " (agency)". Never notes, fit, gaps, model text, EI record details or
-claim labels.
+Privacy (ADR-015, amended by ADR-019): messages the bot sends carry company,
+title, link, the LLM tier name, a cosine when one is stored, status words and
+references. A watchlist agency with no separate employer stored is labelled
+" (agency)". Never notes, fit ratings, gaps, model text, vectors, EI record
+details or claim labels.
 
 Dates: after Applied and a method, the bot asks when, with buttons (today, yesterday,
 this week, last week, or another date typed as YYYY-MM-DD). Exact days record precision
@@ -35,6 +36,7 @@ import hashlib
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import secrets
@@ -170,6 +172,43 @@ def parse_date(text: str, today: dt.date) -> Dating:
     if day > today:
         raise Refusal("That date is in the future, so it can't be recorded.")
     return Dating("exact", day=day.isoformat())
+
+
+def _tier_name(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    tier = payload.get("tier")
+    if not isinstance(tier, str) or not tier.strip() or "\n" in tier or "\r" in tier:
+        return None
+    return tier.strip()
+
+
+def _cosine(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _alert_text(
+    label: str, title: str, url: str | None, tier: str | None, score: float | None
+) -> str:
+    lines = [f"{label} — {title}"]
+    if url:
+        lines.append(url)
+    if tier:
+        lines.append(f"LLM: {tier}")
+    if score is not None:
+        lines.append(f"similarity: {score:.2f}")
+    return "\n".join(lines)
 
 
 class Bot:
@@ -483,12 +522,18 @@ class Bot:
             self.alert(search, posting_id)
 
     def alert(self, search: sqlite3.Connection, posting_id: int) -> None:
-        """A posting alert with Applied and Skipped buttons: company, title, link only."""
+        """Company, title, link, the LLM tier, and a similarity line when a cosine is stored."""
         posting = search_store.posting_by_id(search, posting_id)
         if posting is None:
             raise Refusal("That posting isn't in search.db any more.")
         label = self._labelled_company(posting.company)
-        text = f"{label} — {posting.title}" + (f"\n{posting.url}" if posting.url else "")
+        row = search.execute(
+            "SELECT scout_metadata, embedding_score FROM postings WHERE id = ?",
+            (posting_id,),
+        ).fetchone()
+        tier = _tier_name(row["scout_metadata"]) if row is not None else None
+        score = _cosine(row["embedding_score"]) if row is not None else None
+        text = _alert_text(label, posting.title, posting.url, tier, score)
         payload = {"posting_id": posting_id}
         self._keyboard(
             search, text, [[("Applied", "apply", payload), ("Skipped", "skip", payload)]], ALERT_TTL

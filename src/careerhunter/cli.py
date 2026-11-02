@@ -619,6 +619,7 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
             config=doc,
             exclusions=exclusions,
             scorer=scorer,
+            data_dir=datadir.root,
         )
     finally:
         conn.close()
