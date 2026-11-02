@@ -182,7 +182,7 @@ The templates use placeholder names such as Example Robotics, Example City, and 
 
 `fit_rubric.weights` and `fit_rubric.thresholds` are not applied. Scoring uses `gap_tiers` and leaves the numeric rating empty.
 
-`fit_rubric.embedding_weight` is validated and not applied. The watcher does not blend it into the score or the alert. `search.resume: null` skips embeddings.
+`fit_rubric.embedding_weight` is validated and the watcher does not apply it. The watcher does not blend it into the score or the alert. `careerhunter embed-eval` reads it when ranking a report. `search.resume: null` skips embeddings.
 
 `hard_gates.max_commute_km` and `hard_gates.exclude_work_models` are not applied.
 
@@ -199,6 +199,14 @@ uv run careerhunter scout-prompt
 Paste the text into your private scout setup. The command prints to the terminal and writes nothing. It does not include your chat id, and it does not include gates the watcher does not skip on.
 
 With the template files, the prompt names Example Staffing Mill, the title keyword Senior Director, and the shift pattern overnight. Yours will name whatever you put in the two files.
+
+### Compare a cosine with the tier
+
+`careerhunter embed-eval` reads stored cosines and tiers. It does not call the model. The report is a mode 0600 file under `evals/` in the data folder. The terminal prints the relative path only. When `fit_rubric.embedding_weight` is set, the report also ranks `weight * cosine + (1 - weight) * tier`. That blend is not stored and not sent.
+
+```bash
+make embed-eval
+```
 
 ### Your EI claim
 
