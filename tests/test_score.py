@@ -11,7 +11,7 @@ import pytest
 
 from careerhunter import watch
 from careerhunter.fetch import Fetched
-from careerhunter.filters import PostingText
+from careerhunter.filters import PostingText, decide
 from careerhunter.score import (
     DEFAULT_URL,
     Score,
@@ -94,6 +94,36 @@ def test_the_prompt_uses_only_the_rubric_and_the_posting() -> None:
     assert "DO-NOT-LEAK-WEIGHTS" not in text
     assert "424242" not in text
     assert "local-model" in text
+
+
+def test_notes_do_not_change_a_verdict_or_enter_the_score() -> None:
+    plain = {
+        "hard_gates": {"seniority_words": ["Senior"]},
+        "search": {"location_rules": {"remote": ["Canada"]}},
+        "fit_rubric": RUBRIC["fit_rubric"],
+    }
+    noted = {**plain, "notes": "DO-NOT-LEAK-NOTES"}
+    exclusions = {"companies": ["Example Staffing Mill"], "notes": "DO-NOT-LEAK-NOTES"}
+    kept = PostingText("Example Robotics", "Operations Coordinator", "Canada", work_model="remote")
+    assert decide(kept, config=plain, exclusions={}, role_filters=None, applied=False) == decide(
+        kept, config=noted, exclusions=exclusions, role_filters=None, applied=False
+    )
+    senior = PostingText("Example Robotics", "Senior Coordinator", "Canada", work_model="remote")
+    skipped = decide(senior, config=plain, exclusions={}, role_filters=None, applied=False)
+    assert skipped.reason == "seniority"
+    assert (
+        decide(senior, config=noted, exclusions=exclusions, role_filters=None, applied=False)
+        == skipped
+    )
+
+    seen: dict[str, bytes] = {}
+
+    def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        seen["body"] = payload
+        return reply('{"gaps":[]}')
+
+    assert score_posting(posting(), noted, transport=transport) is not None
+    assert "DO-NOT-LEAK-NOTES" not in seen["body"].decode()
 
 
 def test_gap_tiers_name_the_tier_and_a_high_count_skips() -> None:
