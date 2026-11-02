@@ -20,7 +20,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1) |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
 | 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
-| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2) |
+| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019 |
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
@@ -350,6 +350,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - There are more files to back up: `search.db` plus one file per claim.
 
 ## ADR-015: Telegram is a cloud service: bot messages are kept minimal
+
+> **Amended by [ADR-019](#adr-019-local-embedding-vectors-live-in-searchdb-beside-the-llm-tier) (Phase 3.5).** A watcher alert also includes the tier name and, when a cosine is stored, that cosine. It still does not send notes, fit ratings, gaps, the model text, vectors, skip reasons, or the claim.
 
 **Context.**
 - The bot (Phase 2) talks to the operator through Telegram. Bot chats are not end-to-end encrypted: every message, both ways, passes through and is stored on Telegram's servers.
