@@ -289,6 +289,93 @@ def set_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -
     conn.execute("UPDATE postings SET snapshot_path = ? WHERE id = ?", (path, posting_id))
 
 
+def _blob(value: object) -> bytes | None:
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, bytes):
+        return value
+    return None
+
+
+def resume_embedding(conn: sqlite3.Connection) -> tuple[str, int, bytes] | None:
+    """The one stored resume vector: sha256, dimension, float32 bytes. No resume text."""
+    row = conn.execute(
+        "SELECT content_sha256, dim, vector FROM resume_embedding WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return None
+    blob = _blob(row["vector"])
+    if blob is None:
+        return None
+    return str(row["content_sha256"]), int(row["dim"]), blob
+
+
+def save_resume_embedding(
+    conn: sqlite3.Connection,
+    content_sha256: str,
+    dim: int,
+    vector: bytes,
+    embedded_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO resume_embedding (id, content_sha256, dim, vector, embedded_at) "
+        "VALUES (1, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "content_sha256 = excluded.content_sha256, dim = excluded.dim, "
+        "vector = excluded.vector, embedded_at = excluded.embedded_at",
+        (content_sha256, dim, vector, embedded_at),
+    )
+
+
+def posting_embedding(conn: sqlite3.Connection, posting_id: int) -> tuple[int, bytes] | None:
+    row = conn.execute(
+        "SELECT dim, vector FROM posting_embeddings WHERE posting_id = ?",
+        (posting_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    blob = _blob(row["vector"])
+    if blob is None:
+        return None
+    return int(row["dim"]), blob
+
+
+def posting_embeddings(conn: sqlite3.Connection) -> list[tuple[int, int, bytes]]:
+    found: list[tuple[int, int, bytes]] = []
+    for row in conn.execute(
+        "SELECT posting_id, dim, vector FROM posting_embeddings ORDER BY posting_id"
+    ):
+        blob = _blob(row["vector"])
+        if blob is None:
+            continue
+        found.append((int(row["posting_id"]), int(row["dim"]), blob))
+    return found
+
+
+def save_posting_embedding(
+    conn: sqlite3.Connection,
+    posting_id: int,
+    dim: int,
+    vector: bytes,
+    embedded_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO posting_embeddings (posting_id, dim, vector, embedded_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(posting_id) DO UPDATE SET "
+        "dim = excluded.dim, vector = excluded.vector, embedded_at = excluded.embedded_at",
+        (posting_id, dim, vector, embedded_at),
+    )
+
+
+def set_embedding_score(conn: sqlite3.Connection, posting_id: int, score: float | None) -> None:
+    """The cosine beside the LLM tier, or null. Does not set fit_rating."""
+    conn.execute(
+        "UPDATE postings SET embedding_score = ? WHERE id = ?",
+        (score, posting_id),
+    )
+
+
 def recent_applications(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row]:
     """The latest applications, newest first, with company, title and current status."""
     rows: list[sqlite3.Row] = conn.execute(

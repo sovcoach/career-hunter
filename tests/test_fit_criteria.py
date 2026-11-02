@@ -31,6 +31,8 @@ def test_the_template_uses_every_new_field_and_is_valid() -> None:
     d = doc()
     assert validate_config(d) == []
     assert {"lanes", "location_rules"} <= set(d["search"])
+    assert d["search"]["resume"] is None
+    assert d["fit_rubric"]["embedding_weight"] is None
     assert "gap_tiers" in d["fit_rubric"]
     assert {"seniority_words", "title_exceptions", "shift_patterns"} <= set(d["hard_gates"])
     assert "schedule_limits" in d
@@ -67,6 +69,17 @@ def test_watcher_interval_is_optional() -> None:
     d = doc()
     del d["schedule"]["watcher_interval_minutes"]
     assert validate_config(d) == []
+
+
+def test_resume_and_embedding_weight_are_optional() -> None:
+    d = doc()
+    del d["search"]["resume"]
+    del d["fit_rubric"]["embedding_weight"]
+    assert validate_config(d) == []
+    d["search"]["resume"] = "notes/sample.txt"
+    for weight in (0, 1, 0.0, 1.0, 0.5, None):
+        d["fit_rubric"]["embedding_weight"] = weight
+        assert validate_config(d) == []
 
 
 def _set(path: str, value: Any) -> Any:
@@ -118,6 +131,20 @@ def _set(path: str, value: Any) -> Any:
         (_set("watchlist.1.agency", "yes"), "agency must be true or false"),
         (_set("watchlist.1.role_filters.work_models", ["office"]), "role_filters.work_models"),
         (_set("watchlist.1.role_filters.seniority", ["junior"]), "unknown keys"),
+        (_set("fit_rubric.embedding_weight", 1.5), "number from 0 to 1"),
+        (_set("fit_rubric.embedding_weight", -0.1), "number from 0 to 1"),
+        (_set("fit_rubric.embedding_weight", True), "number from 0 to 1"),
+        (_set("fit_rubric.embedding_weight", False), "number from 0 to 1"),
+        (_set("fit_rubric.embedding_weight", "high"), "number from 0 to 1"),
+        (_set("search.resume", "../outside.txt"), "search.resume must be a relative path"),
+        (_set("search.resume", "notes/../../outside.txt"), "search.resume must be a relative path"),
+        (
+            _set("search.resume", "/Volumes/ExampleDrive/ExampleFolder/notes.txt"),
+            "search.resume must be a relative path",
+        ),
+        (_set("search.resume", ""), "search.resume must be a relative path"),
+        (_set("search.resume", "  "), "search.resume must be a relative path"),
+        (_set("search.resume", 3), "search.resume must be a relative path"),
         (_set("telegram.chat_id", "me"), "telegram.chat_id"),
         (_set("telegram.chat_id", -100123), "positive numeric id"),
         (_set("telegram.token", "x"), "unknown keys"),

@@ -9,7 +9,10 @@ rows or snapshots. The bot sends an alert for each scored posting when it polls.
 A posting that is already stored is not inserted again. Before the fetch, watcher rows
 that still have no skip are filtered again, and rows that are still unscored are
 scored. A network error, a parse error, HTTP 429, or a model that does not answer is
-a log line, not a skip.
+a log line, not a skip. When `search.resume` is set, the same pass stores a cosine
+beside the score. A missing resume, a down embedding server, or a bad dimension is
+`embedding miss posting <id>: <reason>`, and the run still finishes. A cosine does
+not cause a skip.
 
 The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
 one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
@@ -24,9 +27,11 @@ import sqlite3
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from careerhunter import db, filters, search_store
+from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError
 from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
@@ -106,14 +111,17 @@ def run(
     config: Mapping[str, Any] | None = None,
     exclusions: Mapping[str, Any] | None = None,
     scorer: Scorer | None = None,
+    data_dir: Path | None = None,
+    embed_transport: Callable[[str, bytes], tuple[int, bytes]] | None = None,
 ) -> list[str]:
     """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`."""
     dt.date.fromisoformat(today)
     rules = config or {}
     skipped = exclusions or {}
-    lines: list[str] = []
+    embedder = Embedder(conn, data_dir, rules, transport=embed_transport)
+    lines = embedder.refresh()
     _recheck(conn, watchlist, rules, skipped, today, lines)
-    _score_waiting(conn, scorer, today, lines)
+    _score_waiting(conn, scorer, today, lines, embedder)
     blocked: set[str] = set()
     for item in watchlist:
         entry = _entry(item)
@@ -134,6 +142,7 @@ def run(
             today,
             fetcher,
             scorer,
+            embedder,
         )
     return lines
 
@@ -168,6 +177,7 @@ def _watch_one(
     today: str,
     fetcher: Fetcher,
     scorer: Scorer | None,
+    embedder: Embedder,
 ) -> None:
     if ats is None:
         lines.append(_line(name, None, "no ats_type; skipped"))
@@ -207,7 +217,9 @@ def _watch_one(
             )
         )
         return
-    _record_jobs(conn, lines, name, ats, jobs, role_filters, config, exclusions, today, scorer)
+    _record_jobs(
+        conn, lines, name, ats, jobs, role_filters, config, exclusions, today, scorer, embedder
+    )
 
 
 def _fetch_jobs(
@@ -258,6 +270,7 @@ def _record_jobs(
     exclusions: Mapping[str, Any],
     today: str,
     scorer: Scorer | None,
+    embedder: Embedder,
 ) -> None:
     new = 0
     existing = 0
@@ -338,7 +351,7 @@ def _record_jobs(
             description=item.description,
             requisition_id=item.requisition_id,
         )
-        _score_one(conn, posting_id, seen, scorer, today, lines, name, ats)
+        _score_one(conn, posting_id, seen, scorer, today, lines, name, ats, embedder)
     lines.append(_line(name, ats, f"{new} new, {existing} already recorded"))
 
 
@@ -392,6 +405,7 @@ def _score_waiting(
     scorer: Scorer | None,
     today: str,
     lines: list[str],
+    embedder: Embedder,
 ) -> None:
     """Score watcher postings that passed the filter and have no model text yet."""
     if scorer is None:
@@ -418,6 +432,7 @@ def _score_waiting(
             lines,
             str(row["company"]),
             None,
+            embedder,
         )
 
 
@@ -430,6 +445,7 @@ def _score_one(
     lines: list[str],
     name: str,
     ats: str | None,
+    embedder: Embedder,
 ) -> None:
     if scorer is None:
         return
@@ -439,20 +455,23 @@ def _score_one(
         result = None
     if result is None:
         lines.append(_line(name, ats, f"{posting.title!r} left unscored"))
-        return
-    metadata = None if result.tier is None else json.dumps({"tier": result.tier})
-    with db.transaction(conn):
-        search_store.set_posting_score(
-            conn,
-            posting_id,
-            gaps=result.gaps,
-            llm_output=result.llm_output,
-            scout_metadata=metadata,
-        )
-        if result.excluded and not search_store.posting_has_skip(conn, posting_id):
-            search_store.insert_skip(conn, posting_id, today, "gap_tier")
-    if result.excluded:
-        lines.append(_line(name, ats, f"{posting.title!r} skipped (gap_tier)"))
+    else:
+        metadata = None if result.tier is None else json.dumps({"tier": result.tier})
+        with db.transaction(conn):
+            search_store.set_posting_score(
+                conn,
+                posting_id,
+                gaps=result.gaps,
+                llm_output=result.llm_output,
+                scout_metadata=metadata,
+            )
+            if result.excluded and not search_store.posting_has_skip(conn, posting_id):
+                search_store.insert_skip(conn, posting_id, today, "gap_tier")
+        if result.excluded:
+            lines.append(_line(name, ats, f"{posting.title!r} skipped (gap_tier)"))
+    reason = embedder.attach(posting_id, posting)
+    if reason is not None:
+        lines.append(miss_line(posting_id, reason))
 
 
 def _align(conn: sqlite3.Connection, name: str, ats_type: str, ats_slug: str) -> _Aligned:

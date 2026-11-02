@@ -27,10 +27,11 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
 | `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist once, records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert for each scored posting |
 | `careerhunter scout-prompt` | Prints a scout prompt from exclusions and the hard gates the watcher skips on. Writes nothing |
+| `careerhunter embed-eval` | Ranks stored cosines against LLM tiers. Writes a private report under `evals/` and prints only that relative path |
 
 ## What it does *not* do (yet)
 
-- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends the alerts when it polls. Scoring stays on this Mac, at a loopback address.
+- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends the alerts when it polls: company, title, link, the LLM tier, and a similarity line when a cosine is stored. Scoring and embeddings stay on this Mac, at a loopback address.
 - No automatic deletes, ever. Records are kept for at least the 6 years EI requires.
 - No cloud sync and no accounts. It is a local tool.
 
