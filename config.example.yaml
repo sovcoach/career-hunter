@@ -114,6 +114,13 @@ watchlist:
   - name: Example Staffing
     agency: true               # optional: a staffing agency, labelled as such
 
+# Optional discovery settings (ADR-020). A null URL leaves discovery off.
+# A set URL is plain http to 127.0.0.1, localhost, or ::1, with no userinfo.
+# career_hosts lists extra career-page hostnames: no scheme, path, wildcard, or "..".
+discovery:
+  searxng_url: null
+  career_hosts: []
+
 # EI claims. career-hunter keeps one EI job-search record file per claim,
 # ei_record_<label>.db. Set the active claim here: it is never worked out for you.
 # A label names the two years a claim spans, like 2026-27, and the claim must start

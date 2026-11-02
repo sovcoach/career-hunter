@@ -25,6 +25,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
 | 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5) |
+| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4) |
 
 ---
 
@@ -478,3 +479,36 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A retry after the description is gone embeds only the stored fields, so it may not match the first vector.
 - Cosine is computed in Python over the stored BLOBs. That fits one resume against the rows on disk, and it needs no approximate index.
 - The report can show a weighted blend that the watcher never stores. That line is not the alert decision.
+
+## ADR-020: Discovery asks a local SearXNG and queues companies for approval
+
+**Context.**
+- The watcher fetches Greenhouse, Lever, and Ashby boards named on the config watchlist. It does not look for companies that are not already listed.
+- A cloud search API would put a vendor key in this tool and send every query to that account. The useful search is a few site-restricted queries, run on purpose.
+- `fetch.py` refuses loopback. That is right for a job-ad URL and wrong for a process on this Mac. The scoring and embedding clients already use a separate loopback HTTP client.
+- A search hit is not a posting. The result title and snippet are page text. This tool still does not store a posting description.
+- Approving a board by rewriting `config.yaml` would drop comments and reorder the operator's file. `companies.watchlist` is filled by the watcher today. It is not an input, and a seeded `watchlist: true` row is not fetched.
+- Discovery rows are learning data. They do not belong in an EI record.
+
+**Decision.**
+- **SearXNG is operator-run.** career-hunter does not install it, start it, or open a port. It listens on `127.0.0.1` only. `public_instance` and `image_proxy` stay off, the limiter stays off, and `search.formats` includes `json`. Engines that need an API key stay disabled. No search-engine API key is stored for this tool.
+- **The client is loopback only.** `discovery.searxng_url` is optional. The example is null, and null leaves discovery off. A set URL is plain `http` to `127.0.0.1`, `localhost`, or `::1`, with no userinfo, query, or fragment. Redirects are not followed. The client is not `fetch.py`.
+- **Queries are site-restricted.** A query is `site:<host>` plus one title and one location. Titles come from `search.lanes`, or from `search.target_titles` when there are no lanes. Locations come from `search.locations`. Hosts are `boards.greenhouse.io`, `job-boards.greenhouse.io`, `jobs.lever.co`, `jobs.ashbyhq.com`, and each exact hostname in `discovery.career_hosts`. One run sends at most 12 queries. Exclusions, the resume, salary, and the chat id are not part of the query.
+- **A career host is a hostname only.** No scheme, path, wildcard, or `..`. The example list is empty. A hit is kept only when it reduces to a Greenhouse, Lever, or Ashby slug, or to `https` on one of those career hosts. The slug is one path segment, the same rule the watcher uses. Every other host is dropped. The command does not fetch the result or parse HTML.
+- **The queue is `discovery_candidates` in `search.db`.** Search migration 0005 adds it. The EI track stays at version 1. A row is a board or a career page, with the reduced URL, the ATS type and slug when there is one, a suggested name, and a status of pending, approved, or rejected. The suggested name is the slug, or the host for a career page. There is no snippet column and no raw response. The same key is not inserted again once it is pending, approved, or rejected, or already on the config watchlist.
+- **Approve and reject are CLI commands.** They do not rewrite `config.yaml` or `exclusions.yaml`, and they do not send Telegram messages. Approving a board inserts or fills a company with `watchlist = 1`. A new company uses `source = 'discovery'`. An existing company's source is left as it is, and a stored ATS identity that disagrees is refused. The next `careerhunter watch` also fetches companies where `source = 'discovery'`, `watchlist = 1`, and the ATS type is Greenhouse, Lever, or Ashby with a valid slug. Config watchlist entries are fetched as they are today. A seeded watchlist row with any other source is not fetched by this extra path. From that fetch on, the existing filter, score, cosine, and alert path owns the board. Approving a career page stores `careers_url` with `watchlist = 0` and does not fetch it. Rejecting a row stores that status and does not insert a company.
+- **A miss fails closed for the run.** A down server, a non-200 status, or a body that is not JSON writes `discovery miss: unreachable` and nothing else. The run still exits 0 and writes no queue row. There is no discovery LaunchAgent in this slice.
+- **No EI write.** The commands open `search.db` only. They do not write applications, snapshots, or EI rows.
+
+**Alternatives.**
+- A cloud search API. Rejected: this tool would hold a vendor key, and every query would go to that account.
+- Calling SearXNG through `fetch.py`. Rejected: that client refuses loopback.
+- Rewriting `config.yaml` on approve. Rejected: a dump of the file would drop the operator's comments and reorder keys.
+- Inserting postings from result titles and snippets. Rejected: a hit is not a board payload, and the snippet would become stored page text.
+- Fetching or crawling career pages in this slice. Rejected: that is open web scraping. A career page is recorded and left unfetched.
+- Telegram approve and reject buttons. Rejected for this slice: that is a new write path on the bot.
+
+**Trade-offs.**
+- The query string leaves the machine. SearXNG sends it to the engines the operator enabled. The resume, exclusions, and EI record stay local.
+- An approved board is fetched because of the database flag, so it does not appear in `config.yaml` until the operator copies it there.
+- A career-page approval stores a URL and does not make the watcher fetch that site.
