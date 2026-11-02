@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import inspect
 import json
 import sqlite3
 import urllib.parse
@@ -11,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from careerhunter import cli, db, discover
+from careerhunter import cli, db, discover, search_store
 from careerhunter.platform_checks import SystemProbe
 
 SNIPPET = "DO-NOT-LEAK-SNIPPET"
@@ -350,6 +351,254 @@ def test_the_client_returns_a_redirect_and_does_not_follow_it(
     ]
     with pytest.raises(discover.DiscoverError):
         discover.default_transport("http://example.com/search?q=One")
+
+
+def _insert_candidate(
+    conn: sqlite3.Connection,
+    *,
+    kind: str = "board",
+    url: str = "https://boards.greenhouse.io/newrobotics",
+    ats_type: str | None = "greenhouse",
+    ats_slug: str | None = "newrobotics",
+    name: str = "newrobotics",
+    status: str = "pending",
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO discovery_candidates "
+        "(kind, url, ats_type, ats_slug, suggested_name, status, first_seen) "
+        "VALUES (?, ?, ?, ?, ?, ?, '2026-11-02')",
+        (kind, url, ats_type, ats_slug, name, status),
+    )
+    assert cur.lastrowid is not None
+    return int(cur.lastrowid)
+
+
+def _company(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT name, ats_type, ats_slug, careers_url, watchlist, source FROM companies "
+        "WHERE name = ?",
+        (name,),
+    ).fetchone()
+    assert row is not None
+    return row
+
+
+def test_approve_fills_a_board_and_stores_a_career_page_unfetched(
+    search: sqlite3.Connection,
+) -> None:
+    board = _insert_candidate(search)
+    career = _insert_candidate(
+        search,
+        kind="career",
+        url="https://jobs.example.com/careers",
+        ats_type=None,
+        ats_slug=None,
+        name="jobs.example.com",
+    )
+    assert discover.approve(search, board).suggested_name == "newrobotics"
+    assert discover.approve(search, career).kind == "career"
+    queued = _company(search, "newrobotics")
+    assert queued["ats_type"] == "greenhouse"
+    assert queued["ats_slug"] == "newrobotics"
+    assert queued["watchlist"] == 1
+    assert queued["source"] == "discovery"
+    page = _company(search, "jobs.example.com")
+    assert page["careers_url"] == "https://jobs.example.com/careers"
+    assert page["watchlist"] == 0
+    assert page["source"] == "discovery"
+    assert page["ats_type"] is None
+    with pytest.raises(discover.DiscoverError, match="is approved"):
+        discover.approve(search, board)
+
+
+def test_a_career_page_fills_an_empty_url_and_refuses_a_different_one(
+    search: sqlite3.Connection,
+) -> None:
+    search_store.upsert_company(search, "jobs.example.com", source="manual", watchlist=1)
+    fill = _insert_candidate(
+        search,
+        kind="career",
+        url="https://jobs.example.com/careers",
+        ats_type=None,
+        ats_slug=None,
+        name="jobs.example.com",
+    )
+    discover.approve(search, fill)
+    filled = _company(search, "jobs.example.com")
+    assert filled["careers_url"] == "https://jobs.example.com/careers"
+    assert filled["watchlist"] == 1
+    assert filled["source"] == "manual"
+    search_store.upsert_company(
+        search,
+        "jobs.example.org",
+        careers_url="https://jobs.example.org/jobs",
+        source="manual",
+    )
+    refused = _insert_candidate(
+        search,
+        kind="career",
+        url="https://jobs.example.org/careers",
+        ats_type=None,
+        ats_slug=None,
+        name="jobs.example.org",
+    )
+    with pytest.raises(discover.DiscoverError, match="disagrees with the stored company"):
+        discover.approve(search, refused)
+    kept = _company(search, "jobs.example.org")
+    assert kept["careers_url"] == "https://jobs.example.org/jobs"
+    assert kept["source"] == "manual"
+    status = search.execute(
+        "SELECT status FROM discovery_candidates WHERE id = ?", (refused,)
+    ).fetchone()
+    assert status is not None
+    assert status["status"] == "pending"
+
+
+def test_approve_keeps_an_existing_source_and_refuses_a_disagreement(
+    search: sqlite3.Connection,
+) -> None:
+    search_store.upsert_company(search, "freshlogistics", source="manual")
+    kept = _insert_candidate(
+        search,
+        url="https://jobs.lever.co/freshlogistics",
+        ats_type="lever",
+        ats_slug="freshlogistics",
+        name="freshlogistics",
+    )
+    discover.approve(search, kept)
+    row = _company(search, "freshlogistics")
+    assert row["source"] == "manual"
+    assert row["watchlist"] == 1
+    assert row["ats_type"] == "lever"
+    assert row["ats_slug"] == "freshlogistics"
+    search_store.upsert_company(
+        search,
+        "exampleorg",
+        ats_type="greenhouse",
+        ats_slug="exampleorg",
+        source="watcher",
+        watchlist=1,
+    )
+    refused = _insert_candidate(
+        search,
+        url="https://jobs.ashbyhq.com/exampleorg",
+        ats_type="ashby",
+        ats_slug="exampleorg",
+        name="exampleorg",
+    )
+    with pytest.raises(discover.DiscoverError, match="disagrees with the stored company"):
+        discover.approve(search, refused)
+    unchanged = _company(search, "exampleorg")
+    assert unchanged["source"] == "watcher"
+    assert unchanged["ats_type"] == "greenhouse"
+    assert unchanged["ats_slug"] == "exampleorg"
+    status = search.execute(
+        "SELECT status FROM discovery_candidates WHERE id = ?", (refused,)
+    ).fetchone()
+    assert status is not None
+    assert status["status"] == "pending"
+
+
+def test_reject_inserts_no_company(search: sqlite3.Connection) -> None:
+    candidate = _insert_candidate(
+        search,
+        url="https://boards.greenhouse.io/sampletown",
+        ats_slug="sampletown",
+        name="sampletown",
+    )
+    assert discover.reject(search, candidate).id == candidate
+    assert search.execute("SELECT count(*) FROM companies").fetchone()[0] == 0
+    status = search.execute(
+        "SELECT status FROM discovery_candidates WHERE id = ?", (candidate,)
+    ).fetchone()
+    assert status is not None
+    assert status["status"] == "rejected"
+    with pytest.raises(discover.DiscoverError, match="is rejected"):
+        discover.approve(search, candidate)
+    with pytest.raises(discover.DiscoverError, match="was not found"):
+        discover.reject(search, 99)
+
+
+def test_approve_and_reject_leave_config_and_the_ei_file_alone(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ei = inited / "ei_record_2026-27.db"
+    ei.write_bytes(b"synthetic-ei\n")
+    config = (inited / "config.yaml").read_bytes()
+    exclusions = (inited / "exclusions.yaml").read_bytes()
+    conn = db.connect(inited / "search.db")
+    board = _insert_candidate(conn)
+    refused_name = "samplelogistics"
+    search_store.upsert_company(
+        conn, refused_name, ats_type="greenhouse", ats_slug="samplelogistics", source="manual"
+    )
+    refused = _insert_candidate(
+        conn,
+        url="https://jobs.lever.co/samplelogistics",
+        ats_type="lever",
+        ats_slug="samplelogistics",
+        name=refused_name,
+    )
+    dropped = _insert_candidate(
+        conn,
+        url="https://jobs.ashbyhq.com/exampleorg",
+        ats_type="ashby",
+        ats_slug="exampleorg",
+        name="exampleorg",
+    )
+    conn.close()
+    assert cli.main(["discover", "approve", str(board)], probe=probe) == 0
+    approved = capsys.readouterr()
+    assert approved.out == "1 board newrobotics greenhouse newrobotics\n"
+    assert approved.err == ""
+    assert cli.main(["discover", "approve", str(refused)], probe=probe) == cli.EXIT_ERROR
+    disagree = capsys.readouterr()
+    assert disagree.out == ""
+    assert disagree.err == (
+        f"error: discovery candidate {refused} disagrees with the stored company\n"
+    )
+    assert cli.main(["discover", "reject", str(dropped)], probe=probe) == 0
+    assert capsys.readouterr().out == "3 board exampleorg ashby exampleorg\n"
+    assert cli.main(["discover", "approve"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: discover approve needs a candidate id\n"
+    assert cli.main(["discover", "list", "1"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: discover list takes no candidate id\n"
+    assert ei.read_bytes() == b"synthetic-ei\n"
+    assert (inited / "config.yaml").read_bytes() == config
+    assert (inited / "exclusions.yaml").read_bytes() == exclusions
+    assert list(inited.glob("ei_record_*")) == [ei]
+    conn = db.connect(inited / "search.db")
+    companies = conn.execute("SELECT count(*) FROM companies").fetchone()
+    applications = conn.execute("SELECT count(*) FROM applications").fetchone()
+    pending = conn.execute(
+        "SELECT count(*) FROM discovery_candidates WHERE status = 'pending'"
+    ).fetchone()
+    conn.close()
+    assert companies is not None and companies[0] == 2
+    assert applications is not None and applications[0] == 0
+    assert pending is not None and pending[0] == 1
+
+
+def test_the_alert_query_stays_on_watcher_postings(search: sqlite3.Connection) -> None:
+    text = inspect.getsource(search_store.pending_alert_ids)
+    assert "p.source = 'watcher'" in text
+    assert "discovery" not in text
+    watcher, _inserted = search_store.upsert_company(search, "Example Robotics", source="watcher")
+    other, _also = search_store.upsert_company(search, "Example Org", source="discovery")
+    search.execute(
+        "INSERT INTO postings (company_id, title, first_seen, source, llm_output) "
+        "VALUES (?, 'Operations Coordinator', '2026-11-02', 'watcher', 'synthetic')",
+        (watcher,),
+    )
+    watcher_id = int(search.execute("SELECT last_insert_rowid()").fetchone()[0])
+    search.execute(
+        "INSERT INTO postings (company_id, title, first_seen, source, llm_output) "
+        "VALUES (?, 'Customer Success Specialist', '2026-11-02', 'discovery', 'synthetic')",
+        (other,),
+    )
+    assert search_store.pending_alert_ids(search) == [watcher_id]
 
 
 def test_the_queue_has_no_snippet_column(tmp_path: Path) -> None:
