@@ -38,6 +38,9 @@ search:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here
     remote: [Canada]                    # fully remote only within these regions
     allow_travel_outside: false         # refuse roles needing office days elsewhere
+  # Optional file inside the data folder. Null skips embeddings. An absolute path,
+  # or any ".." segment, is invalid. The real path stays in your own config.
+  resume: null
 
 # Hard gates: a posting failing any of these is skipped, with the reason recorded.
 hard_gates:
@@ -75,6 +78,9 @@ fit_rubric:
       all_minor: strong        # every gap learnable or nice-to-have
       any_core: possible       # any gap core to the job
     exempt_requirements: []    # requirement types that never count as a gap
+  # Optional number from 0 to 1. Validated only: the watcher does not use it for
+  # skips, alerts, or what it stores. Null leaves it unset.
+  embedding_weight: null
 
 schedule:
   # A zone name (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); UTC if unset.
