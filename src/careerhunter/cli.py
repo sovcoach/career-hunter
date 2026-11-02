@@ -40,6 +40,7 @@ from careerhunter.filters import PostingText
 from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.score import Score, score_posting
+from careerhunter.scout_prompt import render
 from careerhunter.seed import SeedError, Tally, import_seed
 from careerhunter.storage_guard import DataDir, StorageGuardError
 
@@ -628,6 +629,20 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_scout_prompt(datadir: DataDir, args: argparse.Namespace) -> int:
+    """Print a scout prompt from exclusions and hard gates. Writes nothing."""
+    if not datadir.config_path.is_file():
+        _err("error: config.yaml is missing")
+        return EXIT_ERROR
+    if not datadir.exclusions_path.is_file():
+        _err("error: exclusions.yaml is missing")
+        return EXIT_ERROR
+    config = load_config(datadir.config_path)
+    exclusions = load_exclusions(datadir.exclusions_path)
+    sys.stdout.write(render(config, exclusions))
+    return EXIT_OK
+
+
 def _append_watch_log(datadir: DataDir, lines: list[str]) -> None:
     """The same lines stderr shows, kept after the guard has passed. 0600."""
     if not lines:
@@ -809,6 +824,10 @@ def build_parser() -> argparse.ArgumentParser:
         "watch",
         help="fetch Greenhouse, Lever and Ashby boards on the watchlist once and exit",
     )
+    sub.add_parser(
+        "scout-prompt",
+        help="print a scout prompt from exclusions and the hard gates the watcher skips on",
+    )
     sub.add_parser("doctor", help="check the setup and report what is missing")
     return parser
 
@@ -823,6 +842,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "bot": cmd_bot,
     "service": cmd_service,
     "watch": cmd_watch,
+    "scout-prompt": cmd_scout_prompt,
     "doctor": cmd_doctor,
 }
 
