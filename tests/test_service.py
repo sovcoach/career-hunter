@@ -49,17 +49,19 @@ def test_plist_contents(tmp_path: Path) -> None:
 
 def test_install_status_uninstall(tmp_path: Path, launch_agents: Path) -> None:
     run = fake_launchctl()
-    path = service.install(
+    paths = service.install(
         tmp_path / "Data", program_path=Path("/venv/bin/careerhunter"), runner=run
     )
-    assert path == service.plist_path() and path.is_file()
-    assert path.stat().st_mode & 0o777 == 0o644
-    assert run.calls[0][0] == "bootstrap" and run.calls[0][-1] == str(path)
+    assert paths == [service.plist_path(), service.watch_plist_path()]
+    assert all(path.is_file() and path.stat().st_mode & 0o777 == 0o644 for path in paths)
+    assert [call[0] for call in run.calls] == ["bootstrap", "bootstrap"]
     assert service.status(run) == service.ServiceStatus(True, True, True, 4242, "(never exited)")
-    with pytest.raises(service.ServiceError, match="already exists"):
+    with pytest.raises(service.ServiceError, match="already exist"):
         service.install(tmp_path / "Data", runner=run)
     assert service.uninstall(run) is True
-    assert not path.exists() and run.calls[-1][0] == "bootout"
+    assert not service.plist_path().exists()
+    assert not service.watch_plist_path().exists()
+    assert [call[0] for call in run.calls[-2:]] == ["bootout", "bootout"]
     assert service.uninstall(run) is False
     assert service.status(run) == service.ServiceStatus(installed=False)
 
@@ -68,6 +70,87 @@ def test_a_failed_bootstrap_leaves_nothing_behind(tmp_path: Path) -> None:
     with pytest.raises(service.ServiceError, match="bootstrap failed"):
         service.install(tmp_path, program_path=Path("/x"), runner=fake_launchctl("denied", 5))
     assert not service.plist_path().exists()
+    assert not service.watch_plist_path().exists()
+
+
+def test_watch_plist_runs_once_per_interval(tmp_path: Path) -> None:
+    doc = plistlib.loads(service.watch_plist(Path("/venv/bin/careerhunter"), tmp_path / "Data", 15))
+    assert doc["Label"] == "org.careerhunter.watch"
+    assert doc["ProgramArguments"] == ["/venv/bin/careerhunter", "watch"]
+    assert doc["EnvironmentVariables"] == {"CAREERHUNTER_DATA_DIR": str(tmp_path / "Data")}
+    assert doc["StartInterval"] == 900 and doc["RunAtLoad"] is True
+    assert "KeepAlive" not in doc and "ThrottleInterval" not in doc
+    assert doc["StandardOutPath"] == doc["StandardErrorPath"] == "/dev/null"
+    assert "token" not in str(doc).lower()
+    with pytest.raises(service.ServiceError, match="integer >= 15"):
+        service.watch_plist(Path("/x"), tmp_path, 14)
+
+
+def test_install_adds_the_watch_agent_when_the_bot_is_already_there(tmp_path: Path) -> None:
+    service.install(
+        tmp_path / "Data",
+        program_path=Path("/venv/bin/careerhunter"),
+        runner=fake_launchctl(),
+    )
+    service.watch_plist_path().unlink()
+    run = fake_launchctl()
+    made = service.install(
+        tmp_path / "Data",
+        program_path=Path("/venv/bin/careerhunter"),
+        runner=run,
+        watch_interval_minutes=15,
+    )
+    assert made == [service.watch_plist_path()]
+    assert service.plist_path().is_file()
+    assert [call[0] for call in run.calls] == ["bootstrap"]
+    doc = plistlib.loads(service.watch_plist_path().read_bytes())
+    assert doc["StartInterval"] == 900
+    assert doc["ProgramArguments"] == ["/venv/bin/careerhunter", "watch"]
+
+
+def test_a_failed_watch_bootstrap_keeps_the_bot(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def run(args: list[str]) -> tuple[int, str]:
+        calls.append(args)
+        if args[0] == "bootstrap" and sum(call[0] == "bootstrap" for call in calls) == 2:
+            return 5, "denied"
+        return 0, ""
+
+    with pytest.raises(service.ServiceError, match="bootstrap failed"):
+        service.install(tmp_path, program_path=Path("/x"), runner=run)
+    assert service.plist_path().is_file()
+    assert not service.watch_plist_path().exists()
+
+
+def test_service_command_reports_both_agents(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "run_launchctl", fake_launchctl())
+    assert cli.main(["service", "install"], probe=probe) == 0
+    installed = capsys.readouterr().out
+    assert "org.careerhunter.bot.plist; the bot starts now and at every login" in installed
+    assert "careerhunter watch runs now and every 60 minutes" in installed
+    assert "org.careerhunter.watch.plist" in installed
+
+    monkeypatch.setattr(service, "run_launchctl", _split_launchctl(STOPPED))
+    assert cli.main(["service", "status"], probe=probe) == 0
+    status = capsys.readouterr().out
+    assert "bot: running (pid 4242)" in status
+    assert "watch: loaded" in status
+
+    monkeypatch.setattr(service, "run_launchctl", fake_launchctl())
+    assert cli.main(["service", "uninstall"], probe=probe) == 0
+    assert capsys.readouterr().out == "uninstalled\n"
+    assert cli.main(["service", "status"], probe=probe) == 0
+    missing = capsys.readouterr().out
+    assert "bot: not installed (run: careerhunter service install)" in missing
+    assert "watch: not installed (run: careerhunter service install)" in missing
+    assert cli.main(["service", "uninstall"], probe=probe) == 0
+    assert capsys.readouterr().out == "not installed\n"
 
 
 def test_status_of_a_stopped_service(tmp_path: Path) -> None:
@@ -102,6 +185,8 @@ def test_doctor_without_the_service(
     assert code == 0
     assert "telegram        --  telegram.chat_id not set" in out
     assert "bot service     --  not installed" in out
+    assert "watch service   --  not installed" in out
+    assert "watch           --  no successful run yet" in out
     assert "logs/           OK  0 files, all owner-only" in out
 
 
@@ -119,6 +204,8 @@ def test_doctor_with_a_healthy_service(
     assert code == 0
     assert "bot service     OK  running (pid 4242)" in out
     assert "bot heartbeat   OK  polled within the last 5 minutes" in out
+    assert "watch service   OK  running (pid 4242)" in out
+    assert "watch           --  no successful run yet" in out
 
 
 @pytest.mark.parametrize(
@@ -163,3 +250,100 @@ def test_doctor_with_the_chat_set(
     shutil.rmtree(ready / "logs")
     _, out = doctor(probe, capsys)
     assert "logs/           --  missing" in out
+
+
+def _heartbeat(ready: Path) -> None:
+    path = ready / "logs" / "bot.heartbeat"
+    path.write_text(dt.datetime.now(dt.UTC).isoformat())
+    path.chmod(0o600)
+
+
+def _stamp(ready: Path, age: dt.timedelta) -> None:
+    moment = dt.datetime.now(dt.UTC) - age
+    path = ready / "logs" / "watch.success"
+    path.write_text(moment.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+
+
+def _split_launchctl(watch_output: str, watch_code: int = 0) -> Any:
+    def run(args: list[str]) -> tuple[int, str]:
+        if args and args[0] == "print" and args[-1].endswith(service.WATCH_LABEL):
+            return watch_code, watch_output
+        return 0, RUNNING
+
+    return run
+
+
+def test_doctor_reports_a_loaded_watch_and_a_fresh_success(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service.install(ready, program_path=Path("/x"), runner=fake_launchctl())
+    monkeypatch.setattr(service, "run_launchctl", _split_launchctl(STOPPED))
+    _heartbeat(ready)
+    _stamp(ready, dt.timedelta(minutes=12))
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "watch service   OK  loaded" in out
+    assert "watch           OK  last success 12 min ago" in out
+    assert "watch interval" not in out
+
+
+def test_doctor_flags_an_unreadable_success_stamp(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (ready / "logs" / "watch.success").write_text("not-a-time\n")
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert "watch           BAD last success stamp is unreadable" in out
+
+
+def test_doctor_flags_a_stale_watch(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service.install(ready, program_path=Path("/x"), runner=fake_launchctl())
+    monkeypatch.setattr(service, "run_launchctl", _split_launchctl(STOPPED))
+    _heartbeat(ready)
+    _stamp(ready, dt.timedelta(minutes=121))
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert "watch           BAD last success 121 min ago" in out
+
+
+def test_doctor_flags_a_watch_plist_that_is_not_loaded(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service.install(ready, program_path=Path("/x"), runner=fake_launchctl())
+    monkeypatch.setattr(service, "run_launchctl", _split_launchctl("", 1))
+    _heartbeat(ready)
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert "watch service   BAD installed but not loaded" in out
+
+
+def test_doctor_warns_when_the_installed_interval_disagrees(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import yaml
+
+    service.install(ready, program_path=Path("/x"), runner=fake_launchctl())
+    monkeypatch.setattr(service, "run_launchctl", _split_launchctl(STOPPED))
+    _heartbeat(ready)
+    _stamp(ready, dt.timedelta(0))
+    path = ready / "config.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["schedule"]["watcher_interval_minutes"] = 15
+    path.write_text(yaml.safe_dump(doc))
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "watch interval  WARN plist has 3600s, config asks for 900s" in out

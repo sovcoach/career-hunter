@@ -79,7 +79,7 @@ fit_rubric:
 schedule:
   # A zone name (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); UTC if unset.
   timezone: UTC
-  watcher_interval_minutes: 60    # optional
+  watcher_interval_minutes: 60    # optional; minutes between watch runs, minimum 15
   # Quiet hours are not implemented. Alerts go out whenever the bot polls.
 
 # Optional: limits on the work schedule. Anything above a limit is flagged (or
