@@ -36,7 +36,7 @@ A small "storage guard" runs before every command and checks that the data folde
 | `score.py` | Scores one kept posting on a local loopback model. The prompt is lanes, location rules, hard gates and `gap_tiers`. Stores gaps, model text and the tier name. Leaves `fit_rating` null. Not `fetch.py`. |
 | `watch.py` | One run of `careerhunter watch`: fetch Greenhouse, Lever and Ashby, filter, then score. Writes `search.db` only. Does not call Telegram. |
 | `snapshots.py` | Job-ad snapshots: the page, an ATS's public JSON, or a PDF or screenshot sent to the bot. |
-| `service.py` | The launchd LaunchAgent that keeps the bot running. |
+| `service.py` | Two user LaunchAgents: the bot, kept running, and `org.careerhunter.watch`, which runs `careerhunter watch` once per `schedule.watcher_interval_minutes` and exits. |
 | `scripts/check_no_datadir_paths.py` | Pre-commit hook that blocks staged content pointing into the data folder. |
 | `scripts/pre_push_guard.py` | Pre-push hook that refuses any push updating or deleting `main` (ADR-011). |
 | `scripts/verify_tree.py` | `make verify-tree`: every hook and gitleaks over every tracked and untracked file. |
@@ -53,7 +53,7 @@ A small "storage guard" runs before every command and checks that the data folde
 ├── seed.yaml                             ← one-off import of past history
 ├── exports/                              ← EI reports, timestamped, never overwritten
 ├── snapshots/<YYYY>/                     ← copies of job ads (0600; ADR-017)
-├── logs/                                 ← bot.log and bot.heartbeat (0600; events only)
+├── logs/                                 ← bot.log, bot.heartbeat, watch.log, watch.success (0600)
 └── backups/
 ```
 
@@ -181,6 +181,8 @@ Scoring posts to `http://127.0.0.1:1234/v1/chat/completions` and nowhere else. T
 
 The bot, on each successful poll, sends one alert for each watcher posting that has a score, no skip, and no `alerted_at` (search migration 0003). The text is the company, the title and the link, with Applied and Skipped. When the stored company is a watchlist entry flagged `agency: true`, it is shown as `Name (agency)`, because no separate employer was stored. A failed send leaves `alerted_at` null and is tried again next poll. Quiet hours are not implemented.
 
+`careerhunter service install` also installs `org.careerhunter.watch`. That agent runs `careerhunter watch` once and exits. launchd starts it again after `schedule.watcher_interval_minutes` (default 60, minimum 15). It has no `KeepAlive`. A run that exits 0 writes `logs/watch.success`. Board failures and a down model still exit 0, so they still count. A missing config or database does not update the stamp. `doctor` reports whether the agent is loaded and whether the stamp is within two intervals. Changing the interval means uninstalling both services and installing them again.
+
 ## The Telegram bot (Phase 2)
 
 ```
@@ -195,7 +197,7 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 - No inbound port and no webhook: the bot only ever calls out to Telegram, and to the job-ad links it is given.
 - Every write goes through the same ledger functions as the CLI, after the same claim checks (ADR-014). The bot re-reads config.yaml before each write.
 - What it sends is minimal (ADR-015); what it trusts is limited (ADR-016); how it saves job ads is in ADR-017.
-- `doctor` reports the chat setting, whether the service is running, and how recent its heartbeat is.
+- `doctor` reports the chat setting, whether the bot service is running, how recent its heartbeat is, whether the watch agent is loaded, and the age of the last successful watch.
 
 ## Phase roadmap
 
