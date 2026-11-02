@@ -1,10 +1,10 @@
 # career-hunter
 
-**In plain language:** career-hunter is a private, self-hosted job-search assistant that runs on your own Mac. It keeps a careful record of every job you apply to and every other job-search activity, such as networking, job fairs, agency registrations and courses. When you need to show your job search, for example when Service Canada asks for it during an Employment Insurance (EI) claim, it produces a clean report as a PDF and a spreadsheet. Later phases will score new postings and message you on Telegram when a good match appears.
+**In plain language:** career-hunter is a private, self-hosted job-search assistant that runs on your own Mac. It keeps a careful record of every job you apply to and every other job-search activity, such as networking, job fairs, agency registrations and courses. When you need to show your job search, for example when Service Canada asks for it during an Employment Insurance (EI) claim, it produces a clean report as a PDF and a spreadsheet. It can also watch boards you name, score the postings it keeps, and message you on Telegram.
 
 Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards. Filtering, scoring and alerts are not built yet.
+> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards, filters them, and scores the ones it keeps with a local model. The bot sends one alert for each scored posting.
 
 ---
 
@@ -25,11 +25,11 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
 | `careerhunter bot run` / `service install` | Runs the Telegram bot, by hand or as a background service on the Mac |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
-| `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist once, and records new postings in `search.db`. It does not score, filter or send alerts |
+| `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist once, records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The bot sends one alert for each scored posting |
 
 ## What it does *not* do (yet)
 
-- Filtering, scoring and Telegram alerts for new postings are not built yet. `careerhunter watch` only records new postings from Greenhouse, Lever and Ashby. The bot still calls Telegram, and it still fetches job-ad links you send it.
+- Quiet hours and the watch timer are not built. `careerhunter watch` does not call Telegram. The bot sends the alerts when it polls. Scoring stays on this Mac, at a loopback address.
 - No automatic deletes, ever. Records are kept for at least the 6 years EI requires.
 - No cloud sync and no accounts. It is a local tool.
 
