@@ -26,8 +26,9 @@ With lanes present, search.target_titles becomes optional; with gap_tiers presen
 fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
 optional. search.resume and fit_rubric.embedding_weight are optional. resume is a path
 relative to the data folder. When it is set, the watcher stores a cosine beside the
-tier. embedding_weight is a number from 0 to 1 and is not read for skips, alerts, or
-stored scores. Every problem is reported in one pass.
+tier. embedding_weight is a number from 0 to 1. The watcher does not read it for
+skips, alerts, or stored scores. embed-eval may rank a blend with it. Every problem
+is reported in one pass.
 
 schedule.timezone is the only place a time zone is set. It takes an IANA name
 (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); a fixed offset doesn't

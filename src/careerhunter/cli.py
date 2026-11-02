@@ -22,7 +22,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from careerhunter import __version__, bot, claims, db, secrets_store, service, storage_guard, watch
+from careerhunter import (
+    __version__,
+    bot,
+    claims,
+    db,
+    embed_eval,
+    secrets_store,
+    service,
+    storage_guard,
+    watch,
+)
 from careerhunter.bot import BotStartupError
 from careerhunter.claims import ActiveClaim, ClaimError, ClaimSettings, settings_from_config
 from careerhunter.config import (
@@ -630,6 +640,36 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
+    """Rank stored cosines against tiers. The report stays in the data folder."""
+    if not datadir.config_path.is_file():
+        _err("error: config.yaml is missing")
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing")
+        return EXIT_ERROR
+    config = load_config(datadir.config_path)
+    try:
+        names = embed_eval.tier_names(config)
+    except embed_eval.EvalError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    weight = embed_eval.embedding_weight(config)
+    conn = db.connect_read_only(datadir.search_db_path)
+    try:
+        try:
+            rows = embed_eval.load_rows(conn, names)
+        except sqlite3.OperationalError:
+            _err("error: search.db has no embedding_score column; run careerhunter migrate")
+            return EXIT_ERROR
+    finally:
+        conn.close()
+    text = embed_eval.render(rows, names, weight)
+    path = embed_eval.write_report(datadir.root, text, dt.datetime.now(dt.UTC))
+    print(path.relative_to(datadir.root).as_posix())
+    return EXIT_OK
+
+
 def cmd_scout_prompt(datadir: DataDir, args: argparse.Namespace) -> int:
     """Print a scout prompt from exclusions and hard gates. Writes nothing."""
     if not datadir.config_path.is_file():
@@ -829,6 +869,10 @@ def build_parser() -> argparse.ArgumentParser:
         "scout-prompt",
         help="print a scout prompt from exclusions and the hard gates the watcher skips on",
     )
+    sub.add_parser(
+        "embed-eval",
+        help="rank stored cosines against LLM tiers; the report stays in the data folder",
+    )
     sub.add_parser("doctor", help="check the setup and report what is missing")
     return parser
 
@@ -844,6 +888,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "service": cmd_service,
     "watch": cmd_watch,
     "scout-prompt": cmd_scout_prompt,
+    "embed-eval": cmd_embed_eval,
     "doctor": cmd_doctor,
 }
 

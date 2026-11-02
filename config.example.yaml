@@ -78,8 +78,8 @@ fit_rubric:
       all_minor: strong        # every gap learnable or nice-to-have
       any_core: possible       # any gap core to the job
     exempt_requirements: []    # requirement types that never count as a gap
-  # Optional number from 0 to 1. Validated only: the watcher does not use it for
-  # skips, alerts, or what it stores. Null leaves it unset.
+  # Optional number from 0 to 1. The watcher does not use it for skips, alerts, or
+  # what it stores. embed-eval ranks a blend with it when it is set. Null leaves it unset.
   embedding_weight: null
 
 schedule:
