@@ -10,6 +10,7 @@ import argparse
 import datetime as dt
 import getpass
 import os
+import plistlib
 import shutil
 import sqlite3
 import stat
@@ -30,6 +31,7 @@ from careerhunter.config import (
     load_exclusions,
     telegram_chat_id,
     timezone_name,
+    watch_interval_minutes,
 )
 from careerhunter.config import today as config_today
 from careerhunter.export import export, plural
@@ -265,21 +267,39 @@ def cmd_bot(datadir: DataDir, args: argparse.Namespace) -> int:
     return bot.run(datadir)
 
 
+def _service_minutes(datadir: DataDir) -> int:
+    if not datadir.config_path.is_file():
+        return watch_interval_minutes(None)
+    return watch_interval_minutes(load_config(datadir.config_path))
+
+
+def _print_service(name: str, current: service.ServiceStatus, *, stay_running: bool) -> None:
+    if not current.installed:
+        print(f"{name}: not installed (run: careerhunter service install)")
+    elif not current.loaded:
+        print(f"{name}: installed but not loaded")
+    elif current.running:
+        print(f"{name}: running (pid {current.pid})")
+    elif stay_running:
+        print(f"{name}: installed but not running (last exit {current.last_exit or 'unknown'})")
+    else:
+        print(f"{name}: loaded")
+
+
 def cmd_service(datadir: DataDir, args: argparse.Namespace) -> int:
     if args.service_action == "install":
-        path = service.install(datadir.root)
-        print(f"installed {path}; the bot starts now and at every login")
+        minutes = _service_minutes(datadir)
+        for path in service.install(datadir.root, watch_interval_minutes=minutes):
+            if path.name == f"{service.WATCH_LABEL}.plist":
+                print(f"installed {path}; careerhunter watch runs now and every {minutes} minutes")
+            else:
+                print(f"installed {path}; the bot starts now and at every login")
     elif args.service_action == "uninstall":
         removed = service.uninstall()
         print("uninstalled" if removed else "not installed")
     else:
-        current = service.status()
-        if not current.installed:
-            print("not installed (run: careerhunter service install)")
-        elif current.running:
-            print(f"running (pid {current.pid})")
-        else:
-            print(f"installed but not running (last exit {current.last_exit or 'unknown'})")
+        _print_service("bot", service.status(), stay_running=True)
+        _print_service("watch", service.status(label=service.WATCH_LABEL), stay_running=False)
     return EXIT_OK
 
 
@@ -388,6 +408,61 @@ def _doctor_bot(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | 
         report.line("bot heartbeat", "BAD", f"last poll {minutes} min ago; see logs/bot.log")
     else:
         report.line("bot heartbeat", "OK", "polled within the last 5 minutes")
+
+
+def _doctor_watch(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
+    """Whether the watch agent is loaded, and how old the last finished run is."""
+    current = service.status(label=service.WATCH_LABEL)
+    if not current.installed:
+        report.line("watch service", "--", "not installed (run: careerhunter service install)")
+    elif not current.loaded:
+        report.line("watch service", "BAD", "installed but not loaded")
+    elif current.running and current.pid is not None:
+        report.line("watch service", "OK", f"running (pid {current.pid})")
+    else:
+        report.line("watch service", "OK", "loaded")
+    if current.installed:
+        _doctor_watch_interval(report, config_doc)
+    _doctor_watch_success(report, datadir, config_doc)
+
+
+def _doctor_watch_interval(report: _Report, config_doc: dict[str, Any] | None) -> None:
+    if config_doc is None:
+        return
+    path = service.watch_plist_path()
+    try:
+        installed = plistlib.loads(path.read_bytes()).get("StartInterval")
+    except (OSError, plistlib.InvalidFileException):
+        report.line("watch interval", "WARN", "could not read the watch plist; reinstall it")
+        return
+    expected = watch_interval_minutes(config_doc) * 60
+    if installed != expected:
+        report.line(
+            "watch interval",
+            "WARN",
+            f"plist has {installed}s, config asks for {expected}s; reinstall the watch service",
+        )
+
+
+def _doctor_watch_success(
+    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None
+) -> None:
+    path = datadir.logs / "watch.success"
+    try:
+        stamp = dt.datetime.fromisoformat(path.read_text().strip())
+    except FileNotFoundError:
+        report.line("watch", "--", "no successful run yet")
+        return
+    except (OSError, ValueError):
+        report.line("watch", "BAD", "last success stamp is unreadable")
+        return
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.UTC)
+    age = dt.datetime.now(dt.UTC) - stamp.astimezone(dt.UTC)
+    minutes = max(0, int(age.total_seconds() // 60))
+    limit = dt.timedelta(minutes=2 * watch_interval_minutes(config_doc))
+    detail = f"last success {minutes} min ago"
+    report.line("watch", "BAD" if age > limit else "OK", detail)
 
 
 def _doctor_private_folder(report: _Report, name: str, folder: Path) -> None:
@@ -548,7 +623,35 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
         conn.close()
     for line in lines:
         _err(line)
+    _append_watch_log(datadir, lines)
+    _record_watch_success(datadir)
     return EXIT_OK
+
+
+def _append_watch_log(datadir: DataDir, lines: list[str]) -> None:
+    """The same lines stderr shows, kept after the guard has passed. 0600."""
+    if not lines:
+        return
+    path = datadir.logs / "watch.log"
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.chmod(path, 0o600)
+
+
+def _record_watch_success(datadir: DataDir) -> None:
+    """One UTC timestamp. Written only after a watch run has finished."""
+    path = datadir.logs / "watch.success"
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(stamp + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
 
 
 def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
@@ -653,6 +756,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
     _doctor_private_folder(report, "snapshots/", datadir.snapshots)
     _doctor_private_folder(report, "logs/", datadir.logs)
     _doctor_bot(report, datadir, config_doc)
+    _doctor_watch(report, datadir, config_doc)
 
     repo = storage_guard.repo_root()
     if repo is not None and (repo / ".git").exists():
@@ -699,7 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("run", "discover"),
         help="run: poll Telegram until stopped; discover: list chats that messaged the bot",
     )
-    p = sub.add_parser("service", help="run the bot as a launchd service on this Mac")
+    p = sub.add_parser("service", help="run the bot and the watch as launchd services on this Mac")
     p.add_argument("service_action", choices=("install", "uninstall", "status"))
     sub.add_parser(
         "watch",

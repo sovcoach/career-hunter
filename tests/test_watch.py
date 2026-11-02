@@ -967,6 +967,12 @@ def test_watch_command_records_the_example_boards_without_a_socket(
             assert row["snapshot_path"] is None
     finally:
         conn.close()
+    success = inited / "logs" / "watch.success"
+    assert success.stat().st_mode & 0o777 == 0o600
+    assert success.read_text().strip().endswith("Z")
+    log = inited / "logs" / "watch.log"
+    assert log.stat().st_mode & 0o777 == 0o600
+    assert log.read_text() == captured.err
 
 
 def test_watch_requires_config(
@@ -975,6 +981,7 @@ def test_watch_requires_config(
     (inited / "config.yaml").unlink()
     assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
     assert capsys.readouterr().err == "error: config.yaml is missing\n"
+    assert not (inited / "logs" / "watch.success").exists()
 
 
 def test_watch_requires_the_database(
@@ -983,3 +990,16 @@ def test_watch_requires_the_database(
     (inited / "search.db").unlink()
     assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
     assert capsys.readouterr().err == "error: search.db is missing; run careerhunter init\n"
+    assert not (inited / "logs" / "watch.success").exists()
+
+
+def test_a_watch_that_raises_does_not_stamp(
+    inited: Path, probe: SystemProbe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> list[str]:
+        raise RuntimeError("synthetic watch failure")
+
+    monkeypatch.setattr(cli.watch, "run", boom)
+    with pytest.raises(RuntimeError, match="synthetic watch failure"):
+        cli.main(["watch"], probe=probe)
+    assert not (inited / "logs" / "watch.success").exists()

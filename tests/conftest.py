@@ -261,12 +261,16 @@ def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def launch_agents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """The bot service's plist lives under a temporary home, never ~/Library."""
+    """Service plists live under a temporary home, never ~/Library."""
     from careerhunter import service
 
     home = tmp_path / "home"
-    real = service.plist_path
-    monkeypatch.setattr(service, "plist_path", lambda h=None: real(h or home))
+    real = service.launch_agents_dir
+
+    def under_test_home(chosen: Path | None = None) -> Path:
+        return real(chosen or home)
+
+    monkeypatch.setattr(service, "launch_agents_dir", under_test_home)
     return home
 
 
