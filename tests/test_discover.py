@@ -1,0 +1,367 @@
+"""Discovery queues companies from result URLs. Snippets stay out of the database."""
+
+from __future__ import annotations
+
+import http.client
+import json
+import sqlite3
+import urllib.parse
+from pathlib import Path
+
+import pytest
+import yaml
+
+from careerhunter import cli, db, discover
+from careerhunter.platform_checks import SystemProbe
+
+SNIPPET = "DO-NOT-LEAK-SNIPPET"
+TITLE = "DO-NOT-LEAK-TITLE"
+QUERY = "DO-NOT-LEAK-QUERY"
+PATH = "/Volumes/ExampleDrive/ExampleFolder"
+EXCLUSION = "DO-NOT-LEAK-EXCLUSION"
+URLS = [
+    "https://job-boards.greenhouse.io/examplerobotics/jobs/99",
+    "https://boards.greenhouse.io/embed/job_board?for=examplerobotics",
+    "https://job-boards.greenhouse.io/newrobotics/jobs/42",
+    "https://boards.greenhouse.io/newrobotics",
+    "https://jobs.lever.co/samplelogistics/abc",
+    "https://jobs.lever.co/freshlogistics/post-1",
+    "https://jobs.ashbyhq.com/exampleorg/role-9",
+    "https://jobs.example.com/careers?utm=1#top",
+    "https://evil.example/jobs/1",
+    "http://jobs.example.com/careers",
+]
+
+
+def _body(urls: list[str]) -> bytes:
+    results = [
+        {"url": url, "title": TITLE, "content": f"{SNIPPET} {PATH}", "engine": "example"}
+        for url in urls
+    ]
+    return json.dumps({"results": results, "query": QUERY}).encode()
+
+
+class _Talk:
+    def __init__(self, body: bytes, status: int = 200, fail_at: int | None = None) -> None:
+        self.body = body
+        self.status = status
+        self.fail_at = fail_at
+        self.calls: list[str] = []
+
+    def __call__(self, url: str) -> tuple[int, bytes]:
+        self.calls.append(url)
+        if self.fail_at is not None and len(self.calls) >= self.fail_at:
+            if self.status == 0:
+                raise OSError("down")
+            return self.status, b""
+        return 200, self.body
+
+
+def _enable(root: Path, *, hosts: list[str] | None = None) -> None:
+    path = root / "config.yaml"
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    doc["discovery"]["searxng_url"] = "http://127.0.0.1:8888/search"
+    if hosts is not None:
+        doc["discovery"]["career_hosts"] = hosts
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    exclusions = root / "exclusions.yaml"
+    loaded = yaml.safe_load(exclusions.read_text(encoding="utf-8"))
+    loaded["companies"].append(EXCLUSION)
+    exclusions.write_text(yaml.safe_dump(loaded), encoding="utf-8")
+
+
+@pytest.fixture
+def inited(data_env: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]) -> Path:
+    assert cli.main(["init"], probe=probe) == 0
+    capsys.readouterr()
+    return data_env
+
+
+def test_queries_stop_at_twelve_and_use_the_first_title_variant() -> None:
+    config = {
+        "search": {
+            "lanes": [{"titles": ["One", ["Alpha", "Beta"], "Three", "Four"]}],
+            "locations": ["Example City", "Sample Town"],
+        },
+        "discovery": {"career_hosts": ["jobs.example.com"]},
+    }
+    queries = discover.build_queries(config)
+    assert len(queries) == 12
+    assert queries[0] == "site:boards.greenhouse.io One Example City"
+    assert any("Alpha" in query for query in queries)
+    assert "Beta" not in "\n".join(queries)
+    assert discover.build_queries({"search": {}}) == []
+    bare = discover.build_queries({"search": {"target_titles": ["One"]}})
+    assert bare[0] == "site:boards.greenhouse.io One"
+    assert len(bare) == 4
+
+
+def test_no_titles_makes_no_request(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+
+    def refuse(url: str) -> tuple[int, bytes]:
+        raise AssertionError(url)
+
+    outcome = discover.run(
+        conn,
+        {
+            "discovery": {"searxng_url": "http://127.0.0.1:8888/search"},
+            "search": {"locations": ["Example City"]},
+        },
+        today="2026-11-02",
+        transport=refuse,
+    )
+    conn.close()
+    assert outcome == discover.Outcome(None, ())
+
+
+def test_the_search_url_stays_on_loopback() -> None:
+    url = discover.request_url("http://127.0.0.1:8888/search", "site:jobs.lever.co One")
+    parsed = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    assert parsed["format"] == ["json"]
+    assert parsed["q"] == ["site:jobs.lever.co One"]
+    assert discover.request_url("http://127.0.0.1:8888", "One").startswith(
+        "http://127.0.0.1:8888/search?"
+    )
+    for base in (
+        "https://127.0.0.1/search",
+        "http://example.com/search",
+        "http://user@127.0.0.1/search",
+        "http://10.0.0.1/search",
+    ):
+        with pytest.raises(discover.DiscoverError):
+            discover.request_url(base, "One")
+
+
+def test_urls_reduce_to_a_board_or_an_allowlisted_career_page() -> None:
+    hosts = ["jobs.example.com"]
+    board = discover.classify("https://job-boards.greenhouse.io/newrobotics/jobs/42", hosts)
+    embed = discover.classify("https://boards.greenhouse.io/embed/job_board?for=newrobotics", hosts)
+    assert board == embed
+    assert board is not None
+    assert board.ats_type == "greenhouse"
+    assert board.ats_slug == "newrobotics"
+    assert board.url == "https://boards.greenhouse.io/newrobotics"
+    lever = discover.classify("https://jobs.lever.co/freshlogistics/post-1", hosts)
+    ashby = discover.classify("https://jobs.ashbyhq.com/exampleorg/role-9", hosts)
+    assert lever is not None and lever.ats_type == "lever" and lever.ats_slug == "freshlogistics"
+    assert ashby is not None and ashby.ats_type == "ashby"
+    career = discover.classify("https://jobs.example.com/careers?utm=1#top", hosts)
+    assert career is not None
+    assert career.kind == "career"
+    assert career.url == "https://jobs.example.com/careers"
+    assert career.suggested_name == "jobs.example.com"
+    assert discover.classify("https://evil.example/jobs/1", hosts) is None
+    assert discover.classify("http://jobs.example.com/careers", hosts) is None
+
+
+def test_a_miss_writes_nothing(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    config = {
+        "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "career_hosts": []},
+        "search": {"target_titles": ["One"], "locations": ["Example City"]},
+    }
+    down = _Talk(b"", status=0, fail_at=1)
+    outcome = discover.run(conn, config, today="2026-11-02", transport=down)
+    assert outcome.notice == discover.MISS
+    assert outcome.rows == ()
+    bad = _Talk(b"<html>", status=200)
+    outcome = discover.run(conn, config, today="2026-11-02", transport=bad)
+    assert outcome.notice == discover.MISS
+    partial = _Talk(_body(["https://jobs.lever.co/freshlogistics/post-1"]), fail_at=3, status=500)
+    outcome = discover.run(conn, config, today="2026-11-02", transport=partial)
+    assert outcome.notice == discover.MISS
+    assert partial.calls
+    huge = _Talk(b"x" * (discover.MAX_BODY + 1))
+    outcome = discover.run(conn, config, today="2026-11-02", transport=huge)
+    assert outcome.notice == discover.MISS
+    off = discover.run(conn, {"discovery": {"searxng_url": None}}, today="2026-11-02")
+    assert off.notice == discover.OFF
+    assert off.rows == ()
+    count = conn.execute("SELECT count(*) FROM discovery_candidates").fetchone()
+    conn.close()
+    assert count is not None
+    assert count[0] == 0
+
+
+def test_the_command_queues_reduced_urls_and_drops_the_snippet(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited, hosts=["jobs.example.com"])
+    talk = _Talk(_body(URLS))
+    monkeypatch.setattr(discover, "default_transport", talk)
+    assert cli.main(["discover"], probe=probe) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.splitlines() == [
+        "1 board newrobotics greenhouse newrobotics",
+        "2 board freshlogistics lever freshlogistics",
+        "3 board exampleorg ashby exampleorg",
+        "4 career jobs.example.com - https://jobs.example.com/careers",
+    ]
+    assert len(talk.calls) == 12
+    assert all("format=json" in call for call in talk.calls)
+    asked = [
+        urllib.parse.parse_qs(urllib.parse.urlsplit(call).query)["q"][0] for call in talk.calls
+    ]
+    assert any(query.startswith("site:jobs.example.com ") for query in asked)
+    blob = captured.out + captured.err + "\n".join(talk.calls) + "\n".join(asked)
+    for secret in (SNIPPET, TITLE, QUERY, PATH, EXCLUSION):
+        assert secret not in blob
+    conn = db.connect(inited / "search.db")
+    stored = [
+        " ".join("" if value is None else str(value) for value in row)
+        for row in conn.execute("SELECT * FROM discovery_candidates ORDER BY id")
+    ]
+    companies = conn.execute("SELECT count(*) FROM companies").fetchone()
+    postings = conn.execute("SELECT count(*) FROM postings").fetchone()
+    conn.close()
+    text = "\n".join(stored)
+    for secret in (SNIPPET, TITLE, QUERY, PATH, EXCLUSION, "utm", "jobs/42"):
+        assert secret not in text
+    assert "https://boards.greenhouse.io/newrobotics" in text
+    assert companies is not None and companies[0] == 0
+    assert postings is not None and postings[0] == 0
+    assert list(inited.glob("ei_record_*.db")) == []
+    assert not (inited / "logs" / "watch.success").exists()
+    assert cli.main(["discover"], probe=probe) == 0
+    again = capsys.readouterr()
+    assert again.out == ""
+    assert again.err == ""
+    assert cli.main(["discover", "list"], probe=probe) == 0
+    listed = capsys.readouterr()
+    assert listed.out == captured.out
+
+
+def test_a_null_url_makes_no_request(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(url: str) -> tuple[int, bytes]:
+        raise AssertionError(url)
+
+    monkeypatch.setattr(discover, "default_transport", refuse)
+    assert cli.main(["discover"], probe=probe) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "discovery off\n"
+    assert not (inited / "search.db").exists() or _count(inited) == 0
+
+
+def test_a_missing_config_writes_nothing(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (inited / "config.yaml").unlink()
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "config.yaml is missing" in captured.err
+
+
+def _count(root: Path) -> int:
+    conn = db.connect(root / "search.db")
+    row = conn.execute("SELECT count(*) FROM discovery_candidates").fetchone()
+    conn.close()
+    assert row is not None
+    return int(row[0])
+
+
+def test_a_missing_database_writes_nothing(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (inited / "search.db").unlink()
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: search.db is missing; run careerhunter init\n"
+
+
+def test_a_miss_on_the_command_exits_zero(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited, hosts=["jobs.example.com"])
+
+    def down(url: str) -> tuple[int, bytes]:
+        raise OSError(url)
+
+    monkeypatch.setattr(discover, "default_transport", down)
+    assert cli.main(["discover"], probe=probe) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{discover.MISS}\n"
+    assert "site:" not in captured.err
+    assert _count(inited) == 0
+
+
+def test_the_client_returns_a_redirect_and_does_not_follow_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    class Response:
+        status = 302
+
+        def read(self, amount: int) -> bytes:
+            assert amount == discover.MAX_BODY + 1
+            return b"go away"
+
+    class Conn:
+        def __init__(self, host: str, port: int, timeout: float) -> None:
+            calls.append(("open", host, str(port)))
+
+        def request(
+            self,
+            method: str,
+            path: str,
+            body: bytes | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            assert headers == {"Accept": "application/json"}
+            calls.append((method, path, ""))
+
+        def getresponse(self) -> Response:
+            return Response()
+
+        def close(self) -> None:
+            calls.append(("close", "", ""))
+
+    monkeypatch.setattr(http.client, "HTTPConnection", Conn)
+    status, body = discover.default_transport("http://127.0.0.1:8888/search?q=One&format=json")
+    assert status == 302
+    assert body == b"go away"
+    assert calls == [
+        ("open", "127.0.0.1", "8888"),
+        ("GET", "/search?q=One&format=json", ""),
+        ("close", "", ""),
+    ]
+    with pytest.raises(discover.DiscoverError):
+        discover.default_transport("http://example.com/search?q=One")
+
+
+def test_the_queue_has_no_snippet_column(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(discovery_candidates)")}
+    assert {"title", "content", "snippet", "query"} & columns == set()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO discovery_candidates "
+            "(kind, url, ats_type, ats_slug, suggested_name, status, first_seen) "
+            "VALUES ('board', 'https://boards.greenhouse.io/x', 'greenhouse', NULL, "
+            "'x', 'pending', '2026-11-02')"
+        )
+    conn.close()

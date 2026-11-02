@@ -200,6 +200,16 @@ Paste the text into your private scout setup. The command prints to the terminal
 
 With the template files, the prompt names Example Staffing Mill, the title keyword Senior Director, and the shift pattern overnight. Yours will name whatever you put in the two files.
 
+### Find companies beyond the watchlist
+
+SearXNG runs on this Mac and listens on `127.0.0.1` only. Leave `public_instance` and `image_proxy` off, leave the limiter off, and add `json` to `search.formats`. Leave engines that need an API key disabled. Set `discovery.searxng_url` to that loopback URL, for example `http://127.0.0.1:8888/search`. A null URL leaves discovery off.
+
+`careerhunter discover` sends at most 12 site-restricted queries. It prints each new pending row and stores it in `search.db`. It does not fetch the page. A down server prints `discovery miss: unreachable` and stores nothing. `careerhunter discover list` prints the pending rows again.
+
+```bash
+make discover
+```
+
 ### Compare a cosine with the tier
 
 `careerhunter embed-eval` reads stored cosines and tiers. It does not call the model. The report is a mode 0600 file under `evals/` in the data folder. The terminal prints the relative path only. When `fit_rubric.embedding_weight` is set, the report also ranks `weight * cosine + (1 - weight) * tier`. That blend is not stored and not sent.

@@ -27,6 +27,7 @@ from careerhunter import (
     bot,
     claims,
     db,
+    discover,
     embed_eval,
     secrets_store,
     service,
@@ -640,6 +641,34 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
+    """Queue companies from a local SearXNG. Prints rows and writes search.db only."""
+    if not datadir.config_path.is_file():
+        _err("error: config.yaml is missing")
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    doc = load_config(datadir.config_path)
+    conn = db.connect(datadir.search_db_path)
+    try:
+        db.migrate(conn, "search")
+        if args.discover_action == "list":
+            rows: Sequence[discover.Queued] = discover.pending(conn)
+            notice = None
+        else:
+            outcome = discover.run(conn, doc, today=config_today(doc).isoformat())
+            rows = outcome.rows
+            notice = outcome.notice
+    finally:
+        conn.close()
+    if notice:
+        _err(notice)
+    for row in rows:
+        print(discover.format_row(row))
+    return EXIT_OK
+
+
 def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
     """Rank stored cosines against tiers. The report stays in the data folder."""
     if not datadir.config_path.is_file():
@@ -865,6 +894,17 @@ def build_parser() -> argparse.ArgumentParser:
         "watch",
         help="fetch Greenhouse, Lever and Ashby boards on the watchlist once and exit",
     )
+    discover_parser = sub.add_parser(
+        "discover",
+        help="queue companies from a local SearXNG; pages are not fetched",
+    )
+    discover_parser.add_argument(
+        "discover_action",
+        nargs="?",
+        choices=("run", "list"),
+        default="run",
+        help="run: search and queue new rows; list: print pending rows",
+    )
     sub.add_parser(
         "scout-prompt",
         help="print a scout prompt from exclusions and the hard gates the watcher skips on",
@@ -887,6 +927,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "bot": cmd_bot,
     "service": cmd_service,
     "watch": cmd_watch,
+    "discover": cmd_discover,
     "scout-prompt": cmd_scout_prompt,
     "embed-eval": cmd_embed_eval,
     "doctor": cmd_doctor,
