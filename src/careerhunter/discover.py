@@ -3,6 +3,9 @@
 The client is not `fetch.py`. It allows only plain http to a loopback host, follows
 no redirects, and reads result URLs only. Titles, snippets, and the response body are
 not stored. A down server yields one closed miss line and writes nothing.
+
+Approve and reject update this queue, and a board approval can fill a company row.
+They do not rewrite config files, send Telegram, or open an EI record.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from careerhunter import db
+from careerhunter import db, search_store
 
 MAX_QUERIES = 12
 MAX_BODY = 1_048_576
@@ -193,6 +196,26 @@ def pending(conn: sqlite3.Connection) -> list[Queued]:
         "FROM discovery_candidates WHERE status = 'pending' ORDER BY id"
     )
     return [_queued(row) for row in rows]
+
+
+def approve(conn: sqlite3.Connection, candidate_id: int) -> Queued:
+    """Approve one pending row. A board is watchable. A career page is only stored."""
+    row = _pending_row(conn, candidate_id)
+    with db.transaction(conn):
+        if str(row["kind"]) == "board":
+            _approve_board(conn, row)
+        else:
+            _approve_career(conn, row)
+        _mark(conn, candidate_id, "approved")
+    return _queued(row)
+
+
+def reject(conn: sqlite3.Connection, candidate_id: int) -> Queued:
+    """Mark one pending row rejected. No company is inserted."""
+    row = _pending_row(conn, candidate_id)
+    with db.transaction(conn):
+        _mark(conn, candidate_id, "rejected")
+    return _queued(row)
 
 
 def run(
@@ -461,6 +484,85 @@ def _watch_items(config: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     if not isinstance(raw, list):
         return []
     return [item for item in raw if isinstance(item, Mapping)]
+
+
+def _pending_row(conn: sqlite3.Connection, candidate_id: int) -> sqlite3.Row:
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT id, kind, url, ats_type, ats_slug, suggested_name, status "
+        "FROM discovery_candidates WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if row is None or candidate_id < 1:
+        raise DiscoverError(f"discovery candidate {candidate_id} was not found")
+    status = str(row["status"])
+    if status != "pending":
+        raise DiscoverError(f"discovery candidate {candidate_id} is {status}")
+    return row
+
+
+def _mark(conn: sqlite3.Connection, candidate_id: int, status: str) -> None:
+    cur = conn.execute(
+        "UPDATE discovery_candidates SET status = ? WHERE id = ? AND status = 'pending'",
+        (status, candidate_id),
+    )
+    if cur.rowcount != 1:
+        raise DiscoverError(f"discovery candidate {candidate_id} is not pending")
+
+
+def _approve_board(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    ats = row["ats_type"]
+    slug = row["ats_slug"]
+    if not isinstance(ats, str) or not isinstance(slug, str):
+        raise DiscoverError(f"discovery candidate {int(row['id'])} was not found")
+    name = str(row["suggested_name"])
+    existing = conn.execute(
+        "SELECT id, ats_type, ats_slug FROM companies WHERE name = ?",
+        (name,),
+    ).fetchone()
+    if existing is None:
+        search_store.upsert_company(
+            conn, name, ats_type=ats, ats_slug=slug, watchlist=1, source="discovery"
+        )
+        return
+    if _ats_disagrees(existing["ats_type"], existing["ats_slug"], ats, slug):
+        raise DiscoverError(
+            f"discovery candidate {int(row['id'])} disagrees with the stored company"
+        )
+    conn.execute(
+        "UPDATE companies SET ats_type = coalesce(ats_type, ?), ats_slug = coalesce(ats_slug, ?), "
+        "watchlist = 1 WHERE id = ?",
+        (ats, slug, existing["id"]),
+    )
+
+
+def _approve_career(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    name = str(row["suggested_name"])
+    url = str(row["url"])
+    existing = conn.execute(
+        "SELECT id, careers_url FROM companies WHERE name = ?",
+        (name,),
+    ).fetchone()
+    if existing is None:
+        search_store.upsert_company(conn, name, careers_url=url, watchlist=0, source="discovery")
+        return
+    stored = existing["careers_url"]
+    if isinstance(stored, str) and stored != url:
+        raise DiscoverError(
+            f"discovery candidate {int(row['id'])} disagrees with the stored company"
+        )
+    if stored is None:
+        conn.execute(
+            "UPDATE companies SET careers_url = ? WHERE id = ?",
+            (url, existing["id"]),
+        )
+
+
+def _ats_disagrees(stored_type: object, stored_slug: object, ats: str, slug: str) -> bool:
+    type_text = stored_type if isinstance(stored_type, str) else None
+    slug_text = stored_slug if isinstance(stored_slug, str) else None
+    return (type_text is not None and type_text != ats) or (
+        slug_text is not None and slug_text != slug
+    )
 
 
 def _queued(row: sqlite3.Row) -> Queued:

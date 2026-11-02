@@ -208,7 +208,11 @@ SearXNG runs on this Mac and listens on `127.0.0.1` only. Leave `public_instance
 
 ```bash
 make discover
+careerhunter discover approve 4
+careerhunter discover reject 4
 ```
+
+`approve` marks that pending row approved. A board becomes a company with `watchlist` 1, and a new company has `source` discovery. The next `careerhunter watch` fetches that board. A career page stores `careers_url` and is not fetched. `reject` stores the rejection and inserts no company. Neither command rewrites `config.yaml` or `exclusions.yaml`.
 
 ### Compare a cosine with the tier
 

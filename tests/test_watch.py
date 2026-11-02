@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from careerhunter import cli, db, search_store
+from careerhunter import cli, db, discover, search_store
 from careerhunter import watch as w
 from careerhunter.fetch import Fetched, FetchError
 from careerhunter.models import Posting
@@ -1003,3 +1003,143 @@ def test_a_watch_that_raises_does_not_stamp(
     with pytest.raises(RuntimeError, match="synthetic watch failure"):
         cli.main(["watch"], probe=probe)
     assert not (inited / "logs" / "watch.success").exists()
+
+
+def _candidate(
+    conn: sqlite3.Connection,
+    *,
+    url: str,
+    ats_type: str | None,
+    ats_slug: str | None,
+    name: str,
+    kind: str = "board",
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO discovery_candidates "
+        "(kind, url, ats_type, ats_slug, suggested_name, status, first_seen) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+        (kind, url, ats_type, ats_slug, name, DAY),
+    )
+    assert cur.lastrowid is not None
+    return int(cur.lastrowid)
+
+
+def test_watch_fetches_an_approved_discovery_board_only(
+    search: sqlite3.Connection, datadir: DataDir
+) -> None:
+    sentinel = b"do-not-rewrite\n"
+    (datadir.root / "config.yaml").write_bytes(sentinel)
+    (datadir.root / "exclusions.yaml").write_bytes(sentinel)
+    ei = datadir.root / "ei_record_2026-27.db"
+    ei.write_bytes(b"synthetic-ei\n")
+    search_store.upsert_company(
+        search,
+        "Sample Seed",
+        ats_type="greenhouse",
+        ats_slug="sampleseed",
+        watchlist=1,
+        source="manual",
+    )
+    search_store.upsert_company(
+        search,
+        "Old Robotics",
+        ats_type="greenhouse",
+        ats_slug="oldrobotics",
+        watchlist=1,
+        source="watcher",
+    )
+    search_store.upsert_company(
+        search,
+        "Workday Example",
+        ats_type="workday",
+        ats_slug="workdayexample",
+        watchlist=1,
+        source="discovery",
+    )
+    search_store.upsert_company(
+        search,
+        "Bad Slug",
+        ats_type="greenhouse",
+        ats_slug="bad/slug",
+        watchlist=1,
+        source="discovery",
+    )
+    career = _candidate(
+        search,
+        kind="career",
+        url="https://jobs.example.com/careers",
+        ats_type=None,
+        ats_slug=None,
+        name="jobs.example.com",
+    )
+    board = _candidate(
+        search,
+        url="https://boards.greenhouse.io/newrobotics",
+        ats_type="greenhouse",
+        ats_slug="newrobotics",
+        name="newrobotics",
+    )
+    same = _candidate(
+        search,
+        url="https://boards.greenhouse.io/examplerobotics",
+        ats_type="greenhouse",
+        ats_slug="examplerobotics",
+        name="Example Robotics",
+    )
+    discover.approve(search, career)
+    discover.approve(search, board)
+    discover.approve(search, same)
+    fetcher = Scripted(
+        {
+            url("greenhouse", "examplerobotics"): fetched(one_greenhouse("examplerobotics")),
+            url("greenhouse", "newrobotics"): fetched(one_greenhouse("newrobotics", ident=1002)),
+        }
+    )
+    lines = w.run(
+        search,
+        [company("Example Robotics", "greenhouse", "examplerobotics")],
+        today=DAY,
+        fetcher=fetcher,
+    )
+    assert fetcher.calls == [
+        url("greenhouse", "examplerobotics"),
+        url("greenhouse", "newrobotics"),
+    ]
+    assert "sampleseed" not in "\n".join(fetcher.calls)
+    assert "oldrobotics" not in "\n".join(fetcher.calls)
+    stored = postings(search)
+    assert [row["company"] for row in stored] == ["Example Robotics", "newrobotics"]
+    assert {row["source"] for row in stored} == {"watcher"}
+    search.execute("UPDATE postings SET llm_output = 'synthetic' WHERE source = 'watcher'")
+    other, _inserted = search_store.upsert_company(search, "Example Org", source="discovery")
+    search.execute(
+        "INSERT INTO postings (company_id, title, first_seen, source, llm_output) "
+        "VALUES (?, 'Customer Success Specialist', ?, 'discovery', 'synthetic')",
+        (other, DAY),
+    )
+    alerted = search_store.pending_alert_ids(search)
+    watcher_ids = [
+        int(row["id"])
+        for row in search.execute("SELECT id FROM postings WHERE source = 'watcher' ORDER BY id")
+    ]
+    discovery_ids = [
+        int(row["id"])
+        for row in search.execute("SELECT id FROM postings WHERE source = 'discovery'")
+    ]
+    assert alerted == watcher_ids
+    assert discovery_ids
+    assert not set(discovery_ids) & set(alerted)
+    career_row = search.execute(
+        "SELECT watchlist, source, careers_url FROM companies WHERE name = ?",
+        ("jobs.example.com",),
+    ).fetchone()
+    assert career_row is not None
+    assert career_row["watchlist"] == 0
+    assert career_row["source"] == "discovery"
+    assert career_row["careers_url"] == "https://jobs.example.com/careers"
+    assert search.execute("SELECT count(*) FROM applications").fetchone()[0] == 0
+    assert (datadir.root / "config.yaml").read_bytes() == sentinel
+    assert (datadir.root / "exclusions.yaml").read_bytes() == sentinel
+    assert ei.read_bytes() == b"synthetic-ei\n"
+    assert list(datadir.root.glob("ei_record_*")) == [ei]
+    assert any("newrobotics" in line for line in lines)

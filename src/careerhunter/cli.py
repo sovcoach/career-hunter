@@ -642,7 +642,16 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
 
 
 def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
-    """Queue companies from a local SearXNG. Prints rows and writes search.db only."""
+    """Queue companies, or approve or reject one pending row. Writes search.db only."""
+    action = args.discover_action
+    candidate_id = args.candidate_id
+    if action in ("approve", "reject"):
+        if not isinstance(candidate_id, int):
+            _err(f"error: discover {action} needs a candidate id")
+            return EXIT_ERROR
+    elif candidate_id is not None:
+        _err(f"error: discover {action} takes no candidate id")
+        return EXIT_ERROR
     if not datadir.config_path.is_file():
         _err("error: config.yaml is missing")
         return EXIT_ERROR
@@ -653,13 +662,11 @@ def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
     conn = db.connect(datadir.search_db_path)
     try:
         db.migrate(conn, "search")
-        if args.discover_action == "list":
-            rows: Sequence[discover.Queued] = discover.pending(conn)
-            notice = None
-        else:
-            outcome = discover.run(conn, doc, today=config_today(doc).isoformat())
-            rows = outcome.rows
-            notice = outcome.notice
+        try:
+            rows, notice = _discover_rows(conn, doc, action, candidate_id)
+        except discover.DiscoverError as exc:
+            _err(f"error: {exc}")
+            return EXIT_ERROR
     finally:
         conn.close()
     if notice:
@@ -667,6 +674,22 @@ def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
     for row in rows:
         print(discover.format_row(row))
     return EXIT_OK
+
+
+def _discover_rows(
+    conn: sqlite3.Connection,
+    doc: dict[str, Any],
+    action: str,
+    candidate_id: int | None,
+) -> tuple[Sequence[discover.Queued], str | None]:
+    if action == "list":
+        return discover.pending(conn), None
+    if action == "approve" and isinstance(candidate_id, int):
+        return (discover.approve(conn, candidate_id),), None
+    if action == "reject" and isinstance(candidate_id, int):
+        return (discover.reject(conn, candidate_id),), None
+    outcome = discover.run(conn, doc, today=config_today(doc).isoformat())
+    return outcome.rows, outcome.notice
 
 
 def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
@@ -892,7 +915,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("service_action", choices=("install", "uninstall", "status"))
     sub.add_parser(
         "watch",
-        help="fetch Greenhouse, Lever and Ashby boards on the watchlist once and exit",
+        help="fetch Greenhouse, Lever and Ashby boards on the watchlist, "
+        "and approved discovery boards, once and exit",
     )
     discover_parser = sub.add_parser(
         "discover",
@@ -901,9 +925,16 @@ def build_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument(
         "discover_action",
         nargs="?",
-        choices=("run", "list"),
+        choices=("run", "list", "approve", "reject"),
         default="run",
-        help="run: search and queue new rows; list: print pending rows",
+        help="run: search and queue new rows; list: print pending rows; "
+        "approve or reject: decide one pending row",
+    )
+    discover_parser.add_argument(
+        "candidate_id",
+        nargs="?",
+        type=int,
+        help="the pending row id for approve or reject",
     )
     sub.add_parser(
         "scout-prompt",
