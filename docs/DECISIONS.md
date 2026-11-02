@@ -20,10 +20,11 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1) |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
 | 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
-| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2) |
+| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019 |
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
+| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5) |
 
 ---
 
@@ -350,6 +351,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-015: Telegram is a cloud service: bot messages are kept minimal
 
+> **Amended by [ADR-019](#adr-019-local-embedding-vectors-live-in-searchdb-beside-the-llm-tier) (Phase 3.5).** A watcher alert also includes the tier name and, when a cosine is stored, that cosine. It still does not send notes, fit ratings, gaps, the model text, vectors, skip reasons, or the claim.
+
 **Context.**
 - The bot (Phase 2) talks to the operator through Telegram. Bot chats are not end-to-end encrypted: every message, both ways, passes through and is stored on Telegram's servers.
 - Telegram also holds updates the bot hasn't fetched yet for up to 24 hours, and keeps the chat history.
@@ -445,3 +448,33 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 **Trade-offs.**
 - A fixed offset doesn't follow any daylight-saving changes. Choosing between a name and an offset is left to the operator.
+
+## ADR-019: Local embedding vectors live in search.db beside the LLM tier
+
+**Context.**
+- The watcher scores each posting with a local chat model and stores a tier name from `gap_tiers`. That tier judges missing requirements. It does not measure how close the posting text is to a resume.
+- A cosine between one resume vector and each posting vector can sit beside that tier. It must not replace the tier, cause a skip, or decide an alert by itself.
+- The useful query is one cosine of one resume against the postings already in `search.db`, not nearest-neighbour search.
+- sqlite-vec 0.1.9, the latest stable release at the time of this decision, is still before 1.0. A `vec0` virtual table would be permanent checksummed SQL, and every open of that table would need the extension. `doctor`, `export`, `seed`, and the bot open `search.db` for other work.
+
+**Decision.**
+- **Float32 vectors are BLOBs in ordinary tables in `search.db`.** Search migration 0004 adds `resume_embedding` (one row: SHA-256 of the resume bytes, dimension, vector, timestamp) and `posting_embeddings` (one row per posting: dimension, vector, timestamp). `postings.embedding_score` holds the cosine, from -1 to 1, or null. The resume text and the posting text are not stored. The EI files stay on schema 1. `fit_rating` stays null.
+- **No native extension.** `search.db` stays mode 0600 and opens with the standard library.
+- **The embedding client is loopback only.** It posts to `http://127.0.0.1:1234/v1/embeddings` on the local LM Studio server, with the model id `local-embedding`. No redirects, and it is not `fetch.py`.
+- **The cosine is stored beside the LLM tier and never replaces it.** The existing skip rules stay as they are. A cosine does not cause a skip. The alert keeps company, title, and link, and adds `LLM: <tier>`. When a cosine is present, one more line is `similarity: 0.82`.
+- **A miss fails closed for that posting only.** If the resume file is missing, the embedding server is down, or a vector has the wrong dimension, that posting's cosine stays null. The watch log gets `embedding miss posting <id>: <reason>` and nothing else: no resume text, no posting text, and no vector. The run continues and still exits 0. The alert then has the LLM line only.
+- **The description is still not a column.** The first score pass embeds the in-memory text: company, title, location, work model, and the description when the board sent one. A later pass has only the stored fields. The vector is the only kept trace of that description. When the resume bytes change, stored posting vectors are compared again locally, without calling the model.
+- **`search.resume` is an optional path relative to the data folder.** The example is null. An absolute path or a `..` segment is invalid. The real path stays in the data-folder config.
+- **`fit_rubric.embedding_weight` is validated and the watcher does not apply it.** It is an optional number from 0 to 1. The example is null. The watcher does not read it for skips, alerts, or what it stores.
+- **Evaluation reads stored scores only.** `careerhunter embed-eval` does not call the model. The report is a mode 0600 file under `evals/` in the data folder. The terminal prints the relative path only. Spearman uses midranks and Pearson correlation on those ranks, from the standard library. LLM rank comes from the order of `gap_tiers`, best first. Precision at 5 and at 10 counts an application as a hit. Fewer than two comparable rows writes `undefined` and exits 0. If `embedding_weight` is set, the report also ranks `weight * cosine + (1 - weight) * tier`. That blend is not stored and not alerted.
+
+**Alternatives.**
+- sqlite-vec. Rejected: this corpus is one resume against existing rows, the library is still before 1.0, and a virtual table would force every opener of `search.db` to load a native extension.
+- A cloud embedding API. Rejected: the resume and the posting text stay on the machine.
+- Blending the two scores in the watcher. Rejected: the tier and the cosine answer different questions. The weight belongs in the evaluation report.
+- Storing the posting description so a later pass can embed the same text. Rejected: the description is not stored.
+
+**Trade-offs.**
+- A retry after the description is gone embeds only the stored fields, so it may not match the first vector.
+- Cosine is computed in Python over the stored BLOBs. That fits one resume against the rows on disk, and it needs no approximate index.
+- The report can show a weighted blend that the watcher never stores. That line is not the alert decision.

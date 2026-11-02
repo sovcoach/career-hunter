@@ -1012,8 +1012,12 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
     assert _poll(env) == 0
     sends = _sends(env)
     assert [p["text"] for p in sends] == [
-        "Example Robotics — Operations Coordinator\nhttps://jobs.example.com/ads/robotics",
-        "Example Staffing (agency) — Support Coordinator\nhttps://jobs.example.com/ads/staffing",
+        "Example Robotics — Operations Coordinator\n"
+        "https://jobs.example.com/ads/robotics\n"
+        "LLM: strong",
+        "Example Staffing (agency) — Support Coordinator\n"
+        "https://jobs.example.com/ads/staffing\n"
+        "LLM: strong",
     ]
     for params in sends:
         labels = [b["text"] for row in params["reply_markup"]["inline_keyboard"] for b in row]
@@ -1024,7 +1028,7 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
         "SENTINEL-llm-alert",
         "on_call",
         "over_weekend_limit",
-        "strong",
+        "similarity:",
     ):
         assert hidden not in sent
     conn = env.search()
@@ -1039,6 +1043,39 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
     before = len(_sends(env))
     assert _poll(env) == 0
     assert len(_sends(env)) == before
+
+
+def test_alert_adds_similarity_only_when_a_cosine_is_stored(env: Env, keep_umask: None) -> None:
+    robotics = _insert(
+        env,
+        "Example Robotics",
+        "Operations Coordinator",
+        "https://jobs.example.com/ads/robotics",
+    )
+    logistics = _insert(
+        env,
+        "Sample Logistics",
+        "Support Coordinator",
+        "https://jobs.example.com/ads/logistics",
+    )
+    conn = db.connect(env.datadir.search_db_path)
+    conn.execute("UPDATE postings SET embedding_score = ? WHERE id = ?", (0.82, robotics))
+    conn.execute("UPDATE postings SET embedding_score = ? WHERE id = ?", (-1.0, logistics))
+    conn.close()
+    assert _poll(env) == 0
+    assert [p["text"] for p in _sends(env)] == [
+        "Example Robotics — Operations Coordinator\n"
+        "https://jobs.example.com/ads/robotics\n"
+        "LLM: strong\n"
+        "similarity: 0.82",
+        "Sample Logistics — Support Coordinator\n"
+        "https://jobs.example.com/ads/logistics\n"
+        "LLM: strong\n"
+        "similarity: -1.00",
+    ]
+    sent = env.api.everything_sent()
+    assert "SENTINEL-gaps-alert" not in sent
+    assert "SENTINEL-llm-alert" not in sent
 
 
 def test_skips_unscored_and_other_sources_stay_silent(env: Env, keep_umask: None) -> None:
