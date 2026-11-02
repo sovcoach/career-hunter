@@ -209,6 +209,29 @@ def set_posting_score(
     )
 
 
+def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
+    """Watcher postings with a score, no skip, and no alert yet. Oldest id first."""
+    rows = conn.execute(
+        """
+        SELECT p.id FROM postings p
+        WHERE p.source = 'watcher'
+          AND p.llm_output IS NOT NULL
+          AND p.alerted_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
+        ORDER BY p.id
+        """
+    )
+    return [int(row["id"]) for row in rows]
+
+
+def mark_alerted(conn: sqlite3.Connection, posting_id: int, alerted_at: str) -> None:
+    """Record that Telegram accepted the alert. The caller sends first."""
+    conn.execute(
+        "UPDATE postings SET alerted_at = ? WHERE id = ?",
+        (alerted_at, posting_id),
+    )
+
+
 def insert_skip(conn: sqlite3.Connection, posting_id: int, date: str, reason: str) -> int:
     cur = conn.execute(
         "INSERT INTO skips (posting_id, date, reason) VALUES (?, ?, ?)",

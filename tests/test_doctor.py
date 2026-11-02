@@ -38,7 +38,7 @@ def test_a_clean_setup(ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixt
         "config.yaml     OK",
         "exclusions.yaml OK",
         "ei claim        OK  2026-27 active (from 2026-08-05)",
-        "search.db       OK  schema version 2",
+        "search.db       OK  schema version 3",
         "search.db       OK  0600",
         "claim 2026-27   OK  schema version 1",
         "claim 2026-27   OK  active, from 2026-08-05",
@@ -120,7 +120,7 @@ def test_schema_behind_is_reported_not_migrated(
     conn.close()
     code, out = doctor(probe, capsys)
     assert code == cli.EXIT_ERROR
-    assert "search.db       BAD schema version 0, expected 2; run: careerhunter migrate" in out
+    assert "search.db       BAD schema version 0, expected 3; run: careerhunter migrate" in out
     assert "reconcile       --  skipped until the problems above are fixed" in out
     conn = db.connect_read_only(path)
     assert db.schema_version(conn) == 0

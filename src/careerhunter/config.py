@@ -9,6 +9,8 @@ The structured fit criteria (issue #9) are optional sections alongside the origi
 fields. Validation lives here. `careerhunter watch` applies exclusions, hard gates,
 location rules, role filters and schedule limits. `score.py` then scores
 survivors against `gap_tiers` on a local loopback model and leaves `fit_rating` null.
+The bot sends one alert for each scored watcher posting. Quiet hours are not
+implemented.
 
 - search.lanes: named groups of target titles, by priority, optionally a fallback;
 - search.location_rules: places for on-site and hybrid work, regions for remote;

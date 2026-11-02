@@ -2,8 +2,9 @@
 
 One `careerhunter watch` run reads the watchlist and fetches those three boards, one
 company after another, through `fetch.py`. It writes companies, postings, skip reasons
-and local scores in `search.db`. It does not alert, write applications, EI rows or
-snapshots. `run` returns the log lines; the CLI prints them to stderr.
+and local scores in `search.db`. It does not call Telegram, write applications, EI
+rows or snapshots. The bot sends an alert for each scored posting when it polls.
+`run` returns the log lines; the CLI prints them to stderr.
 
 A posting that is already stored is not inserted again. Before the fetch, watcher rows
 that still have no skip are filtered again, and rows that are still unscored are

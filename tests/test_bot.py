@@ -21,7 +21,7 @@ import pytest
 import yaml
 
 from careerhunter import bot as botmod
-from careerhunter import claims, db, ledger, telegram
+from careerhunter import claims, db, ledger, search_store, telegram
 from careerhunter.bot import Bot, BotStartupError
 from careerhunter.claims import ClaimSettings
 from careerhunter.fetch import Fetched, FetchError
@@ -58,11 +58,15 @@ class FakeTelegram:
         self.updates: list[Any] = []
         self.files: dict[str, bytes] = {}
         self.me: Any = {"is_bot": True, "username": "synthetic_bot"}
+        self.fail_sends = 0
 
     def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
         params = params or {}
         self.calls.append((method, params))
         if method == "sendMessage":
+            if self.fail_sends:
+                self.fail_sends -= 1
+                raise telegram.TelegramError("sendMessage failed")
             return {"message_id": next(self.ids)}
         if method == "getMe":
             if isinstance(self.me, Exception):
@@ -925,3 +929,175 @@ def test_an_http_error_body_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None
     with pytest.raises(telegram.TelegramError) as exc:
         telegram.HttpTelegram(TOKEN).call("sendMessage", {"chat_id": CHAT, "text": "x"})
     assert "HTTP 400" in str(exc.value) and TOKEN not in str(exc.value)
+
+
+# --- watcher alerts -----------------------------------------------------------------------------
+
+
+def _poll(env: Env, polls: int = 1) -> int:
+    return botmod.run(
+        env.datadir,
+        secret=lambda _name: TOKEN,
+        api_factory=lambda _token: env.api,
+        clock=env.clock,
+        fetcher=env.web,
+        max_polls=polls,
+    )
+
+
+def _insert(
+    env: Env,
+    company: str,
+    title: str,
+    url: str,
+    *,
+    source: str = "watcher",
+    scored: bool = True,
+    skip: str | None = None,
+    schedule: str | None = None,
+) -> int:
+    conn = db.connect(env.datadir.search_db_path)
+    db.migrate(conn, "search")
+    posting = Posting(
+        company,
+        title,
+        "2026-10-28",
+        url=url,
+        source=source,
+        schedule=schedule,
+        gaps='["SENTINEL-gaps-alert"]' if scored else None,
+        llm_output='{"gaps":["SENTINEL-llm-alert"]}' if scored else None,
+        scout_metadata='{"tier": "strong"}' if scored else None,
+        fit_rating=8 if scored else None,
+    )
+    _, posting_id, _, _ = search_store.find_or_create_posting(
+        conn, posting, Dating("exact", day="2026-10-28")
+    )
+    if skip:
+        search_store.insert_skip(conn, posting_id, "2026-10-28", skip)
+    conn.close()
+    return posting_id
+
+
+def _sends(env: Env) -> list[dict[str, Any]]:
+    return [params for method, params in env.api.calls if method == "sendMessage"]
+
+
+def test_company_label_marks_only_the_agency_itself() -> None:
+    doc = {
+        "watchlist": [
+            {"name": " Acme Staffing ", "agency": True},
+            {"name": "Acme", "agency": False},
+        ]
+    }
+    assert botmod.company_label("acme staffing", doc) == "acme staffing (agency)"
+    assert botmod.company_label("Acme", doc) == "Acme"
+    assert botmod.company_label("Acme Client", doc) == "Acme Client"
+
+
+def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) -> None:
+    robotics = _insert(
+        env,
+        "Example Robotics",
+        "Operations Coordinator",
+        "https://jobs.example.com/ads/robotics",
+        schedule="over_weekend_limit on_call",
+    )
+    staffing = _insert(
+        env,
+        "Example Staffing",
+        "Support Coordinator",
+        "https://jobs.example.com/ads/staffing",
+    )
+    assert _poll(env) == 0
+    sends = _sends(env)
+    assert [p["text"] for p in sends] == [
+        "Example Robotics — Operations Coordinator\nhttps://jobs.example.com/ads/robotics",
+        "Example Staffing (agency) — Support Coordinator\nhttps://jobs.example.com/ads/staffing",
+    ]
+    for params in sends:
+        labels = [b["text"] for row in params["reply_markup"]["inline_keyboard"] for b in row]
+        assert labels == ["Applied", "Skipped"]
+    sent = env.api.everything_sent()
+    for hidden in (
+        "SENTINEL-gaps-alert",
+        "SENTINEL-llm-alert",
+        "on_call",
+        "over_weekend_limit",
+        "strong",
+    ):
+        assert hidden not in sent
+    conn = env.search()
+    found = conn.execute("SELECT id, alerted_at FROM postings")
+    rows = {int(row["id"]): row["alerted_at"] for row in found}
+    conn.close()
+    assert rows[robotics] == rows[staffing] == "2026-10-28T16:00:00Z"
+    writer = db.connect(env.datadir.search_db_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        writer.execute("UPDATE postings SET alerted_at = '2026-10-28' WHERE id = ?", (robotics,))
+    writer.close()
+    before = len(_sends(env))
+    assert _poll(env) == 0
+    assert len(_sends(env)) == before
+
+
+def test_skips_unscored_and_other_sources_stay_silent(env: Env, keep_umask: None) -> None:
+    _insert(
+        env,
+        "Example Robotics",
+        "Skipped Role",
+        "https://jobs.example.com/ads/skipped",
+        skip="location_rule",
+    )
+    _insert(
+        env,
+        "Sample Logistics",
+        "Unscored Role",
+        "https://jobs.example.com/ads/unscored",
+        scored=False,
+    )
+    _insert(
+        env,
+        "Example Org",
+        "Logged Role",
+        "https://jobs.example.com/ads/logged",
+        source="self_sourced",
+    )
+    _insert(
+        env,
+        "Example Robotics",
+        "Gap Tier Role",
+        "https://jobs.example.com/ads/gap",
+        skip="gap_tier",
+    )
+    assert _poll(env) == 0
+    assert _sends(env) == []
+    conn = env.search()
+    pending = conn.execute("SELECT count(*) FROM postings WHERE alerted_at IS NOT NULL").fetchone()[
+        0
+    ]
+    conn.close()
+    assert pending == 0
+
+
+def test_a_failed_send_is_retried_without_logging_the_posting(env: Env, keep_umask: None) -> None:
+    _insert(
+        env,
+        "Example Robotics",
+        "Operations Coordinator",
+        "https://jobs.example.com/ads/retry",
+    )
+    env.api.fail_sends = 1
+    assert _poll(env) == 0
+    conn = env.search()
+    assert conn.execute("SELECT alerted_at FROM postings").fetchone()[0] is None
+    conn.close()
+    log_text = (env.datadir.logs / "bot.log").read_text()
+    assert "alert failed (TelegramError)" in log_text
+    assert "Example Robotics" not in log_text
+    assert "Operations Coordinator" not in log_text
+    assert _poll(env) == 0
+    assert _sends(env)[-1]["text"].startswith("Example Robotics — Operations Coordinator")
+    conn = env.search()
+    assert conn.execute("SELECT alerted_at FROM postings").fetchone()[0] == "2026-10-28T16:00:00Z"
+    conn.close()
