@@ -24,7 +24,9 @@ LaunchAgent runs, default 60 and at least 15.
 
 With lanes present, search.target_titles becomes optional; with gap_tiers present, the
 fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
-optional. Every problem is reported in one pass.
+optional. search.resume and fit_rubric.embedding_weight are optional. resume is a path
+relative to the data folder. embedding_weight is a number from 0 to 1 and is not read
+for skips, alerts, or stored scores. Every problem is reported in one pass.
 
 schedule.timezone is the only place a time zone is set. It takes an IANA name
 (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); a fixed offset doesn't
@@ -89,6 +91,27 @@ def _number(doc: dict[str, Any], key: str, where: str, problems: list[str]) -> N
     value = doc.get(key)
     if value is not None and (isinstance(value, bool) or not isinstance(value, int | float)):
         problems.append(f"{where}.{key} must be a number")
+
+
+def _resume_path(value: Any, problems: list[str]) -> None:
+    """search.resume is null, or a relative path with no '..' segment."""
+    if value is None:
+        return
+    message = "search.resume must be a relative path inside the data folder"
+    if not isinstance(value, str) or not value.strip():
+        problems.append(message)
+        return
+    path = Path(value.strip())
+    if path.is_absolute() or ".." in path.parts:
+        problems.append(message)
+
+
+def _embedding_weight(value: Any, problems: list[str]) -> None:
+    """fit_rubric.embedding_weight is null, or a number from 0 to 1. Bools are refused."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int | float) or not 0 <= value <= 1:
+        problems.append("fit_rubric.embedding_weight must be a number from 0 to 1")
 
 
 def _int(value: Any) -> TypeGuard[int]:
@@ -263,6 +286,8 @@ def validate_config(doc: Any) -> list[str]:
         rules = _optional_mapping(search, "location_rules", "search", problems)
         if rules is not None:
             _validate_location_rules(rules, problems)
+        if "resume" in search:
+            _resume_path(search["resume"], problems)
 
     gates = _section(doc, "hard_gates", problems)
     for key in ("min_salary", "max_commute_km"):
@@ -271,6 +296,8 @@ def validate_config(doc: Any) -> list[str]:
     _validate_seniority(gates, problems)
 
     rubric = _section(doc, "fit_rubric", problems)
+    if "embedding_weight" in rubric:
+        _embedding_weight(rubric["embedding_weight"], problems)
     gap_tiers = _optional_mapping(rubric, "gap_tiers", "fit_rubric", problems)
     if gap_tiers is not None:
         _validate_gap_tiers(gap_tiers, problems)
