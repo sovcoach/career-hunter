@@ -354,17 +354,20 @@ Expected output:
 
 ```text
 installed ~/Library/LaunchAgents/org.careerhunter.bot.plist; the bot starts now and at every login
+installed ~/Library/LaunchAgents/org.careerhunter.watch.plist; careerhunter watch runs now and every 60 minutes
 ```
 
-It restarts if it stops, retrying once a minute (for example, while the data drive is still locked after a restart). Check it with `uv run careerhunter doctor`:
+The bot restarts if it stops, retrying once a minute (for example, while the data drive is still locked after a restart). The watch agent runs once and exits, then waits for `schedule.watcher_interval_minutes`. Check both with `uv run careerhunter doctor`:
 
 ```text
 telegram        OK  chat set
 bot service     OK  running (pid 4242)
 bot heartbeat   OK  polled within the last 5 minutes
+watch service   OK  loaded
+watch           --  no successful run yet
 ```
 
-Its log is `logs/bot.log` in your data folder. It records events only, never message text or the token. To stop it: `uv run careerhunter service uninstall`.
+The bot log is `logs/bot.log` in your data folder. It records events only, never message text or the token. A finished watch writes `logs/watch.success` and appends its log lines to `logs/watch.log`. To stop both: `uv run careerhunter service uninstall`. Changing the watch interval means uninstalling both services and installing them again.
 
 ### 10d. Using it
 

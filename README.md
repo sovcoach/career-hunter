@@ -23,13 +23,13 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
 | `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
-| `careerhunter bot run` / `service install` | Runs the Telegram bot, by hand or as a background service on the Mac |
+| `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
-| `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist once, records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The bot sends one alert for each scored posting |
+| `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist once, records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert for each scored posting |
 
 ## What it does *not* do (yet)
 
-- Quiet hours and the watch timer are not built. `careerhunter watch` does not call Telegram. The bot sends the alerts when it polls. Scoring stays on this Mac, at a loopback address.
+- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends the alerts when it polls. Scoring stays on this Mac, at a loopback address.
 - No automatic deletes, ever. Records are kept for at least the 6 years EI requires.
 - No cloud sync and no accounts. It is a local tool.
 

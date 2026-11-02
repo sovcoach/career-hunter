@@ -10,7 +10,8 @@ fields. Validation lives here. `careerhunter watch` applies exclusions, hard gat
 location rules, role filters and schedule limits. `score.py` then scores
 survivors against `gap_tiers` on a local loopback model and leaves `fit_rating` null.
 The bot sends one alert for each scored watcher posting. Quiet hours are not
-implemented.
+implemented. `schedule.watcher_interval_minutes` is how often the watch
+LaunchAgent runs, default 60 and at least 15.
 
 - search.lanes: named groups of target titles, by priority, optionally a fallback;
 - search.location_rules: places for on-site and hybrid work, regions for remote;
@@ -44,6 +45,8 @@ import yaml
 from careerhunter.claims import validate_section
 from careerhunter.enums import ATS_TYPES, WORK_MODELS
 
+DEFAULT_WATCH_INTERVAL_MINUTES = 60
+MIN_WATCH_INTERVAL_MINUTES = 15
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 
 
@@ -299,8 +302,11 @@ def validate_config(doc: Any) -> list[str]:
             except ValueError as exc:
                 problems.append(f"schedule.timezone: {exc}")
         interval = schedule.get("watcher_interval_minutes")
-        if interval is not None and (not _int(interval) or interval < 15):
-            problems.append("schedule.watcher_interval_minutes must be an integer >= 15")
+        if interval is not None and (not _int(interval) or interval < MIN_WATCH_INTERVAL_MINUTES):
+            problems.append(
+                "schedule.watcher_interval_minutes must be an integer >= "
+                f"{MIN_WATCH_INTERVAL_MINUTES}"
+            )
 
     limits = _optional_mapping(doc, "schedule_limits", "config", problems)
     if limits:
@@ -403,6 +409,19 @@ def parse_timezone(value: Any) -> dt.tzinfo:
         raise ValueError(
             f"{value!r} isn't a known time zone name or a UTC offset like UTC+05:30"
         ) from None
+
+
+def watch_interval_minutes(doc: dict[str, Any] | None) -> int:
+    """Minutes between watch runs. A missing or unusable value uses the default."""
+    if not isinstance(doc, dict):
+        return DEFAULT_WATCH_INTERVAL_MINUTES
+    schedule = doc.get("schedule")
+    if not isinstance(schedule, dict):
+        return DEFAULT_WATCH_INTERVAL_MINUTES
+    value = schedule.get("watcher_interval_minutes", DEFAULT_WATCH_INTERVAL_MINUTES)
+    if not _int(value) or value < MIN_WATCH_INTERVAL_MINUTES:
+        return DEFAULT_WATCH_INTERVAL_MINUTES
+    return value
 
 
 def timezone_name(doc: dict[str, Any]) -> str | None:
