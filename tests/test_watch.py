@@ -14,6 +14,7 @@ from careerhunter import watch as w
 from careerhunter.fetch import Fetched, FetchError
 from careerhunter.models import Posting
 from careerhunter.platform_checks import SystemProbe
+from careerhunter.score import Score
 from careerhunter.storage_guard import DataDir
 
 DAY = "2026-11-01"
@@ -317,13 +318,12 @@ def test_lever_board_normalizes_including_a_missing_work_model(
         {"text": "   "},
         "not-a-job",
     ]
-    # role_filters are validated on the watchlist and not applied by this command.
+    # Role filters are applied when the run is given config. This test is normalization.
     item = company(
         "Sample Logistics",
         "lever",
         "samplelogistics",
         careers_url="https://example.org/jobs",
-        role_filters={"role_families": ["support"], "work_models": ["remote"]},
     )
     fetcher = Scripted({url("lever", "samplelogistics"): fetched(payload)})
     lines = watched(search, datadir, [item], fetcher)
@@ -925,16 +925,20 @@ def test_watch_command_records_the_example_boards_without_a_socket(
                 [
                     {
                         "id": "abc-123",
-                        "text": "Warehouse Clerk",
+                        "text": "Operations Coordinator",
                         "hostedUrl": "https://jobs.lever.co/samplelogistics/abc-123",
-                        "categories": {"location": "Example City"},
+                        "categories": {"location": "Canada"},
                         "workplaceType": "remote",
                     }
                 ]
             )
         raise AssertionError(board)
 
+    def local_score(posting: object, config: object, **kwargs: object) -> Score:
+        return Score(llm_output='{"gaps":[]}', gaps="[]", tier="strong")
+
     monkeypatch.setattr(cli, "fetch_url", fake)
+    monkeypatch.setattr(cli, "score_posting", local_score)
     monkeypatch.setattr(cli, "config_today", lambda doc, now=None: dt.date(2026, 11, 1))
     assert cli.main(["watch"], probe=probe) == 0
     captured = capsys.readouterr()
@@ -951,10 +955,16 @@ def test_watch_command_records_the_example_boards_without_a_socket(
         rows = postings(conn)
         assert [(row["company"], row["title"], row["first_seen"]) for row in rows] == [
             ("Example Robotics", "Operations Coordinator", DAY),
-            ("Sample Logistics", "Warehouse Clerk", DAY),
+            ("Sample Logistics", "Operations Coordinator", DAY),
         ]
         for row in rows:
-            assert_watcher(row)
+            assert row["source"] == "watcher"
+            assert row["first_seen"] == DAY
+            assert row["fit_rating"] is None
+            assert row["gaps"] == "[]"
+            assert row["llm_output"] == '{"gaps":[]}'
+            assert row["scout_metadata"] == '{"tier": "strong"}'
+            assert row["snapshot_path"] is None
     finally:
         conn.close()
 

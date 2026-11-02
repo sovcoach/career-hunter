@@ -41,7 +41,7 @@ search:
 
 # Hard gates: a posting failing any of these is skipped, with the reason recorded.
 hard_gates:
-  min_salary: 55000            # in your local currency, per year
+  min_salary: null             # yearly pay below this is skipped; null turns the gate off
   max_commute_km: 40
   exclude_work_models: []      # e.g. [onsite]
   # Optional gates; a posting that trips one is skipped with that reason (Phase 3).
@@ -80,9 +80,7 @@ schedule:
   # A zone name (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); UTC if unset.
   timezone: UTC
   watcher_interval_minutes: 60    # optional
-  quiet_hours:
-    start: "21:00"
-    end: "07:00"
+  # Quiet hours are not implemented. Alerts go out whenever the bot polls.
 
 # Optional: limits on the work schedule. Anything above a limit is flagged (or
 # excluded, with over_limit: exclude).

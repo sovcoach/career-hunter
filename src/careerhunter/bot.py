@@ -17,7 +17,9 @@ Trust boundary (ADR-016):
   Before every write the bot re-reads config and re-checks the claims, as the CLI does.
 
 Privacy (ADR-015): messages the bot sends carry only company, title, link, status
-words and references. Never notes, fit, EI record details or claim labels.
+words and references. A watchlist agency with no separate employer stored is
+labelled " (agency)". Never notes, fit, gaps, model text, EI record details or
+claim labels.
 
 Dates: after Applied and a method, the bot asks when, with buttons (today, yesterday,
 this week, last week, or another date typed as YYYY-MM-DD). Exact days record precision
@@ -39,10 +41,12 @@ import secrets
 import sqlite3
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any
+
+import yaml
 
 from careerhunter import claims, db, enums, ledger, search_store, snapshots
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating
@@ -121,6 +125,26 @@ def _utc(moment: dt.datetime) -> str:
 
 def _words(value: str) -> str:
     return value.replace("_", " ")
+
+
+def company_label(company: str, doc: Mapping[str, Any]) -> str:
+    """The company line for an alert.
+
+    A watchlist entry with ``agency: true`` whose name is the stored company had no
+    separate employer on the posting, so the label gains `` (agency)``. A client name
+    stored from the board does not match that entry and stays as it is.
+    """
+    watchlist = doc.get("watchlist")
+    if not isinstance(watchlist, list):
+        return company
+    folded = company.casefold().strip()
+    for item in watchlist:
+        if not isinstance(item, dict) or item.get("agency") is not True:
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.casefold().strip() == folded:
+            return f"{company} (agency)"
+    return company
 
 
 def choice_dating(choice: str, today: dt.date) -> Dating:
@@ -315,6 +339,33 @@ class Bot:
             fh.write(self._now() + "\n")
         os.replace(tmp, path)
 
+    def _labelled_company(self, company: str) -> str:
+        """Agency suffix when config can be read. A bad config still sends the alert."""
+        try:
+            return company_label(company, self._config())
+        except (ConfigError, OSError, yaml.YAMLError, ValueError):
+            return company
+
+    def send_pending_alerts(self) -> None:
+        """Send each scored watcher posting that has not been alerted.
+
+        The message goes out first. ``alerted_at`` is set only after Telegram accepts
+        it. If the process stops between those two steps, the next poll sends it again.
+        A failed send leaves ``alerted_at`` null. Skips and unscored rows are not sent.
+        """
+        try:
+            with self._search() as search:
+                posting_ids = search_store.pending_alert_ids(search)
+        except (OSError, sqlite3.Error) as exc:
+            log.warning("pending alerts could not be read (%s)", type(exc).__name__)
+            return
+        for posting_id in posting_ids:
+            try:
+                with self._search() as search:
+                    self.alert(search, posting_id)
+            except (Refusal, TelegramError, OSError, sqlite3.Error) as exc:
+                log.warning("alert failed (%s); left for the next poll", type(exc).__name__)
+
     # --- entry point -------------------------------------------------------------------
 
     def handle(self, update: dict[str, Any]) -> str:
@@ -436,11 +487,13 @@ class Bot:
         posting = search_store.posting_by_id(search, posting_id)
         if posting is None:
             raise Refusal("That posting isn't in search.db any more.")
-        text = f"{posting.company} — {posting.title}" + (f"\n{posting.url}" if posting.url else "")
+        label = self._labelled_company(posting.company)
+        text = f"{label} — {posting.title}" + (f"\n{posting.url}" if posting.url else "")
         payload = {"posting_id": posting_id}
         self._keyboard(
             search, text, [[("Applied", "apply", payload), ("Skipped", "skip", payload)]], ALERT_TTL
         )
+        search_store.mark_alerted(search, posting_id, self._now())
 
     def _cmd_status(self, rest: str) -> None:
         parts = rest.split()
@@ -910,6 +963,7 @@ def run(
                 bot.save_offset(offset)
             log.info("update handled: %s", bot.handle_safely(update))
         bot.heartbeat()
+        bot.send_pending_alerts()
     return 0
 
 

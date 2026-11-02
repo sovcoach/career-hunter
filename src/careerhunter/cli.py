@@ -34,8 +34,10 @@ from careerhunter.config import (
 from careerhunter.config import today as config_today
 from careerhunter.export import export, plural
 from careerhunter.fetch import fetch as fetch_url
+from careerhunter.filters import PostingText
 from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.platform_checks import SystemProbe
+from careerhunter.score import Score, score_posting
 from careerhunter.seed import SeedError, Tally, import_seed
 from careerhunter.storage_guard import DataDir, StorageGuardError
 
@@ -523,10 +525,25 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
     entries = doc.get("watchlist", [])
     if not isinstance(entries, list):
         raise ConfigError(datadir.config_path, ["watchlist must be a list"])
+    exclusions: dict[str, Any] = {}
+    if datadir.exclusions_path.is_file():
+        exclusions = load_exclusions(datadir.exclusions_path)
+
+    def scorer(posting: PostingText) -> Score | None:
+        return score_posting(posting, doc)
+
     conn = db.connect(datadir.search_db_path)
     try:
         db.migrate(conn, "search")
-        lines = watch.run(conn, entries, today=config_today(doc).isoformat(), fetcher=fetch_url)
+        lines = watch.run(
+            conn,
+            entries,
+            today=config_today(doc).isoformat(),
+            fetcher=fetch_url,
+            config=doc,
+            exclusions=exclusions,
+            scorer=scorer,
+        )
     finally:
         conn.close()
     for line in lines:

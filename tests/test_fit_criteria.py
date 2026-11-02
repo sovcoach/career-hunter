@@ -57,6 +57,12 @@ def test_gap_tiers_make_weights_and_thresholds_optional() -> None:
     assert any("thresholds" in p for p in problems)
 
 
+def test_quiet_hours_are_not_in_the_example() -> None:
+    assert "quiet_hours" not in doc()["schedule"]
+    text = (ROOT / "config.example.yaml").read_text()
+    assert "Quiet hours are not implemented" in text
+
+
 def test_watcher_interval_is_optional() -> None:
     d = doc()
     del d["schedule"]["watcher_interval_minutes"]

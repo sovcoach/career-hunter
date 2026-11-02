@@ -6,7 +6,11 @@ data directory, never in code. The EI claim section is checked by
 claims.validate_section.
 
 The structured fit criteria (issue #9) are optional sections alongside the original
-fields, and are validated here only; scoring them is Phase 3:
+fields. Validation lives here. `careerhunter watch` applies exclusions, hard gates,
+location rules, role filters and schedule limits. `score.py` then scores
+survivors against `gap_tiers` on a local loopback model and leaves `fit_rating` null.
+The bot sends one alert for each scored watcher posting. Quiet hours are not
+implemented.
 
 - search.lanes: named groups of target titles, by priority, optionally a fallback;
 - search.location_rules: places for on-site and hybrid work, regions for remote;
