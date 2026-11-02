@@ -160,6 +160,31 @@ Edit these with TextEdit, or any plain-text editor:
 - **`exclusions.yaml`**: companies and keywords to skip.
 - **`seed.yaml`**: the applications and activities you've *already* done. Delete the example entries and add your own. The comments at the top explain each field. If you only remember roughly when you applied, use `date_precision: week` with `week_of`. If you don't remember at all, use `date_precision: unknown`. Don't guess an exact date. Include the job ad's `url` (or `requisition_id`) whenever you have it: it's how career-hunter tells a re-posted role apart from the original.
 
+### Which setting the watcher reads
+
+The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note you keep somewhere else is not applied. Map it onto a field:
+
+| What you decided | Field |
+|---|---|
+| Target titles, in priority groups | `search.lanes` |
+| Where on-site, hybrid, and remote work is acceptable | `search.location_rules` |
+| How many missing requirements still count | `fit_rubric.gap_tiers` |
+| Languages, credentials, shifts, pay, seniority, and a minimum salary | `hard_gates` |
+| A cap on weekend days | `schedule_limits` |
+| Which roles to keep at one company | that company's `role_filters` |
+| A staffing agency | `agency: true` on that watchlist entry |
+| Companies, title keywords, description keywords, and one role | `exclusions.yaml` |
+
+The templates use placeholder names such as Example Robotics, Example City, and Example Staffing Mill.
+
+`search.target_titles`, `search.locations`, and `search.work_models` still validate so an older file loads. The watcher does not match them. Use lanes and location rules.
+
+`fit_rubric.weights` and `fit_rubric.thresholds` are not applied. Scoring uses `gap_tiers` and leaves the numeric rating empty.
+
+`hard_gates.max_commute_km` and `hard_gates.exclude_work_models` are not applied.
+
+One `role_filters` block requires every family, work model, and place it lists. It cannot say "remote, or else Example City." Treating that as an AND would hide roles that should stay. There is no field for that or-rule yet.
+
 ### Refresh the scout prompt
 
 When a posting comes from a scout rather than `careerhunter watch`, the scout's instructions have to match the exclusions and the hard gates. After you change either file:
