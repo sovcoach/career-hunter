@@ -9,6 +9,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - The project is MIT licensed (ADR-021). See `LICENSE`.
+- `init` creates `evals/`. `doctor` tightens files there the same way it tightens `logs/`. A missing folder is reported and does not fail `doctor`. `backups/` stays unchecked.
 - `discovery.searxng_url` and `discovery.career_hosts` are optional and validated (ADR-020). The example leaves the URL null and the host list empty. The URL is plain http to a loopback host, with no userinfo. A career host is a hostname only: no scheme, path, wildcard, or `..`.
 - `discovery.interval_minutes` is optional and validated (ADR-020). Missing or null means 1440 minutes. A set value is an integer of at least 60. The example is 1440.
 - `careerhunter discover` asks a local SearXNG and queues company candidates in `search.db` (search migration 0005). Queries are `site:` restricted, at most 12. A hit is kept only when it reduces to a Greenhouse, Lever, or Ashby board, or to a host in `discovery.career_hosts`. The result title and snippet are not stored. A down server writes `discovery miss: unreachable` and the command still exits 0. A null URL makes no request. The EI schema is unchanged.

@@ -247,6 +247,46 @@ def test_reconciliation_gaps_are_reported(
     ) in out
 
 
+def test_a_missing_evals_folder_does_not_fail(
+    data_env: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["init"], probe=probe) == 0
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "evals/          OK  0 files, all owner-only" in out
+    (data_env / "evals").rmdir()
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "evals/          --  missing (run: careerhunter init)" in out
+
+
+def test_loose_evals_are_fixed(
+    data_env: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["init"], probe=probe) == 0
+    folder = data_env / "evals"
+    report = folder / "embed-eval-synthetic.txt"
+    report.write_text("synthetic\n")
+    os.chmod(report, 0o644)
+    child = folder / "nested"
+    child.mkdir(mode=0o755)
+    elsewhere = data_env / "elsewhere.txt"
+    elsewhere.write_text("synthetic")
+    os.chmod(elsewhere, 0o644)
+    (folder / "link").symlink_to(elsewhere)
+
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "evals/          FIXED embed-eval-synthetic.txt (0o644), nested (0o755)" in out
+    assert report.stat().st_mode & 0o777 == 0o600
+    assert child.stat().st_mode & 0o777 == 0o700
+    assert elsewhere.stat().st_mode & 0o777 == 0o644
+
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "evals/          OK  1 file, all owner-only" in out
+
+
 def test_loose_exports_and_snapshots_are_fixed(
     ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
 ) -> None:

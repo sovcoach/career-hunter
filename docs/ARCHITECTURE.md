@@ -58,7 +58,7 @@ A small "storage guard" runs before every command and checks that the data folde
 ├── exports/                              ← EI reports, timestamped, never overwritten
 ├── snapshots/<YYYY>/                     ← copies of job ads (0600; ADR-017)
 ├── logs/                                 ← bot.log, bot.heartbeat, watch.log, watch.success, discover.success (0600)
-├── evals/                                ← embed-eval reports (0600; ADR-019)
+├── evals/                                ← embed-eval reports; init creates it; doctor tightens it (0600)
 └── backups/                              ← reserved for later automation (ADR-001)
 ```
 

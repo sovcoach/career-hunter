@@ -963,6 +963,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
     _doctor_private_folder(report, "exports/", datadir.exports)
     _doctor_private_folder(report, "snapshots/", datadir.snapshots)
     _doctor_private_folder(report, "logs/", datadir.logs)
+    _doctor_private_folder(report, "evals/", datadir.evals)
     _doctor_bot(report, datadir, config_doc)
     _doctor_watch(report, datadir, config_doc)
     _doctor_discover(report, datadir, config_doc)
