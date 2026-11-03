@@ -4,7 +4,7 @@
 
 Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards, filters them, and scores the ones it keeps with a local model. The bot sends one alert for each scored posting.
+> **Status:** Phase 5 (ops and portfolio), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else. A private Telegram bot records applications, statuses and activities. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards, filters them, and scores the ones it keeps with a local model. A local embedding cosine can sit beside that tier. `careerhunter discover` queues companies from a local SearXNG for approval. The bot sends one alert for each scored posting, and it can approve or reject a pending discovery row.
 
 ---
 
@@ -22,7 +22,7 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter seed` | Imports your existing applications and activities from a simple YAML file, each into the right place. Re-running is safe: nothing is duplicated |
 | `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
 | `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
-| `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
+| `careerhunter secret set/verify` | Stores a secret (for example the Telegram bot token) in the macOS Keychain without ever showing it |
 | `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits. A set discovery URL also installs a discovery LaunchAgent |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
 | `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist, and approved discovery boards, once. It records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert for each scored posting |

@@ -132,11 +132,12 @@ created  $CAREERHUNTER_DATA_DIR
 created  $CAREERHUNTER_DATA_DIR/exports
 created  $CAREERHUNTER_DATA_DIR/snapshots
 created  $CAREERHUNTER_DATA_DIR/logs
+created  $CAREERHUNTER_DATA_DIR/evals
 created  $CAREERHUNTER_DATA_DIR/backups
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 1
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 6
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -249,7 +250,7 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 1
+search.db: applied nothing; schema version 6
 ei_record_2026-27.db: created; schema version 1
 EI claim 2026-27 (from 2026-08-02)
 ```
@@ -267,7 +268,7 @@ data dir        OK  $CAREERHUNTER_DATA_DIR (volume /Volumes/ExampleDrive, encryp
 config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
-search.db       OK  schema version 1
+search.db       OK  schema version 6
 search.db       OK  0600
 claim 2026-27   OK  schema version 1
 claim 2026-27   OK  active, from 2026-08-02
@@ -276,7 +277,7 @@ reconcile       OK  search.db and 1 claim record agree
 secret          telegram_bot_token: missing
 ```
 
-`telegram_bot_token: missing` is expected until Phase 2.
+`telegram_bot_token: missing` is expected until you store one with `careerhunter secret set`.
 
 ## Step 8: Import your history
 
