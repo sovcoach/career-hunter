@@ -24,6 +24,23 @@ def test_agents_md_holds_the_rules() -> None:
         assert heading in text
 
 
+def test_merges_are_local_and_in_utc() -> None:
+    text = _text(AGENTS)
+    assert "## Merging" in text
+    assert "TZ=UTC git merge --no-ff" in text
+    assert "never through GitHub's web UI" in text
+    assert "Create a merge commit" not in text
+    assert "merges on GitHub" not in text
+
+
+def test_the_operator_push_to_main_is_defined() -> None:
+    merging = _text(AGENTS).split("## Merging", 1)[1]
+    assert "CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push origin main" in merging
+    assert "Bypassed rule violations" in merging
+    assert "Agents never merge and never push `main`" in merging
+    assert "Never force-push `main`" in merging
+
+
 def test_claude_md_only_points_to_agents_md() -> None:
     text = _text(CLAUDE)
     assert "@AGENTS.md" in text.splitlines()
