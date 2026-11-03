@@ -24,38 +24,53 @@ def test_agents_md_holds_the_rules() -> None:
         assert heading in text
 
 
-def test_merges_are_local_and_in_utc() -> None:
+def test_merges_happen_on_github() -> None:
     text = _text(AGENTS)
-    assert "## Merging" in text
-    assert "TZ=UTC git merge --no-ff" in text
-    assert "never through GitHub's web UI" in text
-    assert "Create a merge commit" not in text
-    assert "merges on GitHub" not in text
+    merging = text.split("## Merging", 1)[1].split("\n## ", 1)[0]
+    assert 'on GitHub with "Create a merge commit" once its CI checks pass' in merging
+    assert "A local merge is optional." in merging
+    assert "never through GitHub's web UI" not in text
+    assert "TZ=UTC" not in text
 
 
-def test_the_operator_push_to_main_is_defined() -> None:
-    merging = _text(AGENTS).split("## Merging", 1)[1]
+def test_agents_never_merge_or_push_main() -> None:
+    merging = _text(AGENTS).split("## Merging", 1)[1].split("\n## ", 1)[0]
+    assert "Agents never merge, never push `main`, and never force-push `main`." in merging
+
+
+def test_the_optional_local_merge_push_is_defined() -> None:
+    merging = _text(AGENTS).split("## Merging", 1)[1].split("\n## ", 1)[0]
     assert "CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push origin main" in merging
     assert "Bypassed rule violations" in merging
-    assert "Agents never merge and never push `main`" in merging
-    assert "Never force-push `main`" in merging
 
 
-def test_adrs_010_to_012_record_the_local_merge() -> None:
+def test_privacy_rule_covers_paths_usernames_location_and_criteria() -> None:
+    privacy = _text(AGENTS).split("## Privacy in public files", 1)[1]
+    assert "location or region, username, or personal criteria" in privacy
+    assert "time zone offsets in commit and tag metadata are fine" in privacy
+
+
+def test_adrs_010_to_012_allow_web_merges_and_keep_the_record() -> None:
     decisions = _text(ROOT / "docs" / "DECISIONS.md")
+    web = "> **Amended: web merges allowed (#44).** Supersedes the local-merge note below."
+    local = "> **Amended: local merges (#44).**"
     for number in ("010", "011", "012"):
         section = decisions.split(f"## ADR-{number}:", 1)[1].split("\n## ADR-", 1)[0]
-        assert "> **Amended: local merges (#44).**" in section
+        assert web in section
+        assert local in section
+        assert section.index(web) < section.index(local)
+        assert "Web merges are allowed for operator convenience." in section
         row = next(line for line in decisions.splitlines() if line.startswith(f"| {number} |"))
-        assert row.endswith("amended (local merges) |")
+        assert row.endswith("amended (local merges); amended (web merges) |")
 
 
-def test_contributing_describes_the_local_merge() -> None:
-    workflow = _text(ROOT / "CONTRIBUTING.md").split("## Workflow", 1)[1].split("\n## ", 1)[0]
-    assert "TZ=UTC git merge --no-ff" in workflow
+def test_contributing_describes_the_web_merge() -> None:
+    contributing = _text(ROOT / "CONTRIBUTING.md")
+    workflow = contributing.split("## Workflow", 1)[1].split("\n## ", 1)[0]
+    assert '**Merge on GitHub** with "Create a merge commit"' in workflow
+    assert "A local merge is optional" in workflow
     assert "(AGENTS.md#merging)" in workflow
-    assert "never through GitHub's web UI" in workflow
-    assert "Merge through the PR" not in workflow
+    assert "TZ=UTC" not in contributing
 
 
 def test_claude_md_only_points_to_agents_md() -> None:
