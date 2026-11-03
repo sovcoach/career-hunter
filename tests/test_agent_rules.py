@@ -50,13 +50,18 @@ def test_privacy_rule_covers_paths_usernames_location_and_criteria() -> None:
     assert "time zone offsets in commit and tag metadata are fine" in privacy
 
 
-def test_adrs_010_to_012_record_the_local_merge() -> None:
+def test_adrs_010_to_012_allow_web_merges_and_keep_the_record() -> None:
     decisions = _text(ROOT / "docs" / "DECISIONS.md")
+    web = "> **Amended: web merges allowed (#44).** Supersedes the local-merge note below."
+    local = "> **Amended: local merges (#44).**"
     for number in ("010", "011", "012"):
         section = decisions.split(f"## ADR-{number}:", 1)[1].split("\n## ADR-", 1)[0]
-        assert "> **Amended: local merges (#44).**" in section
+        assert web in section
+        assert local in section
+        assert section.index(web) < section.index(local)
+        assert "Web merges are allowed for operator convenience." in section
         row = next(line for line in decisions.splitlines() if line.startswith(f"| {number} |"))
-        assert row.endswith("amended (local merges) |")
+        assert row.endswith("amended (local merges); amended (web merges) |")
 
 
 def test_contributing_describes_the_local_merge() -> None:
