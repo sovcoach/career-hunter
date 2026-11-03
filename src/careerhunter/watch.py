@@ -1,9 +1,12 @@
 """Fetch Greenhouse, Lever and Ashby boards, filter the new postings, then score them.
 
 One `careerhunter watch` run reads the watchlist and fetches those three boards, one
-company after another, through `fetch.py`. It writes companies, postings, skip reasons
-and local scores in `search.db`. It does not call Telegram, write applications, EI
-rows or snapshots. The bot sends an alert for each scored posting when it polls.
+company after another, through `fetch.py`. It also fetches companies stored with
+`source` discovery and `watchlist` 1 when the ATS type is Greenhouse, Lever, or Ashby
+and the slug is one path segment. A seeded watchlist row with any other source is not
+fetched by that extra path. It writes companies, postings, skip reasons and local
+scores in `search.db`. It does not call Telegram, write applications, EI rows or
+snapshots. The bot sends an alert for each scored posting when it polls.
 `run` returns the log lines; the CLI prints them to stderr.
 
 A posting that is already stored is not inserted again. Before the fetch, watcher rows
@@ -123,7 +126,7 @@ def run(
     _recheck(conn, watchlist, rules, skipped, today, lines)
     _score_waiting(conn, scorer, today, lines, embedder)
     blocked: set[str] = set()
-    for item in watchlist:
+    for item in _with_discovery_boards(conn, watchlist):
         entry = _entry(item)
         if entry is None:
             lines.append("watch: a watchlist entry has no name; skipped")
@@ -145,6 +148,37 @@ def run(
             embedder,
         )
     return lines
+
+
+def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -> list[Any]:
+    """Config entries, then approved discovery boards that are not already listed."""
+    items: list[Any] = list(watchlist)
+    seen: set[tuple[str, str]] = set()
+    for item in watchlist:
+        entry = _entry(item)
+        if entry is None:
+            continue
+        _name, ats, slug, _filters = entry
+        if ats and slug:
+            seen.add((ats, slug.casefold()))
+    rows = conn.execute(
+        "SELECT name, ats_type, ats_slug FROM companies "
+        "WHERE source = 'discovery' AND watchlist = 1 "
+        "AND ats_type IN ('greenhouse', 'lever', 'ashby') "
+        "AND ats_slug IS NOT NULL AND length(trim(ats_slug)) > 0 "
+        "ORDER BY id"
+    )
+    for row in rows:
+        ats = str(row["ats_type"])
+        slug = str(row["ats_slug"]).strip()
+        if board_url(ats, slug) is None:
+            continue
+        key = (ats, slug.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({"name": str(row["name"]), "ats_type": ats, "ats_slug": slug})
+    return items
 
 
 def _entry(item: object) -> tuple[str, str | None, str | None, Mapping[str, Any] | None] | None:

@@ -27,8 +27,10 @@ fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is a
 optional. search.resume and fit_rubric.embedding_weight are optional. resume is a path
 relative to the data folder. When it is set, the watcher stores a cosine beside the
 tier. embedding_weight is a number from 0 to 1. The watcher does not read it for
-skips, alerts, or stored scores. embed-eval may rank a blend with it. Every problem
-is reported in one pass.
+skips, alerts, or stored scores. embed-eval may rank a blend with it.
+discovery.searxng_url and discovery.career_hosts are optional. A null URL leaves
+discovery off. The URL is plain http to a loopback host, with no userinfo. A career
+host is a hostname only. Every problem is reported in one pass.
 
 schedule.timezone is the only place a time zone is set. It takes an IANA name
 (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); a fixed offset doesn't
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import urllib.parse
 import zoneinfo
 from pathlib import Path
 from typing import Any, TypeGuard
@@ -52,6 +55,11 @@ from careerhunter.enums import ATS_TYPES, WORK_MODELS
 DEFAULT_WATCH_INTERVAL_MINUTES = 60
 MIN_WATCH_INTERVAL_MINUTES = 15
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_CAREER_HOST = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
 
 
 class ConfigError(Exception):
@@ -114,6 +122,65 @@ def _embedding_weight(value: Any, problems: list[str]) -> None:
         return
     if isinstance(value, bool) or not isinstance(value, int | float) or not 0 <= value <= 1:
         problems.append("fit_rubric.embedding_weight must be a number from 0 to 1")
+
+
+def _searxng_url(value: Any, problems: list[str]) -> None:
+    """discovery.searxng_url is null, or plain http to a loopback host."""
+    if value is None:
+        return
+    message = "discovery.searxng_url must be an http loopback URL"
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        problems.append(message)
+        return
+    try:
+        parts = urllib.parse.urlsplit(value)
+        port = parts.port
+    except ValueError:
+        problems.append(message)
+        return
+    if (
+        parts.scheme != "http"
+        or parts.username is not None
+        or parts.password is not None
+        or parts.hostname not in _LOOPBACK_HOSTS
+        or parts.query
+        or parts.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        problems.append(message)
+
+
+def _career_hosts(value: Any, problems: list[str]) -> None:
+    """discovery.career_hosts is null or a list of hostnames. No scheme, path, or wildcard."""
+    if value is None:
+        return
+    if not isinstance(value, list):
+        problems.append("discovery.career_hosts must be a list of hostnames")
+        return
+    seen: set[str] = set()
+    for i, host in enumerate(value):
+        if not isinstance(host, str) or _CAREER_HOST.fullmatch(host) is None:
+            problems.append(f"discovery.career_hosts[{i}] must be a hostname")
+            continue
+        key = host.casefold()
+        if key in seen:
+            problems.append("discovery.career_hosts names must be unique")
+        seen.add(key)
+
+
+def _validate_discovery(section: Any, problems: list[str]) -> None:
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        problems.append("discovery must be a mapping")
+        return
+    extra = set(section) - {"searxng_url", "career_hosts"}
+    if extra:
+        problems.append(f"discovery has unknown keys: {sorted(extra)}")
+    if "searxng_url" in section:
+        _searxng_url(section["searxng_url"], problems)
+    if "career_hosts" in section:
+        _career_hosts(section["career_hosts"], problems)
 
 
 def _int(value: Any) -> TypeGuard[int]:
@@ -357,6 +424,7 @@ def validate_config(doc: Any) -> list[str]:
             _validate_watchlist_item(item, where, problems)
 
     _validate_telegram(doc.get("telegram"), problems)
+    _validate_discovery(doc.get("discovery"), problems)
     problems.extend(validate_section(doc.get("ei")))
     return problems
 
