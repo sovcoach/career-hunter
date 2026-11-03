@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from careerhunter import db, search_store, watch
+from careerhunter import db, loopback, search_store, watch
 from careerhunter import embed as embedding
 from careerhunter.embed import (
     DEFAULT_URL,
@@ -25,6 +25,7 @@ from careerhunter.filters import PostingText
 from careerhunter.models import Posting
 from careerhunter.score import Score
 from careerhunter.storage_guard import DataDir
+from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
 from tests.test_score import BROKEN, RUBRIC, broken_connection
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, url
 
@@ -456,36 +457,18 @@ def test_a_redirect_and_a_bad_body_are_unreachable() -> None:
 def test_the_default_transport_posts_once_and_does_not_follow_a_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, int]] = []
-
-    class Response:
-        status = 302
-
-        def read(self, _n: int) -> bytes:
-            return b"go away"
-
-    class Conn:
-        def __init__(self, host: str, port: int, timeout: float) -> None:
-            calls.append(("open", host, port))
-
-        def request(
-            self, method: str, path: str, body: bytes | None = None, headers: Any = None
-        ) -> None:
-            calls.append((method, path, len(body or b"")))
-
-        def getresponse(self) -> Response:
-            return Response()
-
-        def close(self) -> None:
-            calls.append(("close", "", 0))
-
-    monkeypatch.setattr(http.client, "HTTPConnection", Conn)
+    server = FakeServer(Reply(302, b"go away"))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
     with pytest.raises(EmbedError) as exc:
         embed_text(RESUME)
     assert str(exc.value) == "unreachable"
-    assert calls[0] == ("open", "127.0.0.1", 1234)
-    assert calls[1][0:2] == ("POST", "/v1/embeddings")
-    assert calls[2] == ("close", "", 0)
+    assert [(host, address, port) for host, address, port, _t in server.opened] == [
+        ("127.0.0.1", "127.0.0.1", 1234)
+    ]
+    assert [(method, path) for method, path, _b, _h in server.requests] == [
+        ("POST", "/v1/embeddings")
+    ]
+    assert server.closes == 1
     assert RESUME not in str(exc.value)
 
 
@@ -545,7 +528,7 @@ def test_cosine_of_known_vectors() -> None:
 def test_a_broken_reply_from_the_default_transport_is_unreachable(
     monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
-    monkeypatch.setattr(http.client, "HTTPConnection", broken_connection(error))
+    monkeypatch.setattr(loopback, "LoopbackConnection", broken_connection(error))
     with pytest.raises(EmbedError) as exc:
         embed_text(RESUME)
     assert str(exc.value) == "unreachable"
@@ -594,3 +577,38 @@ def test_a_bug_in_our_own_parser_still_raises(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(embedding, "_values", bug)
     with pytest.raises(RuntimeError, match="synthetic bug"):
         embed_text(RESUME, transport=lambda url, payload: (200, _vector([1.0, 0.0])))
+
+
+def test_a_1536_dimension_reply_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    vector = [round(-0.0123456789 + i * 1e-7, 10) for i in range(1536)]
+    body = json.dumps({"data": [{"embedding": vector}]}).encode()
+    assert len(body) > 20_000  # larger than the scoring cap this client used to share
+    monkeypatch.setattr(loopback, "LoopbackConnection", FakeServer(Reply(body=body)))
+    assert len(embed_text(RESUME)) == 1536
+
+
+def test_a_reply_over_the_embedding_cap_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = b"x" * (embedding.MAX_REPLY + 1)
+    server = FakeServer(Reply(body=body, step=65536))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME)
+    assert str(exc.value) == "unreachable"
+    assert server.reads == 17  # 16 full chunks, then the one that passes the cap
+
+
+def test_embedding_has_its_own_60_second_deadline(
+    monkeypatch: pytest.MonkeyPatch, loopback_watchdog: ManualWatchdog
+) -> None:
+    clock = FakeClock()
+    server = FakeServer(
+        Reply(body=b'{"data": [{"embedding": [1.0, 0.0]}]}', clock=clock, header_cost=61.0)
+    )
+    monkeypatch.setattr(loopback, "_clock", clock)
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME)
+    assert str(exc.value) == "unreachable"
+    assert [a.seconds for a in loopback_watchdog.armed] == [60.0]
+    assert [timeout for *_rest, timeout in server.opened] == [30.0]
+    assert RESUME not in str(exc.value)

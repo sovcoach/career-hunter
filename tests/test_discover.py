@@ -12,8 +12,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from careerhunter import cli, db, discover, search_store
+from careerhunter import cli, db, discover, loopback, search_store
 from careerhunter.platform_checks import SystemProbe
+from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
 from tests.test_score import BROKEN, broken_connection
 
 SNIPPET = "DO-NOT-LEAK-SNIPPET"
@@ -338,44 +339,18 @@ def test_list_does_not_refresh_discover_success(
 def test_the_client_returns_a_redirect_and_does_not_follow_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, str]] = []
-
-    class Response:
-        status = 302
-
-        def read(self, amount: int) -> bytes:
-            assert amount == discover.MAX_BODY + 1
-            return b"go away"
-
-    class Conn:
-        def __init__(self, host: str, port: int, timeout: float) -> None:
-            calls.append(("open", host, str(port)))
-
-        def request(
-            self,
-            method: str,
-            path: str,
-            body: bytes | None = None,
-            headers: dict[str, str] | None = None,
-        ) -> None:
-            assert headers == {"Accept": "application/json"}
-            calls.append((method, path, ""))
-
-        def getresponse(self) -> Response:
-            return Response()
-
-        def close(self) -> None:
-            calls.append(("close", "", ""))
-
-    monkeypatch.setattr(http.client, "HTTPConnection", Conn)
+    server = FakeServer(Reply(302, b"go away"))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
     status, body = discover.default_transport("http://127.0.0.1:8888/search?q=One&format=json")
     assert status == 302
     assert body == b"go away"
-    assert calls == [
-        ("open", "127.0.0.1", "8888"),
-        ("GET", "/search?q=One&format=json", ""),
-        ("close", "", ""),
+    assert [(host, address, port) for host, address, port, _t in server.opened] == [
+        ("127.0.0.1", "127.0.0.1", 8888)
     ]
+    assert server.requests == [
+        ("GET", "/search?q=One&format=json", None, {"Accept": "application/json"})
+    ]
+    assert server.closes == 1
     with pytest.raises(discover.DiscoverError):
         discover.default_transport("http://example.com/search?q=One")
 
@@ -668,7 +643,7 @@ def _rows(conn: sqlite3.Connection) -> int:
 def test_a_broken_reply_from_the_client_is_a_miss(
     monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
-    monkeypatch.setattr(http.client, "HTTPConnection", broken_connection(error))
+    monkeypatch.setattr(loopback, "LoopbackConnection", broken_connection(error))
     with pytest.raises(discover.DiscoverError) as exc:
         discover.default_transport("http://127.0.0.1:8888/search?q=One&format=json")
     assert str(exc.value) == discover.MISS
@@ -755,3 +730,32 @@ def test_a_reply_that_is_not_utf8_does_not_stop_the_command(
     assert captured.err == f"{discover.MISS}\n"
     assert _count(inited) == 0
     assert (inited / "logs" / "discover.success").is_file()
+
+
+def test_discovery_has_its_own_30_second_deadline(
+    monkeypatch: pytest.MonkeyPatch, loopback_watchdog: ManualWatchdog
+) -> None:
+    clock = FakeClock()
+    server = FakeServer(Reply(body=_body([_GOOD]), clock=clock, header_cost=31.0))
+    monkeypatch.setattr(loopback, "_clock", clock)
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    with pytest.raises(discover.DiscoverError) as exc:
+        discover.default_transport("http://127.0.0.1:8888/search?q=One&format=json")
+    assert str(exc.value) == discover.MISS
+    assert [a.seconds for a in loopback_watchdog.armed] == [30.0]
+    assert [timeout for *_rest, timeout in server.opened] == [20.0]
+
+
+def test_a_localhost_url_is_resolved_and_must_stay_on_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FakeServer(Reply(body=_body([_GOOD])))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    monkeypatch.setattr(loopback, "_resolver", lambda host, port, timeout: ["::1"])
+    status, _body_bytes = discover.default_transport("http://localhost:8888/search?q=One")
+    assert status == 200
+    assert [(host, address) for host, address, _p, _t in server.opened] == [("localhost", "::1")]
+    monkeypatch.setattr(loopback, "_resolver", lambda host, port, timeout: ["93.184.216.34"])
+    with pytest.raises(discover.DiscoverError):
+        discover.default_transport("http://localhost:8888/search?q=One")
+    assert len(server.opened) == 1  # the refused answer was never dialled

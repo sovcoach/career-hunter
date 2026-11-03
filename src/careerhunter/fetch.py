@@ -24,7 +24,6 @@ passes, which also covers the headers.
 
 from __future__ import annotations
 
-import contextlib
 import http.client
 import ipaddress
 import socket
@@ -38,7 +37,17 @@ from typing import Any, Protocol
 
 import truststore
 
-from careerhunter.deadline import BodyTooLarge, Clock, Deadline, DeadlineExceeded, read_capped
+from careerhunter.deadline import (
+    BodyTooLarge,
+    Clock,
+    Controls,
+    Deadline,
+    DeadlineExceeded,
+    Hop,
+    Watchdog,
+    read_capped,
+)
+from careerhunter.deadline import start_timer as _timer
 
 MAX_BYTES = 5 * 1024 * 1024
 MAX_REDIRECTS = 5
@@ -98,26 +107,14 @@ class Connection(Protocol):
     def close(self) -> None: ...
 
 
-class Armed(Protocol):
-    def cancel(self) -> None: ...
-
-
 Resolver = Callable[[str, int, float], list[str]]
 Connector = Callable[[str, str, str, int, float], Connection]
 Lookup = Callable[..., Sequence[tuple[Any, ...]]]
 Spawn = Callable[[Callable[[], None]], None]
-Watchdog = Callable[[float, Callable[[], None]], Armed]
 
 
 def _thread(work: Callable[[], None]) -> None:
     threading.Thread(target=work, daemon=True).start()
-
-
-def _timer(seconds: float, fire: Callable[[], None]) -> Armed:
-    timer = threading.Timer(seconds, fire)
-    timer.daemon = True
-    timer.start()
-    return timer
 
 
 def bounded_resolver(
@@ -175,27 +172,7 @@ def check_address(address: str) -> str:
     return str(ip)
 
 
-class _Controls:
-    """A timeout that can change between reads, and a shutdown another thread can call."""
-
-    sock: Any
-
-    def set_timeout(self, seconds: float) -> None:
-        if self.sock is not None:
-            self.sock.settimeout(seconds)
-
-    def abort(self) -> None:
-        """Wake a blocked read by shutting the socket down. No effect once closed."""
-        sock = self.sock
-        if sock is None:
-            return
-        # The plain socket's shutdown, not SSLSocket's: that one drops the SSL object
-        # first, which a read blocked in another thread is still using.
-        with contextlib.suppress(OSError, ValueError):
-            socket.socket.shutdown(sock, socket.SHUT_RDWR)
-
-
-class _PinnedHTTPConnection(_Controls, http.client.HTTPConnection):
+class _PinnedHTTPConnection(Controls, http.client.HTTPConnection):
     def __init__(self, host: str, address: str, port: int, timeout: float) -> None:
         super().__init__(host, port, timeout=timeout)
         self._address = address
@@ -204,7 +181,7 @@ class _PinnedHTTPConnection(_Controls, http.client.HTTPConnection):
         self.sock = socket.create_connection((self._address, self.port), self.timeout)
 
 
-class _PinnedHTTPSConnection(_Controls, http.client.HTTPSConnection):
+class _PinnedHTTPSConnection(Controls, http.client.HTTPSConnection):
     def __init__(
         self, host: str, address: str, port: int, timeout: float, context: ssl.SSLContext
     ) -> None:
@@ -223,35 +200,6 @@ def pinned_connector(scheme: str, host: str, address: str, port: int, timeout: f
         context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         return _PinnedHTTPSConnection(host, address, port, timeout, context)
     return _PinnedHTTPConnection(host, address, port, timeout)
-
-
-class _Hop:
-    """One connection and its watchdog. The lock keeps a late fire off a closing hop."""
-
-    def __init__(self, conn: Connection) -> None:
-        self.conn = conn
-        self.lock = threading.Lock()
-        self.closed = False
-        self.fired = False
-
-    def fire(self) -> None:
-        # Only this fire, which runs once, and close take the lock. A fire that cannot
-        # take it has arrived mid-close, and there is nothing left to abort.
-        if not self.lock.acquire(blocking=False):
-            return
-        try:
-            if self.closed:
-                return
-            self.fired = True
-            self.conn.abort()
-        finally:
-            self.lock.release()
-
-    def close(self, armed: Armed) -> None:
-        with self.lock:
-            self.closed = True
-            armed.cancel()
-            self.conn.close()
 
 
 def _late(host: str) -> str:
@@ -324,7 +272,7 @@ def fetch(
     for _ in range(max_redirects + 1):
         parts, host, port, address = _target(url, resolver, limit, timeout)
         conn = connector(parts.scheme, host, address, port, _step(limit, timeout, host))
-        hop = _Hop(conn)
+        hop = Hop(conn)
         armed = arm(limit.remaining(), hop.fire)
         try:
             path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))

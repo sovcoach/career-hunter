@@ -8,13 +8,20 @@ each redirect hop and each chunk of the body.
 `read_capped` reads a body in chunks with `read1`, which makes at most one `recv` per
 call. Before each chunk the socket timeout is set to the time left, so no single
 `recv` can outlast the deadline.
+
+A socket timeout cannot bound the reply headers, which `http.client` reads in many
+`recv` calls. A `Hop` pairs one connection with a watchdog timer that shuts the socket
+down when the deadline passes, which wakes any blocked read.
 """
 
 from __future__ import annotations
 
+import contextlib
+import socket
+import threading
 import time
 from collections.abc import Callable
-from typing import Protocol
+from typing import Any, Protocol
 
 Clock = Callable[[], float]
 CHUNK = 64 * 1024
@@ -30,6 +37,75 @@ class BodyTooLarge(Exception):
 
 class Chunked(Protocol):
     def read1(self, n: int = -1) -> bytes: ...
+
+
+class Armed(Protocol):
+    def cancel(self) -> None: ...
+
+
+class Abortable(Protocol):
+    def abort(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+Watchdog = Callable[[float, Callable[[], None]], Armed]
+
+
+def start_timer(seconds: float, fire: Callable[[], None]) -> Armed:
+    timer = threading.Timer(seconds, fire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+class Controls:
+    """A timeout that can change between reads, and a shutdown another thread can call."""
+
+    sock: Any
+
+    def set_timeout(self, seconds: float) -> None:
+        if self.sock is not None:
+            self.sock.settimeout(seconds)
+
+    def abort(self) -> None:
+        """Wake a blocked read by shutting the socket down. No effect once closed."""
+        sock = self.sock
+        if sock is None:
+            return
+        # The plain socket's shutdown, not SSLSocket's: that one drops the SSL object
+        # first, which a read blocked in another thread is still using.
+        with contextlib.suppress(OSError, ValueError):
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+
+class Hop:
+    """One connection and its watchdog. The lock keeps a late fire off a closing hop."""
+
+    def __init__(self, conn: Abortable) -> None:
+        self.conn = conn
+        self.lock = threading.Lock()
+        self.closed = False
+        self.fired = False
+
+    def fire(self) -> None:
+        # Only this fire, which runs once, and close take the lock. A fire that cannot
+        # take it has arrived mid-close, and there is nothing left to abort.
+        if not self.lock.acquire(blocking=False):
+            return
+        try:
+            if self.closed:
+                return
+            self.fired = True
+            self.conn.abort()
+        finally:
+            self.lock.release()
+
+    def close(self, armed: Armed) -> None:
+        with self.lock:
+            self.closed = True
+            armed.cancel()
+            self.conn.close()
 
 
 class Deadline:

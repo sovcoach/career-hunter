@@ -24,12 +24,17 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from careerhunter import db, search_store
+from careerhunter import db, loopback, search_store
+from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
-from careerhunter.score import ScoreError, Transport, default_transport, require_loopback
+from careerhunter.score import ScoreError, Transport, require_loopback
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/embeddings"
 MODEL_NAME = "local-embedding"
+TOTAL = 60.0
+TIMEOUT = 30.0
+# A 1536-dimension vector is about 21 KB of JSON; the cap leaves room for larger models.
+MAX_REPLY = 1_048_576
 _REASONS = frozenset({"unreachable", "no-resume", "dim-mismatch"})
 
 
@@ -61,6 +66,28 @@ def posting_text(posting: PostingText) -> str:
     if posting.description and posting.description.strip():
         lines.append(f"Description: {posting.description}")
     return "\n".join(lines)
+
+
+def default_transport(
+    url: str, payload: bytes, *, budget: Deadline | None = None
+) -> tuple[int, bytes]:
+    """POST once, within TOTAL. A redirect status is returned as-is and is not followed."""
+    host, port, path = require_loopback(url)
+    try:
+        return loopback.exchange(
+            "POST",
+            host,
+            port,
+            path,
+            body=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            total=TOTAL,
+            per_op=TIMEOUT,
+            max_bytes=MAX_REPLY,
+            budget=budget,
+        )
+    except loopback.LoopbackError:
+        raise EmbedError("unreachable") from None
 
 
 def embed_text(

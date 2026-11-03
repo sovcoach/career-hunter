@@ -5,12 +5,12 @@ from __future__ import annotations
 import http.client
 import json
 import sqlite3
-from typing import Any
 
 import pytest
 
+from careerhunter import loopback, watch
 from careerhunter import score as scoring
-from careerhunter import watch
+from careerhunter.deadline import Deadline
 from careerhunter.fetch import Fetched
 from careerhunter.filters import PostingText, decide
 from careerhunter.score import (
@@ -21,6 +21,7 @@ from careerhunter.score import (
     require_loopback,
     score_posting,
 )
+from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, postings, url
 
 RUBRIC = {
@@ -171,55 +172,22 @@ def test_a_non_loopback_url_is_not_requested() -> None:
 def test_the_default_transport_posts_once_and_does_not_follow_redirects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, int]] = []
-
-    class Response:
-        status = 302
-
-        def read(self, amount: int) -> bytes:
-            return b"go away"
-
-    class Conn:
-        def __init__(self, host: str, port: int, timeout: float) -> None:
-            calls.append(("open", host, port))
-
-        def request(
-            self,
-            method: str,
-            path: str,
-            body: bytes | None = None,
-            headers: Any = None,
-        ) -> None:
-            calls.append((method, path, len(body or b"")))
-
-        def getresponse(self) -> Response:
-            return Response()
-
-        def close(self) -> None:
-            calls.append(("close", "", 0))
-
-    monkeypatch.setattr(http.client, "HTTPConnection", Conn)
+    server = FakeServer(Reply(302, b"go away"))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
     status, body = default_transport(DEFAULT_URL, b"{}")
     assert status == 302 and body == b"go away"
-    assert calls == [
-        ("open", "127.0.0.1", 1234),
-        ("POST", "/v1/chat/completions", 2),
-        ("close", "", 0),
+    assert [(host, address, port) for host, address, port, _t in server.opened] == [
+        ("127.0.0.1", "127.0.0.1", 1234)
     ]
+    assert [(method, path, sent) for method, path, sent, _h in server.requests] == [
+        ("POST", "/v1/chat/completions", b"{}")
+    ]
+    assert server.closes == 1
 
 
 def test_a_refused_connection_stays_a_score_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Conn:
-        def __init__(self, host: str, port: int, timeout: float) -> None:
-            pass
-
-        def request(self, *args: object, **kwargs: object) -> None:
-            raise ConnectionRefusedError("synthetic")
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(http.client, "HTTPConnection", Conn)
+    server = FakeServer(Reply(error=ConnectionRefusedError("synthetic"), error_at="request"))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
     with pytest.raises(ScoreError):
         default_transport(DEFAULT_URL, b"{}")
 
@@ -354,44 +322,22 @@ BROKEN = [
 ]
 
 
-def broken_connection(error: Exception, *, at: str = "response") -> type:
-    """A fake HTTPConnection whose reply breaks, at getresponse() or in read()."""
-
-    class Response:
-        status = 200
-
-        def read(self, _amount: int) -> bytes:
-            raise error
-
-    class Conn:
-        def __init__(self, host: str, port: int, timeout: float) -> None:
-            pass
-
-        def request(self, *args: object, **kwargs: object) -> None:
-            pass
-
-        def getresponse(self) -> Response:
-            if at == "response":
-                raise error
-            return Response()
-
-        def close(self) -> None:
-            pass
-
-    return Conn
+def broken_connection(error: BaseException, *, at: str = "response") -> FakeServer:
+    """A fake local server whose reply breaks, at the status line or in the body."""
+    return FakeServer(Reply(error=error, error_at=at))
 
 
 @pytest.mark.parametrize("error", BROKEN, ids=lambda e: type(e).__name__)
 def test_a_broken_reply_is_a_score_error(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
-    monkeypatch.setattr(http.client, "HTTPConnection", broken_connection(error))
+    monkeypatch.setattr(loopback, "LoopbackConnection", broken_connection(error))
     with pytest.raises(ScoreError):
         default_transport(DEFAULT_URL, b"{}")
 
 
 def test_a_reply_that_breaks_mid_body_is_a_score_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        http.client,
-        "HTTPConnection",
+        loopback,
+        "LoopbackConnection",
         broken_connection(http.client.IncompleteRead(b"par"), at="read"),
     )
     with pytest.raises(ScoreError):
@@ -473,3 +419,39 @@ def test_a_broken_model_reply_leaves_postings_unscored_and_the_run_finishes(
     assert len(postings(search)) == 2
     assert sum("left unscored" in line for line in lines) == 2
     assert all(row["llm_output"] is None for row in postings(search))
+
+
+def _model(monkeypatch: pytest.MonkeyPatch, header_cost: float) -> tuple[FakeServer, FakeClock]:
+    clock = FakeClock()
+    server = FakeServer(Reply(body=reply('{"gaps": []}')[1], clock=clock, header_cost=header_cost))
+    monkeypatch.setattr(loopback, "_clock", clock)
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    return server, clock
+
+
+def test_a_reply_whose_headers_arrive_at_100_seconds_is_scored(
+    monkeypatch: pytest.MonkeyPatch, loopback_watchdog: ManualWatchdog
+) -> None:
+    server, _clock = _model(monkeypatch, header_cost=100.0)
+    result = score_posting(posting(), RUBRIC)
+    assert result is not None and result.tier == "strong"
+    # The reply does not stream, so one step may take the whole total.
+    assert [timeout for *_rest, timeout in server.opened] == [120.0]
+    assert [a.seconds for a in loopback_watchdog.armed] == [120.0]
+    assert [a.cancels for a in loopback_watchdog.armed] == [1]
+
+
+def test_a_reply_whose_headers_arrive_at_121_seconds_is_a_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, _clock = _model(monkeypatch, header_cost=121.0)
+    assert score_posting(posting(), RUBRIC) is None
+    assert server.reads == 0  # the body was never read
+    assert server.closes == 1
+
+
+def test_the_run_budget_can_end_scoring_sooner(monkeypatch: pytest.MonkeyPatch) -> None:
+    server, clock = _model(monkeypatch, header_cost=50.0)
+    with pytest.raises(ScoreError):
+        default_transport(DEFAULT_URL, b"{}", budget=Deadline(40.0, clock))
+    assert [timeout for *_rest, timeout in server.opened] == [40.0]
