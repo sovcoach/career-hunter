@@ -5,7 +5,8 @@ no redirects, and reads result URLs only. Titles, snippets, and the response bod
 not stored. A down server yields one closed miss line and writes nothing.
 
 Approve and reject update this queue, and a board approval can fill a company row.
-They do not rewrite config files, send Telegram, or open an EI record.
+They do not rewrite config files or open an EI record. The bot may call them.
+Sending the message is separate: `notified_at` is set only after Telegram accepts it.
 """
 
 from __future__ import annotations
@@ -68,6 +69,7 @@ class Queued:
     suggested_name: str
     ats_type: str | None
     ref: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -196,6 +198,27 @@ def pending(conn: sqlite3.Connection) -> list[Queued]:
         "FROM discovery_candidates WHERE status = 'pending' ORDER BY id"
     )
     return [_queued(row) for row in rows]
+
+
+def due(conn: sqlite3.Connection, *, notified_before: str) -> list[Queued]:
+    """Pending rows never sent, or last sent at or before `notified_before`."""
+    rows = conn.execute(
+        "SELECT id, kind, suggested_name, ats_type, ats_slug, url "
+        "FROM discovery_candidates "
+        "WHERE status = 'pending' AND (notified_at IS NULL OR notified_at <= ?) "
+        "ORDER BY id",
+        (notified_before,),
+    )
+    return [_queued(row) for row in rows]
+
+
+def mark_notified(conn: sqlite3.Connection, candidate_ids: Sequence[int], notified_at: str) -> None:
+    """Record that Telegram accepted the message for these rows."""
+    for candidate_id in candidate_ids:
+        conn.execute(
+            "UPDATE discovery_candidates SET notified_at = ? WHERE id = ?",
+            (notified_at, candidate_id),
+        )
 
 
 def approve(conn: sqlite3.Connection, candidate_id: int) -> Queued:
@@ -452,6 +475,7 @@ def _store(
                     suggested_name=hit.suggested_name,
                     ats_type=hit.ats_type,
                     ref=hit.ats_slug if hit.kind == "board" and hit.ats_slug else hit.url,
+                    url=hit.url,
                 )
             )
     return stored
@@ -576,4 +600,5 @@ def _queued(row: sqlite3.Row) -> Queued:
         suggested_name=str(row["suggested_name"]),
         ats_type=str(ats) if isinstance(ats, str) else None,
         ref=ref,
+        url=str(row["url"]),
     )
