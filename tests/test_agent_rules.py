@@ -41,6 +41,15 @@ def test_the_operator_push_to_main_is_defined() -> None:
     assert "Never force-push `main`" in merging
 
 
+def test_adrs_010_to_012_record_the_local_merge() -> None:
+    decisions = _text(ROOT / "docs" / "DECISIONS.md")
+    for number in ("010", "011", "012"):
+        section = decisions.split(f"## ADR-{number}:", 1)[1].split("\n## ADR-", 1)[0]
+        assert "> **Amended: local merges (#44).**" in section
+        row = next(line for line in decisions.splitlines() if line.startswith(f"| {number} |"))
+        assert row.endswith("amended (local merges) |")
+
+
 def test_claude_md_only_points_to_agents_md() -> None:
     text = _text(CLAUDE)
     assert "@AGENTS.md" in text.splitlines()
