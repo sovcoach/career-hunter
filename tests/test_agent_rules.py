@@ -24,21 +24,30 @@ def test_agents_md_holds_the_rules() -> None:
         assert heading in text
 
 
-def test_merges_are_local_and_in_utc() -> None:
+def test_merges_happen_on_github() -> None:
     text = _text(AGENTS)
-    assert "## Merging" in text
-    assert "TZ=UTC git merge --no-ff" in text
-    assert "never through GitHub's web UI" in text
-    assert "Create a merge commit" not in text
-    assert "merges on GitHub" not in text
+    merging = text.split("## Merging", 1)[1].split("\n## ", 1)[0]
+    assert 'on GitHub with "Create a merge commit" once its CI checks pass' in merging
+    assert "A local merge is optional." in merging
+    assert "never through GitHub's web UI" not in text
+    assert "TZ=UTC" not in text
 
 
-def test_the_operator_push_to_main_is_defined() -> None:
-    merging = _text(AGENTS).split("## Merging", 1)[1]
+def test_agents_never_merge_or_push_main() -> None:
+    merging = _text(AGENTS).split("## Merging", 1)[1].split("\n## ", 1)[0]
+    assert "Agents never merge, never push `main`, and never force-push `main`." in merging
+
+
+def test_the_optional_local_merge_push_is_defined() -> None:
+    merging = _text(AGENTS).split("## Merging", 1)[1].split("\n## ", 1)[0]
     assert "CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push origin main" in merging
     assert "Bypassed rule violations" in merging
-    assert "Agents never merge and never push `main`" in merging
-    assert "Never force-push `main`" in merging
+
+
+def test_privacy_rule_covers_paths_usernames_location_and_criteria() -> None:
+    privacy = _text(AGENTS).split("## Privacy in public files", 1)[1]
+    assert "location or region, username, or personal criteria" in privacy
+    assert "time zone offsets in commit and tag metadata are fine" in privacy
 
 
 def test_adrs_010_to_012_record_the_local_merge() -> None:
