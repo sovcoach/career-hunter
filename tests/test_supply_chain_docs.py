@@ -29,6 +29,20 @@ def test_adr_006_names_how_the_rule_is_enforced() -> None:
     assert "fails closed" in section
 
 
+def test_adr_006_limits_the_exception_to_listed_security_fixes() -> None:
+    section = _adr_006()
+    assert "allowed only when it fixes a known advisory" in section
+    assert (
+        "`scripts/lock_age_allowlist.toml` lists its package, exact version and advisory IDs"
+        in section
+    )
+    assert "fails on any entry whose package and version are no longer in `uv.lock`" in section
+
+
+def test_adr_006_names_the_per_package_cutoff() -> None:
+    assert "`[tool.uv] exclude-newer-package`" in _adr_006()
+
+
 def test_the_index_row_records_the_amendment() -> None:
     rows = DECISIONS.read_text(encoding="utf-8").splitlines()
     row = next(line for line in rows if line.startswith("| 006 |"))

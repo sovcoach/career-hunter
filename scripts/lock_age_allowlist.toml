@@ -1,0 +1,11 @@
+# Versions allowed in uv.lock although they were locked less than 14 days after
+# their upload, because they fix known advisories (ADR-006).
+#
+# Each entry names the package, the exact version, and the CVE, GHSA or PYSEC IDs it
+# fixes. scripts/check_lock_age.py fails on an entry whose package and version are no
+# longer in uv.lock, so remove an entry when that version leaves the lock.
+#
+# [[allow]]
+# package = "example-package"
+# version = "1.2.3"
+# advisories = ["CVE-2026-0001"]

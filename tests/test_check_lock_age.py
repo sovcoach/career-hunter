@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -70,8 +71,18 @@ def repo(tmp_path: Path) -> Path:
 
 
 def run(repo: Path) -> tuple[int, list[str]]:
-    count, violations = check_lock_age.check(repo, NOW)
-    return count, [v.line() for v in violations]
+    result = check_lock_age.check(repo, NOW)
+    return result.checked, [v.line() for v in result.violations]
+
+
+def write_allowlist(repo: Path, text: str) -> None:
+    path = repo / "scripts" / "lock_age_allowlist.toml"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def allow_entry(package: str, version: str, advisories: str = '["CVE-2026-0001"]') -> str:
+    return f'[[allow]]\npackage = "{package}"\nversion = "{version}"\nadvisories = {advisories}\n'
 
 
 def test_a_version_two_weeks_old_when_locked_passes(repo: Path) -> None:
@@ -205,7 +216,7 @@ def test_main_passes_and_says_so(repo: Path, capsys: pytest.CaptureFixture[str])
         "2026-02-01T00:00:00Z",
     )
     assert check_lock_age.main(["check_lock_age.py", str(repo)], now=NOW) == 0
-    assert "OK, all 1 locked versions" in capsys.readouterr().out
+    assert "OK, all 1 locked versions pass" in capsys.readouterr().out
 
 
 def test_main_explains_why_it_cannot_check(
@@ -213,3 +224,78 @@ def test_main_explains_why_it_cannot_check(
 ) -> None:
     assert check_lock_age.main(["check_lock_age.py", str(tmp_path)], now=NOW) == 1
     assert "cannot check: uv.lock not found" in capsys.readouterr().err
+
+
+YOUNG = [("example-widget", "1.0.0", "2026-01-01T00:00:00Z")]
+YOUNG_LOCKED = "2026-01-05T00:00:00Z"
+
+
+def test_a_listed_security_fix_is_allowed(repo: Path) -> None:
+    commit_lock(repo, lock_text(YOUNG), YOUNG_LOCKED)
+    write_allowlist(
+        repo, allow_entry("example-widget", "1.0.0", '["CVE-2026-0001", "GHSA-2c3f-gh4j-m5pq"]')
+    )
+    result = check_lock_age.check(repo, NOW)
+    assert result.violations == [] and result.stale == []
+    assert result.allowed == [
+        check_lock_age.Allowed("example-widget", "1.0.0", ("CVE-2026-0001", "GHSA-2c3f-gh4j-m5pq"))
+    ]
+
+
+def test_an_allowlist_name_matches_however_it_is_spelled(repo: Path) -> None:
+    commit_lock(repo, lock_text(YOUNG), YOUNG_LOCKED)
+    write_allowlist(repo, allow_entry("Example_Widget", "1.0.0"))
+    result = check_lock_age.check(repo, NOW)
+    assert result.violations == [] and len(result.allowed) == 1
+
+
+def test_an_entry_for_another_version_does_not_excuse_this_one(repo: Path) -> None:
+    commit_lock(repo, lock_text(YOUNG), YOUNG_LOCKED)
+    write_allowlist(repo, allow_entry("example-widget", "0.9.0"))
+    result = check_lock_age.check(repo, NOW)
+    assert [v.name for v in result.violations] == ["example-widget"]
+    assert [(s.name, s.version) for s in result.stale] == [("example-widget", "0.9.0")]
+
+
+def test_a_stale_entry_fails_even_when_every_version_is_old_enough(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commit_lock(repo, lock_text(YOUNG), "2026-02-01T00:00:00Z")
+    write_allowlist(repo, allow_entry("example-gadget", "2.0.0"))
+    assert check_lock_age.main(["check_lock_age.py", str(repo)], now=NOW) == 1
+    err = capsys.readouterr().err
+    assert "stale entries in scripts/lock_age_allowlist.toml" in err
+    assert "example-gadget 2.0.0 is not in uv.lock" in err
+
+
+def test_main_names_the_allowed_fixes(repo: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    commit_lock(repo, lock_text(YOUNG), YOUNG_LOCKED)
+    write_allowlist(repo, allow_entry("example-widget", "1.0.0"))
+    assert check_lock_age.main(["check_lock_age.py", str(repo)], now=NOW) == 0
+    out = capsys.readouterr().out
+    assert "allowed as a security fix: example-widget 1.0.0 (1 advisories)" in out
+
+
+def test_an_empty_allowlist_excuses_nothing(repo: Path) -> None:
+    commit_lock(repo, lock_text(YOUNG), YOUNG_LOCKED)
+    write_allowlist(repo, "# no entries\n")
+    assert len(check_lock_age.check(repo, NOW).violations) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("[[allow]\n", "not valid TOML"),
+        ('owner = "someone"\n', "may only hold [[allow]] entries"),
+        ('[[allow]]\npackage = "example-widget"\nversion = "1.0.0"\n', "exactly package"),
+        (allow_entry("example-widget", "1.0.0", "[]"), "advisories must list"),
+        (allow_entry("example-widget", "1.0.0", '["not-an-id"]'), "advisories must list"),
+        (allow_entry("example-widget", "", '["CVE-2026-0001"]'), "version must be"),
+        (allow_entry("example-widget", "1.0.0") * 2, "repeats example-widget 1.0.0"),
+    ],
+)
+def test_a_malformed_allowlist_fails_closed(repo: Path, text: str, message: str) -> None:
+    commit_lock(repo, lock_text(YOUNG), YOUNG_LOCKED)
+    write_allowlist(repo, text)
+    with pytest.raises(check_lock_age.LockAgeError, match=re.escape(message)):
+        check_lock_age.check(repo, NOW)
