@@ -214,6 +214,8 @@ careerhunter discover reject 4
 
 `approve` marks that pending row approved. A board becomes a company with `watchlist` 1, and a new company has `source` discovery. The next `careerhunter watch` fetches that board. A career page stores `careers_url` and is not fetched. `reject` stores the rejection and inserts no company. Neither command rewrites `config.yaml` or `exclusions.yaml`.
 
+The bot does the same thing from the allowlisted chat. Each pending row is one message with the suggested name, the URL, and Approve and Reject. When more than five are waiting, one message lists up to eight, and the rest follow on a later poll. A tap that does not apply answers `Not changed.` and leaves the row pending.
+
 ### Compare a cosine with the tier
 
 `careerhunter embed-eval` reads stored cosines and tiers. It does not call the model. The report is a mode 0600 file under `evals/` in the data folder. The terminal prints the relative path only. When `fit_rubric.embedding_weight` is set, the report also ranks `weight * cosine + (1 - weight) * tier`. That blend is not stored and not sent.
@@ -429,7 +431,15 @@ watch service   OK  loaded
 watch           --  no successful run yet
 ```
 
-The bot log is `logs/bot.log` in your data folder. It records events only, never message text or the token. A finished watch writes `logs/watch.success` and appends its log lines to `logs/watch.log`. To stop both: `uv run careerhunter service uninstall`. Changing the watch interval means uninstalling both services and installing them again.
+The bot log is `logs/bot.log` in your data folder. It records events only, never message text or the token. A finished watch writes `logs/watch.success` and appends its log lines to `logs/watch.log`. To stop them: `uv run careerhunter service uninstall`. Changing an interval means uninstalling the services and installing them again.
+
+A null `discovery.searxng_url` leaves the discovery agent out. `doctor` then shows `discovery agent --  off`. Set the URL and run `service install` again. It adds `org.careerhunter.discover` and leaves the bot and watch agents as they are. The new line looks like:
+
+```text
+installed ~/Library/LaunchAgents/org.careerhunter.discover.plist; careerhunter discover runs now and every 1440 minutes
+```
+
+That agent runs once and exits, then waits for `discovery.interval_minutes`. A finished search writes `logs/discover.success`. It does not write `discover.log`. Approve and reject do not refresh that stamp. `doctor` shows the agent and how old the stamp is. A stamp older than two intervals is a failure. A warning, such as a plist left behind after the URL is set back to null, does not fail `doctor`. `service uninstall` removes the bot, the watch agent, and the discovery agent.
 
 ### 10d. Using it
 

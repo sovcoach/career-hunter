@@ -20,7 +20,9 @@ SQLite can't commit atomically across two WAL databases, so the order is fixed:
 If step 3 fails, the EI record still stands and PartialWriteError says so; `doctor`
 reports the gap. `reconcile()` compares the two layers in both directions.
 
-A skip is a search-only decision: it never opens an EI file.
+A skip is a search-only decision: it never opens an EI file. A discovery
+decision is search-only too: it approves or rejects one queued company and
+does not open an EI file.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from careerhunter import ei_store, enums, search_store
+from careerhunter import discover, ei_store, enums, search_store
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating, read_file_claim
 from careerhunter.db import transaction
 from careerhunter.ei_store import EiApplication
@@ -149,6 +151,17 @@ def record_status(
                 )
             ei_store.add_status(to_ei.conn, ei_id, status, status_date)
     return to_ei is not None
+
+
+def record_discovery_decision(
+    search: sqlite3.Connection, candidate_id: int, decision: str
+) -> discover.Queued:
+    """Approve or reject one queued company. Opens no EI file."""
+    if decision == "approve":
+        return discover.approve(search, candidate_id)
+    if decision == "reject":
+        return discover.reject(search, candidate_id)
+    raise ValueError(f"unknown discovery decision {decision!r}")
 
 
 def record_skip(search: sqlite3.Connection, posting: Posting, date: str, reason: str) -> int:

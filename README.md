@@ -23,12 +23,12 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
 | `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
-| `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits |
+| `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits. A set discovery URL also installs a discovery LaunchAgent |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
 | `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist, and approved discovery boards, once. It records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert for each scored posting |
 | `careerhunter scout-prompt` | Prints a scout prompt from exclusions and the hard gates the watcher skips on. Writes nothing |
 | `careerhunter embed-eval` | Ranks stored cosines against LLM tiers. Writes a private report under `evals/` and prints only that relative path |
-| `careerhunter discover` | Queues companies from a local SearXNG into `search.db`. `approve` and `reject` update that queue only and do not fetch pages. An approved board is fetched on the next `careerhunter watch` |
+| `careerhunter discover` | Queues companies from a local SearXNG into `search.db`. `approve` and `reject` update that queue only and do not fetch pages. The bot can approve or reject a pending row from the allowlisted chat. That message is the suggested name and the URL. An approved board is fetched on the next `careerhunter watch`. When the URL is set, `service install` runs this search once per `discovery.interval_minutes` and exits |
 
 ## What it does *not* do (yet)
 

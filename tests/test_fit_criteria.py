@@ -11,6 +11,8 @@ import pytest
 import yaml
 
 from careerhunter.config import (
+    discovery_enabled,
+    discovery_interval_minutes,
     telegram_chat_id,
     timezone,
     today,
@@ -35,6 +37,7 @@ def test_the_template_uses_every_new_field_and_is_valid() -> None:
     assert d["fit_rubric"]["embedding_weight"] is None
     assert d["discovery"]["searxng_url"] is None
     assert d["discovery"]["career_hosts"] == []
+    assert d["discovery"]["interval_minutes"] == 1440
     assert "gap_tiers" in d["fit_rubric"]
     assert {"seniority_words", "title_exceptions", "shift_patterns"} <= set(d["hard_gates"])
     assert "schedule_limits" in d
@@ -71,6 +74,29 @@ def test_watcher_interval_is_optional() -> None:
     d = doc()
     del d["schedule"]["watcher_interval_minutes"]
     assert validate_config(d) == []
+
+
+def test_discovery_interval_defaults_to_a_day() -> None:
+    d = doc()
+    assert discovery_enabled(d) is False
+    assert discovery_interval_minutes(d) == 1440
+    d["discovery"]["searxng_url"] = "http://127.0.0.1:8888/search"
+    assert discovery_enabled(d) is True
+    d["discovery"]["searxng_url"] = None
+    del d["discovery"]["interval_minutes"]
+    assert validate_config(d) == []
+    assert discovery_interval_minutes(d) == 1440
+    d["discovery"]["interval_minutes"] = None
+    assert validate_config(d) == []
+    assert discovery_interval_minutes(d) == 1440
+    d["discovery"]["interval_minutes"] = 60
+    assert validate_config(d) == []
+    assert discovery_interval_minutes(d) == 60
+    del d["discovery"]
+    assert discovery_interval_minutes(d) == 1440
+    assert discovery_interval_minutes(None) == 1440
+    assert discovery_enabled(d) is False
+    assert discovery_enabled(None) is False
 
 
 def test_discovery_settings_are_optional() -> None:
@@ -180,6 +206,11 @@ def _set(path: str, value: Any) -> Any:
             _set("discovery.career_hosts", ["jobs.example.com", "Jobs.Example.com"]),
             "names must be unique",
         ),
+        (_set("discovery.interval_minutes", 59), "integer >= 60"),
+        (_set("discovery.interval_minutes", True), "integer >= 60"),
+        (_set("discovery.interval_minutes", False), "integer >= 60"),
+        (_set("discovery.interval_minutes", "daily"), "integer >= 60"),
+        (_set("discovery.interval_minutes", 60.5), "integer >= 60"),
         (_set("discovery", "on"), "discovery must be a mapping"),
         (_set("discovery.token", "x"), "unknown keys"),
         (_set("telegram.chat_id", "me"), "telegram.chat_id"),

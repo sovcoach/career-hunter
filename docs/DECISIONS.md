@@ -25,7 +25,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
 | 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5) |
-| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4) |
+| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended |
 
 ---
 
@@ -482,6 +482,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-020: Discovery asks a local SearXNG and queues companies for approval
 
+> **Amended.** Two additions. Pending discovery rows can be approved or rejected from the allowlisted Telegram chat, with the same rules as the CLI. `discovery.interval_minutes` schedules an optional one-shot LaunchAgent for `careerhunter discover`. The decision bullets added below specify both. The earlier bullets stay as the record of the first slice.
+
 **Context.**
 - The watcher fetches Greenhouse, Lever, and Ashby boards named on the config watchlist. It does not look for companies that are not already listed.
 - A cloud search API would put a vendor key in this tool and send every query to that account. The useful search is a few site-restricted queries, run on purpose.
@@ -497,8 +499,10 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - **A career host is a hostname only.** No scheme, path, wildcard, or `..`. The example list is empty. A hit is kept only when it reduces to a Greenhouse, Lever, or Ashby slug, or to `https` on one of those career hosts. The slug is one path segment, the same rule the watcher uses. Every other host is dropped. The command does not fetch the result or parse HTML.
 - **The queue is `discovery_candidates` in `search.db`.** Search migration 0005 adds it. The EI track stays at version 1. A row is a board or a career page, with the reduced URL, the ATS type and slug when there is one, a suggested name, and a status of pending, approved, or rejected. The suggested name is the slug, or the host for a career page. There is no snippet column and no raw response. The same key is not inserted again once it is pending, approved, or rejected, or already on the config watchlist.
 - **Approve and reject are CLI commands.** They do not rewrite `config.yaml` or `exclusions.yaml`, and they do not send Telegram messages. Approving a board inserts or fills a company with `watchlist = 1`. A new company uses `source = 'discovery'`. An existing company's source is left as it is, and a stored ATS identity that disagrees is refused. The next `careerhunter watch` also fetches companies where `source = 'discovery'`, `watchlist = 1`, and the ATS type is Greenhouse, Lever, or Ashby with a valid slug. Config watchlist entries are fetched as they are today. A seeded watchlist row with any other source is not fetched by this extra path. From that fetch on, the existing filter, score, cosine, and alert path owns the board. Approving a career page stores `careers_url` with `watchlist = 0` and does not fetch it. Rejecting a row stores that status and does not insert a company.
-- **A miss fails closed for the run.** A down server, a non-200 status, or a body that is not JSON writes `discovery miss: unreachable` and nothing else. The run still exits 0 and writes no queue row. There is no discovery LaunchAgent in this slice.
+- **A miss fails closed for the run.** A down server, a non-200 status, or a body that is not JSON writes `discovery miss: unreachable` and nothing else. The run still exits 0 and writes no queue row. There is no discovery LaunchAgent in this slice. The amendment above adds one.
 - **No EI write.** The commands open `search.db` only. They do not write applications, snapshots, or EI rows.
+- **Telegram approve and reject use the same rules.** After a poll, the bot may send a pending row to the allowlisted chat. The message is the suggested name and the reduced URL, plus Approve and Reject. The buttons are opaque single-use tokens. A tap calls `discover.approve` or `discover.reject` through the ledger and opens `search.db` only. It does not rewrite config files and it does not open an EI record. Search migration 0006 records `notified_at` after Telegram accepts the message. At most five pending rows are one message each. More than five are one digest of at most eight, and the rest wait for a later poll.
+- **`discovery.interval_minutes` is optional.** Missing or null means 1440 minutes, once a day. A set value is an integer of at least 60. When `discovery.searxng_url` is set, `service install` also installs `org.careerhunter.discover`. That agent runs `careerhunter discover` once per the interval and exits. It has no `KeepAlive`. A null URL does not install it. A run that exits 0 writes `logs/discover.success`. Approve and reject do not write that stamp. `doctor` reports whether the agent is loaded and whether the stamp is within two intervals.
 
 **Alternatives.**
 - A cloud search API. Rejected: this tool would hold a vendor key, and every query would go to that account.
@@ -506,9 +510,13 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - Rewriting `config.yaml` on approve. Rejected: a dump of the file would drop the operator's comments and reorder keys.
 - Inserting postings from result titles and snippets. Rejected: a hit is not a board payload, and the snippet would become stored page text.
 - Fetching or crawling career pages in this slice. Rejected: that is open web scraping. A career page is recorded and left unfetched.
-- Telegram approve and reject buttons. Rejected for this slice: that is a new write path on the bot.
+- Telegram approve and reject buttons. Rejected for the first slice. The amendment above accepts them, and the write stays the existing approve and reject functions.
+- A discovery daemon with `KeepAlive`. Rejected: one shot per interval matches the watch agent. A crash waits for the next interval.
+- Installing the discovery agent when the URL is null. Rejected: it would run an off discovery on a timer.
 
 **Trade-offs.**
 - The query string leaves the machine. SearXNG sends it to the engines the operator enabled. The resume, exclusions, and EI record stay local.
 - An approved board is fetched because of the database flag, so it does not appear in `config.yaml` until the operator copies it there.
 - A career-page approval stores a URL and does not make the watcher fetch that site.
+- A daily run still sends at most 12 site-restricted queries. A shorter interval, down to 60 minutes, sends that set more often.
+- A discovery message leaves the suggested name and the URL on Telegram's servers. The snippet and the query do not.
