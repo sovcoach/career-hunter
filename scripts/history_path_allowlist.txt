@@ -1,0 +1,13 @@
+# Paths a pull request's history may contain (scripts/check_history.py, #29).
+# One path per line. An entry also allows anything below it.
+
+# Documented placeholders: the data folder and the repo.
+/Volumes/ExampleDrive
+/Users/example
+
+# Synthetic volumes used in tests and in docs/SETUP.md.
+/Volumes/CHBase
+/Volumes/CHTest
+/Volumes/Fake
+/Volumes/Other
+/Volumes/x

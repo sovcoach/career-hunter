@@ -53,6 +53,15 @@ Tests never need a real data folder or Keychain: the storage guard and Keychain 
 | `make test` / `make cov` | Tests / tests with coverage |
 | `make lint` / `make format` | Check / fix style |
 | `make typecheck` | mypy, strict |
-| `make check` | Everything CI runs, plus all pre-commit hooks |
+| `make check` | Lint, types, tests with coverage, and all pre-commit hooks. CI also runs the supply-chain checks below |
 | `make verify-tree` | Every hook and gitleaks over every file, **untracked ones included**. `make check` uses `pre-commit run --all-files`, which only sees tracked files, and the gitleaks hook only scans staged changes (ADR-013), so run this before committing new files |
 | `make hooks` | Reinstall the git hooks, the pre-push guard and `push.default=current` |
+| `make check-lock-age` | Every version in `uv.lock` was at least 14 days old when it was locked, unless it is a listed security fix (ADR-006) |
+| `make check-history BASE=origin/main` | No local `/Volumes/` or `/Users/` path in the commits since `BASE`, other than the allowed placeholders |
+
+## Supply-chain checks
+
+CI's **Supply chain** job runs two checks with full history (#29). Run them yourself before pushing: `make check-lock-age` after any re-lock, and `make check-history BASE=origin/main`.
+
+- **Lock age.** Every version in `uv.lock` must have been uploaded at least 14 days before the commit that first locked it (ADR-006). `[tool.uv] exclude-newer` in `pyproject.toml` keeps `uv lock` behind a cutoff: move it forward deliberately when you re-lock, and evict a single version that breaks the rule with `exclude-newer-package`. A younger version is allowed only as a fix for known advisories, listed in `scripts/lock_age_allowlist.toml` with its package, exact version and advisory IDs. Remove an entry when that version leaves the lock: the check fails on a stale one.
+- **Local paths in history.** A pull request's commits, messages included, may contain no `/Volumes/` or `/Users/` path except those in `scripts/history_path_allowlist.txt`: `/Volumes/ExampleDrive/ExampleFolder` for the data folder, `/Users/example/ExampleFolder/career-hunter` for the repo, and a few synthetic test volumes. A finding names the commit and masks the path. A path a test must reject is assembled at runtime from pieces, so it never appears in a file (ADR-013).

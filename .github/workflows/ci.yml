@@ -50,3 +50,21 @@ jobs:
           tar -xzf gitleaks.tgz gitleaks
       - name: Scan every commit
         run: ./gitleaks git --redact --verbose --config .gitleaks.toml .
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # both checks read history; a shallow clone fails them closed
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Locked versions were two weeks old when locked (ADR-006)
+        run: uv run --no-project python scripts/check_lock_age.py
+      - name: No local paths in this pull request's commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: uv run --no-project python scripts/check_history.py "$BASE" "$HEAD"

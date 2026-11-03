@@ -11,7 +11,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 003 | Secrets live in the macOS Keychain | Accepted (Phase 1) |
 | 004 | SQLite is the record store | Accepted (Phase 1); amended by 014 |
 | 005 | The schema is designed around EI record-keeping | Accepted (Phase 1); amended by 014 |
-| 006 | gitleaks via the pinned upstream pre-commit hook, not brew | Accepted (Phase 1) |
+| 006 | gitleaks via the pinned upstream pre-commit hook, not brew | Accepted (Phase 1); amended (lockfile) |
 | 007 | A dedicated Telegram bot for notifications | Accepted (for Phase 2) |
 | 008 | An always-on Mac mini as the host | Accepted (Phase 1) |
 | 009 | Guards fail closed, with no override flag | Accepted (Phase 1) |
@@ -141,6 +141,8 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 - An undated (`unknown`) seed entry is matched to its earlier import by company, title and location, because its first-seen month is the import date and so changes between runs.
 
 ## ADR-006: gitleaks via the pinned upstream pre-commit hook, not brew
+
+> **Amended: the lockfile (#29).** The two-week rule below now covers every version in `uv.lock` (direct and transitive, runtime and dev), as well as every pre-commit hook revision and GitHub Action pin. For the lockfile, two weeks is measured from a version's earliest upload time to the commit that first put that version in `uv.lock`. `scripts/check_lock_age.py` enforces it in CI and through `make check-lock-age`, and fails closed when it cannot tell, such as on a shallow clone or a missing upload time. `[tool.uv] exclude-newer` in `pyproject.toml` holds an absolute cutoff, moved forward deliberately at each re-lock, so `uv lock` cannot pick a newer release. A single version that the cutoff would keep but that breaks the rule, and fixes no advisory, is evicted with a per-package cutoff in `[tool.uv] exclude-newer-package`. The one exception: a version younger than 14 days is allowed only when it fixes a known advisory, and only when `scripts/lock_age_allowlist.toml` lists its package, exact version and advisory IDs. The check fails on any entry whose package and version are no longer in `uv.lock`. The ruff and mypy hook revisions must match their locked versions, and a test checks that. The age of hook revisions and Action pins stays a review item, because checking it needs the network.
 
 **Context.** Secret scanning should run on every commit for anyone who clones the repo, at a known version.
 
