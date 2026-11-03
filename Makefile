@@ -2,7 +2,7 @@
 # seed/export/doctor need CAREERHUNTER_DATA_DIR set (see docs/SETUP.md).
 
 .DEFAULT_GOAL := help
-.PHONY: help setup hooks test cov lint format typecheck check verify-tree check-lock-age seed export doctor embed-eval discover
+.PHONY: help setup hooks test cov lint format typecheck check verify-tree check-lock-age check-history seed export doctor embed-eval discover
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  make %-11s %s\n", $$1, $$2}'
@@ -41,6 +41,9 @@ verify-tree: ## Every hook and gitleaks over every file, tracked and untracked
 
 check-lock-age: ## Every locked version was two weeks old when locked (ADR-006)
 	uv run python scripts/check_lock_age.py
+
+check-history: ## No local paths in this branch's commits, e.g. make check-history BASE=origin/main
+	uv run python scripts/check_history.py $(or $(BASE),origin/main)
 
 seed: ## Import seed.yaml from your data folder (safe to re-run)
 	uv run careerhunter seed
