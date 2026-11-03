@@ -31,14 +31,6 @@ The first `make check` also builds gitleaks, which takes a minute or two.
 
 The data-path hook needs `CAREERHUNTER_DATA_DIR` set in the shell you commit from (the same value career-hunter uses). No path is built into the hook, so without it every commit is refused with a message saying so.
 
-**Privacy tip:** git records your time zone offset in every commit and tag. If you'd rather not publish it, commit and tag with UTC timestamps:
-
-```bash
-TZ=UTC git commit
-```
-
-Existing history keeps whatever offsets it was made with.
-
 Tests never need a real data folder or Keychain: the storage guard and Keychain are replaced with fakes. To try the CLI by hand without your real drive, create a throwaway encrypted disk image (see "Testing the CLI safely" in [docs/SETUP.md](docs/SETUP.md#testing-the-cli-safely)).
 
 ## Workflow
@@ -49,14 +41,8 @@ Tests never need a real data folder or Keychain: the storage guard and Keychain 
    `feat: …`, `fix: …`, `docs: …`, `test: …`, `refactor: …`, `chore: …`, `ci: …`.
 4. Update `CHANGELOG.md` under `[Unreleased]`, and `docs/DECISIONS.md` if a design choice changed.
 5. Open a **pull request** using the template. CI must pass: lint, types, tests with coverage of at least 85%, and gitleaks.
-6. **Merge locally, in UTC.** Once the pull request's CI checks pass, the operator merges it on their own machine, never through GitHub's web UI, so the merge commit carries no local time zone offset (ADR-010). The full steps are in [AGENTS.md](AGENTS.md#merging):
-   - `git switch main`, then `git pull --ff-only`;
-   - `TZ=UTC git merge --no-ff <branch> -m "Merge pull request #<N> from sovcoach/<branch>"`;
-   - `make check` on the result;
-   - push `main` with the manual override below. GitHub reports "Bypassed rule violations" for the pull request and status check rules; that's expected on this push only (ADR-012).
-
-   No force pushes to `main`. Any other push to `main` is refused by the pre-push guard.
-   - **Manual override, for the operator only:** `CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push origin main`. Type it by hand for the merge push or a deliberate fix; never put it in a script or alias. AI assistants are denied any command that mentions the variable, and never merge (ADR-011).
+6. **Merge on GitHub** with "Create a merge commit" once the pull request's CI checks pass (ADR-010). A local merge is optional; its steps are in [AGENTS.md](AGENTS.md#merging). No force pushes to `main`: any other push to `main` is refused by the pre-push guard.
+   - **Manual override, for the operator only:** `CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push origin main`. It's for a deliberate, by-hand fix or the optional local merge; never put it in a script or alias. AI assistants are denied any command that mentions the variable, and never merge (ADR-011).
 7. At the end of a phase: move `[Unreleased]` to a version and tag it (`vX.Y.0`).
 
 ## Common commands

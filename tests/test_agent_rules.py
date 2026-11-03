@@ -64,12 +64,13 @@ def test_adrs_010_to_012_allow_web_merges_and_keep_the_record() -> None:
         assert row.endswith("amended (local merges); amended (web merges) |")
 
 
-def test_contributing_describes_the_local_merge() -> None:
-    workflow = _text(ROOT / "CONTRIBUTING.md").split("## Workflow", 1)[1].split("\n## ", 1)[0]
-    assert "TZ=UTC git merge --no-ff" in workflow
+def test_contributing_describes_the_web_merge() -> None:
+    contributing = _text(ROOT / "CONTRIBUTING.md")
+    workflow = contributing.split("## Workflow", 1)[1].split("\n## ", 1)[0]
+    assert '**Merge on GitHub** with "Create a merge commit"' in workflow
+    assert "A local merge is optional" in workflow
     assert "(AGENTS.md#merging)" in workflow
-    assert "never through GitHub's web UI" in workflow
-    assert "Merge through the PR" not in workflow
+    assert "TZ=UTC" not in contributing
 
 
 def test_claude_md_only_points_to_agents_md() -> None:

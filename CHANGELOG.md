@@ -28,7 +28,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 - The agent working rules move to `AGENTS.md`, the single source of truth. `CLAUDE.md` only points to it (#44).
-- Pull requests are merged locally by the operator with `TZ=UTC git merge --no-ff`, never through the web UI, so merge commits carry no local time zone offset. `AGENTS.md` ("Merging") and CONTRIBUTING.md give the steps, including the operator's push to `main`. ADR-010, ADR-011 and ADR-012 are amended (#44).
+- Pull requests merge on GitHub with "Create a merge commit" once CI passes; a local merge is optional, and its steps are in `AGENTS.md` ("Merging"). Commits and tags no longer need UTC timestamps. ADR-010, ADR-011 and ADR-012 are amended, and CONTRIBUTING.md matches (#44).
 
 ## [0.3.0] - 2026-11-01
 
