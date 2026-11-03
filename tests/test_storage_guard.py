@@ -131,7 +131,9 @@ def test_create_makes_private_dirs(fake_volume: Path, repo: Path, probe: FakePro
     assert datadir.root in created
     assert os.stat(datadir.root).st_mode & 0o777 == 0o700
     for sub in storage_guard.SUBDIRS:
-        assert (datadir.root / sub).is_dir()
+        path = datadir.root / sub
+        assert path.is_dir()
+        assert os.stat(path).st_mode & 0o777 == 0o700
     assert guard(datadir.root, probe, repo, exists=True).root == datadir.root
     assert create(datadir) == []  # idempotent
 

@@ -277,7 +277,7 @@ def test_a_missing_config_writes_nothing(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "error: config.yaml is missing\n"
-    assert not (inited / "evals").exists()
+    assert list((inited / "evals").iterdir()) == []
 
 
 def test_missing_gap_tiers_write_nothing(
@@ -292,7 +292,7 @@ def test_missing_gap_tiers_write_nothing(
     assert captured.out == ""
     assert "fit_rubric.gap_tiers is not set" in captured.err
     assert str(inited) not in captured.err
-    assert not (inited / "evals").exists()
+    assert list((inited / "evals").iterdir()) == []
 
 
 def test_a_database_without_the_column_is_an_error(
@@ -308,4 +308,4 @@ def test_a_database_without_the_column_is_an_error(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "embedding_score column" in captured.err
-    assert not (inited / "evals").exists()
+    assert list((inited / "evals").iterdir()) == []
