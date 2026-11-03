@@ -86,4 +86,4 @@ Secrets go in the **macOS Keychain** through the Python `keyring` library. They 
 
 Python 3.12+ managed with [uv](https://docs.astral.sh/uv/), SQLite, PyYAML, keyring and ReportLab. Quality checks: ruff, mypy (strict), pytest with coverage, gitleaks, pre-commit, and GitHub Actions.
 
-A license will be added in Phase 5.
+The code is released under the MIT License. See [LICENSE](LICENSE).
