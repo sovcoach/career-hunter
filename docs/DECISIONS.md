@@ -17,7 +17,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 009 | Guards fail closed, with no override flag | Accepted (Phase 1) |
 | 010 | Repo workflow conventions | Accepted (Phase 1) |
 | 011 | Claude Code permission rules as a guard-rail | Accepted (Phase 1) |
-| 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1) |
+| 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1); amended by 021 |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
 | 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
 | 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019 |
@@ -26,6 +26,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 018 | One setting for the time zone | Accepted (Phase 2) |
 | 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5) |
 | 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended |
+| 021 | The public repo is MIT | Accepted (Phase 5) |
 
 ---
 
@@ -244,6 +245,8 @@ Ask rules only work while Claude Code's auto mode is off, so anything that must 
 
 ## ADR-012: The repo goes public after Phase 1 verification; `main` is protected then
 
+> **Amended by [ADR-021](#adr-021-the-public-repo-is-mit) (Phase 5).** The reuse grant is the MIT License. The trade-off below records the all-rights-reserved state that applied until that grant.
+
 **Context.**
 - The repo is a portfolio piece, so it is meant to be visible.
 - GitHub Free doesn't offer branch protection or rulesets on private repositories, so `main` can't be protected while the repo is private.
@@ -264,7 +267,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 **Trade-offs.**
 - There is a short window where `main` is unprotected. It is covered by the per-push approval rule in ADR-011 and by making step 4 the very next action.
 - Being public means every commit is visible forever. That is why the history must be clean before going public, and why the gitleaks scan covers all history, not only new commits.
-- Until a license is added in Phase 5, the code is visible but **all rights reserved**: others can read it, but have no grant to reuse it.
+- Until a license is added in Phase 5, the code is visible but **all rights reserved**: others can read it, but have no grant to reuse it. Phase 5 adds that grant: see ADR-021.
 
 ## ADR-013: No exemptions in the data-path hook, not even for its own tests
 
@@ -520,3 +523,22 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A career-page approval stores a URL and does not make the watcher fetch that site.
 - A daily run still sends at most 12 site-restricted queries. A shorter interval, down to 60 minutes, sends that set more often.
 - A discovery message leaves the suggested name and the URL on Telegram's servers. The snippet and the query do not.
+
+## ADR-021: The public repo is MIT
+
+**Context.**
+- ADR-012 made the repo public after Phase 1 and left reuse ungranted until Phase 5.
+- Until this decision, a reader could look at the code and had no permission to use it.
+
+**Decision.**
+- The grant is the MIT License, in `LICENSE`, copyright 2026 Daniel.
+- `pyproject.toml` names that license. The README points at `LICENSE`.
+- Source files do not carry their own copyright headers. The one `LICENSE` file is the grant.
+
+**Alternatives.**
+- Apache-2.0. Rejected: this project does not need a patent grant.
+- Staying all rights reserved. Rejected: ADR-012 already set Phase 5 as the point a reuse grant is added.
+
+**Trade-offs.**
+- MIT allows reuse, including in closed-source copies, as long as the notice is kept.
+- The grant covers the code in this repository. The data folder stays outside the repo (ADR-001).
