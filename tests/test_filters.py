@@ -241,7 +241,7 @@ def test_an_earlier_gate_wins(search: sqlite3.Connection, datadir: DataDir) -> N
         exclusions={"companies": ["Example Robotics"]},
     )
     assert "1 new, 0 already recorded" not in "\n".join(again)
-    assert "0 new, 1 already recorded" in again[-1]
+    assert "0 new, 1 already recorded" in again[-2]
     assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 1
 
 
@@ -254,7 +254,10 @@ def test_a_failed_board_writes_no_skip(search: sqlite3.Connection, datadir: Data
         fetcher=Scripted({board: FetchError("synthetic failure")}),
         config={"hard_gates": {"seniority_words": ["Coordinator"]}},
     )
-    assert lines == ["watch: Example Robotics (greenhouse): FetchError; nothing recorded"]
+    assert lines == [
+        "watch: Example Robotics (greenhouse): FetchError; nothing recorded",
+        "watch: 0 boards fetched, 1 failed",
+    ]
     assert postings(search) == []
     assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 0
     assert list(datadir.root.glob("ei_record_*")) == []

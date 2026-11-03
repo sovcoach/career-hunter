@@ -19,6 +19,14 @@ not cause a skip.
 
 The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
 one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
+
+One company's failure does not stop the run. An exception while handling one board, or
+one row of the recheck or scoring pass, or the embedding refresh, is rolled back and
+logged as `watch: <who>: <ExceptionType>; continuing`. `sqlite3.IntegrityError` is
+isolated the same way. Any other `sqlite3.Error` is rolled back and re-raised: the
+database itself is failing, so the run stops. A board that is not fetched and parsed
+stores nothing, and its company and postings are left as they were. The last line is
+`watch: <n> boards fetched, <m> failed`.
 """
 
 from __future__ import annotations
@@ -28,10 +36,11 @@ import json
 import re
 import sqlite3
 import urllib.parse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from careerhunter import db, filters, search_store
 from careerhunter.embed import Embedder, miss_line
@@ -42,6 +51,9 @@ from careerhunter.score import Score, ScoreError
 
 Fetcher = Callable[[str], Fetched]
 Scorer = Callable[[PostingText], Score | None]
+# Told about each isolated crash, after the rollback and the log line.
+OnCrash = Callable[[str, Exception], None]
+Tally = Literal["fetched", "failed"]
 
 _BOARDS = ("greenhouse", "lever", "ashby")
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -88,6 +100,21 @@ class _Skip:
 
 
 @dataclass(frozen=True)
+class _Parsed:
+    jobs: list[_Job | _Skip]
+
+
+@dataclass(frozen=True)
+class _Failed:
+    kind: str  # the fetch error's type, HTTP 429, HTTP <status>, or the parse error
+
+
+@dataclass
+class _Guard:
+    failed: bool = False
+
+
+@dataclass(frozen=True)
 class _Aligned:
     ok: bool
     stored_type: str | None = None
@@ -116,38 +143,86 @@ def run(
     scorer: Scorer | None = None,
     data_dir: Path | None = None,
     embed_transport: Callable[[str, bytes], tuple[int, bytes]] | None = None,
+    on_crash: OnCrash | None = None,
 ) -> list[str]:
     """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`."""
     dt.date.fromisoformat(today)
     rules = config or {}
     skipped = exclusions or {}
+    hook = on_crash or _no_hook
     embedder = Embedder(conn, data_dir, rules, transport=embed_transport)
-    lines = embedder.refresh()
-    _recheck(conn, watchlist, rules, skipped, today, lines)
-    _score_waiting(conn, scorer, today, lines, embedder)
+    lines: list[str] = []
+    with _isolated(conn, lines, "embedding refresh", hook):
+        lines.extend(embedder.refresh())
+    _recheck(conn, watchlist, rules, skipped, today, lines, hook)
+    _score_waiting(conn, scorer, today, lines, embedder, hook)
     blocked: set[str] = set()
+    fetched = failed = 0
     for item in _with_discovery_boards(conn, watchlist):
         entry = _entry(item)
         if entry is None:
             lines.append("watch: a watchlist entry has no name; skipped")
             continue
         name, ats, slug, role_filters = entry
-        _watch_one(
-            conn,
-            lines,
-            blocked,
-            name,
-            ats,
-            slug,
-            role_filters,
-            rules,
-            skipped,
-            today,
-            fetcher,
-            scorer,
-            embedder,
-        )
+        tally: Tally | None = None
+        with _isolated(conn, lines, name, hook) as guard:
+            tally = _watch_one(
+                conn,
+                lines,
+                blocked,
+                name,
+                ats,
+                slug,
+                role_filters,
+                rules,
+                skipped,
+                today,
+                fetcher,
+                scorer,
+                embedder,
+            )
+        if guard.failed:
+            tally = "failed"
+        fetched += tally == "fetched"
+        failed += tally == "failed"
+    lines.append(f"watch: {fetched} boards fetched, {failed} failed")
     return lines
+
+
+def _no_hook(who: str, exc: Exception) -> None:
+    return None
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction:
+        conn.execute("ROLLBACK")
+
+
+@contextmanager
+def _isolated(
+    conn: sqlite3.Connection, lines: list[str], who: str, on_crash: OnCrash
+) -> Iterator[_Guard]:
+    """Roll back and log a crash, then carry on. A database failure is re-raised."""
+    guard = _Guard()
+    try:
+        yield guard
+    except sqlite3.IntegrityError as exc:  # before sqlite3.Error, its base class
+        _crashed(conn, lines, who, exc, on_crash)
+        guard.failed = True
+    except sqlite3.Error:
+        _rollback(conn)
+        raise
+    except Exception as exc:
+        _crashed(conn, lines, who, exc, on_crash)
+        guard.failed = True
+
+
+def _crashed(
+    conn: sqlite3.Connection, lines: list[str], who: str, exc: Exception, on_crash: OnCrash
+) -> None:
+    _rollback(conn)
+    lines.append(f"watch: {who}: {type(exc).__name__}; continuing")
+    on_crash(who, exc)
 
 
 def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -> list[Any]:
@@ -212,32 +287,35 @@ def _watch_one(
     fetcher: Fetcher,
     scorer: Scorer | None,
     embedder: Embedder,
-) -> None:
+) -> Tally | None:
+    """Whether the board was fetched and parsed, failed, or (None) never attempted."""
     if ats is None:
         lines.append(_line(name, None, "no ats_type; skipped"))
-        return
+        return None
     if ats == "workday":
         lines.append(_line(name, ats, "not fetched yet; skipped"))
-        return
+        return None
     if ats not in _BOARDS:
         lines.append(_line(name, ats, "not a board this command fetches; skipped"))
-        return
+        return None
     if not slug:
         lines.append(_line(name, ats, "no ats_slug; skipped"))
-        return
+        return None
     url = board_url(ats, slug)
     if url is None:
         lines.append(_line(name, ats, "ats_slug is not a single path segment; skipped"))
-        return
+        return None
     host = urllib.parse.urlsplit(url).hostname or ""
     if host in blocked:
         lines.append(
             _line(name, ats, f"{host} already returned HTTP 429 this run; left for the next run")
         )
-        return
-    jobs = _fetch_jobs(lines, blocked, name, ats, slug, url, host, fetcher)
-    if jobs is None:
-        return
+        return None
+    outcome = _fetch_jobs(lines, blocked, name, ats, slug, url, host, fetcher)
+    if isinstance(outcome, _Failed):
+        return "failed"
+    # One transaction, after a board parsed and before any posting is recorded: a
+    # failed fetch never touches the company, and a disagreement records nothing.
     with db.transaction(conn):
         aligned = _align(conn, name, ats, slug)
     if not aligned.ok:
@@ -250,10 +328,21 @@ def _watch_one(
                 f"ats_slug={_shown(aligned.stored_slug)}); skipped",
             )
         )
-        return
+        return "failed"
     _record_jobs(
-        conn, lines, name, ats, jobs, role_filters, config, exclusions, today, scorer, embedder
+        conn,
+        lines,
+        name,
+        ats,
+        outcome.jobs,
+        role_filters,
+        config,
+        exclusions,
+        today,
+        scorer,
+        embedder,
     )
+    return "fetched"
 
 
 def _fetch_jobs(
@@ -265,13 +354,14 @@ def _fetch_jobs(
     url: str,
     host: str,
     fetcher: Fetcher,
-) -> list[_Job | _Skip] | None:
-    """Parse one board. None means nothing from this board is stored."""
+) -> _Parsed | _Failed:
+    """Parse one board. A failure means nothing from this board is stored."""
     try:
         fetched = fetcher(url)
-    except FetchError:
-        lines.append(_line(name, ats, "FetchError; nothing recorded"))
-        return None
+    except FetchError as exc:
+        kind = type(exc).__name__
+        lines.append(_line(name, ats, f"{kind}; nothing recorded"))
+        return _Failed(kind)
     if fetched.status == 429:
         # Do not read the body, sleep, or retry. The next watch tries again.
         blocked.add(host)
@@ -282,15 +372,15 @@ def _fetch_jobs(
                 f"HTTP 429, retry-after {_retry(fetched.retry_after)}; left for the next run",
             )
         )
-        return None
+        return _Failed("HTTP 429")
     if fetched.status != 200:
         lines.append(_line(name, ats, f"HTTP {fetched.status}; nothing recorded"))
-        return None
+        return _Failed(f"HTTP {fetched.status}")
     try:
-        return _parse(ats, slug, fetched.body)
+        return _Parsed(_parse(ats, slug, fetched.body))
     except BoardParseError as exc:
         lines.append(_line(name, ats, f"HTTP 200, {exc}; nothing recorded"))
-        return None
+        return _Failed(str(exc))
 
 
 def _record_jobs(
@@ -396,8 +486,9 @@ def _recheck(
     exclusions: Mapping[str, Any],
     today: str,
     lines: list[str],
+    on_crash: OnCrash,
 ) -> None:
-    """Filter watcher postings that have no skip and no score yet."""
+    """Filter watcher postings that have no skip and no score yet. One row at a time."""
     roles = {
         entry[0].casefold(): entry[3] for item in watchlist if (entry := _entry(item)) is not None
     }
@@ -409,29 +500,42 @@ def _recheck(
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
     ).fetchall()
     for row in rows:
-        verdict = filters.decide(
-            PostingText(
-                company=row["company"],
-                title=row["title"],
-                location=row["location"],
-                work_model=row["work_model"],
-                requisition_id=row["requisition_id"],
-            ),
-            config=config,
-            exclusions=exclusions,
-            role_filters=roles.get(str(row["company"]).casefold()),
-            applied=search_store.posting_has_application(conn, int(row["id"])),
-        )
-        with db.transaction(conn):
-            if verdict.reason:
-                if not search_store.posting_has_skip(conn, int(row["id"])):
-                    search_store.insert_skip(conn, int(row["id"]), today, verdict.reason)
-            elif verdict.schedule != row["schedule"]:
-                search_store.set_posting_schedule(conn, int(row["id"]), verdict.schedule)
+        with _isolated(conn, lines, str(row["company"]), on_crash):
+            _recheck_one(conn, row, roles, config, exclusions, today, lines)
+
+
+def _recheck_one(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    roles: Mapping[str, Mapping[str, Any] | None],
+    config: Mapping[str, Any],
+    exclusions: Mapping[str, Any],
+    today: str,
+    lines: list[str],
+) -> None:
+    verdict = filters.decide(
+        PostingText(
+            company=row["company"],
+            title=row["title"],
+            location=row["location"],
+            work_model=row["work_model"],
+            requisition_id=row["requisition_id"],
+        ),
+        config=config,
+        exclusions=exclusions,
+        role_filters=roles.get(str(row["company"]).casefold()),
+        applied=search_store.posting_has_application(conn, int(row["id"])),
+    )
+    with db.transaction(conn):
         if verdict.reason:
-            lines.append(
-                _line(str(row["company"]), None, f"{row['title']!r} skipped ({verdict.reason})")
-            )
+            if not search_store.posting_has_skip(conn, int(row["id"])):
+                search_store.insert_skip(conn, int(row["id"]), today, verdict.reason)
+        elif verdict.schedule != row["schedule"]:
+            search_store.set_posting_schedule(conn, int(row["id"]), verdict.schedule)
+    if verdict.reason:
+        lines.append(
+            _line(str(row["company"]), None, f"{row['title']!r} skipped ({verdict.reason})")
+        )
 
 
 def _score_waiting(
@@ -440,6 +544,7 @@ def _score_waiting(
     today: str,
     lines: list[str],
     embedder: Embedder,
+    on_crash: OnCrash,
 ) -> None:
     """Score watcher postings that passed the filter and have no model text yet."""
     if scorer is None:
@@ -451,23 +556,24 @@ def _score_waiting(
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
     ).fetchall()
     for row in rows:
-        _score_one(
-            conn,
-            int(row["id"]),
-            PostingText(
-                company=row["company"],
-                title=row["title"],
-                location=row["location"],
-                work_model=row["work_model"],
-                requisition_id=row["requisition_id"],
-            ),
-            scorer,
-            today,
-            lines,
-            str(row["company"]),
-            None,
-            embedder,
-        )
+        with _isolated(conn, lines, str(row["company"]), on_crash):
+            _score_one(
+                conn,
+                int(row["id"]),
+                PostingText(
+                    company=row["company"],
+                    title=row["title"],
+                    location=row["location"],
+                    work_model=row["work_model"],
+                    requisition_id=row["requisition_id"],
+                ),
+                scorer,
+                today,
+                lines,
+                str(row["company"]),
+                None,
+                embedder,
+            )
 
 
 def _score_one(
