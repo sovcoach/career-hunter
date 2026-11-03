@@ -14,6 +14,7 @@ import yaml
 
 from careerhunter import cli, db, discover, search_store
 from careerhunter.platform_checks import SystemProbe
+from tests.test_score import BROKEN, broken_connection
 
 SNIPPET = "DO-NOT-LEAK-SNIPPET"
 TITLE = "DO-NOT-LEAK-TITLE"
@@ -642,3 +643,115 @@ def test_the_queue_has_no_snippet_column(tmp_path: Path) -> None:
             "'x', 'pending', '2026-11-02')"
         )
     conn.close()
+
+
+def _search_db(tmp_path: Path) -> sqlite3.Connection:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    return conn
+
+
+_SEARCH = {
+    "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "career_hosts": []},
+    "search": {"target_titles": ["One"], "locations": ["Example City"]},
+}
+_GOOD = "https://job-boards.greenhouse.io/newrobotics/jobs/42"
+
+
+def _rows(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT count(*) FROM discovery_candidates").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+@pytest.mark.parametrize("error", BROKEN, ids=lambda e: type(e).__name__)
+def test_a_broken_reply_from_the_client_is_a_miss(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    monkeypatch.setattr(http.client, "HTTPConnection", broken_connection(error))
+    with pytest.raises(discover.DiscoverError) as exc:
+        discover.default_transport("http://127.0.0.1:8888/search?q=One&format=json")
+    assert str(exc.value) == discover.MISS
+
+
+def test_a_transport_that_breaks_is_a_miss_that_stores_nothing(tmp_path: Path) -> None:
+    def broken(url: str) -> tuple[int, bytes]:
+        raise http.client.IncompleteRead(b"")
+
+    conn = _search_db(tmp_path)
+    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=broken)
+    assert outcome == discover.Outcome(discover.MISS, ())
+    assert _rows(conn) == 0
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b"\xff\xfe\x00{", id="not-utf8"),
+        pytest.param(json.dumps({"error": "too many requests"}).encode(), id="error-object"),
+        pytest.param(json.dumps({"results": "x"}).encode(), id="results-not-list"),
+        pytest.param(json.dumps({"results": ["x"]}).encode(), id="result-not-object"),
+        pytest.param(json.dumps({"results": [{"title": "t"}]}).encode(), id="no-url"),
+        pytest.param(json.dumps({"results": [{"url": 5}]}).encode(), id="url-not-text"),
+        pytest.param(
+            json.dumps({"results": [{"title": "t"}, {"url": 5}, "x"]}).encode(), id="all-bad"
+        ),
+    ],
+)
+def test_a_reply_of_the_wrong_shape_is_a_miss_that_stores_nothing(
+    tmp_path: Path, body: bytes
+) -> None:
+    conn = _search_db(tmp_path)
+    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=_Talk(body))
+    assert outcome == discover.Outcome(discover.MISS, ())
+    assert _rows(conn) == 0
+    conn.close()
+
+
+def test_a_result_without_a_url_is_skipped_and_the_good_one_kept(tmp_path: Path) -> None:
+    body = json.dumps({"results": [{"url": _GOOD}, {"title": "t"}]}).encode()
+    conn = _search_db(tmp_path)
+    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=_Talk(body))
+    assert outcome.notice is None
+    assert [row.url for row in outcome.rows] == ["https://boards.greenhouse.io/newrobotics"]
+    assert _rows(conn) == 1
+    conn.close()
+
+
+def test_an_empty_result_list_is_a_normal_reply(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    talk = _Talk(json.dumps({"results": []}).encode())
+    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=talk)
+    assert outcome == discover.Outcome(None, ())
+    assert len(talk.calls) == 4  # every query was sent; none was a miss
+    conn.close()
+
+
+def test_a_bug_in_our_own_parser_still_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def bug(body: bytes) -> list[str] | None:
+        raise RuntimeError("synthetic bug")
+
+    monkeypatch.setattr(discover, "_result_urls", bug)
+    conn = _search_db(tmp_path)
+    with pytest.raises(RuntimeError, match="synthetic bug"):
+        discover.run(conn, _SEARCH, today="2026-11-02", transport=_Talk(_body([_GOOD])))
+    conn.close()
+
+
+def test_a_reply_that_is_not_utf8_does_not_stop_the_command(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited, hosts=["jobs.example.com"])
+    monkeypatch.setattr(discover, "default_transport", lambda url: (200, b"\xff\xfe\x00{"))
+    assert cli.main(["discover"], probe=probe) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{discover.MISS}\n"
+    assert _count(inited) == 0
+    assert (inited / "logs" / "discover.success").is_file()

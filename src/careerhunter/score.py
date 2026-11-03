@@ -9,7 +9,8 @@ The prompt is built from lanes, location rules, hard gates and `gap_tiers`, plus
 posting fields. The model lists gaps. This module applies `gap_tiers` and stores the
 tier name. `fit_rating` is left null. There is no mapping onto 0-10.
 
-A down server, a redirect, or a reply that does not parse leaves the posting unscored.
+A down server, a redirect, a broken reply, or a reply that does not parse leaves the
+posting unscored.
 """
 
 from __future__ import annotations
@@ -95,7 +96,7 @@ def default_transport(url: str, payload: bytes) -> tuple[int, bytes]:
         )
         response = conn.getresponse()
         return response.status, response.read(MAX_OUTPUT + 1)
-    except OSError as exc:
+    except (OSError, http.client.HTTPException) as exc:
         raise ScoreError("the local model could not be reached") from exc
     finally:
         conn.close()
@@ -119,7 +120,7 @@ def score_posting(
     try:
         require_loopback(url)
         status, body = send(url, _request_body(posting, config))
-    except (ScoreError, OSError):
+    except (ScoreError, OSError, http.client.HTTPException):
         return None
     content = _content(status, body)
     if content is None:

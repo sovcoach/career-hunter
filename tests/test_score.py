@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from careerhunter import score as scoring
 from careerhunter import watch
 from careerhunter.fetch import Fetched
 from careerhunter.filters import PostingText, decide
@@ -344,3 +345,131 @@ def test_a_later_run_scores_waiting_rows_before_the_fetch(search: sqlite3.Connec
     assert row["scout_metadata"] is None
     assert row["fit_rating"] is None
     assert search.execute("SELECT reason FROM skips").fetchone()["reason"] == "gap_tier"
+
+
+BROKEN = [
+    http.client.IncompleteRead(b""),
+    http.client.RemoteDisconnected("synthetic"),
+    http.client.BadStatusLine("synthetic"),
+]
+
+
+def broken_connection(error: Exception, *, at: str = "response") -> type:
+    """A fake HTTPConnection whose reply breaks, at getresponse() or in read()."""
+
+    class Response:
+        status = 200
+
+        def read(self, _amount: int) -> bytes:
+            raise error
+
+    class Conn:
+        def __init__(self, host: str, port: int, timeout: float) -> None:
+            pass
+
+        def request(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def getresponse(self) -> Response:
+            if at == "response":
+                raise error
+            return Response()
+
+        def close(self) -> None:
+            pass
+
+    return Conn
+
+
+@pytest.mark.parametrize("error", BROKEN, ids=lambda e: type(e).__name__)
+def test_a_broken_reply_is_a_score_error(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    monkeypatch.setattr(http.client, "HTTPConnection", broken_connection(error))
+    with pytest.raises(ScoreError):
+        default_transport(DEFAULT_URL, b"{}")
+
+
+def test_a_reply_that_breaks_mid_body_is_a_score_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        http.client,
+        "HTTPConnection",
+        broken_connection(http.client.IncompleteRead(b"par"), at="read"),
+    )
+    with pytest.raises(ScoreError):
+        default_transport(DEFAULT_URL, b"{}")
+
+
+def test_an_injected_transport_that_breaks_leaves_the_posting_unscored() -> None:
+    def broken(url: str, payload: bytes) -> tuple[int, bytes]:
+        raise http.client.IncompleteRead(b"")
+
+    assert score_posting(posting(), RUBRIC, transport=broken) is None
+
+
+def _message(content: object) -> bytes:
+    return json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(json.dumps({"error": "model not loaded"}).encode(), id="error-object"),
+        pytest.param(json.dumps({"choices": []}).encode(), id="no-choices"),
+        pytest.param(json.dumps({"choices": ["x"]}).encode(), id="choice-not-object"),
+        pytest.param(json.dumps({"choices": [{}]}).encode(), id="no-message"),
+        pytest.param(json.dumps({"choices": [{"message": "x"}]}).encode(), id="message-text"),
+        pytest.param(_message(""), id="empty-content"),
+        pytest.param(_message(None), id="null-content"),
+        pytest.param(_message(42), id="number-content"),
+        pytest.param(_message("[1]"), id="content-not-object"),
+        pytest.param(_message('{"gaps": "x"}'), id="gaps-not-list"),
+        pytest.param(_message('{"gaps": [{"kind": "minor"}]}'), id="gap-without-name"),
+        pytest.param(_message('{"gaps": [{"name": "SQL", "kind": "major"}]}'), id="bad-kind"),
+        pytest.param(
+            _message('{"gaps": [{"name": "SQL", "kind": "minor", "type": 5}]}'), id="bad-type"
+        ),
+    ],
+)
+def test_a_reply_of_the_wrong_shape_leaves_the_posting_unscored(body: bytes) -> None:
+    assert score_posting(posting(), RUBRIC, transport=lambda url, payload: (200, body)) is None
+
+
+def test_a_bug_in_our_own_parser_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def bug(content: str) -> object:
+        raise RuntimeError("synthetic bug")
+
+    monkeypatch.setattr(scoring, "_parse_gaps", bug)
+    with pytest.raises(RuntimeError, match="synthetic bug"):
+        score_posting(posting(), RUBRIC, transport=lambda url, payload: reply('{"gaps": []}'))
+
+
+def test_a_broken_model_reply_leaves_postings_unscored_and_the_run_finishes(
+    search: sqlite3.Connection,
+) -> None:
+    first = url("greenhouse", "examplerobotics")
+    second = url("greenhouse", "samplelogistics")
+
+    def broken(address: str, payload: bytes) -> tuple[int, bytes]:
+        raise http.client.RemoteDisconnected("synthetic")
+
+    def scorer(text: PostingText) -> Score | None:
+        return score_posting(text, RUBRIC, transport=broken)
+
+    lines = watch.run(
+        search,
+        [
+            company("Example Robotics", "greenhouse", "examplerobotics"),
+            company("Sample Logistics", "greenhouse", "samplelogistics"),
+        ],
+        today=DAY,
+        fetcher=Scripted(
+            {
+                first: fetched(one_greenhouse("examplerobotics")),
+                second: fetched(one_greenhouse("samplelogistics", ident=2002)),
+            }
+        ),
+        config=RUBRIC,
+        scorer=scorer,
+    )
+    assert len(postings(search)) == 2
+    assert sum("left unscored" in line for line in lines) == 2
+    assert all(row["llm_output"] is None for row in postings(search))

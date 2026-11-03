@@ -133,7 +133,7 @@ def default_transport(url: str) -> tuple[int, bytes]:
         conn.request("GET", path, headers={"Accept": "application/json"})
         response = conn.getresponse()
         return response.status, response.read(MAX_BODY + 1)
-    except OSError as exc:
+    except (OSError, http.client.HTTPException) as exc:
         raise DiscoverError(MISS) from exc
     finally:
         conn.close()
@@ -263,7 +263,7 @@ def run(
         try:
             target = request_url(base, query)
             status, body = talk(target)
-        except (DiscoverError, OSError):
+        except (DiscoverError, OSError, http.client.HTTPException):
             return Outcome(MISS, ())
         if status != 200 or len(body) > MAX_BODY:
             return Outcome(MISS, ())
@@ -407,19 +407,26 @@ def _slug(value: str) -> str | None:
 
 
 def _result_urls(body: bytes) -> list[str] | None:
+    """The result URLs, or None when the reply is not a SearXNG result list.
+
+    A result without a string url is skipped. A non-empty list where every result is
+    skipped is not a usable reply either.
+    """
     try:
         payload = json.loads(body)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     if not isinstance(payload, dict):
         return None
-    results = payload.get("results", [])
+    results = payload.get("results")
     if not isinstance(results, list):
         return None
     urls: list[str] = []
     for item in results:
         if isinstance(item, dict) and isinstance(item.get("url"), str):
             urls.append(item["url"])
+    if results and not urls:
+        return None
     return urls
 
 

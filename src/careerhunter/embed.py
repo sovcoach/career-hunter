@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import http.client
 import json
 import math
 import sqlite3
@@ -73,7 +74,7 @@ def embed_text(
     try:
         require_loopback(url)
         status, body = send(url, _request(text))
-    except (ScoreError, OSError):
+    except (ScoreError, OSError, http.client.HTTPException):
         raise EmbedError("unreachable") from None
     return _values(status, body)
 

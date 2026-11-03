@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from careerhunter import db, search_store, watch
+from careerhunter import embed as embedding
 from careerhunter.embed import (
     DEFAULT_URL,
     MODEL_NAME,
@@ -24,7 +25,7 @@ from careerhunter.filters import PostingText
 from careerhunter.models import Posting
 from careerhunter.score import Score
 from careerhunter.storage_guard import DataDir
-from tests.test_score import RUBRIC
+from tests.test_score import BROKEN, RUBRIC, broken_connection
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, url
 
 RESUME = "Synthetic resume for operations work."
@@ -538,3 +539,58 @@ def test_cosine_of_known_vectors() -> None:
         cosine([1.0], [1.0, 0.0])
     with pytest.raises(EmbedError):
         cosine([0.0, 0.0], [0.0, 0.0])
+
+
+@pytest.mark.parametrize("error", BROKEN, ids=lambda e: type(e).__name__)
+def test_a_broken_reply_from_the_default_transport_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    monkeypatch.setattr(http.client, "HTTPConnection", broken_connection(error))
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME)
+    assert str(exc.value) == "unreachable"
+    assert RESUME not in str(exc.value)
+
+
+def test_an_injected_transport_that_breaks_is_unreachable() -> None:
+    def broken(url: str, payload: bytes) -> tuple[int, bytes]:
+        raise http.client.RemoteDisconnected("synthetic")
+
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME, transport=broken)
+    assert str(exc.value) == "unreachable"
+    assert RESUME not in str(exc.value)
+
+
+def _vector(value: object) -> bytes:
+    return json.dumps({"data": [{"embedding": value}]}).encode()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(json.dumps({"error": "model not loaded"}).encode(), id="error-object"),
+        pytest.param(json.dumps({"data": []}).encode(), id="no-data"),
+        pytest.param(json.dumps({"data": ["x"]}).encode(), id="data-not-object"),
+        pytest.param(json.dumps({"data": [{}]}).encode(), id="no-vector"),
+        pytest.param(_vector([]), id="empty-vector"),
+        pytest.param(_vector("x"), id="vector-not-list"),
+        pytest.param(_vector([1, "a"]), id="non-numeric"),
+        pytest.param(_vector([True, 1.0]), id="boolean"),
+        pytest.param(b'{"data": [{"embedding": [1e400, 1.0]}]}', id="infinite"),
+    ],
+)
+def test_a_reply_of_the_wrong_shape_is_unreachable(body: bytes) -> None:
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME, transport=lambda url, payload: (200, body))
+    assert str(exc.value) == "unreachable"
+    assert RESUME not in str(exc.value)
+
+
+def test_a_bug_in_our_own_parser_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def bug(status: int, body: bytes) -> list[float]:
+        raise RuntimeError("synthetic bug")
+
+    monkeypatch.setattr(embedding, "_values", bug)
+    with pytest.raises(RuntimeError, match="synthetic bug"):
+        embed_text(RESUME, transport=lambda url, payload: (200, _vector([1.0, 0.0])))
