@@ -254,6 +254,10 @@ def test_a_null_url_makes_no_request(
     assert captured.out == ""
     assert captured.err == "discovery off\n"
     assert not (inited / "search.db").exists() or _count(inited) == 0
+    stamp = inited / "logs" / "discover.success"
+    assert stamp.is_file()
+    assert stamp.stat().st_mode & 0o777 == 0o600
+    assert not (inited / "logs" / "discover.log").exists()
 
 
 def test_a_missing_config_writes_nothing(
@@ -266,6 +270,7 @@ def test_a_missing_config_writes_nothing(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "config.yaml is missing" in captured.err
+    assert not (inited / "logs" / "discover.success").exists()
 
 
 def _count(root: Path) -> int:
@@ -286,6 +291,7 @@ def test_a_missing_database_writes_nothing(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "error: search.db is missing; run careerhunter init\n"
+    assert not (inited / "logs" / "discover.success").exists()
 
 
 def test_a_miss_on_the_command_exits_zero(
@@ -306,6 +312,26 @@ def test_a_miss_on_the_command_exits_zero(
     assert captured.err == f"{discover.MISS}\n"
     assert "site:" not in captured.err
     assert _count(inited) == 0
+    stamp = inited / "logs" / "discover.success"
+    assert stamp.is_file()
+    assert stamp.stat().st_mode & 0o777 == 0o600
+    assert not (inited / "logs" / "discover.log").exists()
+
+
+def test_list_does_not_refresh_discover_success(
+    inited: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["discover"], probe=probe) == 0
+    capsys.readouterr()
+    path = inited / "logs" / "discover.success"
+    path.write_text("2020-01-01T00:00:00Z\n")
+    assert cli.main(["discover", "list"], probe=probe) == 0
+    assert path.read_text() == "2020-01-01T00:00:00Z\n"
+    assert cli.main(["discover"], probe=probe) == 0
+    refreshed = path.read_text()
+    assert refreshed != "2020-01-01T00:00:00Z\n"
+    assert refreshed.strip().endswith("Z")
+    assert not (inited / "logs" / "discover.log").exists()
 
 
 def test_the_client_returns_a_redirect_and_does_not_follow_it(
@@ -569,6 +595,8 @@ def test_approve_and_reject_leave_config_and_the_ei_file_alone(
     assert (inited / "config.yaml").read_bytes() == config
     assert (inited / "exclusions.yaml").read_bytes() == exclusions
     assert list(inited.glob("ei_record_*")) == [ei]
+    assert not (inited / "logs" / "discover.success").exists()
+    assert not (inited / "logs" / "discover.log").exists()
     conn = db.connect(inited / "search.db")
     companies = conn.execute("SELECT count(*) FROM companies").fetchone()
     applications = conn.execute("SELECT count(*) FROM applications").fetchone()

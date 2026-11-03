@@ -31,8 +31,9 @@ skips, alerts, or stored scores. embed-eval may rank a blend with it.
 discovery.searxng_url and discovery.career_hosts are optional. A null URL leaves
 discovery off. The URL is plain http to a loopback host, with no userinfo. A career
 host is a hostname only. discovery.interval_minutes is optional. Missing or null
-means 1440 minutes, and a set value is an integer of at least 60. Every problem is
-reported in one pass.
+means 1440 minutes, and a set value is an integer of at least 60. When the URL is
+set, service install uses that interval for the discovery LaunchAgent. Every
+problem is reported in one pass.
 
 schedule.timezone is the only place a time zone is set. It takes an IANA name
 (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); a fixed offset doesn't
@@ -522,6 +523,17 @@ def parse_timezone(value: Any) -> dt.tzinfo:
         raise ValueError(
             f"{value!r} isn't a known time zone name or a UTC offset like UTC+05:30"
         ) from None
+
+
+def discovery_enabled(doc: dict[str, Any] | None) -> bool:
+    """True when discovery.searxng_url is set. Null or missing leaves discovery off."""
+    if not isinstance(doc, dict):
+        return False
+    section = doc.get("discovery")
+    if not isinstance(section, dict):
+        return False
+    url = section.get("searxng_url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 def discovery_interval_minutes(doc: dict[str, Any] | None) -> int:

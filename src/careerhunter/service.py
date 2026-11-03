@@ -9,6 +9,9 @@ Keychain, which needs the logged-in user's session.
   not a loop.
 - The watch agent runs `careerhunter watch` once per
   `schedule.watcher_interval_minutes` and exits. It has no `KeepAlive`.
+- The discovery agent runs `careerhunter discover` once per
+  `discovery.interval_minutes` and exits. It has no `KeepAlive`. Install adds it
+  only when `discovery.searxng_url` is set.
 - launchd's own stdout and stderr go to /dev/null. Each command writes its own log,
   into the data folder's logs/, only after the storage guard has passed, so launchd
   never creates a log file under /Volumes while the drive is missing.
@@ -27,10 +30,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from careerhunter.config import DEFAULT_WATCH_INTERVAL_MINUTES, MIN_WATCH_INTERVAL_MINUTES
+from careerhunter.config import (
+    DEFAULT_WATCH_INTERVAL_MINUTES,
+    MIN_DISCOVERY_INTERVAL_MINUTES,
+    MIN_WATCH_INTERVAL_MINUTES,
+)
 
 LABEL = "org.careerhunter.bot"
 WATCH_LABEL = "org.careerhunter.watch"
+DISCOVER_LABEL = "org.careerhunter.discover"
 Runner = Callable[[list[str]], tuple[int, str]]
 
 
@@ -56,6 +64,10 @@ def plist_path(home: Path | None = None) -> Path:
 
 def watch_plist_path(home: Path | None = None) -> Path:
     return agent_plist_path(WATCH_LABEL, home)
+
+
+def discover_plist_path(home: Path | None = None) -> Path:
+    return agent_plist_path(DISCOVER_LABEL, home)
 
 
 def program() -> Path:
@@ -85,26 +97,55 @@ def plist(program_path: Path, data_dir: Path) -> bytes:
     )
 
 
-def watch_plist(program_path: Path, data_dir: Path, minutes: int) -> bytes:
-    """One watch run per interval. No KeepAlive, so a finished run waits for the next."""
-    if (
-        isinstance(minutes, bool)
-        or not isinstance(minutes, int)
-        or minutes < MIN_WATCH_INTERVAL_MINUTES
-    ):
-        raise ServiceError(
-            f"watcher_interval_minutes must be an integer >= {MIN_WATCH_INTERVAL_MINUTES}"
-        )
+def _interval_plist(
+    label: str,
+    program_path: Path,
+    data_dir: Path,
+    command: str,
+    minutes: int,
+    *,
+    minimum: int,
+    field: str,
+) -> bytes:
+    """One run per interval. No KeepAlive, so a finished run waits for the next."""
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < minimum:
+        raise ServiceError(f"{field} must be an integer >= {minimum}")
     return plistlib.dumps(
         {
-            "Label": WATCH_LABEL,
-            "ProgramArguments": [str(program_path), "watch"],
+            "Label": label,
+            "ProgramArguments": [str(program_path), command],
             "EnvironmentVariables": {"CAREERHUNTER_DATA_DIR": str(data_dir)},
             "RunAtLoad": True,
             "StartInterval": minutes * 60,
             "ProcessType": "Background",
             **_quiet_paths(),
         }
+    )
+
+
+def watch_plist(program_path: Path, data_dir: Path, minutes: int) -> bytes:
+    """One watch run per interval. No KeepAlive, so a finished run waits for the next."""
+    return _interval_plist(
+        WATCH_LABEL,
+        program_path,
+        data_dir,
+        "watch",
+        minutes,
+        minimum=MIN_WATCH_INTERVAL_MINUTES,
+        field="watcher_interval_minutes",
+    )
+
+
+def discover_plist(program_path: Path, data_dir: Path, minutes: int) -> bytes:
+    """One discovery search per interval. No KeepAlive."""
+    return _interval_plist(
+        DISCOVER_LABEL,
+        program_path,
+        data_dir,
+        "discover",
+        minutes,
+        minimum=MIN_DISCOVERY_INTERVAL_MINUTES,
+        field="discovery_interval_minutes",
     )
 
 
@@ -165,35 +206,44 @@ def install(
     runner: Runner | None = None,
     home: Path | None = None,
     watch_interval_minutes: int = DEFAULT_WATCH_INTERVAL_MINUTES,
+    discovery_interval_minutes: int | None = None,
 ) -> list[Path]:
-    """Install whichever of the bot and watch agents is missing. Both, if neither is."""
+    """Install whichever requested agent is missing.
+
+    ``discovery_interval_minutes`` None does not install the discovery agent.
+    A set value installs that agent even when the bot and watch plists already
+    exist, and does not bootstrap those two again.
+    """
     runner = runner or run_launchctl
     binary = program_path or program()
-    bot_path = plist_path(home)
-    watch_path = watch_plist_path(home)
-    if bot_path.exists() and watch_path.exists():
-        raise ServiceError(
-            f"{bot_path.name} and {watch_path.name} already exist; "
-            "run: careerhunter service uninstall"
+    # Build every body before writing so a bad interval leaves nothing new behind.
+    planned = [
+        (plist_path(home), plist(binary, data_dir)),
+        (watch_plist_path(home), watch_plist(binary, data_dir, watch_interval_minutes)),
+    ]
+    if discovery_interval_minutes is not None:
+        planned.append(
+            (
+                discover_plist_path(home),
+                discover_plist(binary, data_dir, discovery_interval_minutes),
+            )
         )
-    # Build both before writing so a bad interval leaves nothing new behind.
-    bot_body = plist(binary, data_dir)
-    watch_body = watch_plist(binary, data_dir, watch_interval_minutes)
+    missing = [(path, body) for path, body in planned if not path.exists()]
+    if not missing:
+        names = " and ".join(path.name for path, _body in planned)
+        raise ServiceError(f"{names} already exist; run: careerhunter service uninstall")
     made: list[Path] = []
-    if not bot_path.exists():
-        _install_one(bot_path, bot_body, runner)
-        made.append(bot_path)
-    if not watch_path.exists():
-        _install_one(watch_path, watch_body, runner)
-        made.append(watch_path)
+    for path, body in missing:
+        _install_one(path, body, runner)
+        made.append(path)
     return made
 
 
 def uninstall(runner: Runner | None = None, home: Path | None = None) -> bool:
-    """Stop both agents and remove their plists. False if neither was installed."""
+    """Stop the installed agents and remove their plists. False if none were."""
     runner = runner or run_launchctl
     removed = False
-    for label in (LABEL, WATCH_LABEL):
+    for label in (LABEL, WATCH_LABEL, DISCOVER_LABEL):
         path = agent_plist_path(label, home)
         if not path.exists():
             continue

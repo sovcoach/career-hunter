@@ -118,6 +118,7 @@ watchlist:
 # A set URL is plain http to 127.0.0.1, localhost, or ::1, with no userinfo.
 # career_hosts lists extra career-page hostnames: no scheme, path, wildcard, or "..".
 # interval_minutes is optional. Missing or null means 1440, and the minimum is 60.
+# When the URL is set, service install runs careerhunter discover on this interval.
 discovery:
   searxng_url: null
   career_hosts: []

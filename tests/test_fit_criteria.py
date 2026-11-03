@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from careerhunter.config import (
+    discovery_enabled,
     discovery_interval_minutes,
     telegram_chat_id,
     timezone,
@@ -77,7 +78,11 @@ def test_watcher_interval_is_optional() -> None:
 
 def test_discovery_interval_defaults_to_a_day() -> None:
     d = doc()
+    assert discovery_enabled(d) is False
     assert discovery_interval_minutes(d) == 1440
+    d["discovery"]["searxng_url"] = "http://127.0.0.1:8888/search"
+    assert discovery_enabled(d) is True
+    d["discovery"]["searxng_url"] = None
     del d["discovery"]["interval_minutes"]
     assert validate_config(d) == []
     assert discovery_interval_minutes(d) == 1440
@@ -90,6 +95,8 @@ def test_discovery_interval_defaults_to_a_day() -> None:
     del d["discovery"]
     assert discovery_interval_minutes(d) == 1440
     assert discovery_interval_minutes(None) == 1440
+    assert discovery_enabled(d) is False
+    assert discovery_enabled(None) is False
 
 
 def test_discovery_settings_are_optional() -> None:
