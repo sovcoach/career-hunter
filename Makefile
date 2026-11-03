@@ -2,7 +2,7 @@
 # seed/export/doctor need CAREERHUNTER_DATA_DIR set (see docs/SETUP.md).
 
 .DEFAULT_GOAL := help
-.PHONY: help setup hooks test cov lint format typecheck check verify-tree seed export doctor embed-eval discover
+.PHONY: help setup hooks test cov lint format typecheck check verify-tree check-lock-age seed export doctor embed-eval discover
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  make %-11s %s\n", $$1, $$2}'
@@ -38,6 +38,9 @@ check: lint typecheck cov ## Everything CI runs, except the full-history secret 
 
 verify-tree: ## Every hook and gitleaks over every file, tracked and untracked
 	uv run python scripts/verify_tree.py
+
+check-lock-age: ## Every locked version was two weeks old when locked (ADR-006)
+	uv run python scripts/check_lock_age.py
 
 seed: ## Import seed.yaml from your data folder (safe to re-run)
 	uv run careerhunter seed
