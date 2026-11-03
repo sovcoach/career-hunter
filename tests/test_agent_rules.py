@@ -50,6 +50,14 @@ def test_adrs_010_to_012_record_the_local_merge() -> None:
         assert row.endswith("amended (local merges) |")
 
 
+def test_contributing_describes_the_local_merge() -> None:
+    workflow = _text(ROOT / "CONTRIBUTING.md").split("## Workflow", 1)[1].split("\n## ", 1)[0]
+    assert "TZ=UTC git merge --no-ff" in workflow
+    assert "(AGENTS.md#merging)" in workflow
+    assert "never through GitHub's web UI" in workflow
+    assert "Merge through the PR" not in workflow
+
+
 def test_claude_md_only_points_to_agents_md() -> None:
     text = _text(CLAUDE)
     assert "@AGENTS.md" in text.splitlines()

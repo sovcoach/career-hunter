@@ -26,6 +26,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - When `discovery.searxng_url` is set, `service install` also installs `org.careerhunter.discover`, including when the bot and watch plists are already there. It runs `careerhunter discover` once per `discovery.interval_minutes` (default 1440, minimum 60) and exits. It has no `KeepAlive`. A run that exits 0 writes `logs/discover.success`, including a miss and discovery off. Approve, reject, and list do not. There is no `discover.log`. A null URL does not install the agent. `doctor` reports it: off when the URL is null and no plist is present, a warning when a plist is left behind, and not installed when the URL is set and the plist is absent. A loaded agent is compared with the interval. A stamp older than two intervals is a failure. A warning does not fail `doctor`.
 - `CLAUDE.md`: the working rules for AI agent sessions. They cover approval before every commit, push or PR, guarded git commands run on their own, UTC timestamps, no attribution lines, synthetic test data, and placeholder paths with no personal details in public files.
 
+### Changed
+- The agent working rules move to `AGENTS.md`, the single source of truth. `CLAUDE.md` only points to it (#44).
+- Pull requests are merged locally by the operator with `TZ=UTC git merge --no-ff`, never through the web UI, so merge commits carry no local time zone offset. `AGENTS.md` ("Merging") and CONTRIBUTING.md give the steps, including the operator's push to `main`. ADR-010, ADR-011 and ADR-012 are amended (#44).
+
 ## [0.3.0] - 2026-11-01
 
 ### Added

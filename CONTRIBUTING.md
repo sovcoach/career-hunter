@@ -49,8 +49,14 @@ Tests never need a real data folder or Keychain: the storage guard and Keychain 
    `feat: …`, `fix: …`, `docs: …`, `test: …`, `refactor: …`, `chore: …`, `ci: …`.
 4. Update `CHANGELOG.md` under `[Unreleased]`, and `docs/DECISIONS.md` if a design choice changed.
 5. Open a **pull request** using the template. CI must pass: lint, types, tests with coverage of at least 85%, and gitleaks.
-6. Merge through the PR. No direct or force pushes to `main`: GitHub enforces this (ADR-012), and so does the pre-push guard.
-   - **Manual override, for the operator only:** `CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push origin main`. It's for a deliberate, by-hand fix; never put it in a script or alias. AI assistants are denied any command that mentions the variable (ADR-011).
+6. **Merge locally, in UTC.** Once the pull request's CI checks pass, the operator merges it on their own machine, never through GitHub's web UI, so the merge commit carries no local time zone offset (ADR-010). The full steps are in [AGENTS.md](AGENTS.md#merging):
+   - `git switch main`, then `git pull --ff-only`;
+   - `TZ=UTC git merge --no-ff <branch> -m "Merge pull request #<N> from sovcoach/<branch>"`;
+   - `make check` on the result;
+   - push `main` with the manual override below. GitHub reports "Bypassed rule violations" for the pull request and status check rules; that's expected on this push only (ADR-012).
+
+   No force pushes to `main`. Any other push to `main` is refused by the pre-push guard.
+   - **Manual override, for the operator only:** `CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push origin main`. Type it by hand for the merge push or a deliberate fix; never put it in a script or alias. AI assistants are denied any command that mentions the variable, and never merge (ADR-011).
 7. At the end of a phase: move `[Unreleased]` to a version and tag it (`vX.Y.0`).
 
 ## Common commands
