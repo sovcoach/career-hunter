@@ -27,6 +27,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - When `discovery.searxng_url` is set, `service install` also installs `org.careerhunter.discover`, including when the bot and watch plists are already there. It runs `careerhunter discover` once per `discovery.interval_minutes` (default 1440, minimum 60) and exits. It has no `KeepAlive`. A run that exits 0 writes `logs/discover.success`, including a miss and discovery off. Approve, reject, and list do not. There is no `discover.log`. A null URL does not install the agent. `doctor` reports it: off when the URL is null and no plist is present, a warning when a plist is left behind, and not installed when the URL is set and the plist is absent. A loaded agent is compared with the interval. A stamp older than two intervals is a failure. A warning does not fail `doctor`.
 - `CLAUDE.md`: the working rules for AI agent sessions. They cover approval before every commit, push or PR, guarded git commands run on their own, UTC timestamps, no attribution lines, synthetic test data, and placeholder paths with no personal details in public files.
 
+### Changed
+- The README status names the running pipeline: the EI split, the bot, the watcher, local scoring, the embedding cosine, and discovery. The version number stays 0.3.0 until the release commit.
+- The architecture roadmap marks Phases 3, 3.5, and 4 done. Phase 5 is this release. The component table adds `discover.py`, `embed.py`, `embed_eval.py`, and `scout_prompt.py`.
+- The architecture intro names the Telegram bot token as a current secret. The data-folder diagram includes `evals/` and `logs/discover.success`. `backups/` stays reserved (ADR-001).
+- SECURITY.md says the bot is in use. A discovery message is the suggested name and the reduced URL. What the bot does not send stays the ADR-015 list, including vectors (ADR-019).
+- Setup samples show search schema version 6, and `init` lists `evals/`. The EI record sample stays at schema version 1. The missing-token line no longer waits on Phase 2.
+
 ## [0.3.0] - 2026-11-01
 
 ### Added

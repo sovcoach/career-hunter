@@ -7,7 +7,7 @@
 
 Inside that folder, the data itself has two layers that never mix either. `search.db` holds everything career-hunter learns from: postings, fit ratings, skip reasons and the like. Each EI claim gets its own small record file, holding only what Service Canada may ask for. The two are linked by a random ID that means nothing on its own.
 
-A small "storage guard" runs before every command and checks that the data folder is somewhere safe. Secrets, such as the future Telegram bot token, sit in the macOS Keychain, separate from both halves.
+A small "storage guard" runs before every command and checks that the data folder is somewhere safe. Secrets, such as the Telegram bot token, sit in the macOS Keychain, separate from both halves.
 
 ---
 
@@ -29,11 +29,15 @@ A small "storage guard" runs before every command and checks that the data folde
 | `search_store.py` | Reads and writes on `search.db`, including the posting identity rules. |
 | `seed.py` | Validates `seed.yaml`, runs the claim check, then imports each record into its layer. Idempotent by natural keys. |
 | `export.py` | Builds one claim's EI record for a date range as CSV and PDF, from that claim's file alone. |
-| `bot.py` | The Telegram bot: the chat allowlist, commands, buttons and replies, writing through the ledger; fail-closed startup and the polling loop. On each successful poll it sends one alert per scored watcher posting. |
+| `bot.py` | The Telegram bot: the chat allowlist, commands, buttons and replies, writing through the ledger; fail-closed startup and the polling loop. On each successful poll it sends one alert per scored watcher posting, and pending discovery rows to the allowlisted chat. |
 | `telegram.py` | A minimal Bot API client (standard library plus `truststore`) whose errors never carry the token. |
 | `fetch.py` | Fetches a link safely: public addresses only, pinned to the checked address on every redirect hop. Keeps a `Retry-After` header when the server sends one. |
 | `filters.py` | The decision to keep, skip or flag a posting: exclusions, hard gates, location rules, role filters and schedule limits. A skip reason is a string. No fetching, scoring or alerts. |
 | `score.py` | Scores one kept posting on a local loopback model. The prompt is lanes, location rules, hard gates and `gap_tiers`. Stores gaps, model text and the tier name. Leaves `fit_rating` null. Not `fetch.py`. |
+| `embed.py` | Asks the loopback embeddings endpoint for one resume vector and one posting vector. Not `fetch.py`. |
+| `embed_eval.py` | Ranks stored cosines against stored LLM tiers and writes a private report under `evals/`. Does not call the model. |
+| `scout_prompt.py` | Prints a scout prompt from exclusions and the hard gates the watcher skips on. Writes nothing. |
+| `discover.py` | Queues company candidates from a local SearXNG into `search.db`. Approve and reject update that queue only. |
 | `watch.py` | One run of `careerhunter watch`: fetch Greenhouse, Lever and Ashby, filter, then score. Writes `search.db` only. Does not call Telegram. |
 | `snapshots.py` | Job-ad snapshots: the page, an ATS's public JSON, or a PDF or screenshot sent to the bot. |
 | `service.py` | User LaunchAgents: the bot, kept running; `org.careerhunter.watch`, which runs `careerhunter watch` once per `schedule.watcher_interval_minutes` and exits; and, when `discovery.searxng_url` is set, `org.careerhunter.discover`, which runs `careerhunter discover` once per `discovery.interval_minutes` and exits. |
@@ -53,8 +57,9 @@ A small "storage guard" runs before every command and checks that the data folde
 ├── seed.yaml                             ← one-off import of past history
 ├── exports/                              ← EI reports, timestamped, never overwritten
 ├── snapshots/<YYYY>/                     ← copies of job ads (0600; ADR-017)
-├── logs/                                 ← bot.log, bot.heartbeat, watch.log, watch.success (0600)
-└── backups/
+├── logs/                                 ← bot.log, bot.heartbeat, watch.log, watch.success, discover.success (0600)
+├── evals/                                ← embed-eval reports (0600; ADR-019)
+└── backups/                              ← reserved for later automation (ADR-001)
 ```
 
 - **Outside the repo:** a git mistake can't leak data that isn't there. See DECISIONS ADR-001.
@@ -209,7 +214,7 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 - No inbound port and no webhook: the bot only ever calls out to Telegram, and to the job-ad links it is given.
 - Every write goes through the same ledger functions as the CLI, after the same claim checks (ADR-014). The bot re-reads config.yaml before each write.
 - What it sends is minimal (ADR-015); what it trusts is limited (ADR-016); how it saves job ads is in ADR-017.
-- `doctor` reports the chat setting, whether the bot service is running, how recent its heartbeat is, whether the watch agent is loaded, and the age of the last successful watch.
+- `doctor` reports the chat setting, whether the bot service is running, how recent its heartbeat is, and whether the watch and discovery agents are loaded and how old their success stamps are.
 
 ## Phase roadmap
 
@@ -217,9 +222,10 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 |---|---|---|
 | 1, Foundation (v0.1.0) | Storage guards, Keychain helper, schema and migrations, seed import, EI export, CI, docs | done |
 | 1.5, Data layer split (v0.2.0) | `search.db` and one EI record file per claim, a correlation ID, write order and reconciliation, claim config and sealing | done |
-| 2, Telegram bot (v0.3.0) | The bot (alerts with Applied/Skipped, `/log`, `/status`, `/activity`, `/recent`), job-ad snapshots, the launchd service, the fit-criteria schema (validation only), and repo hygiene | **this release** |
-| 3, Watcher | Fetch watchlisted companies' ATS boards; job-ad snapshots for the EI record; fit rating against the config rubric; skips with reasons | planned |
-| 4, Discovery | Find new companies and postings beyond the watchlist | planned |
-| 5, Release | License, polish | planned |
+| 2, Telegram bot (v0.3.0) | The bot (alerts with Applied/Skipped, `/log`, `/status`, `/activity`, `/recent`), job-ad snapshots, the launchd service, the fit-criteria schema (validation only), and repo hygiene | done |
+| 3, Watcher | Fetch Greenhouse, Lever and Ashby boards; filter and record skip reasons; score kept postings on a local model (`fit_rating` stays null); alert through the existing bot | done |
+| 3.5, Embeddings | A local embedding cosine beside the LLM tier, and `careerhunter embed-eval` (ADR-019) | done |
+| 4, Discovery | Queue companies from a local SearXNG, approve or reject them, and run discovery on its own LaunchAgent | done |
+| 5, Ops and portfolio | MIT license, docs aligned with the running pipeline, and an owner-only check for `evals/` | **this release** |
 
 Each phase lands as a pull request against `main` with its own milestone, and gets a semver tag when merged. The repo goes public once Phase 1 is verified, and `main` is protected straight after (ADR-012).
