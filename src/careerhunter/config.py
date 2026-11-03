@@ -30,7 +30,9 @@ tier. embedding_weight is a number from 0 to 1. The watcher does not read it for
 skips, alerts, or stored scores. embed-eval may rank a blend with it.
 discovery.searxng_url and discovery.career_hosts are optional. A null URL leaves
 discovery off. The URL is plain http to a loopback host, with no userinfo. A career
-host is a hostname only. Every problem is reported in one pass.
+host is a hostname only. discovery.interval_minutes is optional. Missing or null
+means 1440 minutes, and a set value is an integer of at least 60. Every problem is
+reported in one pass.
 
 schedule.timezone is the only place a time zone is set. It takes an IANA name
 (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); a fixed offset doesn't
@@ -54,6 +56,8 @@ from careerhunter.enums import ATS_TYPES, WORK_MODELS
 
 DEFAULT_WATCH_INTERVAL_MINUTES = 60
 MIN_WATCH_INTERVAL_MINUTES = 15
+DEFAULT_DISCOVERY_INTERVAL_MINUTES = 1440
+MIN_DISCOVERY_INTERVAL_MINUTES = 60
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _CAREER_HOST = re.compile(
@@ -174,13 +178,25 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
     if not isinstance(section, dict):
         problems.append("discovery must be a mapping")
         return
-    extra = set(section) - {"searxng_url", "career_hosts"}
+    extra = set(section) - {"searxng_url", "career_hosts", "interval_minutes"}
     if extra:
         problems.append(f"discovery has unknown keys: {sorted(extra)}")
     if "searxng_url" in section:
         _searxng_url(section["searxng_url"], problems)
     if "career_hosts" in section:
         _career_hosts(section["career_hosts"], problems)
+    if "interval_minutes" in section:
+        _discovery_interval(section["interval_minutes"], problems)
+
+
+def _discovery_interval(value: Any, problems: list[str]) -> None:
+    """discovery.interval_minutes is null, or an integer of at least 60. Bools are refused."""
+    if value is None:
+        return
+    if not _int(value) or value < MIN_DISCOVERY_INTERVAL_MINUTES:
+        problems.append(
+            f"discovery.interval_minutes must be an integer >= {MIN_DISCOVERY_INTERVAL_MINUTES}"
+        )
 
 
 def _int(value: Any) -> TypeGuard[int]:
@@ -506,6 +522,19 @@ def parse_timezone(value: Any) -> dt.tzinfo:
         raise ValueError(
             f"{value!r} isn't a known time zone name or a UTC offset like UTC+05:30"
         ) from None
+
+
+def discovery_interval_minutes(doc: dict[str, Any] | None) -> int:
+    """Minutes between discovery runs. A missing or unusable value uses the default."""
+    if not isinstance(doc, dict):
+        return DEFAULT_DISCOVERY_INTERVAL_MINUTES
+    section = doc.get("discovery")
+    if not isinstance(section, dict):
+        return DEFAULT_DISCOVERY_INTERVAL_MINUTES
+    value = section.get("interval_minutes", DEFAULT_DISCOVERY_INTERVAL_MINUTES)
+    if value is None or not _int(value) or value < MIN_DISCOVERY_INTERVAL_MINUTES:
+        return DEFAULT_DISCOVERY_INTERVAL_MINUTES
+    return value
 
 
 def watch_interval_minutes(doc: dict[str, Any] | None) -> int:
