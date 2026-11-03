@@ -47,3 +47,18 @@ def test_the_index_row_records_the_amendment() -> None:
     rows = DECISIONS.read_text(encoding="utf-8").splitlines()
     row = next(line for line in rows if line.startswith("| 006 |"))
     assert row.endswith("amended (lockfile) |")
+
+
+def test_contributing_documents_both_checks() -> None:
+    contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    section = contributing.split("## Supply-chain checks", 1)[1].split("\n## ", 1)[0]
+    for name in (
+        "`make check-lock-age`",
+        "`make check-history BASE=origin/main`",
+        "`scripts/lock_age_allowlist.toml`",
+        "`scripts/history_path_allowlist.txt`",
+        "`exclude-newer-package`",
+    ):
+        assert name in section
+    assert "`/Volumes/ExampleDrive/ExampleFolder`" in section
+    assert "`/Users/example/ExampleFolder/career-hunter`" in section
