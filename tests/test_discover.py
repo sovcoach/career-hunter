@@ -259,7 +259,9 @@ def test_a_null_url_makes_no_request(
     stamp = inited / "logs" / "discover.success"
     assert stamp.is_file()
     assert stamp.stat().st_mode & 0o777 == 0o600
-    assert not (inited / "logs" / "discover.log").exists()
+    log = inited / "logs" / "discover.log"
+    assert log.read_text() == "discovery off\ndiscover: 0 queued\n"
+    assert log.stat().st_mode & 0o777 == 0o600
 
 
 def test_a_missing_config_writes_nothing(
@@ -317,7 +319,10 @@ def test_a_miss_on_the_command_exits_zero(
     stamp = inited / "logs" / "discover.success"
     assert stamp.is_file()
     assert stamp.stat().st_mode & 0o777 == 0o600
-    assert not (inited / "logs" / "discover.log").exists()
+    log = inited / "logs" / "discover.log"
+    assert log.read_text() == f"{discover.MISS}\ndiscover: 0 queued\n"
+    assert "site:" not in log.read_text()
+    assert log.stat().st_mode & 0o777 == 0o600
 
 
 def test_list_does_not_refresh_discover_success(
@@ -333,7 +338,9 @@ def test_list_does_not_refresh_discover_success(
     refreshed = path.read_text()
     assert refreshed != "2020-01-01T00:00:00Z\n"
     assert refreshed.strip().endswith("Z")
-    assert not (inited / "logs" / "discover.log").exists()
+    # Only the two search runs wrote to the log; list wrote nothing.
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log == "discovery off\ndiscover: 0 queued\n" * 2
 
 
 def test_the_client_returns_a_redirect_and_does_not_follow_it(
@@ -759,3 +766,148 @@ def test_a_localhost_url_is_resolved_and_must_stay_on_loopback(
     with pytest.raises(discover.DiscoverError):
         discover.default_transport("http://localhost:8888/search?q=One")
     assert len(server.opened) == 1  # the refused answer was never dialled
+
+
+def test_a_search_run_logs_how_many_rows_it_queued(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited, hosts=["jobs.example.com"])
+    monkeypatch.setattr(discover, "default_transport", _Talk(_body(URLS)))
+    assert cli.main(["discover"], probe=probe) == 0
+    queued = capsys.readouterr().out.splitlines()
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log == f"discover: {len(queued)} queued\n"
+    assert SNIPPET not in log and TITLE not in log
+
+
+@pytest.mark.parametrize(
+    ("setup", "line"),
+    [
+        (lambda root, mp: (root / "config.yaml").unlink(), "config.yaml is missing"),
+        (
+            lambda root, mp: (root / "search.db").unlink(),
+            "search.db is missing; run careerhunter init",
+        ),
+        (
+            lambda root, mp: mp.setattr(
+                cli.db,
+                "migrate",
+                lambda conn, kind: (_ for _ in ()).throw(db.MigrationError("synthetic")),
+            ),
+            "MigrationError: synthetic",
+        ),
+    ],
+    ids=["no-config", "no-database", "migrate"],
+)
+def test_a_search_run_that_cannot_start_exits_1_with_its_line_in_the_log(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    setup: object,
+    line: str,
+) -> None:
+    _enable(inited)
+    monkeypatch.setattr(discover, "default_transport", lambda url: pytest.fail(url))
+    setup(inited, monkeypatch)  # type: ignore[operator]
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == f"error: {line}\n"
+    assert (inited / "logs" / "discover.log").read_text() == f"discover: aborted: {line}\n"
+    assert not (inited / "logs" / "discover.success").exists()
+
+
+def test_a_search_run_without_a_log_sends_no_query(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited)
+    monkeypatch.setattr(discover, "default_transport", lambda url: pytest.fail(url))
+    (inited / "logs").mkdir(mode=0o700, exist_ok=True)
+    (inited / "logs" / "discover.log").mkdir()
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: run log not writable: IsADirectoryError\n"
+    assert not (inited / "logs" / "discover.success").exists()
+
+
+def test_a_search_run_that_cannot_open_the_database_exits_1(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def cannot_open(path: object) -> object:
+        raise sqlite3.OperationalError("cannot open")
+
+    _enable(inited)
+    monkeypatch.setattr(cli.db, "connect", cannot_open)
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: OperationalError: cannot open\n"
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log == "discover: aborted: OperationalError: cannot open\n"
+
+
+def test_a_search_run_with_an_invalid_config_exits_1(
+    inited: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (inited / "config.yaml").write_text("discovery: 5\n")
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err.startswith("error: ")
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log.startswith("discover: aborted: ConfigError: ")
+
+
+def test_an_unexpected_search_failure_leaves_its_traceback_in_the_log(
+    inited: Path, probe: SystemProbe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("synthetic discover failure")
+
+    monkeypatch.setattr(cli.discover, "run", boom)
+    with pytest.raises(RuntimeError, match="synthetic discover failure"):
+        cli.main(["discover"], probe=probe)
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log.startswith("discover: aborted: traceback\nTraceback (most recent call last):")
+    assert "RuntimeError: synthetic discover failure" in log
+    assert not (inited / "logs" / "discover.success").exists()
+
+
+def test_a_search_run_whose_log_fails_mid_run_exits_1(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from careerhunter.runlog import RunLog
+
+    def refuse(fd: int, data: memoryview) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "RunLog", lambda path: RunLog(path, writer=refuse))
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: run log not writable: OSError\n"
+    assert not (inited / "logs" / "discover.success").exists()
+
+
+@pytest.mark.parametrize(
+    ("missing", "err"),
+    [
+        ("config.yaml", "error: config.yaml is missing\n"),
+        ("search.db", "error: search.db is missing; run careerhunter init\n"),
+    ],
+)
+def test_list_without_its_files_exits_1_and_writes_no_log(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    missing: str,
+    err: str,
+) -> None:
+    (inited / missing).unlink()
+    assert cli.main(["discover", "list"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == err
+    assert not (inited / "logs" / "discover.log").exists()

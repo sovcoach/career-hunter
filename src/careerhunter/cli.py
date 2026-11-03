@@ -16,8 +16,9 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import traceback
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,7 @@ from careerhunter.fetch import fetch as fetch_url
 from careerhunter.filters import PostingText
 from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.platform_checks import SystemProbe
+from careerhunter.runlog import RunLog, RunLogError
 from careerhunter.score import Score, score_posting
 from careerhunter.scout_prompt import render
 from careerhunter.seed import SeedError, Tally, import_seed
@@ -689,13 +691,35 @@ def _doctor_earlier_claim(
 
 
 def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
-    """Fetch Greenhouse, Lever and Ashby boards once, then exit."""
+    """Fetch Greenhouse, Lever and Ashby boards once, then exit.
+
+    Every line goes to logs/watch.log as it happens, then to stderr. Only the run log,
+    config.yaml, or search.db failing stops the run with exit 1.
+    """
+    try:
+        log = RunLog(datadir.logs / "watch.log")
+    except RunLogError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    with log:
+        try:
+            return _watch(datadir, log)
+        except RunLogError as exc:
+            _err(f"error: {exc}")
+            return EXIT_ERROR
+        except ConfigError as exc:
+            _note(log, f"watch: aborted: ConfigError: {exc}")
+            raise
+        except Exception as exc:
+            _note(log, _with_traceback("watch: aborted", exc))
+            raise
+
+
+def _watch(datadir: DataDir, log: RunLog) -> int:
     if not datadir.config_path.is_file():
-        _err("error: config.yaml is missing")
-        return EXIT_ERROR
+        return _abort(log, "watch", "config.yaml is missing")
     if not datadir.search_db_path.is_file():
-        _err("error: search.db is missing; run careerhunter init")
-        return EXIT_ERROR
+        return _abort(log, "watch", "search.db is missing; run careerhunter init")
     doc = load_config(datadir.config_path)
     entries = doc.get("watchlist", [])
     if not isinstance(entries, list):
@@ -707,10 +731,16 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
     def scorer(posting: PostingText) -> Score | None:
         return score_posting(posting, doc)
 
-    conn = db.connect(datadir.search_db_path)
+    def on_crash(who: str, exc: Exception) -> None:
+        log.note(_with_traceback(f"watch: {who}", exc))
+
+    try:
+        conn = db.connect(datadir.search_db_path)
+    except sqlite3.Error as exc:
+        return _db_abort(log, "watch", exc)
     try:
         db.migrate(conn, "search")
-        lines = watch.run(
+        watch.run(
             conn,
             entries,
             today=config_today(doc).isoformat(),
@@ -719,18 +749,25 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
             exclusions=exclusions,
             scorer=scorer,
             data_dir=datadir.root,
+            on_crash=on_crash,
+            emit=log.append,
         )
+    except (sqlite3.Error, db.MigrationError) as exc:
+        _rollback(conn)
+        return _db_abort(log, "watch", exc)
     finally:
+        _rollback(conn)
         conn.close()
-    for line in lines:
-        _err(line)
-    _append_watch_log(datadir, lines)
     _record_watch_success(datadir)
     return EXIT_OK
 
 
 def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
-    """Queue companies, or approve or reject one pending row. Writes search.db only."""
+    """Queue companies, or approve or reject one pending row. Writes search.db only.
+
+    A search run writes its lines to logs/discover.log as well; list, approve and
+    reject write no log file.
+    """
     action = args.discover_action
     candidate_id = args.candidate_id
     if action in ("approve", "reject"):
@@ -740,46 +777,118 @@ def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
     elif candidate_id is not None:
         _err(f"error: discover {action} takes no candidate id")
         return EXIT_ERROR
+    if action != "run":
+        return _discover_by_hand(datadir, action, candidate_id)
+    try:
+        log = RunLog(datadir.logs / "discover.log")
+    except RunLogError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    with log:
+        try:
+            return _discover_run(datadir, log)
+        except RunLogError as exc:
+            _err(f"error: {exc}")
+            return EXIT_ERROR
+        except ConfigError as exc:
+            _note(log, f"discover: aborted: ConfigError: {exc}")
+            raise
+        except Exception as exc:
+            _note(log, _with_traceback("discover: aborted", exc))
+            raise
+
+
+def _discover_run(datadir: DataDir, log: RunLog) -> int:
+    if not datadir.config_path.is_file():
+        return _abort(log, "discover", "config.yaml is missing")
+    if not datadir.search_db_path.is_file():
+        return _abort(log, "discover", "search.db is missing; run careerhunter init")
+    doc = load_config(datadir.config_path)
+    try:
+        conn = db.connect(datadir.search_db_path)
+    except sqlite3.Error as exc:
+        return _db_abort(log, "discover", exc)
+    try:
+        db.migrate(conn, "search")
+        outcome = discover.run(conn, doc, today=config_today(doc).isoformat())
+    except (sqlite3.Error, db.MigrationError) as exc:
+        _rollback(conn)
+        return _db_abort(log, "discover", exc)
+    finally:
+        _rollback(conn)
+        conn.close()
+    if outcome.notice:
+        log.append(outcome.notice)
+    log.note(f"discover: {len(outcome.rows)} queued")
+    for row in outcome.rows:
+        print(discover.format_row(row))
+    _record_discover_success(datadir)
+    return EXIT_OK
+
+
+def _discover_by_hand(datadir: DataDir, action: str, candidate_id: int | None) -> int:
+    """List, approve or reject. Interactive: no log file."""
     if not datadir.config_path.is_file():
         _err("error: config.yaml is missing")
         return EXIT_ERROR
     if not datadir.search_db_path.is_file():
         _err("error: search.db is missing; run careerhunter init")
         return EXIT_ERROR
-    doc = load_config(datadir.config_path)
     conn = db.connect(datadir.search_db_path)
     try:
         db.migrate(conn, "search")
         try:
-            rows, notice = _discover_rows(conn, doc, action, candidate_id)
+            rows = _discover_rows(conn, action, candidate_id)
         except discover.DiscoverError as exc:
             _err(f"error: {exc}")
             return EXIT_ERROR
     finally:
         conn.close()
-    if notice:
-        _err(notice)
     for row in rows:
         print(discover.format_row(row))
-    if action == "run":
-        _record_discover_success(datadir)
     return EXIT_OK
 
 
 def _discover_rows(
-    conn: sqlite3.Connection,
-    doc: dict[str, Any],
-    action: str,
-    candidate_id: int | None,
-) -> tuple[Sequence[discover.Queued], str | None]:
-    if action == "list":
-        return discover.pending(conn), None
+    conn: sqlite3.Connection, action: str, candidate_id: int | None
+) -> Sequence[discover.Queued]:
     if action == "approve" and isinstance(candidate_id, int):
-        return (discover.approve(conn, candidate_id),), None
+        return (discover.approve(conn, candidate_id),)
     if action == "reject" and isinstance(candidate_id, int):
-        return (discover.reject(conn, candidate_id),), None
-    outcome = discover.run(conn, doc, today=config_today(doc).isoformat())
-    return outcome.rows, outcome.notice
+        return (discover.reject(conn, candidate_id),)
+    return discover.pending(conn)
+
+
+def _abort(log: RunLog, command: str, reason: str) -> int:
+    """An infrastructure stop: the reason to the log file, the usual error to stderr."""
+    _note(log, f"{command}: aborted: {reason}")
+    _err(f"error: {reason}")
+    return EXIT_ERROR
+
+
+def _db_abort(log: RunLog, command: str, exc: Exception) -> int:
+    reason = f"{type(exc).__name__}: {exc}"
+    _note(log, f"{command}: aborted: {reason}")
+    _err(f"error: {reason}")
+    return EXIT_ERROR
+
+
+def _note(log: RunLog, text: str) -> None:
+    """Write to the log file on the way out. If that fails too, say so on stderr."""
+    try:
+        log.note(text)
+    except RunLogError as exc:
+        _err(f"error: {exc}")
+
+
+def _with_traceback(heading: str, exc: BaseException) -> str:
+    return f"{heading}: traceback\n" + "".join(traceback.format_exception(exc))
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction:
+        with suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
 
 
 def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
@@ -824,18 +933,6 @@ def cmd_scout_prompt(datadir: DataDir, args: argparse.Namespace) -> int:
     exclusions = load_exclusions(datadir.exclusions_path)
     sys.stdout.write(render(config, exclusions))
     return EXIT_OK
-
-
-def _append_watch_log(datadir: DataDir, lines: list[str]) -> None:
-    """The same lines stderr shows, kept after the guard has passed. 0600."""
-    if not lines:
-        return
-    path = datadir.logs / "watch.log"
-    path.parent.mkdir(mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "a") as fh:
-        fh.write("\n".join(lines) + "\n")
-    os.chmod(path, 0o600)
 
 
 def _record_success(datadir: DataDir, name: str) -> None:

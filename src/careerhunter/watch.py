@@ -25,8 +25,9 @@ one row of the recheck or scoring pass, or the embedding refresh, is rolled back
 logged as `watch: <who>: <ExceptionType>; continuing`. `sqlite3.IntegrityError` is
 isolated the same way. Any other `sqlite3.Error` is rolled back and re-raised: the
 database itself is failing, so the run stops. A board that is not fetched and parsed
-stores nothing, and its company and postings are left as they were. The last line is
-`watch: <n> boards fetched, <m> failed`.
+stores nothing, and its company and postings are left as they were. A run log that
+cannot be written stops the run too. The last line is
+`watch: <n> boards fetched, <m> failed`. Each line is handed to `emit` as it happens.
 """
 
 from __future__ import annotations
@@ -36,17 +37,18 @@ import json
 import re
 import sqlite3
 import urllib.parse
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn, Self, SupportsIndex
 
 from careerhunter import db, filters, search_store
 from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError
 from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
+from careerhunter.runlog import RunLogError
 from careerhunter.score import Score, ScoreError
 
 Fetcher = Callable[[str], Fetched]
@@ -114,6 +116,34 @@ class _Guard:
     failed: bool = False
 
 
+class _Emitting(list[str]):
+    """The run's lines. Each one is handed to `emit` before it is kept, in order.
+
+    The watcher only adds lines at the end. `insert` would put a line out of order with
+    what was already emitted, so it is refused.
+    """
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        super().__init__()
+        self._emit = emit
+
+    def append(self, line: str) -> None:
+        self._emit(line)
+        super().append(line)
+
+    def extend(self, lines: Iterable[str]) -> None:
+        for line in lines:
+            self.append(line)
+
+    # Same signature as list.__iadd__; mypy compares it with __add__ for list subclasses.
+    def __iadd__(self, value: Iterable[str]) -> Self:  # type: ignore[override, misc]
+        self.extend(value)
+        return self
+
+    def insert(self, index: SupportsIndex, line: str) -> NoReturn:
+        raise TypeError("watch lines are only ever added at the end")
+
+
 @dataclass(frozen=True)
 class _Aligned:
     ok: bool
@@ -144,14 +174,18 @@ def run(
     data_dir: Path | None = None,
     embed_transport: Callable[[str, bytes], tuple[int, bytes]] | None = None,
     on_crash: OnCrash | None = None,
+    emit: Callable[[str], None] | None = None,
 ) -> list[str]:
-    """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`."""
+    """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`.
+
+    Each log line is handed to `emit` as it happens; the same lines are returned.
+    """
     dt.date.fromisoformat(today)
     rules = config or {}
     skipped = exclusions or {}
     hook = on_crash or _no_hook
     embedder = Embedder(conn, data_dir, rules, transport=embed_transport)
-    lines: list[str] = []
+    lines: list[str] = _Emitting(emit or _no_emit)
     with _isolated(conn, lines, "embedding refresh", hook):
         lines.extend(embedder.refresh())
     _recheck(conn, watchlist, rules, skipped, today, lines, hook)
@@ -193,6 +227,10 @@ def _no_hook(who: str, exc: Exception) -> None:
     return None
 
 
+def _no_emit(line: str) -> None:
+    return None
+
+
 def _rollback(conn: sqlite3.Connection) -> None:
     if conn.in_transaction:
         conn.execute("ROLLBACK")
@@ -210,6 +248,9 @@ def _isolated(
         _crashed(conn, lines, who, exc, on_crash)
         guard.failed = True
     except sqlite3.Error:
+        _rollback(conn)
+        raise
+    except RunLogError:  # the run cannot leave a trace, so it does not go on
         _rollback(conn)
         raise
     except Exception as exc:

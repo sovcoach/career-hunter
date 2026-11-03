@@ -1456,3 +1456,298 @@ def test_a_keyboard_interrupt_is_not_caught(search: sqlite3.Connection) -> None:
 
     with pytest.raises(KeyboardInterrupt):
         w.run(search, entries("Example A"), today=DAY, fetcher=interrupted)
+
+
+# Every line watch.run returns was also emitted, in the same order.
+
+
+@pytest.fixture(autouse=True)
+def every_line_is_emitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = w.run
+
+    def checked(*args: Any, **kwargs: Any) -> list[str]:
+        emitted: list[str] = []
+        forward = kwargs.get("emit")
+
+        def record(line: str) -> None:
+            emitted.append(line)
+            if forward is not None:
+                forward(line)
+
+        kwargs["emit"] = record
+        lines = real(*args, **kwargs)
+        assert lines == emitted
+        return lines
+
+    monkeypatch.setattr(w, "run", checked)
+
+
+def test_the_line_list_refuses_an_insert() -> None:
+    lines = w._Emitting(lambda line: None)
+    lines += ["one"]
+    lines.extend(["two"])
+    assert lines == ["one", "two"]
+    with pytest.raises(TypeError):
+        lines.insert(0, "zero")
+
+
+def test_a_run_log_failure_inside_the_run_stops_it(
+    search: sqlite3.Connection,
+) -> None:
+    from careerhunter.runlog import RunLogError
+
+    fetcher = three_boards()
+    fetcher.mapping[board("Example B")] = RunLogError("OSError")
+    crashes = Crashes()
+    with pytest.raises(RunLogError):
+        w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher, on_crash=crashes)
+    assert board("Example C") not in fetcher.calls
+    assert crashes.calls == []
+    assert not search.in_transaction
+
+
+# The watch command: lines on disk as they happen, and only infrastructure stops a run.
+
+
+def _example_boards(monkeypatch: pytest.MonkeyPatch, fetch: Any) -> None:
+    def local_score(posting: object, config: object, **kwargs: object) -> Score:
+        return Score(llm_output='{"gaps":[]}', gaps="[]", tier="strong")
+
+    monkeypatch.setattr(cli, "fetch_url", fetch)
+    monkeypatch.setattr(cli, "score_posting", local_score)
+    monkeypatch.setattr(cli, "config_today", lambda doc, now=None: dt.date(2026, 11, 1))
+
+
+def _lever_board() -> Fetched:
+    return fetched(
+        [
+            {
+                "id": "abc-123",
+                "text": "Operations Coordinator",
+                "hostedUrl": "https://jobs.lever.co/samplelogistics/abc-123",
+                "categories": {"location": "Example City"},
+                "workplaceType": "remote",
+            }
+        ]
+    )
+
+
+def _log(root: Path) -> str:
+    return (root / "logs" / "watch.log").read_text()
+
+
+def test_watch_lines_reach_the_log_file_as_they_happen(
+    inited: Path, probe: SystemProbe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    on_disk: list[str] = []
+
+    def fake(address: str) -> Fetched:
+        if address == url("greenhouse", "examplerobotics"):
+            return fetched(one_greenhouse("examplerobotics"))
+        on_disk.append(_log(inited))  # while the second board is being fetched
+        return _lever_board()
+
+    _example_boards(monkeypatch, fake)
+    assert cli.main(["watch"], probe=probe) == 0
+    assert on_disk == ["watch: Example Robotics (greenhouse): 1 new, 0 already recorded\n"]
+
+
+@pytest.mark.parametrize(
+    ("setup", "line", "err"),
+    [
+        (
+            lambda root, mp: (root / "config.yaml").unlink(),
+            "watch: aborted: config.yaml is missing",
+            "error: config.yaml is missing\n",
+        ),
+        (
+            lambda root, mp: (root / "search.db").unlink(),
+            "watch: aborted: search.db is missing; run careerhunter init",
+            "error: search.db is missing; run careerhunter init\n",
+        ),
+        (
+            lambda root, mp: mp.setattr(
+                cli.db,
+                "connect",
+                lambda path: (_ for _ in ()).throw(sqlite3.OperationalError("cannot open")),
+            ),
+            "watch: aborted: OperationalError: cannot open",
+            "error: OperationalError: cannot open\n",
+        ),
+        (
+            lambda root, mp: mp.setattr(
+                cli.db,
+                "migrate",
+                lambda conn, kind: (_ for _ in ()).throw(db.MigrationError("synthetic")),
+            ),
+            "watch: aborted: MigrationError: synthetic",
+            "error: MigrationError: synthetic\n",
+        ),
+    ],
+    ids=["no-config", "no-database", "connect", "migrate"],
+)
+def test_an_infrastructure_failure_exits_1_with_its_line_in_the_log(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    setup: Any,
+    line: str,
+    err: str,
+) -> None:
+    _example_boards(monkeypatch, lambda address: pytest.fail("no fetch on an abort"))
+    setup(inited, monkeypatch)
+    assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == err
+    assert _log(inited) == line + "\n"
+    assert not (inited / "logs" / "watch.success").exists()
+
+
+def test_an_invalid_config_exits_1_with_its_line_in_the_log(
+    inited: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (inited / "config.yaml").write_text("watchlist: 5\n")
+    assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err.startswith("error: ")
+    assert _log(inited).startswith("watch: aborted: ConfigError: ")
+    assert not (inited / "logs" / "watch.success").exists()
+
+
+def test_a_database_error_mid_run_exits_1(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def locked(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    _example_boards(monkeypatch, lambda address: fetched(one_greenhouse("examplerobotics")))
+    monkeypatch.setattr(search_store, "find_or_create_posting", locked)
+    assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: OperationalError: database is locked\n"
+    assert _log(inited) == "watch: aborted: OperationalError: database is locked\n"
+    assert not (inited / "logs" / "watch.success").exists()
+
+
+def test_an_integrity_error_mid_run_still_finishes(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = search_store.find_or_create_posting
+
+    def conflicts(conn: sqlite3.Connection, posting: Posting, dating: Any) -> Any:
+        if posting.company == "Example Robotics":
+            raise sqlite3.IntegrityError("synthetic")
+        return real(conn, posting, dating)
+
+    def fake(address: str) -> Fetched:
+        if address == url("greenhouse", "examplerobotics"):
+            return fetched(one_greenhouse("examplerobotics"))
+        return _lever_board()
+
+    _example_boards(monkeypatch, fake)
+    monkeypatch.setattr(search_store, "find_or_create_posting", conflicts)
+    assert cli.main(["watch"], probe=probe) == 0
+    assert "watch: Example Robotics: IntegrityError; continuing" in capsys.readouterr().err
+    assert (inited / "logs" / "watch.success").is_file()
+
+
+def test_a_board_crash_keeps_its_traceback_in_the_log_file_only(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake(address: str) -> Fetched:
+        if address == url("greenhouse", "examplerobotics"):
+            raise RuntimeError("synthetic board failure")
+        return _lever_board()
+
+    _example_boards(monkeypatch, fake)
+    assert cli.main(["watch"], probe=probe) == 0
+    err = capsys.readouterr().err
+    assert "watch: Example Robotics: RuntimeError; continuing\n" in err
+    assert "Traceback" not in err
+    log = _log(inited)
+    assert "watch: Example Robotics: traceback\nTraceback (most recent call last):" in log
+    assert "RuntimeError: synthetic board failure" in log
+    assert "watch: 1 boards fetched, 1 failed\n" in log
+
+
+def test_an_unexpected_failure_leaves_its_traceback_in_the_log(
+    inited: Path, probe: SystemProbe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> list[str]:
+        raise RuntimeError("synthetic watch failure")
+
+    monkeypatch.setattr(cli.watch, "run", boom)
+    with pytest.raises(RuntimeError, match="synthetic watch failure"):
+        cli.main(["watch"], probe=probe)
+    log = _log(inited)
+    assert log.startswith("watch: aborted: traceback\nTraceback (most recent call last):")
+    assert "RuntimeError: synthetic watch failure" in log
+    assert not (inited / "logs" / "watch.success").exists()
+
+
+def test_a_run_log_that_cannot_open_stops_the_command_before_any_fetch(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (inited / "logs").mkdir(mode=0o700, exist_ok=True)
+    (inited / "logs" / "watch.log").mkdir()
+    _example_boards(monkeypatch, lambda address: pytest.fail("no fetch without a log"))
+    assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: run log not writable: IsADirectoryError\n"
+    assert not (inited / "logs" / "watch.success").exists()
+
+
+def test_a_run_log_that_fails_mid_run_stops_the_run(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from careerhunter.runlog import RunLog
+
+    def refuse(fd: int, data: memoryview) -> int:
+        raise OSError("disk full")
+
+    calls: list[str] = []
+
+    def fake(address: str) -> Fetched:
+        calls.append(address)
+        if address == url("greenhouse", "examplerobotics"):
+            return fetched(one_greenhouse("examplerobotics"))
+        return _lever_board()
+
+    _example_boards(monkeypatch, fake)
+    monkeypatch.setattr(cli, "RunLog", lambda path: RunLog(path, writer=refuse))
+    assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert err == "error: run log not writable: OSError\n"
+    assert calls == [url("greenhouse", "examplerobotics")]  # the first line failed; no more
+    assert not (inited / "logs" / "watch.success").exists()
+
+
+def test_an_abort_whose_log_line_cannot_be_written_still_says_why(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from careerhunter.runlog import RunLog
+
+    def refuse(fd: int, data: memoryview) -> int:
+        raise OSError("disk full")
+
+    (inited / "config.yaml").unlink()
+    monkeypatch.setattr(cli, "RunLog", lambda path: RunLog(path, writer=refuse))
+    assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == (
+        "error: run log not writable: OSError\nerror: config.yaml is missing\n"
+    )
