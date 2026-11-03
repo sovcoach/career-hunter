@@ -2,7 +2,7 @@
 # seed/export/doctor need CAREERHUNTER_DATA_DIR set (see docs/SETUP.md).
 
 .DEFAULT_GOAL := help
-.PHONY: help setup hooks test cov lint format typecheck check verify-tree seed export doctor embed-eval
+.PHONY: help setup hooks test cov lint format typecheck check verify-tree seed export doctor embed-eval discover
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  make %-11s %s\n", $$1, $$2}'
@@ -51,3 +51,6 @@ doctor: ## Check the setup and report what is missing
 
 embed-eval: ## Rank stored cosines against tiers; the report stays in the data folder
 	uv run careerhunter embed-eval
+
+discover: ## Queue companies from a local SearXNG; pages are not fetched
+	uv run careerhunter discover

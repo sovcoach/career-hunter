@@ -27,6 +27,7 @@ from careerhunter import (
     bot,
     claims,
     db,
+    discover,
     embed_eval,
     secrets_store,
     service,
@@ -640,6 +641,57 @@ def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
+    """Queue companies, or approve or reject one pending row. Writes search.db only."""
+    action = args.discover_action
+    candidate_id = args.candidate_id
+    if action in ("approve", "reject"):
+        if not isinstance(candidate_id, int):
+            _err(f"error: discover {action} needs a candidate id")
+            return EXIT_ERROR
+    elif candidate_id is not None:
+        _err(f"error: discover {action} takes no candidate id")
+        return EXIT_ERROR
+    if not datadir.config_path.is_file():
+        _err("error: config.yaml is missing")
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    doc = load_config(datadir.config_path)
+    conn = db.connect(datadir.search_db_path)
+    try:
+        db.migrate(conn, "search")
+        try:
+            rows, notice = _discover_rows(conn, doc, action, candidate_id)
+        except discover.DiscoverError as exc:
+            _err(f"error: {exc}")
+            return EXIT_ERROR
+    finally:
+        conn.close()
+    if notice:
+        _err(notice)
+    for row in rows:
+        print(discover.format_row(row))
+    return EXIT_OK
+
+
+def _discover_rows(
+    conn: sqlite3.Connection,
+    doc: dict[str, Any],
+    action: str,
+    candidate_id: int | None,
+) -> tuple[Sequence[discover.Queued], str | None]:
+    if action == "list":
+        return discover.pending(conn), None
+    if action == "approve" and isinstance(candidate_id, int):
+        return (discover.approve(conn, candidate_id),), None
+    if action == "reject" and isinstance(candidate_id, int):
+        return (discover.reject(conn, candidate_id),), None
+    outcome = discover.run(conn, doc, today=config_today(doc).isoformat())
+    return outcome.rows, outcome.notice
+
+
 def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
     """Rank stored cosines against tiers. The report stays in the data folder."""
     if not datadir.config_path.is_file():
@@ -863,7 +915,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("service_action", choices=("install", "uninstall", "status"))
     sub.add_parser(
         "watch",
-        help="fetch Greenhouse, Lever and Ashby boards on the watchlist once and exit",
+        help="fetch Greenhouse, Lever and Ashby boards on the watchlist, "
+        "and approved discovery boards, once and exit",
+    )
+    discover_parser = sub.add_parser(
+        "discover",
+        help="queue companies from a local SearXNG; pages are not fetched",
+    )
+    discover_parser.add_argument(
+        "discover_action",
+        nargs="?",
+        choices=("run", "list", "approve", "reject"),
+        default="run",
+        help="run: search and queue new rows; list: print pending rows; "
+        "approve or reject: decide one pending row",
+    )
+    discover_parser.add_argument(
+        "candidate_id",
+        nargs="?",
+        type=int,
+        help="the pending row id for approve or reject",
     )
     sub.add_parser(
         "scout-prompt",
@@ -887,6 +958,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "bot": cmd_bot,
     "service": cmd_service,
     "watch": cmd_watch,
+    "discover": cmd_discover,
     "scout-prompt": cmd_scout_prompt,
     "embed-eval": cmd_embed_eval,
     "doctor": cmd_doctor,
