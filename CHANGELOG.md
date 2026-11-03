@@ -7,6 +7,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-03
+
 ### Added
 - The project is MIT licensed (ADR-021). See `LICENSE`.
 - `init` creates `evals/`. `doctor` tightens files there the same way it tightens `logs/`. A missing folder is reported and does not fail `doctor`. `backups/` stays unchecked.
@@ -124,7 +126,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sovcoach/career-hunter/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sovcoach/career-hunter/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sovcoach/career-hunter/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sovcoach/career-hunter/releases/tag/v0.1.0

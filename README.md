@@ -4,7 +4,7 @@
 
 Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 5 (ops and portfolio), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else. A private Telegram bot records applications, statuses and activities. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards, filters them, and scores the ones it keeps with a local model. A local embedding cosine can sit beside that tier. `careerhunter discover` queues companies from a local SearXNG for approval. The bot sends one alert for each scored posting, and it can approve or reject a pending discovery row.
+> **Status:** Phase 5 (ops and portfolio), version 0.4.0. Tracking, import and export work, with one EI record per claim kept apart from everything else. A private Telegram bot records applications, statuses and activities. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards, filters them, and scores the ones it keeps with a local model. A local embedding cosine can sit beside that tier. `careerhunter discover` queues companies from a local SearXNG for approval. The bot sends one alert for each scored posting, and it can approve or reject a pending discovery row.
 
 ---
 
