@@ -226,6 +226,6 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 | 3, Watcher | Fetch Greenhouse, Lever and Ashby boards; filter and record skip reasons; score kept postings on a local model (`fit_rating` stays null); alert through the existing bot | done |
 | 3.5, Embeddings | A local embedding cosine beside the LLM tier, and `careerhunter embed-eval` (ADR-019) | done |
 | 4, Discovery | Queue companies from a local SearXNG, approve or reject them, and run discovery on its own LaunchAgent | done |
-| 5, Ops and portfolio | MIT license, docs aligned with the running pipeline, and an owner-only check for `evals/` | **this release** |
+| 5, Ops and portfolio (v0.4.0) | MIT license, docs aligned with the running pipeline, and an owner-only check for `evals/` | **this release** |
 
 Each phase lands as a pull request against `main` with its own milestone, and gets a semver tag when merged. The repo goes public once Phase 1 is verified, and `main` is protected straight after (ADR-012).
