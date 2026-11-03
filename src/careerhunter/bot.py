@@ -14,13 +14,15 @@ Trust boundary (ADR-016):
   checked against the chat, the message, an expiry and whether they were used.
 - **Fail closed.** `startup()` refuses unless config.yaml is valid with a chat id,
   every earlier EI claim is sealed, the token is in the Keychain, and getMe works.
-  Before every write the bot re-reads config and re-checks the claims, as the CLI does.
+  Before every EI-bearing write the bot re-reads config and re-checks the claims,
+  as the CLI does. A discovery approve or reject opens `search.db` only.
 
-Privacy (ADR-015, amended by ADR-019): messages the bot sends carry company,
-title, link, the LLM tier name, a cosine when one is stored, status words and
-references. A watchlist agency with no separate employer stored is labelled
-" (agency)". Never notes, fit ratings, gaps, model text, vectors, EI record
-details or claim labels.
+Privacy (ADR-015, amended by ADR-019 and ADR-020): messages the bot sends carry
+company, title, link, the LLM tier name, a cosine when one is stored, status
+words and references. A discovery row sends the suggested name and the reduced
+URL only. A watchlist agency with no separate employer stored is labelled
+" (agency)". Never notes, fit ratings, gaps, model text, vectors, snippets,
+queries, EI record details or claim labels.
 
 Dates: after Applied and a method, the bot asks when, with buttons (today, yesterday,
 this week, last week, or another date typed as YYYY-MM-DD). Exact days record precision
@@ -51,6 +53,7 @@ from typing import Any
 import yaml
 
 from careerhunter import claims, db, enums, ledger, search_store, snapshots
+from careerhunter import discover as discovery
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating
 from careerhunter.config import ConfigError, load_config, telegram_chat_id
 from careerhunter.config import today as config_today
@@ -69,6 +72,8 @@ POLL_TIMEOUT = 50
 TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 REF_SHAPE = re.compile(r"a[1-9][0-9]{0,6}")
 ALERT_TTL = dt.timedelta(days=7)
+DISCOVERY_EACH = 5
+DISCOVERY_DIGEST = 8
 STEP_TTL = dt.timedelta(days=1)
 REF_TTL = dt.timedelta(days=7)
 MAX_UPLOAD = 20 * 1024 * 1024
@@ -405,6 +410,45 @@ class Bot:
             except (Refusal, TelegramError, OSError, sqlite3.Error) as exc:
                 log.warning("alert failed (%s); left for the next poll", type(exc).__name__)
 
+    def send_pending_discovery(self) -> None:
+        """Send pending discovery rows that are due. Name and URL only.
+
+        Five or fewer are one message each. More than five are one digest of at
+        most eight, and the rest wait for a later poll. ``notified_at`` is set
+        only after Telegram accepts the message.
+        """
+        cutoff = _utc(self.clock() - ALERT_TTL)
+        try:
+            with self._search() as search:
+                rows = discovery.due(search, notified_before=cutoff)
+        except (OSError, sqlite3.Error) as exc:
+            log.warning("pending discovery could not be read (%s)", type(exc).__name__)
+            return
+        if len(rows) <= DISCOVERY_EACH:
+            batches: list[list[discovery.Queued]] = [[row] for row in rows]
+        else:
+            batches = [list(rows[:DISCOVERY_DIGEST])]
+        for batch in batches:
+            try:
+                with self._search() as search:
+                    self._send_discovery(search, batch)
+            except (TelegramError, OSError, sqlite3.Error) as exc:
+                log.warning(
+                    "discovery send failed (%s); left for the next poll", type(exc).__name__
+                )
+
+    def _send_discovery(self, search: sqlite3.Connection, rows: list[discovery.Queued]) -> None:
+        text = "\n\n".join(f"{row.suggested_name}\n{row.url}" for row in rows)
+        buttons = [
+            [
+                ("Approve", "discover_approve", {"candidate_id": row.id}),
+                ("Reject", "discover_reject", {"candidate_id": row.id}),
+            ]
+            for row in rows
+        ]
+        self._keyboard(search, text, buttons, ALERT_TTL)
+        discovery.mark_notified(search, [row.id for row in rows], self._now())
+
     # --- entry point -------------------------------------------------------------------
 
     def handle(self, update: dict[str, Any]) -> str:
@@ -670,7 +714,12 @@ class Bot:
                 },
             )
         action, payload = taken
-        self._dispatch(action, payload)
+        try:
+            self._dispatch(action, payload)
+        except discovery.DiscoverError as exc:
+            log.info("discovery decision refused (%s)", type(exc).__name__)
+            self.send("Not changed.")
+            return f"callback:{action}:refused"
         return f"callback:{action}"
 
     def _dispatch(self, action: str, p: dict[str, Any]) -> None:
@@ -726,6 +775,9 @@ class Bot:
                 self._keyboard(search, "New status?", rows, STEP_TTL)
         elif action == "status_set":
             self._finish_status(int(p["application_id"]), str(p["status"]))
+        elif action in ("discover_approve", "discover_reject"):
+            decision = "approve" if action == "discover_approve" else "reject"
+            self._finish_discovery(p.get("candidate_id"), decision)
         elif action == "activity_date":
             if p.get("choice") == "other":
                 with self._search() as search:
@@ -788,6 +840,15 @@ class Bot:
         return f"reply:{kind}"
 
     # --- the writes --------------------------------------------------------------------
+
+    def _finish_discovery(self, candidate_id: object, decision: str) -> None:
+        """The same approve or reject as the CLI. search.db only."""
+        if isinstance(candidate_id, bool) or not isinstance(candidate_id, int) or candidate_id < 1:
+            raise discovery.DiscoverError("not a candidate")
+        with self._search() as search:
+            row = ledger.record_discovery_decision(search, candidate_id, decision)
+        word = "Approved" if decision == "approve" else "Rejected"
+        self.send(f"{word}: {row.suggested_name}\n{row.url}")
 
     def _finish_apply(self, posting_id: int, method: str, dating: Dating) -> None:
         if method not in enums.METHODS:
@@ -1009,6 +1070,7 @@ def run(
             log.info("update handled: %s", bot.handle_safely(update))
         bot.heartbeat()
         bot.send_pending_alerts()
+        bot.send_pending_discovery()
     return 0
 
 

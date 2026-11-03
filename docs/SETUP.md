@@ -214,6 +214,8 @@ careerhunter discover reject 4
 
 `approve` marks that pending row approved. A board becomes a company with `watchlist` 1, and a new company has `source` discovery. The next `careerhunter watch` fetches that board. A career page stores `careers_url` and is not fetched. `reject` stores the rejection and inserts no company. Neither command rewrites `config.yaml` or `exclusions.yaml`.
 
+The bot does the same thing from the allowlisted chat. Each pending row is one message with the suggested name, the URL, and Approve and Reject. When more than five are waiting, one message lists up to eight, and the rest follow on a later poll. A tap that does not apply answers `Not changed.` and leaves the row pending.
+
 ### Compare a cosine with the tier
 
 `careerhunter embed-eval` reads stored cosines and tiers. It does not call the model. The report is a mode 0600 file under `evals/` in the data folder. The terminal prints the relative path only. When `fit_rubric.embedding_weight` is set, the report also ranks `weight * cosine + (1 - weight) * tier`. That blend is not stored and not sent.

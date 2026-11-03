@@ -28,7 +28,7 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist, and approved discovery boards, once. It records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert for each scored posting |
 | `careerhunter scout-prompt` | Prints a scout prompt from exclusions and the hard gates the watcher skips on. Writes nothing |
 | `careerhunter embed-eval` | Ranks stored cosines against LLM tiers. Writes a private report under `evals/` and prints only that relative path |
-| `careerhunter discover` | Queues companies from a local SearXNG into `search.db`. `approve` and `reject` update that queue only and do not fetch pages. An approved board is fetched on the next `careerhunter watch` |
+| `careerhunter discover` | Queues companies from a local SearXNG into `search.db`. `approve` and `reject` update that queue only and do not fetch pages. The bot can approve or reject a pending row from the allowlisted chat. That message is the suggested name and the URL. An approved board is fetched on the next `careerhunter watch` |
 
 ## What it does *not* do (yet)
 
