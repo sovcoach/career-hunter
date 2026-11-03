@@ -15,9 +15,9 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 007 | A dedicated Telegram bot for notifications | Accepted (for Phase 2) |
 | 008 | An always-on Mac mini as the host | Accepted (Phase 1) |
 | 009 | Guards fail closed, with no override flag | Accepted (Phase 1) |
-| 010 | Repo workflow conventions | Accepted (Phase 1) |
-| 011 | Claude Code permission rules as a guard-rail | Accepted (Phase 1) |
-| 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1) |
+| 010 | Repo workflow conventions | Accepted (Phase 1); amended (local merges) |
+| 011 | Claude Code permission rules as a guard-rail | Accepted (Phase 1); amended (local merges) |
+| 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1); amended (local merges) |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
 | 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
 | 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019 |
@@ -206,6 +206,8 @@ Phase 2 built it: see ADR-015 (what the bot sends), ADR-016 (how it decides what
 
 ## ADR-010: Repo workflow conventions
 
+> **Amended: local merges (#44).** Pull requests are no longer merged through GitHub's web UI. A web-UI merge commit records the local time zone offset of whoever clicked the button. The operator now merges each pull request locally, after its CI checks pass, with `TZ=UTC git merge --no-ff <branch>` and a "Merge pull request #N from …" message, runs `make check` on the result, and pushes `main` as described in ADR-011 and ADR-012. The steps live in AGENTS.md under "Merging". Branches, Conventional Commits, releases and the quality gates below are unchanged.
+
 **Context.** The repo is a portfolio piece, so it should show how a project is run, not just what it does.
 
 **Decision.**
@@ -221,6 +223,8 @@ Phase 2 built it: see ADR-015 (what the bot sends), ADR-016 (how it decides what
 - GitHub Free can't protect branches on a **private** repo. Until the repo goes public (ADR-012), "no direct pushes to `main`" is followed by convention.
 
 ## ADR-011: Claude Code permission rules as a guard-rail
+
+> **Amended: local merges (#44).** The pre-push guard's manual override is now also the operator's normal step for pushing a local merge commit to `main` (ADR-010). It stays operator-only and is typed by hand for that one push, never put in a script or alias. Nothing changes for agents: the deny rules still refuse any command that mentions the override, any push that targets `main`, and both ways to skip the hook, so an agent can neither merge into `main` nor push it.
 
 **Context.** AI coding assistants are used on this repo. History-changing git commands should always need a human yes.
 
@@ -243,6 +247,8 @@ During Phase 1.5, an agent ran `git add -N .` and `git reset -q` as parts of one
 Ask rules only work while Claude Code's auto mode is off, so anything that must never happen unattended belongs in **deny**, not ask.
 
 ## ADR-012: The repo goes public after Phase 1 verification; `main` is protected then
+
+> **Amended: local merges (#44).** The branch protection settings are unchanged: a pull request and the `Lint, types, tests` and `gitleaks (full history)` checks are required, and administrators may bypass. That bypass is now the normal merge path, not only an exception for a by-hand fix. The operator pushes a local merge commit (ADR-010) to `main`, and GitHub reports "Bypassed rule violations" for the pull request and status check rules. That is expected only on that push, after the pull request's own checks have passed. Force pushes to `main` are still never part of the flow.
 
 **Context.**
 - The repo is a portfolio piece, so it is meant to be visible.
