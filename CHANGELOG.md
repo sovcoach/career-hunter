@@ -42,6 +42,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A `localhost` SearXNG URL is looked up within the query's deadline, and only a loopback answer is used (#30).
 - After a transport failure (refused, out of time, or too large), nothing more is sent to the embedding server for the rest of the run. A reply that is not a vector is a miss for that posting only (#30, ADR-019).
 - Only infrastructure stops a watch or discover run: a missing or invalid `config.yaml`, a missing `search.db`, a database that cannot be opened, migrated or written, or a run log that cannot be written. Each writes an abort line to the log and exits 1 without the success stamp. A database failure prints `error: <Type>: <message>` (#30, ADR-022).
+- Seniority words now match whole words of the title only, ignoring case. A junior title whose description mentions senior colleagues is no longer skipped; set `hard_gates.seniority_in_description: true` to check the description too. `title_exceptions` and `never_gated_families` also match whole words now, so a short exception no longer exempts a title that only contains its letters: "Art" no longer covers "Partner". Postings already skipped for seniority keep their skip. A key under `hard_gates` that is not a known gate is now refused, and the scout and scoring prompts state the new rule (#31).
 
 ### Fixed
 - One company's exception no longer ends a watch run. It is rolled back and logged as `watch: <company>: <ExceptionType>; continuing`, and the other companies still run (#30).

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 
-from careerhunter import search_store, watch
+import pytest
+
+from careerhunter import filters, search_store, watch
 from careerhunter.fetch import FetchError
-from careerhunter.filters import PostingText, decide
+from careerhunter.filters import PostingText, decide, has_phrase
 from careerhunter.models import Application, Dating, Posting
 from careerhunter.storage_guard import DataDir
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, postings, url
@@ -93,9 +95,9 @@ def test_hard_gates_and_the_seniority_exceptions() -> None:
     assert verdict("Senior Customer Advocate").reason is None
     assert verdict("Support Specialist").reason is None
     assert verdict("Senior Support Specialist").reason == "seniority"
-    # The family is not explicitly senior in the title, so the description does not gate it.
+    # The description is not checked by default, so a junior title is kept.
     assert verdict("Support Specialist", description="Reports to a Director").reason is None
-    assert verdict("Coordinator", description="Reports to a Director").reason == "seniority"
+    assert verdict("Coordinator", description="Reports to a Director").reason is None
 
 
 def test_min_salary_uses_the_highest_stated_yearly_figure() -> None:
@@ -357,3 +359,143 @@ def test_a_description_keyword_matches_only_with_description_text(
         exclusions={"description_keywords": ["unpaid"]},
     )
     assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 0
+
+
+# Whole-word phrase matching, shared by the seniority gate and, later, title lanes.
+
+
+@pytest.mark.parametrize(
+    ("text", "phrase"),
+    [
+        ("Senior Coordinator", "senior"),
+        ("COORDINATOR, SENIOR", "Senior"),
+        ("Team Lead", "Lead"),
+        ("Lead (Night)", "Lead"),
+        ("(Lead) Coordinator", "Lead"),
+        ("Director's Office Coordinator", "Director"),
+        ("Coordinator - Senior", "Senior"),
+        ("Vice-President, Operations", "Vice President"),
+        ("Vice_President of Operations", "vice president"),
+        ("Vice \u2014 President", "Vice President"),
+        ("Sr. Manager", "Sr."),
+        ("Ingénieur principal", "Principal"),
+        ("Engineer II", "II"),
+    ],
+)
+def test_a_phrase_matches_as_whole_words(text: str, phrase: str) -> None:
+    assert has_phrase(text, phrase)
+
+
+@pytest.mark.parametrize(
+    ("text", "phrase"),
+    [
+        ("Team Leader", "Lead"),
+        ("Misleading Title", "Lead"),
+        ("Srinivas Coordinator", "Sr"),
+        ("Directors of Operations", "Director"),
+        ("Seniority Analyst", "Senior"),
+        ("Engineer III", "II"),
+        ("Sr.Manager", "Sr."),
+        ("Leadé Coordinator", "Lead"),
+    ],
+)
+def test_a_phrase_never_matches_inside_a_longer_word(text: str, phrase: str) -> None:
+    assert not has_phrase(text, phrase)
+
+
+COMPOSED = "Ing\u00e9nieur"  # é as one code point
+DECOMPOSED = "Inge\u0301nieur"  # e followed by a combining acute accent
+
+
+@pytest.mark.parametrize(
+    ("text", "phrase"),
+    [(DECOMPOSED + " Lead", COMPOSED), (COMPOSED + " Lead", DECOMPOSED)],
+    ids=["decomposed-title", "composed-title"],
+)
+def test_composed_and_decomposed_accents_match_alike(text: str, phrase: str) -> None:
+    assert has_phrase(text, phrase)
+
+
+def test_an_accent_mark_on_the_last_letter_makes_it_a_different_word() -> None:
+    assert not has_phrase("Lead\u0301 Coordinator", "Lead")
+
+
+def test_a_ligature_matches_its_letters() -> None:
+    assert has_phrase("Pro\ufb01le Analyst", "Profile")
+
+
+def test_folding_a_dotted_capital_i_is_stable() -> None:
+    title = "\u0130nspector Lead"  # İ: casefolds to "i" and a combining dot above
+    once = filters._fold(title)
+    assert filters._fold(once) == once
+    assert has_phrase(title, "\u0130nspector")  # the same word, folded the same way
+    assert has_phrase(title, "Lead")
+    assert not has_phrase(title, "Inspector")  # a plain I is a different letter here
+
+
+def test_a_later_whole_word_counts_after_an_earlier_partial_one() -> None:
+    assert has_phrase("Leadership Lead", "Lead")
+
+
+def test_only_partial_words_do_not_match() -> None:
+    assert not has_phrase("Leadership Leaders", "Lead")
+
+
+@pytest.mark.parametrize("phrase", ["", "   ", "-", "_"])
+def test_a_blank_phrase_matches_nothing(phrase: str) -> None:
+    assert not has_phrase("Senior Coordinator", phrase)
+
+
+# Seniority: whole words of the title; the description only when asked for.
+
+DESCRIBED = {"hard_gates": {**GATES["hard_gates"], "seniority_in_description": True}}
+
+
+def test_a_seniority_word_only_in_the_description_does_not_gate_by_default() -> None:
+    assert verdict("Coordinator", description="Works with a Senior Director").reason is None
+
+
+def test_the_description_gates_when_the_option_is_on() -> None:
+    gated = verdict("Coordinator", description="Reports to a Director", config=DESCRIBED)
+    assert gated.reason == "seniority"
+    # A never-gated family is still not gated by the description alone.
+    family = verdict("Support Specialist", description="Reports to a Director", config=DESCRIBED)
+    assert family.reason is None
+    # Its title still gates it.
+    assert verdict("Senior Support Specialist", config=DESCRIBED).reason == "seniority"
+
+
+@pytest.mark.parametrize("config", [GATES, DESCRIBED], ids=["title-only", "with-description"])
+def test_a_seniority_word_never_matches_inside_a_longer_word(config: object) -> None:
+    assert verdict("Seniority Data Coordinator", config=config).reason is None
+    assert (
+        verdict("Coordinator", description="Directors meet monthly", config=config).reason is None
+    )
+    assert verdict("Senior-level Coordinator", config=config).reason == "seniority"
+
+
+@pytest.mark.parametrize("config", [GATES, DESCRIBED], ids=["title-only", "with-description"])
+def test_title_exceptions_and_never_gated_families_match_whole_words(config: object) -> None:
+    assert verdict("Senior Customer Advocate", config=config).reason is None
+    assert verdict("SENIOR customer-advocate", config=config).reason is None
+    assert verdict("Senior Support Specialist", config=config).reason == "seniority"
+
+
+def test_a_short_exception_no_longer_exempts_a_title_that_merely_contains_it() -> None:
+    gates = {
+        "hard_gates": {
+            "seniority_words": ["Senior"],
+            "title_exceptions": ["Art"],
+            "never_gated_families": ["Port"],
+        }
+    }
+    # "Art" was a substring of "Partner"; it is not a word of this title.
+    assert verdict("Senior Partner Coordinator", config=gates).reason == "seniority"
+    assert verdict("Senior Art Coordinator", config=gates).reason is None
+    # "Port" in "Support" no longer marks the never-gated family.
+    described = {"hard_gates": {**gates["hard_gates"], "seniority_in_description": True}}
+    assert (
+        verdict("Support Coordinator", description="Senior team", config=described).reason
+        == "seniority"
+    )
+    assert verdict("Port Coordinator", description="Senior team", config=described).reason is None

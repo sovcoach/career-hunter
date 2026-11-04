@@ -169,6 +169,14 @@ def _set(path: str, value: Any) -> Any:
         (_set("fit_rubric.gap_tiers.exempt_requirements", "degree"), "exempt_requirements"),
         (_set("hard_gates.shift_patterns", "overnight"), "hard_gates.shift_patterns"),
         (_set("hard_gates.seniority_words", []), "title_exceptions needs"),
+        (
+            _set("hard_gates.seniority_in_description", "yes"),
+            "hard_gates.seniority_in_description must be true or false",
+        ),
+        (
+            _set("hard_gates.seniority_in_desc", True),
+            "hard_gates has unknown keys: ['seniority_in_desc']",
+        ),
         (_set("schedule_limits.weekend_days_per_month", -1), "weekend_days_per_month"),
         (_set("schedule_limits.over_limit", "ignore"), "over_limit must be one of"),
         (_set("watchlist.1.agency", "yes"), "agency must be true or false"),
@@ -305,3 +313,19 @@ def test_role_level_exclusions(roles: Any, message: str) -> None:
 def test_exclude_applied_must_be_boolean() -> None:
     assert validate_exclusions({"exclude_applied": True}) == []
     assert validate_exclusions({"exclude_applied": "yes"})
+
+
+def test_the_seniority_option_is_optional_and_takes_true_or_false() -> None:
+    d = doc()
+    del d["hard_gates"]["seniority_in_description"]
+    assert validate_config(d) == []
+    d["hard_gates"]["seniority_in_description"] = True
+    assert validate_config(d) == []
+
+
+def test_an_unknown_hard_gate_names_the_key_and_no_path() -> None:
+    d = doc()
+    d["hard_gates"]["seniority_in_desc"] = True
+    problems = validate_config(d)
+    assert problems == ["hard_gates has unknown keys: ['seniority_in_desc']"]
+    assert "/" not in problems[0]

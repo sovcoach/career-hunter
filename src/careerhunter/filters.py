@@ -11,6 +11,11 @@ The checks run in one order. The first skip wins, and it is the reason stored on
 A description keyword can match only when the list payload included a description.
 Greenhouse list rows have none. The description is not stored.
 
+Seniority words match whole words of the title, ignoring case. The description is
+checked too only when `seniority_in_description` is true. `title_exceptions` and
+`never_gated_families` match whole words of the title the same way. A never-gated
+family is gated only when the title itself has a seniority word.
+
 One `role_filters` block is a set of AND constraints. It cannot say "this work model,
 or else that place." A missing work model does not fail `work_models`, because a
 Greenhouse list row has no work model.
@@ -27,6 +32,7 @@ excluded it. The word "weekends" on its own does neither.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -128,24 +134,30 @@ def _hard_gate(posting: PostingText, gates: Mapping[str, Any]) -> str | None:
     for key, reason in checks:
         if _any(body, gates.get(key)):
             return reason
-    if _seniority(posting.title, body, gates):
+    if _seniority(posting, gates):
         return "seniority"
     if _under_minimum(body, gates.get("min_salary")):
         return "min_salary"
     return None
 
 
-def _seniority(title: str, body: str, gates: Mapping[str, Any]) -> bool:
+def _seniority(posting: PostingText, gates: Mapping[str, Any]) -> bool:
     words = gates.get("seniority_words")
     if not _strings(words):
         return False
-    if _any(title, gates.get("title_exceptions")):
+    title = posting.title
+    if _any_phrase(title, gates.get("title_exceptions")):
         return False
-    in_title = _any(title, words)
-    if not in_title and not _any(body, words):
+    in_title = _any_phrase(title, words)
+    in_description = (
+        gates.get("seniority_in_description") is True
+        and bool(posting.description)
+        and _any_phrase(posting.description or "", words)
+    )
+    if not in_title and not in_description:
         return False
     # A never-gated family is skipped only when the title itself is explicitly senior.
-    return not (_any(title, gates.get("never_gated_families")) and not in_title)
+    return not (_any_phrase(title, gates.get("never_gated_families")) and not in_title)
 
 
 def _under_minimum(body: str, minimum: object) -> bool:
@@ -282,7 +294,11 @@ def _strings(value: object) -> list[str]:
 
 
 def _fold(value: str) -> str:
-    return _FOLD.sub(" ", value.casefold()).strip()
+    """NFKC, so composed and decomposed accents and ligatures compare alike; then case,
+    then NFKC again, because casefolding can leave a string that is not normalized
+    ("İ" becomes "i" and a combining dot); then runs of separators as one space."""
+    folded = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", value).casefold())
+    return _FOLD.sub(" ", folded).strip()
 
 
 def _same(left: str, right: str) -> bool:
@@ -296,3 +312,41 @@ def _has(haystack: str, needle: str) -> bool:
 
 def _any(haystack: str, needle: object) -> bool:
     return any(_has(haystack, item) for item in _strings(needle))
+
+
+def _any_phrase(haystack: str, needle: object) -> bool:
+    return any(has_phrase(haystack, item) for item in _strings(needle))
+
+
+def has_phrase(text: str, phrase: str) -> bool:
+    """True when `phrase` appears in `text` as whole words, ignoring case.
+
+    Both sides are folded the same way as every other match here: NFKC, case, then runs
+    of spaces, underscores, hyphens and dashes become one space, so "Vice President"
+    matches "Vice-President". A match must have no letter, digit or combining mark
+    directly before or after it: "Lead" matches "Team Lead" and "(Lead)", not "Leader",
+    "Misleading", or "Lead" with an accent mark on its last letter. Punctuation inside
+    the phrase is kept, so "Sr." matches "Sr. Manager". A blank phrase matches nothing.
+    """
+    needle = _fold(phrase)
+    if not needle:
+        return False
+    haystack = _fold(text)
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        if not _in_word(haystack, start - 1) and not _in_word(haystack, end):
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _in_word(text: str, index: int) -> bool:
+    """Whether the character at `index` is a letter, a digit or a combining mark.
+
+    Python's \\w leaves combining marks out, so a decomposed accent would otherwise
+    end a word.
+    """
+    if not 0 <= index < len(text):
+        return False
+    return unicodedata.category(text[index])[0] in "LNM"

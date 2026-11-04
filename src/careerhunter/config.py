@@ -307,6 +307,23 @@ def _validate_gap_tiers(rubric: Any, problems: list[str]) -> None:
     _optional_str_list(rubric, "exempt_requirements", where, problems)
 
 
+_HARD_GATES = frozenset(
+    {
+        "min_salary",
+        "max_commute_km",
+        "exclude_work_models",
+        "required_languages",
+        "credentials",
+        "shift_patterns",
+        "pay_structures",
+        "seniority_words",
+        "seniority_in_description",
+        "title_exceptions",
+        "never_gated_families",
+    }
+)
+
+
 def _validate_seniority(gates: dict[str, Any], problems: list[str]) -> None:
     for key in (
         "required_languages",
@@ -320,6 +337,8 @@ def _validate_seniority(gates: dict[str, Any], problems: list[str]) -> None:
         _optional_str_list(gates, key, "hard_gates", problems)
     if gates.get("title_exceptions") and not gates.get("seniority_words"):
         problems.append("hard_gates.title_exceptions needs hard_gates.seniority_words")
+    if not isinstance(gates.get("seniority_in_description", False), bool):
+        problems.append("hard_gates.seniority_in_description must be true or false")
 
 
 def _validate_watchlist_item(item: dict[str, Any], where: str, problems: list[str]) -> None:
@@ -376,6 +395,9 @@ def validate_config(doc: Any) -> list[str]:
             _resume_path(search["resume"], problems)
 
     gates = _section(doc, "hard_gates", problems)
+    extra = set(gates) - _HARD_GATES
+    if extra:
+        problems.append(f"hard_gates has unknown keys: {sorted(extra)}")
     for key in ("min_salary", "max_commute_km"):
         _number(gates, key, "hard_gates", problems)
     _work_models(gates.get("exclude_work_models", []), "hard_gates.exclude_work_models", problems)

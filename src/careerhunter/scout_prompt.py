@@ -84,17 +84,22 @@ def _gate_rules(gates: Mapping[str, Any]) -> list[str]:
             rules.append(f"{lead}: {_join(values)}.")
     words = _texts(gates.get("seniority_words"))
     if words:
+        # The watcher checks the description only when the option is on.
+        where = "title or description" if gates.get("seniority_in_description") is True else "title"
         rules.append(
-            f"Skip a title or description with any of these seniority words: {_join(words)}."
+            f"Skip a {where} with any of these seniority words as whole words, "
+            f"ignoring case: {_join(words)}."
         )
         allowed = _texts(gates.get("title_exceptions"))
         if allowed:
-            rules.append(f"These titles stay allowed: {_join(allowed)}.")
+            rules.append(
+                f"These titles stay allowed, as whole words, ignoring case: {_join(allowed)}."
+            )
         families = _texts(gates.get("never_gated_families"))
         if families:
             rules.append(
-                "These families are gated for seniority only when the title itself "
-                f"contains one of those words: {_join(families)}."
+                "These families, as whole words, ignoring case, are gated for seniority only "
+                f"when the title itself contains one of those words: {_join(families)}."
             )
     salary = _salary(gates.get("min_salary"))
     if salary is not None:
