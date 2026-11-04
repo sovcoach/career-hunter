@@ -170,7 +170,7 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | Where on-site, hybrid, and remote work is acceptable | `search.location_rules` |
 | How many missing requirements still count | `fit_rubric.gap_tiers` |
 | A resume file inside the data folder, for a similarity line | `search.resume` |
-| Languages, credentials, shifts, pay, seniority, and a minimum salary | `hard_gates` |
+| Languages, credentials, shifts, pay, seniority (in the title, or also the description), and a minimum salary | `hard_gates` |
 | A cap on weekend days | `schedule_limits` |
 | Which roles to keep at one company | that company's `role_filters` |
 | A staffing agency | `agency: true` on that watchlist entry |
@@ -185,6 +185,8 @@ The templates use placeholder names such as Example Robotics, Example City, and 
 `fit_rubric.embedding_weight` is validated and the watcher does not apply it. The watcher does not blend it into the score or the alert. `careerhunter embed-eval` reads it when ranking a report. `search.resume: null` skips embeddings.
 
 `hard_gates.max_commute_km` and `hard_gates.exclude_work_models` are not applied.
+
+`hard_gates.seniority_words`, `title_exceptions` and `never_gated_families` match whole words of the title, ignoring case: "Lead" matches "Team Lead" and "(Lead)", but not "Leader". List a plural on its own if it should count. `hard_gates.seniority_in_description: true` also checks the description for seniority words; it is false by default, so a junior title whose description mentions senior colleagues is kept. A key under `hard_gates` that career-hunter does not know, such as a misspelled option, is refused when the config is loaded.
 
 One `role_filters` block requires every family, work model, and place it lists. It cannot say "remote, or else Example City." Treating that as an AND would hide roles that should stay. There is no field for that or-rule yet.
 
