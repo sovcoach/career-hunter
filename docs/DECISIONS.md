@@ -21,11 +21,12 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
 | 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
 | 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019 |
-| 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2) |
+| 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2); amended (#30) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
-| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5) |
-| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended |
+| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30) |
+| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30) |
+| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30) |
 
 ---
 
@@ -391,6 +392,13 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-016: The bot's trust boundary
 
+> **Amended: fetch deadlines (#30).** A fetch also has one total deadline, 60 seconds, shared by the lookup, every redirect hop and the body. A socket timeout starts again on every read, so on its own it cannot stop a server that sends one byte at a time.
+> - The host name is looked up in a separate thread, and the caller waits only for the time left. At most four lookups can still be running after their caller gave up. With all four taken, a new lookup fails at once instead of waiting.
+> - Before each chunk of the body, the socket timeout is set to the time left.
+> - A watchdog on each hop shuts the socket down when the deadline passes, which also wakes a read that is stuck in the headers. Once it has fired, any error from that hop counts as running out of time.
+> - A body whose declared length is over the cap is refused before anything is read.
+> - A failure is one of four kinds: refused (the link or its address), out of time, too large, or failed (no usable reply).
+
 **Context.**
 - Anyone can find and message a Telegram bot. Restricting it when creating it in BotFather doesn't stop strangers from sending it messages or button presses.
 - Everything in an update (text, button data, reply ids) is chosen by whoever sent it.
@@ -466,6 +474,12 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-019: Local embedding vectors live in search.db beside the LLM tier
 
+> **Amended: loopback deadlines (#30).** The scoring, embedding and SearXNG clients share one exchange with a total deadline: 120 seconds for scoring, 60 for embedding and 30 for discovery. The lookup, the connect, the reply headers and the body all count against it, and a watchdog shuts the socket down when it passes.
+> - The scoring request does not stream, so no byte arrives until the model has finished. One step has to cover that wait, so scoring's step limit is its whole total.
+> - A host name such as `localhost` is looked up inside the deadline, and only an answer in 127.0.0.0/8 or exactly `::1` is used.
+> - Embedding replies have their own 1 MB cap. A vector of 1536 numbers is about 21 KB, and the 20,000-byte scoring cap cut it off, so it always missed.
+> - Only a transport failure (refused, out of time, or a reply over the cap) marks the embedding server down for the rest of the run, so nothing more is sent to it. A reply that arrives but is not a vector is a miss for that posting only. The log text is unchanged either way.
+
 **Context.**
 - The watcher scores each posting with a local chat model and stores a tier name from `gap_tiers`. That tier judges missing requirements. It does not measure how close the posting text is to a resume.
 - A cosine between one resume vector and each posting vector can sit beside that tier. It must not replace the tier, cause a skip, or decide an alert by itself.
@@ -495,6 +509,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - The report can show a weighted blend that the watcher never stores. That line is not the alert decision.
 
 ## ADR-020: Discovery asks a local SearXNG and queues companies for approval
+
+> **Amended: run log and stricter replies (#30).** A search run of `careerhunter discover` writes its lines to `logs/discover.log` in the data folder: the miss or off notice, then `discover: <n> queued`. List, approve and reject write no log. A reply with no `results` list, or a non-empty list where no result has a url, is a miss, and so is a body that is not UTF-8. A result without a url is skipped, and an empty list is a normal reply. The miss text is unchanged. See ADR-022 for the log file.
 
 > **Amended.** Two additions. Pending discovery rows can be approved or rejected from the allowlisted Telegram chat, with the same rules as the CLI. `discovery.interval_minutes` schedules an optional one-shot LaunchAgent for `careerhunter discover`. The decision bullets added below specify both. The earlier bullets stay as the record of the first slice.
 
@@ -534,3 +550,31 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A career-page approval stores a URL and does not make the watcher fetch that site.
 - A daily run still sends at most 12 site-restricted queries. A shorter interval, down to 60 minutes, sends that set more often.
 - A discovery message leaves the suggested name and the URL on Telegram's servers. The snippet and the query do not.
+
+## ADR-022: A watch run isolates failures, logs as it goes, and has a time budget
+
+**Context.**
+- One unexpected exception in one company ended the whole watch run, and the boards after it were never fetched.
+- Log lines were written only when the run finished. launchd discards stderr, so a crash left no trace at all.
+- A run had no limit on its total time. A slow board or a slow local model could hold it past the next scheduled run.
+- A plain time limit fetches the boards in the same order every run, so the same boards at the end of the list would be left out every time.
+
+**Decision.**
+- **One company's failure is isolated.** An exception while handling one board, one row of the recheck or scoring pass, or the embedding refresh is rolled back and logged as `watch: <who>: <ExceptionType>; continuing`, and the run goes on. `sqlite3.IntegrityError` is isolated the same way.
+- **Only infrastructure stops a run.** A missing or invalid `config.yaml`, a missing `search.db`, a database that cannot be opened, migrated or written, or a run log that cannot be written. Each is rolled back, writes an abort line to the log file and exits 1 without the success stamp. A storage guard refusal still exits 2 before anything is opened.
+- **Lines are written as they happen.** Each line goes to `logs/watch.log` (or `logs/discover.log`) the moment it is produced, then to stderr. The file is opened only after the storage guard passes, without following a symlink, and must be a regular file kept at mode 0600. A line is written whole. A failed write to stderr is ignored.
+- **Tracebacks stay in the private log.** A crash the run carries on from, and an unexpected failure, leave their full traceback in the log file only, never on stderr and never in the returned lines.
+- **A run has a 600-second budget**, shared by the fetcher, the scoring and embedding clients and the run itself. The boards come first. The embedding refresh, the recheck and the scoring of waiting rows use what is left, and scoring waits for a complete recheck, so a row the current config has not filtered again is never scored.
+- **Boards rotate.** Search migration 0007 adds `watch_board_attempts`: one row per board, keyed by ATS type and case-folded slug, with the time of the last attempt. Boards never tried come first, then the one tried longest ago; ties keep config order. The row is written in its own transaction just before each fetch. A board the budget leaves out, before or during its fetch, gets its earlier value back, or loses its row if it had none. A crash, an abort or a real failure keeps the new value.
+- **Nothing left over is counted.** Anything the budget does not reach is logged as left for the next run and counted as neither fetched nor failed. A posting is sent to the scorer at most once per run. The last line is `watch: <n> boards fetched, <m> failed, <k> left`, and a board refused for an ATS identity mismatch counts as failed.
+
+**Alternatives.**
+- Writing the log at the end of the run, as before. Rejected: a crash loses every line.
+- A time limit per board only. Rejected: many slow boards still add up to a run with no end.
+- A fixed board order under the budget. Rejected: the same boards would be left out every run.
+- Catching every exception, database errors included. Rejected: a database that cannot be written fails the same way for every company, and carrying on would only hide it.
+
+**Trade-offs.**
+- A posting stored after the budget ran out is scored on a later run from its stored fields only, without the description.
+- A database error that would have affected only one company still stops the run.
+- The log files grow without limit. There is no rotation yet.
