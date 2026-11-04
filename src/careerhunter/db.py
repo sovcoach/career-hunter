@@ -6,9 +6,11 @@ There are two kinds of database file, each with its own migration track:
 - `ei_record`: one ei_record_<label>.db per EI claim.
 
 Migrations are SQL files in careerhunter/migrations/<track>/ named NNNN_short_name.sql.
-Each is applied once, inside a transaction, and its SHA-256 is recorded. If a migration
-that was already applied is later edited, the runner refuses to continue: history is
-fixed, so changes go in a new migration.
+Each is applied once and its SHA-256 is recorded. All the migrations pending in one run
+are applied inside a single BEGIN IMMEDIATE transaction, so only one process migrates a
+file at a time, and a failure applies nothing. If a migration that was already applied
+is later edited, the runner refuses to continue: history is fixed, so changes go in a
+new migration.
 
 Every file also records which track it belongs to, in a one-row `db_identity` table, and
 the runner checks it on every open. A search.db can't be migrated as an EI record (or
@@ -30,6 +32,8 @@ from importlib import resources
 from pathlib import Path
 
 BUSY_TIMEOUT_MS = 5000
+# How long migrate waits for another process's write lock before it gives up.
+MIGRATE_BUSY_TIMEOUT_MS = 60_000
 TRACKS = ("search", "ei_record")
 _MIGRATION_NAME = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 
@@ -203,58 +207,125 @@ def file_track(conn: sqlite3.Connection) -> str | None:
     return str(row["track"]) if row else None
 
 
+def _wrong_track(found: str, track: str) -> MigrationError:
+    return MigrationError(f"this is a {found} database, not a {track} database")
+
+
 def _claim_identity(conn: sqlite3.Connection, track: str) -> None:
-    """Give a brand-new file its identity, or check the identity it already has."""
+    """Give a brand-new file its identity, or check the identity it already has.
+
+    Runs inside the migration transaction: nothing here commits.
+    """
     found = file_track(conn)
     if found == track:
         return
     if found is not None:
-        raise MigrationError(f"this is a {found} database, not a {track} database")
+        raise _wrong_track(found, track)
     if conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
         raise MigrationError(
             "this database has no career-hunter identity (it may be the single "
             f"careerhunter.db from v0.1.0); refusing to treat it as a {track} database"
         )
-    conn.executescript(
-        f"BEGIN;\n{_BOOKKEEPING}\nINSERT INTO db_identity (id, track) VALUES (1, '{track}');\n"
-        "COMMIT;"
-    )
+    for statement in split_statements(_BOOKKEEPING):
+        conn.execute(statement)
+    conn.execute("INSERT INTO db_identity (id, track) VALUES (1, ?)", (track,))
+
+
+def _applied(conn: sqlite3.Connection) -> dict[int, str] | None:
+    """Applied versions and their checksums, or None when the file has no bookkeeping."""
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    ).fetchone()
+    if not has_table:
+        return None
+    return {
+        int(row[0]): str(row[1])
+        for row in conn.execute("SELECT version, checksum FROM schema_migrations")
+    }
+
+
+def _pending(applied: dict[int, str], migrations: list[Migration]) -> list[Migration]:
+    """The migrations not applied yet. An applied one whose checksum changed is refused."""
+    pending: list[Migration] = []
+    for m in migrations:
+        if m.version not in applied:
+            pending.append(m)
+        elif applied[m.version] != m.checksum:
+            raise MigrationError(
+                f"Migration {m.version:04d}_{m.name} was edited after it was applied. "
+                "Put schema changes in a new migration instead."
+            )
+    return pending
+
+
+def _require_autocommit(conn: sqlite3.Connection) -> None:
+    """The runner issues BEGIN and COMMIT itself, so the module must not."""
+    if (
+        conn.isolation_level is not None
+        or conn.autocommit != sqlite3.LEGACY_TRANSACTION_CONTROL
+        or conn.in_transaction
+    ):
+        raise MigrationError("migrate needs an autocommit connection with no open transaction")
+
+
+def _take_migration_lock(conn: sqlite3.Connection) -> None:
+    """BEGIN IMMEDIATE, waiting up to MIGRATE_BUSY_TIMEOUT_MS for another writer."""
+    previous = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+    conn.execute(f"PRAGMA busy_timeout = {int(MIGRATE_BUSY_TIMEOUT_MS)}")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        if exc.sqlite_errorcode in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            raise MigrationError(
+                "another process held the migration lock; nothing was applied"
+            ) from exc
+        raise
+    finally:
+        conn.execute(f"PRAGMA busy_timeout = {previous}")
 
 
 def migrate(
     conn: sqlite3.Connection, track: str, migrations: list[Migration] | None = None
 ) -> list[int]:
-    """Apply pending migrations for `track`. Returns the versions applied this run."""
+    """Apply pending migrations for `track`. Returns the versions applied this run.
+
+    When the file already has its identity and every migration is applied (checksums
+    still checked), this returns without taking a write lock. Otherwise it takes one
+    BEGIN IMMEDIATE transaction, claims or checks the identity, re-reads the applied
+    versions inside the lock, runs each pending migration statement by statement, and
+    commits once. Any error rolls the whole run back and is re-raised, so a process
+    that waited for another one's lock applies only what is still pending, or nothing.
+    """
     _check_track(track)
     migrations = load_migrations(track) if migrations is None else migrations
-    _claim_identity(conn, track)
-    applied = {
-        row["version"]: row["checksum"]
-        for row in conn.execute("SELECT version, checksum FROM schema_migrations")
-    }
-    newly: list[int] = []
-    for m in migrations:
-        if m.version in applied:
-            if applied[m.version] != m.checksum:
-                raise MigrationError(
-                    f"Migration {m.version:04d}_{m.name} was edited after it was applied. "
-                    "Put schema changes in a new migration instead."
-                )
-            continue
-        script = (
-            "BEGIN;\n"
-            f"{m.sql}\n;\n"
-            "INSERT INTO schema_migrations (version, name, checksum) "
-            f"VALUES ({m.version}, '{m.name}', '{m.checksum}');\n"
-            "COMMIT;"
-        )
-        try:
-            conn.executescript(script)
-        except sqlite3.Error:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-            raise
-        newly.append(m.version)
+    _require_autocommit(conn)
+    found = file_track(conn)
+    if found is not None and found != track:
+        raise _wrong_track(found, track)
+    if found == track:
+        applied = _applied(conn)
+        if applied is not None and not _pending(applied, migrations):
+            return []
+    _take_migration_lock(conn)
+    try:
+        _claim_identity(conn, track)
+        applied = _applied(conn)
+        if applied is None:  # pragma: no cover - _claim_identity creates the table
+            raise MigrationError("schema_migrations is missing after the identity check")
+        newly: list[int] = []
+        for m in _pending(applied, migrations):
+            for statement in split_statements(m.sql):
+                conn.execute(statement)
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, checksum) VALUES (?, ?, ?)",
+                (m.version, m.name, m.checksum),
+            )
+            newly.append(m.version)
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:  # a failed COMMIT can leave the transaction open
+            conn.execute("ROLLBACK")
+        raise
     return newly
 
 
