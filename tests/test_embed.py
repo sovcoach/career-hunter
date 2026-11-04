@@ -7,12 +7,14 @@ import http.client
 import json
 import sqlite3
 import struct
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from careerhunter import db, loopback, search_store, watch
 from careerhunter import embed as embedding
+from careerhunter import resume as resume_store
 from careerhunter.embed import (
     DEFAULT_URL,
     MODEL_NAME,
@@ -62,10 +64,13 @@ def _config(resume: str | None, *, weight: float | None = None) -> dict[str, Any
     return doc
 
 
-def _write_resume(datadir: DataDir, text: str = RESUME) -> None:
-    path = datadir.root / "notes"
-    path.mkdir(mode=0o700)
-    (path / "sample.txt").write_text(text, encoding="utf-8")
+def _write_resume(datadir: DataDir, search: sqlite3.Connection, text: str = RESUME) -> None:
+    """Import `text` the way careerhunter resume import does."""
+    resume_store.import_text(datadir.root, search, text, now=lambda: "2026-11-04T12:00:00Z")
+
+
+def _current(datadir: DataDir) -> Path:
+    return datadir.root / resume_store.RESUME_DIR / resume_store.CURRENT
 
 
 def _kept(text: PostingText) -> Score:
@@ -88,7 +93,7 @@ def _run(
     datadir: DataDir,
     transport: EmbedScript | Any,
     *,
-    resume: str | None = "notes/sample.txt",
+    resume: str | None = resume_store.CONFIG_VALUE,
     weight: float | None = None,
     scorer: Any = _kept,
 ) -> list[str]:
@@ -123,7 +128,7 @@ def _absent(text: str) -> None:
 def test_a_kept_posting_stores_the_cosine_beside_the_tier(
     search: sqlite3.Connection, datadir: DataDir, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     transport = EmbedScript({RESUME: SAME_VEC, _greenhouse_text(): SAME_VEC})
     lines = _run(search, datadir, transport, weight=0)
     assert transport.calls == [RESUME, _greenhouse_text()]
@@ -146,7 +151,7 @@ def test_a_kept_posting_stores_the_cosine_beside_the_tier(
 def test_a_down_server_leaves_the_cosine_null_and_the_run_finishes(
     search: sqlite3.Connection, datadir: DataDir, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     calls: list[str] = []
 
     def down(url: str, payload: bytes) -> tuple[int, bytes]:
@@ -179,7 +184,7 @@ def test_a_down_server_leaves_the_cosine_null_and_the_run_finishes(
                 ),
             }
         ),
-        config=_config("notes/sample.txt"),
+        config=_config(resume_store.CONFIG_VALUE),
         scorer=_kept,
         data_dir=datadir.root,
         embed_transport=down,
@@ -236,7 +241,7 @@ def test_a_resume_path_outside_the_data_folder_is_not_read(
 def test_a_dimension_mismatch_leaves_the_cosine_null(
     search: sqlite3.Connection, datadir: DataDir
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     transport = EmbedScript({RESUME: RESUME_VEC, _greenhouse_text(): [1.0, 0.0, 0.0]})
     lines = _run(search, datadir, transport)
     posting_id = int(search.execute("SELECT id FROM postings").fetchone()["id"])
@@ -248,7 +253,7 @@ def test_a_dimension_mismatch_leaves_the_cosine_null(
 
 
 def test_a_negative_cosine_does_not_skip(search: sqlite3.Connection, datadir: DataDir) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     transport = EmbedScript({RESUME: RESUME_VEC, _greenhouse_text(): [-1.0, 0.0]})
     lines = _run(search, datadir, transport)
     assert _score(search) == pytest.approx(-1.0)
@@ -259,7 +264,7 @@ def test_a_negative_cosine_does_not_skip(search: sqlite3.Connection, datadir: Da
 def test_a_gap_tier_skip_still_happens_when_the_cosine_is_high(
     search: sqlite3.Connection, datadir: DataDir
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     transport = EmbedScript({RESUME: SAME_VEC, _greenhouse_text(): SAME_VEC})
 
     def excluded(text: PostingText) -> Score:
@@ -274,7 +279,7 @@ def test_a_gap_tier_skip_still_happens_when_the_cosine_is_high(
 def test_a_changed_resume_reuses_stored_posting_vectors(
     search: sqlite3.Connection, datadir: DataDir
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     first = EmbedScript({RESUME: SAME_VEC, _greenhouse_text(): POST_VEC})
     _run(search, datadir, first)
     blob, embedded_at = search.execute(
@@ -282,7 +287,7 @@ def test_a_changed_resume_reuses_stored_posting_vectors(
     ).fetchone()
     assert isinstance(blob, bytes)
     second_text = "Synthetic resume after a local edit."
-    (datadir.root / "notes" / "sample.txt").write_text(second_text, encoding="utf-8")
+    _write_resume(datadir, search, second_text)
     second = EmbedScript({second_text: POST_VEC})
     lines = _run(search, datadir, second)
     assert second.calls == [second_text]
@@ -299,7 +304,7 @@ def test_a_changed_resume_reuses_stored_posting_vectors(
 def test_a_later_resume_miss_is_logged_once_for_an_unscored_posting(
     search: sqlite3.Connection, datadir: DataDir
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     transport = EmbedScript({RESUME: SAME_VEC, _greenhouse_text(): POST_VEC})
 
     def silent(text: PostingText) -> None:
@@ -307,7 +312,7 @@ def test_a_later_resume_miss_is_logged_once_for_an_unscored_posting(
 
     _run(search, datadir, transport, scorer=silent)
     assert _score(search) == pytest.approx(0.0)
-    (datadir.root / "notes" / "sample.txt").unlink()
+    _current(datadir).unlink()
     lines = _run(search, datadir, EmbedScript({}), scorer=silent)
     posting_id = int(search.execute("SELECT id FROM postings").fetchone()["id"])
     misses = [line for line in lines if line.startswith("embedding miss")]
@@ -319,7 +324,7 @@ def test_a_later_resume_miss_is_logged_once_for_an_unscored_posting(
 def test_an_unchanged_resume_does_not_call_the_model_again(
     search: sqlite3.Connection, datadir: DataDir
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     transport = EmbedScript({RESUME: SAME_VEC, _greenhouse_text(): POST_VEC})
     _run(search, datadir, transport)
     assert len(transport.calls) == 2
@@ -331,7 +336,7 @@ def test_an_unchanged_resume_does_not_call_the_model_again(
 def test_the_description_is_embedded_once_and_stays_out_of_the_log(
     search: sqlite3.Connection, datadir: DataDir, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     seen = posting_text(
         PostingText(
             company="Sample Logistics",
@@ -366,7 +371,7 @@ def test_the_description_is_embedded_once_and_stays_out_of_the_log(
         [company("Sample Logistics", "lever", "samplelogistics")],
         today=DAY,
         fetcher=Scripted({board: fetched(payload)}),
-        config=_config("notes/sample.txt"),
+        config=_config(resume_store.CONFIG_VALUE),
         scorer=_kept,
         data_dir=datadir.root,
         embed_transport=transport,
@@ -382,7 +387,7 @@ def test_the_description_is_embedded_once_and_stays_out_of_the_log(
         [company("Sample Logistics", "lever", "samplelogistics")],
         today=DAY,
         fetcher=Scripted({board: fetched(payload)}),
-        config=_config("notes/sample.txt"),
+        config=_config(resume_store.CONFIG_VALUE),
         scorer=_kept,
         data_dir=datadir.root,
         embed_transport=transport,
@@ -400,10 +405,10 @@ def test_null_resume_skips_embeddings(search: sqlite3.Connection, datadir: DataD
     assert _score(search) is None
 
 
-def test_an_empty_resume_is_a_miss(search: sqlite3.Connection, datadir: DataDir) -> None:
-    path = datadir.root / "notes"
-    path.mkdir(mode=0o700)
-    (path / "sample.txt").write_bytes(b"")
+def test_an_emptied_resume_is_a_miss(search: sqlite3.Connection, datadir: DataDir) -> None:
+    """Emptied after its import, so it no longer matches its recorded hash."""
+    _write_resume(datadir, search)
+    _current(datadir).write_bytes(b"")
     transport = EmbedScript({})
     lines = _run(search, datadir, transport)
     posting_id = int(search.execute("SELECT id FROM postings").fetchone()["id"])
@@ -412,9 +417,8 @@ def test_an_empty_resume_is_a_miss(search: sqlite3.Connection, datadir: DataDir)
 
 
 def test_a_non_text_resume_is_a_miss(search: sqlite3.Connection, datadir: DataDir) -> None:
-    path = datadir.root / "notes"
-    path.mkdir(mode=0o700)
-    (path / "sample.txt").write_bytes(b"\xff")
+    _write_resume(datadir, search)
+    _current(datadir).write_bytes(b"\xff")
     transport = EmbedScript({})
     lines = _run(search, datadir, transport)
     posting_id = int(search.execute("SELECT id FROM postings").fetchone()["id"])
@@ -423,7 +427,7 @@ def test_a_non_text_resume_is_a_miss(search: sqlite3.Connection, datadir: DataDi
 
 
 def test_a_zero_vector_is_unreachable(search: sqlite3.Connection, datadir: DataDir) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     transport = EmbedScript({RESUME: [0.0, 0.0]})
     lines = _run(search, datadir, transport)
     posting_id = int(search.execute("SELECT id FROM postings").fetchone()["id"])
@@ -628,7 +632,7 @@ def _two_postings(search: sqlite3.Connection, datadir: DataDir, transport: Any) 
         [company("Example Robotics", "greenhouse", slug)],
         today=DAY,
         fetcher=Scripted({url("greenhouse", slug): fetched({"jobs": jobs})}),
-        config=_config("notes/sample.txt"),
+        config=_config(resume_store.CONFIG_VALUE),
         scorer=_kept,
         data_dir=datadir.root,
         embed_transport=transport,
@@ -668,7 +672,7 @@ def _scores(search: sqlite3.Connection) -> dict[str, float | None]:
 def test_a_wrong_shape_reply_is_one_postings_miss_and_the_next_is_embedded(
     search: sqlite3.Connection, datadir: DataDir
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     first, second = (
         posting_text(PostingText("Example Robotics", t, "Example City", work_model=None))
         for t in ("Operations Coordinator", "Support Specialist")
@@ -686,7 +690,7 @@ def test_a_wrong_shape_reply_is_one_postings_miss_and_the_next_is_embedded(
 def test_a_refused_connection_stops_embedding_for_the_rest_of_the_run(
     search: sqlite3.Connection, datadir: DataDir
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     first, second = (
         posting_text(PostingText("Example Robotics", t, "Example City", work_model=None))
         for t in ("Operations Coordinator", "Support Specialist")
@@ -704,7 +708,7 @@ def test_a_refused_connection_stops_embedding_for_the_rest_of_the_run(
 def test_a_resume_the_server_cannot_embed_is_asked_once_per_run(
     search: sqlite3.Connection, datadir: DataDir
 ) -> None:
-    _write_resume(datadir)
+    _write_resume(datadir, search)
     transport = ByText({RESUME: ConnectionRefusedError("synthetic")})
     lines = _two_postings(search, datadir, transport)
     assert transport.calls == [RESUME]  # the refresh reused the failure
