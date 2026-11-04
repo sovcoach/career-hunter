@@ -496,15 +496,23 @@ def configured(config: Mapping[str, Any]) -> bool:
 def load(root: Path, conn: sqlite3.Connection, config: Mapping[str, Any]) -> Resume | None:
     """The imported resume, or None when search.resume is unset.
 
-    Refuses, with a ResumeError, a search.resume other than resume/current.txt, a
-    missing import, a file that is missing, a link, readable by others, or changed
-    since its import.
+    Refuses, with a ResumeError, a search.resume other than resume/current.txt, and
+    everything `read_imported` refuses.
     """
     value = _configured_value(config)
     if value is None:
         return None
     if value != CONFIG_VALUE:
         raise ResumeError("config")
+    return read_imported(root, conn)
+
+
+def read_imported(root: Path, conn: sqlite3.Connection) -> Resume:
+    """resume/current.txt, checked against the latest import, whatever config says.
+
+    Refuses a missing import or file, a link, a file readable by others, and a file
+    that differs from its latest recorded hash. doctor uses this for its hash check.
+    """
     expected = latest_import(conn)
     if expected is None:
         raise ResumeError("not_imported")
@@ -523,11 +531,19 @@ def load(root: Path, conn: sqlite3.Connection, config: Mapping[str, Any]) -> Res
             raise ResumeError("mismatch")
         if stat.S_IMODE(info.st_mode) & 0o077:
             raise ResumeError("loose")
-        data = os.read(fd, MAX_TEXT_BYTES + 1)
+        chunks: list[bytes] = []
+        total = 0
+        while total <= MAX_TEXT_BYTES:
+            chunk = os.read(fd, MAX_TEXT_BYTES + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
     except OSError:
         raise ResumeError("mismatch") from None
     finally:
         os.close(fd)
+    data = b"".join(chunks)
     if len(data) > MAX_TEXT_BYTES or hashlib.sha256(data).hexdigest() != expected:
         raise ResumeError("mismatch")
     try:
@@ -535,3 +551,11 @@ def load(root: Path, conn: sqlite3.Connection, config: Mapping[str, Any]) -> Res
     except UnicodeDecodeError:
         raise ResumeError("mismatch") from None
     return Resume(text, expected)
+
+
+def leftovers(root: Path) -> list[str]:
+    """Names of files an interrupted (or running) import leaves in resume/."""
+    folder = root / RESUME_DIR
+    names = [PREVIOUS] if (folder / PREVIOUS).exists() else []
+    names += sorted(p.name for p in folder.glob(f"{TMP_PREFIX}*{TMP_SUFFIX}"))
+    return names

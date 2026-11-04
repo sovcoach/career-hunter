@@ -1009,6 +1009,63 @@ def _record_discover_success(datadir: DataDir) -> None:
     _record_success(datadir, "discover.success")
 
 
+def _doctor_resume(
+    report: _Report,
+    datadir: DataDir,
+    config_doc: dict[str, Any] | None,
+    search: sqlite3.Connection | None,
+) -> None:
+    """resume/: its modes, leftovers, the file against its recorded hash, and config."""
+    folder = datadir.root / resume.RESUME_DIR
+    configured = config_doc is not None and resume.configured(config_doc)
+    if not folder.exists() and not folder.is_symlink():
+        if configured:
+            report.line("resume", "BAD", str(resume.ResumeError("not_imported")))
+        else:
+            report.line("resume", "--", "not imported (optional: careerhunter resume import)")
+        return
+    if folder.is_symlink() or not folder.is_dir():
+        report.line("resume", "BAD", str(resume.ResumeError("folder")))
+        return
+    if stat.S_IMODE(folder.lstat().st_mode) != 0o700:
+        os.chmod(folder, 0o700)
+        report.line("resume/", "FIXED", "folder -> 0700")
+    _doctor_private_folder(report, "resume/", folder)
+    left = resume.leftovers(datadir.root)
+    if left:
+        report.line(
+            "resume",
+            "WARN",
+            f"left by an interrupted or running import: {', '.join(left)}; "
+            "the next import removes them",
+        )
+    if search is None:
+        report.line("resume", "--", "hash not checked until search.db is readable")
+        return
+    try:
+        resume.read_imported(datadir.root, search)
+    except resume.ResumeError as exc:
+        if exc.reason == "not_imported" and not configured:
+            report.line("resume", "--", "not imported (optional: careerhunter resume import)")
+        else:
+            report.line("resume", "BAD", str(exc))
+        return
+    if config_doc is not None and not configured:
+        report.line(
+            "resume",
+            "WARN",
+            f"imported but not used: set search.resume: {resume.CONFIG_VALUE} in config.yaml",
+        )
+        return
+    if config_doc is not None:
+        try:
+            resume.load(datadir.root, search, config_doc)
+        except resume.ResumeError as exc:
+            report.line("resume", "BAD", str(exc))
+            return
+    report.line("resume", "OK", "matches its import")
+
+
 def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
     """Check everything and report. Reads only, apart from tightening file modes."""
     report = _Report()
@@ -1074,6 +1131,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
             search = None
     else:
         report.line("search.db", "--", "not created yet (run: careerhunter init)")
+    _doctor_resume(report, datadir, config_doc, search)
 
     records: dict[str, sqlite3.Connection] = {}
     unreadable = search is None and datadir.search_db_path.exists()
