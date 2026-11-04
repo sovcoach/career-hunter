@@ -256,7 +256,7 @@ def test_a_failed_board_writes_no_skip(search: sqlite3.Connection, datadir: Data
     )
     assert lines == [
         "watch: Example Robotics (greenhouse): FetchError; nothing recorded",
-        "watch: 0 boards fetched, 1 failed",
+        "watch: 0 boards fetched, 1 failed, 0 left",
     ]
     assert postings(search) == []
     assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 0

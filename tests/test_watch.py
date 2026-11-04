@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -289,7 +290,7 @@ def test_greenhouse_board_normalizes_to_the_common_shape(
     assert "a job was not an object; skipped" in "\n".join(lines)
     assert "No Identity Role" in "\n".join(lines)
     assert "7 new, 0 already recorded" in lines[-2]
-    assert lines[-1] == "watch: 1 boards fetched, 0 failed"
+    assert lines[-1] == "watch: 1 boards fetched, 0 failed, 0 left"
 
 
 def test_lever_board_normalizes_including_a_missing_work_model(
@@ -362,7 +363,7 @@ def test_lever_board_normalizes_including_a_missing_work_model(
     assert "a job has no title; skipped" in joined
     assert "a job was not an object; skipped" in joined
     assert "5 new, 0 already recorded" in lines[-2]
-    assert lines[-1] == "watch: 1 boards fetched, 0 failed"
+    assert lines[-1] == "watch: 1 boards fetched, 0 failed, 0 left"
 
 
 def test_ashby_work_model_prefers_workplace_type(
@@ -487,7 +488,7 @@ def test_one_board_failing_does_not_stop_the_run(
         "watch: Example List (greenhouse): HTTP 200, unexpected JSON shape; nothing recorded",
         "watch: Example Shape (lever): HTTP 200, unexpected JSON shape; nothing recorded",
         "watch: Example Org (ashby): 1 new, 0 already recorded",
-        "watch: 1 boards fetched, 5 failed",
+        "watch: 1 boards fetched, 5 failed, 0 left",
     ]
     joined = "\n".join(lines)
     assert "BODY-MARKER" not in joined
@@ -541,7 +542,7 @@ def test_a_429_records_retry_after_and_does_not_parse_the_body(
         "watch: Example Other (greenhouse): "
         "boards-api.greenhouse.io already returned HTTP 429 this run; left for the next run",
         "watch: Sample Logistics (lever): 1 new, 0 already recorded",
-        "watch: 1 boards fetched, 1 failed",
+        "watch: 1 boards fetched, 1 failed, 0 left",
     ]
     assert "BODY-MARKER" not in "\n".join(lines)
     assert [row["title"] for row in postings(search)] == ["Warehouse Clerk"]
@@ -573,7 +574,7 @@ def test_a_missing_or_blank_retry_after_is_logged_as_none(
     assert lines == [
         "watch: Example Robotics (greenhouse): HTTP 429, retry-after none; left for the next run",
         "watch: Sample Logistics (lever): HTTP 429, retry-after none; left for the next run",
-        "watch: 0 boards fetched, 2 failed",
+        "watch: 0 boards fetched, 2 failed, 0 left",
     ]
     assert postings(search) == []
     assert companies(search) == []
@@ -588,7 +589,7 @@ def test_an_empty_board_still_records_the_company(
     )
     assert lines == [
         "watch: Example Robotics (greenhouse): 0 new, 0 already recorded",
-        "watch: 1 boards fetched, 0 failed",
+        "watch: 1 boards fetched, 0 failed, 0 left",
     ]
     assert postings(search) == []
     stored = companies(search)[0]
@@ -735,7 +736,7 @@ def test_an_ats_disagreement_skips_the_company_without_writes(
     assert "disagrees" in lines[0]
     assert f"ats_type={stored_type or 'null'}" in lines[0]
     assert f"ats_slug={stored_slug or 'null'}" in lines[0]
-    assert lines[-1] == "watch: 0 boards fetched, 1 failed"
+    assert lines[-1] == "watch: 0 boards fetched, 1 failed, 0 left"
 
 
 @pytest.mark.parametrize(
@@ -903,12 +904,14 @@ def test_unfetched_entries_make_no_request(search: sqlite3.Connection, datadir: 
         "watch: a watchlist entry has no name; skipped",
         "watch: a watchlist entry has no name; skipped",
         "watch: a watchlist entry has no name; skipped",
-        "watch: 0 boards fetched, 0 failed",  # never attempted: in neither count
+        "watch: 0 boards fetched, 0 failed, 0 left",  # never attempted: in neither count
     ]
 
 
 def test_an_empty_watchlist_does_nothing(search: sqlite3.Connection, datadir: DataDir) -> None:
-    assert watched(search, datadir, [], Scripted({})) == ["watch: 0 boards fetched, 0 failed"]
+    assert watched(search, datadir, [], Scripted({})) == [
+        "watch: 0 boards fetched, 0 failed, 0 left"
+    ]
     assert companies(search) == []
 
 
@@ -927,7 +930,7 @@ def test_watch_command_records_the_example_boards_without_a_socket(
 ) -> None:
     calls: list[str] = []
 
-    def fake(board: str) -> Fetched:
+    def fake(board: str, **_kw: object) -> Fetched:
         calls.append(board)
         if board == url("greenhouse", "examplerobotics"):
             return fetched(one_greenhouse("examplerobotics"))
@@ -955,10 +958,10 @@ def test_watch_command_records_the_example_boards_without_a_socket(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == (
+        "watch: Example Staffing: no ats_type; skipped\n"  # unfetchable entries go first
         "watch: Example Robotics (greenhouse): 1 new, 0 already recorded\n"
         "watch: Sample Logistics (lever): 1 new, 0 already recorded\n"
-        "watch: Example Staffing: no ats_type; skipped\n"
-        "watch: 2 boards fetched, 0 failed\n"
+        "watch: 2 boards fetched, 0 failed, 0 left\n"
     )
     assert calls == [url("greenhouse", "examplerobotics"), url("lever", "samplelogistics")]
     conn = db.connect(inited / "search.db")
@@ -1210,7 +1213,7 @@ def test_a_company_that_raises_is_logged_and_the_others_still_run(
     lines = w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher, on_crash=crashes)
     assert "watch: Example B: IncompleteRead; continuing" in lines
     assert stored_names(search) == ["Example A", "Example C"]
-    assert lines[-1] == "watch: 2 boards fetched, 1 failed"
+    assert lines[-1] == "watch: 2 boards fetched, 1 failed, 0 left"
     assert crashes.calls == [("Example B", error)]
     assert not search.in_transaction
 
@@ -1243,7 +1246,7 @@ def test_the_same_failure_through_the_real_fetcher_is_a_failed_fetch(
     lines = w.run(search, entries(*NAMES), today=DAY, fetcher=real)
     assert "watch: Example B (greenhouse): FetchFailed; nothing recorded" in lines
     assert stored_names(search) == ["Example A", "Example C"]
-    assert lines[-1] == "watch: 2 boards fetched, 1 failed"
+    assert lines[-1] == "watch: 2 boards fetched, 1 failed, 0 left"
 
 
 def _raising_for(
@@ -1328,7 +1331,7 @@ def test_a_failed_board_leaves_its_company_and_postings_as_they_were(
     assert (table(search, "companies"), table(search, "postings")) == before
     assert "watch: Example B (greenhouse): FetchTimeout; nothing recorded" in lines
     assert not any(line.startswith("watch: Example B (greenhouse): 0 new") for line in lines)
-    assert lines[-1] == "watch: 2 boards fetched, 1 failed"
+    assert lines[-1] == "watch: 2 boards fetched, 1 failed, 0 left"
 
 
 def test_a_crash_midway_through_a_board_keeps_every_earlier_posting(
@@ -1443,9 +1446,11 @@ def test_a_refresh_that_raises_is_isolated_and_the_boards_still_run(
         raise error
 
     monkeypatch.setattr(w.Embedder, "refresh", refresh)
+    monkeypatch.setattr(w.Embedder, "enabled", lambda self: True)
     crashes = Crashes()
     lines = w.run(search, entries(*NAMES), today=DAY, fetcher=three_boards(), on_crash=crashes)
-    assert lines[0] == "watch: embedding refresh: RuntimeError; continuing"
+    # The refresh runs after the boards, so its line comes just before the summary.
+    assert lines[-2] == "watch: embedding refresh: RuntimeError; continuing"
     assert stored_names(search) == list(NAMES)
     assert crashes.calls == [("embedding refresh", error)]
 
@@ -1541,7 +1546,7 @@ def test_watch_lines_reach_the_log_file_as_they_happen(
 ) -> None:
     on_disk: list[str] = []
 
-    def fake(address: str) -> Fetched:
+    def fake(address: str, **_kw: object) -> Fetched:
         if address == url("greenhouse", "examplerobotics"):
             return fetched(one_greenhouse("examplerobotics"))
         on_disk.append(_log(inited))  # while the second board is being fetched
@@ -1549,7 +1554,10 @@ def test_watch_lines_reach_the_log_file_as_they_happen(
 
     _example_boards(monkeypatch, fake)
     assert cli.main(["watch"], probe=probe) == 0
-    assert on_disk == ["watch: Example Robotics (greenhouse): 1 new, 0 already recorded\n"]
+    assert on_disk == [
+        "watch: Example Staffing: no ats_type; skipped\n"
+        "watch: Example Robotics (greenhouse): 1 new, 0 already recorded\n"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1595,7 +1603,7 @@ def test_an_infrastructure_failure_exits_1_with_its_line_in_the_log(
     line: str,
     err: str,
 ) -> None:
-    _example_boards(monkeypatch, lambda address: pytest.fail("no fetch on an abort"))
+    _example_boards(monkeypatch, lambda address, **_kw: pytest.fail("no fetch on an abort"))
     setup(inited, monkeypatch)
     assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
     assert capsys.readouterr().err == err
@@ -1622,11 +1630,17 @@ def test_a_database_error_mid_run_exits_1(
     def locked(*args: Any, **kwargs: Any) -> Any:
         raise sqlite3.OperationalError("database is locked")
 
-    _example_boards(monkeypatch, lambda address: fetched(one_greenhouse("examplerobotics")))
+    _example_boards(monkeypatch, lambda address, **_kw: fetched(one_greenhouse("examplerobotics")))
     monkeypatch.setattr(search_store, "find_or_create_posting", locked)
     assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
-    assert capsys.readouterr().err == "error: OperationalError: database is locked\n"
-    assert _log(inited) == "watch: aborted: OperationalError: database is locked\n"
+    assert capsys.readouterr().err == (
+        "watch: Example Staffing: no ats_type; skipped\n"
+        "error: OperationalError: database is locked\n"
+    )
+    assert _log(inited) == (
+        "watch: Example Staffing: no ats_type; skipped\n"
+        "watch: aborted: OperationalError: database is locked\n"
+    )
     assert not (inited / "logs" / "watch.success").exists()
 
 
@@ -1643,7 +1657,7 @@ def test_an_integrity_error_mid_run_still_finishes(
             raise sqlite3.IntegrityError("synthetic")
         return real(conn, posting, dating)
 
-    def fake(address: str) -> Fetched:
+    def fake(address: str, **_kw: object) -> Fetched:
         if address == url("greenhouse", "examplerobotics"):
             return fetched(one_greenhouse("examplerobotics"))
         return _lever_board()
@@ -1661,7 +1675,7 @@ def test_a_board_crash_keeps_its_traceback_in_the_log_file_only(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake(address: str) -> Fetched:
+    def fake(address: str, **_kw: object) -> Fetched:
         if address == url("greenhouse", "examplerobotics"):
             raise RuntimeError("synthetic board failure")
         return _lever_board()
@@ -1674,7 +1688,7 @@ def test_a_board_crash_keeps_its_traceback_in_the_log_file_only(
     log = _log(inited)
     assert "watch: Example Robotics: traceback\nTraceback (most recent call last):" in log
     assert "RuntimeError: synthetic board failure" in log
-    assert "watch: 1 boards fetched, 1 failed\n" in log
+    assert "watch: 1 boards fetched, 1 failed, 0 left\n" in log
 
 
 def test_an_unexpected_failure_leaves_its_traceback_in_the_log(
@@ -1700,7 +1714,7 @@ def test_a_run_log_that_cannot_open_stops_the_command_before_any_fetch(
 ) -> None:
     (inited / "logs").mkdir(mode=0o700, exist_ok=True)
     (inited / "logs" / "watch.log").mkdir()
-    _example_boards(monkeypatch, lambda address: pytest.fail("no fetch without a log"))
+    _example_boards(monkeypatch, lambda address, **_kw: pytest.fail("no fetch without a log"))
     assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
     assert capsys.readouterr().err == "error: run log not writable: IsADirectoryError\n"
     assert not (inited / "logs" / "watch.success").exists()
@@ -1714,12 +1728,17 @@ def test_a_run_log_that_fails_mid_run_stops_the_run(
 ) -> None:
     from careerhunter.runlog import RunLog
 
+    writes: list[int] = []
+
     def refuse(fd: int, data: memoryview) -> int:
-        raise OSError("disk full")
+        writes.append(len(data))
+        if len(writes) == 2:  # the first board's result line
+            raise OSError("disk full")
+        return os.write(fd, data)
 
     calls: list[str] = []
 
-    def fake(address: str) -> Fetched:
+    def fake(address: str, **_kw: object) -> Fetched:
         calls.append(address)
         if address == url("greenhouse", "examplerobotics"):
             return fetched(one_greenhouse("examplerobotics"))
@@ -1729,8 +1748,10 @@ def test_a_run_log_that_fails_mid_run_stops_the_run(
     monkeypatch.setattr(cli, "RunLog", lambda path: RunLog(path, writer=refuse))
     assert cli.main(["watch"], probe=probe) == cli.EXIT_ERROR
     err = capsys.readouterr().err
-    assert err == "error: run log not writable: OSError\n"
-    assert calls == [url("greenhouse", "examplerobotics")]  # the first line failed; no more
+    assert err == (
+        "watch: Example Staffing: no ats_type; skipped\nerror: run log not writable: OSError\n"
+    )
+    assert calls == [url("greenhouse", "examplerobotics")]  # its line failed; no more
     assert not (inited / "logs" / "watch.success").exists()
 
 
@@ -1751,3 +1772,347 @@ def test_an_abort_whose_log_line_cannot_be_written_still_says_why(
     assert capsys.readouterr().err == (
         "error: run log not writable: OSError\nerror: config.yaml is missing\n"
     )
+
+
+# The run budget: boards first, oldest attempt first, and nothing left over is counted.
+
+
+class Timed(Scripted):
+    """A fetcher on a fake clock: each fetch costs `cost` minutes, or `costs[url]`."""
+
+    def __init__(
+        self,
+        mapping: dict[str, Fetched | Exception],
+        clock: Any,
+        *,
+        cost: float = 0.0,
+        costs: dict[str, float] | None = None,
+    ) -> None:
+        super().__init__(mapping)
+        self.clock = clock
+        self.cost = cost
+        self.costs = costs or {}
+
+    def __call__(self, address: str) -> Fetched:
+        self.clock.advance(60 * self.costs.get(address, self.cost))
+        return super().__call__(address)
+
+
+def ticking() -> Any:
+    """A wall clock for attempt stamps: one minute later on every call."""
+    moment = [dt.datetime(2026, 11, 1, 8, 0, tzinfo=dt.UTC)]
+
+    def now() -> dt.datetime:
+        moment[0] += dt.timedelta(minutes=1)
+        return moment[0]
+
+    return now
+
+
+def minutes(clock: Any, total: float) -> Any:
+    from careerhunter.deadline import Deadline
+
+    return Deadline(60 * total, clock)
+
+
+def attempts(conn: sqlite3.Connection) -> dict[str, str]:
+    return {
+        str(row["board_key"]): str(row["last_attempt_at"])
+        for row in conn.execute("SELECT board_key, last_attempt_at FROM watch_board_attempts")
+    }
+
+
+def key(name: str) -> str:
+    return "greenhouse:" + name.lower().replace(" ", "")
+
+
+def test_never_tried_boards_go_first_then_the_oldest_attempt(search: sqlite3.Connection) -> None:
+    with db.transaction(search):
+        search.executemany(
+            "INSERT INTO watch_board_attempts (board_key, last_attempt_at) VALUES (?, ?)",
+            [
+                (key("Example A"), "2026-11-01T10:00:00Z"),
+                (key("Example C"), "2026-11-01T09:00:00Z"),
+            ],
+        )
+    fetcher = three_boards()
+    lines = w.run(search, [*entries(*NAMES), {"name": "No Type"}], today=DAY, fetcher=fetcher)
+    assert lines[0] == "watch: No Type: no ats_type; skipped"  # costs nothing, goes first
+    assert fetcher.calls == [board("Example B"), board("Example C"), board("Example A")]
+
+
+def test_boards_never_tried_keep_their_order(search: sqlite3.Connection) -> None:
+    fetcher = three_boards()
+    w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher)
+    assert fetcher.calls == [board(name) for name in NAMES]
+
+
+def test_the_stamp_is_committed_before_the_fetch_and_kept_on_failure(
+    search: sqlite3.Connection,
+) -> None:
+    from careerhunter.fetch import FetchFailed
+
+    seen: list[dict[str, str]] = []
+
+    def fetch(address: str) -> Fetched:
+        reader = db.connect_read_only(Path(search.execute("PRAGMA database_list").fetchone()[2]))
+        try:
+            seen.append(attempts(reader))  # another connection sees it: it was committed
+        finally:
+            reader.close()
+        raise FetchFailed("synthetic")
+
+    lines = w.run(search, entries("Example A"), today=DAY, fetcher=fetch, now=ticking())
+    assert seen == [{key("Example A"): "2026-11-01T08:01:00Z"}]
+    assert attempts(search) == {key("Example A"): "2026-11-01T08:01:00Z"}
+    assert lines[-1] == "watch: 0 boards fetched, 1 failed, 0 left"
+
+
+def test_a_board_that_crashes_keeps_its_new_stamp_and_moves_to_the_back(
+    search: sqlite3.Connection,
+) -> None:
+    now = ticking()
+    w.run(search, entries(*NAMES), today=DAY, fetcher=three_boards(), now=now)
+    crashing = three_boards()
+    crashing.mapping[board("Example A")] = RuntimeError("synthetic")
+    w.run(search, entries("Example A"), today=DAY, fetcher=crashing, now=now)
+    assert attempts(search)[key("Example A")] == "2026-11-01T08:04:00Z"
+    fetcher = three_boards()
+    w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher, now=now)
+    assert fetcher.calls == [board("Example B"), board("Example C"), board("Example A")]
+
+
+def test_a_board_the_budget_leaves_out_is_fetched_first_next_run(
+    search: sqlite3.Connection,
+) -> None:
+    from tests.fakes import FakeClock
+
+    clock = FakeClock()
+    first = Timed(three_boards().mapping, clock, cost=5)
+    lines = w.run(search, entries(*NAMES), today=DAY, fetcher=first, budget=minutes(clock, 10))
+    assert first.calls == [board("Example A"), board("Example B")]
+    assert "watch: Example C (greenhouse): run budget reached; left for the next run" in lines
+    assert lines[-1] == "watch: 2 boards fetched, 0 failed, 1 left"
+    assert key("Example C") not in attempts(search)  # never attempted, never stamped
+    again = Timed(three_boards().mapping, clock, cost=5)
+    w.run(search, entries(*NAMES), today=DAY, fetcher=again, budget=minutes(clock, 10))
+    assert again.calls[0] == board("Example C")
+
+
+def test_a_fetch_the_budget_cuts_short_keeps_its_old_place(search: sqlite3.Connection) -> None:
+    from careerhunter.fetch import FetchTimeout
+    from tests.fakes import FakeClock
+
+    now = ticking()
+    w.run(search, entries(*NAMES), today=DAY, fetcher=three_boards(), now=now)
+    before = attempts(search)
+    clock = FakeClock()
+    mapping: dict[str, Fetched | Exception] = dict(three_boards().mapping)
+    mapping[board("Example B")] = FetchTimeout("synthetic")  # cut short by the run budget
+    cut = Timed(mapping, clock, costs={board("Example A"): 5, board("Example B"): 6})
+    lines = w.run(
+        search, entries(*NAMES), today=DAY, fetcher=cut, budget=minutes(clock, 10), now=now
+    )
+    assert "watch: Example B (greenhouse): run budget reached; left for the next run" in lines
+    assert lines[-1] == "watch: 1 boards fetched, 0 failed, 2 left"
+    stamps = attempts(search)
+    assert stamps[key("Example B")] == before[key("Example B")]  # its earlier value is back
+    assert stamps[key("Example A")] > before[key("Example A")]  # A succeeded, so it moved
+    fetcher = three_boards()
+    w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher, now=now)
+    assert fetcher.calls[:2] == [board("Example B"), board("Example C")]
+    assert fetcher.calls[2] == board("Example A")  # after the boards the budget left out
+
+
+def test_a_never_tried_board_cut_short_is_still_never_tried(search: sqlite3.Connection) -> None:
+    from careerhunter.fetch import FetchTimeout
+    from tests.fakes import FakeClock
+
+    clock = FakeClock()
+    mapping: dict[str, Fetched | Exception] = dict(three_boards().mapping)
+    mapping[board("Example B")] = FetchTimeout("synthetic")
+    cut = Timed(mapping, clock, costs={board("Example A"): 5, board("Example B"): 6})
+    w.run(search, entries(*NAMES), today=DAY, fetcher=cut, budget=minutes(clock, 10))
+    assert set(attempts(search)) == {key("Example A")}  # B's row is gone again
+    fetcher = three_boards()
+    w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher)
+    assert fetcher.calls == [board("Example B"), board("Example C"), board("Example A")]
+
+
+def test_a_timeout_with_budget_left_is_a_failure(search: sqlite3.Connection) -> None:
+    from careerhunter.fetch import FetchTimeout
+    from tests.fakes import FakeClock
+
+    clock = FakeClock()
+    mapping: dict[str, Fetched | Exception] = dict(three_boards().mapping)
+    mapping[board("Example B")] = FetchTimeout("synthetic")
+    fetcher = Timed(mapping, clock, cost=1)
+    lines = w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher, budget=minutes(clock, 10))
+    assert "watch: Example B (greenhouse): FetchTimeout; nothing recorded" in lines
+    assert lines[-1] == "watch: 2 boards fetched, 1 failed, 0 left"
+    assert key("Example B") in attempts(search)  # a real failure keeps the new stamp
+
+
+def test_when_the_boards_use_the_whole_budget_the_other_passes_wait(
+    search: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.fakes import FakeClock
+
+    monkeypatch.setattr(w.Embedder, "enabled", lambda self: True)
+    refreshed: list[bool] = []
+    monkeypatch.setattr(w.Embedder, "refresh", lambda self: refreshed.append(True) or [])
+    clock = FakeClock()
+    scored: list[str] = []
+
+    def scorer(text: Any) -> Score:
+        scored.append(text.company)
+        return Score(llm_output="kept", gaps="[]", tier="strong")
+
+    fetcher = Timed(three_boards().mapping, clock, cost=5)
+    lines = w.run(
+        search,
+        entries(*NAMES),
+        today=DAY,
+        fetcher=fetcher,
+        scorer=scorer,
+        budget=minutes(clock, 10),
+    )
+    assert lines[-5:] == [
+        "watch: Example C (greenhouse): run budget reached; left for the next run",
+        "watch: embedding refresh: run budget reached; left for the next run",
+        "watch: recheck: run budget reached; left for the next run",
+        "watch: scoring: run budget reached; left for the next run",
+        "watch: 2 boards fetched, 0 failed, 1 left",
+    ]
+    # A was scored as it arrived; B's posting came in after the budget ran out.
+    assert scored == ["Example A"]
+    assert "watch: Example B (greenhouse): 'Coordinator 1001' left for the next run " in "\n".join(
+        lines
+    )
+    assert refreshed == []
+    assert stored_names(search) == ["Example A", "Example B"]
+    assert [row["name"] for row in companies(search)] == ["Example A", "Example B"]
+
+
+def test_scoring_waiting_rows_stops_when_the_budget_runs_out(
+    search: sqlite3.Connection,
+) -> None:
+    from tests.fakes import FakeClock
+
+    w.run(search, entries(*NAMES), today=DAY, fetcher=three_boards())  # three unscored rows
+    clock = FakeClock()
+
+    def scorer(text: Any) -> Score:
+        clock.advance(120)
+        return Score(llm_output="kept", gaps="[]", tier="strong")
+
+    fetcher = Timed(three_boards().mapping, clock, cost=2)
+    lines = w.run(
+        search,
+        entries(*NAMES),
+        today=DAY,
+        fetcher=fetcher,
+        scorer=scorer,
+        budget=minutes(clock, 10),
+    )
+    assert "watch: scoring: run budget reached; 1 postings left for the next run" in lines
+    assert [row["llm_output"] for row in postings(search)].count("kept") == 2
+
+
+def test_a_recheck_cut_short_means_no_scoring(
+    search: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.fakes import FakeClock
+
+    w.run(search, entries(*NAMES), today=DAY, fetcher=three_boards())
+    clock = FakeClock()
+    real = w.filters.decide
+
+    def slow(text: Any, **kwargs: Any) -> Any:
+        clock.advance(300)
+        return real(text, **kwargs)
+
+    monkeypatch.setattr(w.filters, "decide", slow)
+    lines = w.run(
+        search,
+        [],
+        today=DAY,
+        fetcher=Scripted({}),
+        scorer=lambda text: pytest.fail("no scoring after a cut recheck"),
+        budget=minutes(clock, 10),
+    )
+    assert "watch: recheck: run budget reached; 1 postings left for the next run" in lines
+    assert "watch: scoring: run budget reached; left for the next run" in lines
+
+
+def test_a_posting_is_sent_to_the_scorer_once_per_run(search: sqlite3.Connection) -> None:
+    calls: list[str] = []
+
+    def down(text: Any) -> None:
+        calls.append(text.company)
+        return None  # the model did not answer
+
+    w.run(search, entries(*NAMES), today=DAY, fetcher=three_boards(), scorer=down)
+    assert sorted(calls) == list(NAMES)  # inline only; the waiting pass did not retry them
+
+
+def test_new_postings_after_the_budget_runs_out_are_stored_but_not_scored(
+    search: sqlite3.Connection,
+) -> None:
+    from tests.fakes import FakeClock
+
+    clock = FakeClock()
+    scored: list[str] = []
+
+    def scorer(text: Any) -> Score:
+        scored.append(text.title)
+        clock.advance(300)
+        return Score(llm_output="kept", gaps="[]", tier="strong")
+
+    fetcher = Timed({board("Example A"): jobs_for("Example A", 1001, 1002, 1003)}, clock)
+    lines = w.run(
+        search,
+        entries("Example A"),
+        today=DAY,
+        fetcher=fetcher,
+        scorer=scorer,
+        budget=minutes(clock, 10),
+    )
+    assert scored == ["Coordinator 1001", "Coordinator 1002"]
+    assert (
+        "watch: Example A (greenhouse): 'Coordinator 1003' left for the next run "
+        "(run budget reached)" in lines
+    )
+    assert [row["title"] for row in postings(search)] == [
+        "Coordinator 1001",
+        "Coordinator 1002",
+        "Coordinator 1003",
+    ]
+    assert lines[-1] == "watch: 1 boards fetched, 0 failed, 0 left"
+
+
+def test_the_command_gives_one_budget_to_every_client(
+    inited: Path, probe: SystemProbe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from careerhunter.deadline import Deadline
+    from careerhunter.filters import PostingText
+
+    seen: dict[str, Any] = {}
+
+    def capture(conn: sqlite3.Connection, entries_: Any, **kwargs: Any) -> list[str]:
+        seen.update(kwargs)
+        kwargs["scorer"](PostingText("Example Robotics", "Coordinator", "Example City"))
+        return []
+
+    def score(posting: Any, config: Any, **kwargs: Any) -> None:
+        seen["score_transport"] = kwargs["transport"]
+
+    monkeypatch.setattr(cli.watch, "run", capture)
+    monkeypatch.setattr(cli, "score_posting", score)
+    assert cli.main(["watch"], probe=probe) == 0
+    budget = seen["budget"]
+    assert isinstance(budget, Deadline)
+    assert seen["fetcher"].keywords["budget"] is budget
+    assert seen["embed_transport"].keywords["budget"] is budget
+    assert seen["score_transport"].keywords["budget"] is budget
+    assert budget.remaining() <= w.RUN_BUDGET

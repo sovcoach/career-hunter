@@ -258,7 +258,7 @@ def test_watch_scores_a_kept_posting_and_leaves_a_failure_unscored(
     assert any("left unscored" in line for line in later)
 
 
-def test_a_later_run_scores_waiting_rows_before_the_fetch(search: sqlite3.Connection) -> None:
+def test_a_later_run_scores_waiting_rows_after_the_fetch(search: sqlite3.Connection) -> None:
     board = url("ashby", "exampleorg")
     item = company("Example Org", "ashby", "exampleorg")
     payload = {
@@ -305,8 +305,7 @@ def test_a_later_run_scores_waiting_rows_before_the_fetch(search: sqlite3.Connec
         return fetched(payload)
 
     lines = watch.run(search, [item], today=DAY, fetcher=fetcher, scorer=second)
-    assert order[0] == "score"
-    assert "fetch" in order
+    assert order == ["fetch", "score"]  # the boards get first claim on the run budget
     assert any("skipped (gap_tier)" in line for line in lines)
     row = postings(search)[0]
     assert row["llm_output"] == "raw"

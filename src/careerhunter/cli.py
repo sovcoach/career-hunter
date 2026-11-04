@@ -20,6 +20,7 @@ import traceback
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from careerhunter import (
     claims,
     db,
     discover,
+    embed,
     embed_eval,
     secrets_store,
     service,
@@ -48,6 +50,7 @@ from careerhunter.config import (
     watch_interval_minutes,
 )
 from careerhunter.config import today as config_today
+from careerhunter.deadline import Deadline
 from careerhunter.export import export, plural
 from careerhunter.fetch import fetch as fetch_url
 from careerhunter.filters import PostingText
@@ -55,6 +58,7 @@ from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.runlog import RunLog, RunLogError
 from careerhunter.score import Score, score_posting
+from careerhunter.score import default_transport as score_transport
 from careerhunter.scout_prompt import render
 from careerhunter.seed import SeedError, Tally, import_seed
 from careerhunter.storage_guard import DataDir, StorageGuardError
@@ -728,8 +732,11 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
     if datadir.exclusions_path.is_file():
         exclusions = load_exclusions(datadir.exclusions_path)
 
+    # One budget for the whole run, shared by every client the run calls.
+    budget = Deadline(watch.RUN_BUDGET)
+
     def scorer(posting: PostingText) -> Score | None:
-        return score_posting(posting, doc)
+        return score_posting(posting, doc, transport=partial(score_transport, budget=budget))
 
     def on_crash(who: str, exc: Exception) -> None:
         log.note(_with_traceback(f"watch: {who}", exc))
@@ -744,13 +751,15 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             conn,
             entries,
             today=config_today(doc).isoformat(),
-            fetcher=fetch_url,
+            fetcher=partial(fetch_url, budget=budget),
             config=doc,
             exclusions=exclusions,
             scorer=scorer,
             data_dir=datadir.root,
+            embed_transport=partial(embed.default_transport, budget=budget),
             on_crash=on_crash,
             emit=log.append,
+            budget=budget,
         )
     except (sqlite3.Error, db.MigrationError) as exc:
         _rollback(conn)
