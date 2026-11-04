@@ -12,8 +12,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from careerhunter import cli, db, discover, search_store
+from careerhunter import cli, db, discover, loopback, search_store
 from careerhunter.platform_checks import SystemProbe
+from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
+from tests.test_score import BROKEN, broken_connection
 
 SNIPPET = "DO-NOT-LEAK-SNIPPET"
 TITLE = "DO-NOT-LEAK-TITLE"
@@ -257,7 +259,9 @@ def test_a_null_url_makes_no_request(
     stamp = inited / "logs" / "discover.success"
     assert stamp.is_file()
     assert stamp.stat().st_mode & 0o777 == 0o600
-    assert not (inited / "logs" / "discover.log").exists()
+    log = inited / "logs" / "discover.log"
+    assert log.read_text() == "discovery off\ndiscover: 0 queued\n"
+    assert log.stat().st_mode & 0o777 == 0o600
 
 
 def test_a_missing_config_writes_nothing(
@@ -315,7 +319,10 @@ def test_a_miss_on_the_command_exits_zero(
     stamp = inited / "logs" / "discover.success"
     assert stamp.is_file()
     assert stamp.stat().st_mode & 0o777 == 0o600
-    assert not (inited / "logs" / "discover.log").exists()
+    log = inited / "logs" / "discover.log"
+    assert log.read_text() == f"{discover.MISS}\ndiscover: 0 queued\n"
+    assert "site:" not in log.read_text()
+    assert log.stat().st_mode & 0o777 == 0o600
 
 
 def test_list_does_not_refresh_discover_success(
@@ -331,50 +338,26 @@ def test_list_does_not_refresh_discover_success(
     refreshed = path.read_text()
     assert refreshed != "2020-01-01T00:00:00Z\n"
     assert refreshed.strip().endswith("Z")
-    assert not (inited / "logs" / "discover.log").exists()
+    # Only the two search runs wrote to the log; list wrote nothing.
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log == "discovery off\ndiscover: 0 queued\n" * 2
 
 
 def test_the_client_returns_a_redirect_and_does_not_follow_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, str]] = []
-
-    class Response:
-        status = 302
-
-        def read(self, amount: int) -> bytes:
-            assert amount == discover.MAX_BODY + 1
-            return b"go away"
-
-    class Conn:
-        def __init__(self, host: str, port: int, timeout: float) -> None:
-            calls.append(("open", host, str(port)))
-
-        def request(
-            self,
-            method: str,
-            path: str,
-            body: bytes | None = None,
-            headers: dict[str, str] | None = None,
-        ) -> None:
-            assert headers == {"Accept": "application/json"}
-            calls.append((method, path, ""))
-
-        def getresponse(self) -> Response:
-            return Response()
-
-        def close(self) -> None:
-            calls.append(("close", "", ""))
-
-    monkeypatch.setattr(http.client, "HTTPConnection", Conn)
+    server = FakeServer(Reply(302, b"go away"))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
     status, body = discover.default_transport("http://127.0.0.1:8888/search?q=One&format=json")
     assert status == 302
     assert body == b"go away"
-    assert calls == [
-        ("open", "127.0.0.1", "8888"),
-        ("GET", "/search?q=One&format=json", ""),
-        ("close", "", ""),
+    assert [(host, address, port) for host, address, port, _t in server.opened] == [
+        ("127.0.0.1", "127.0.0.1", 8888)
     ]
+    assert server.requests == [
+        ("GET", "/search?q=One&format=json", None, {"Accept": "application/json"})
+    ]
+    assert server.closes == 1
     with pytest.raises(discover.DiscoverError):
         discover.default_transport("http://example.com/search?q=One")
 
@@ -642,3 +625,289 @@ def test_the_queue_has_no_snippet_column(tmp_path: Path) -> None:
             "'x', 'pending', '2026-11-02')"
         )
     conn.close()
+
+
+def _search_db(tmp_path: Path) -> sqlite3.Connection:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    return conn
+
+
+_SEARCH = {
+    "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "career_hosts": []},
+    "search": {"target_titles": ["One"], "locations": ["Example City"]},
+}
+_GOOD = "https://job-boards.greenhouse.io/newrobotics/jobs/42"
+
+
+def _rows(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT count(*) FROM discovery_candidates").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+@pytest.mark.parametrize("error", BROKEN, ids=lambda e: type(e).__name__)
+def test_a_broken_reply_from_the_client_is_a_miss(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    monkeypatch.setattr(loopback, "LoopbackConnection", broken_connection(error))
+    with pytest.raises(discover.DiscoverError) as exc:
+        discover.default_transport("http://127.0.0.1:8888/search?q=One&format=json")
+    assert str(exc.value) == discover.MISS
+
+
+def test_a_transport_that_breaks_is_a_miss_that_stores_nothing(tmp_path: Path) -> None:
+    def broken(url: str) -> tuple[int, bytes]:
+        raise http.client.IncompleteRead(b"")
+
+    conn = _search_db(tmp_path)
+    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=broken)
+    assert outcome == discover.Outcome(discover.MISS, ())
+    assert _rows(conn) == 0
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b"\xff\xfe\x00{", id="not-utf8"),
+        pytest.param(json.dumps({"error": "too many requests"}).encode(), id="error-object"),
+        pytest.param(json.dumps({"results": "x"}).encode(), id="results-not-list"),
+        pytest.param(json.dumps({"results": ["x"]}).encode(), id="result-not-object"),
+        pytest.param(json.dumps({"results": [{"title": "t"}]}).encode(), id="no-url"),
+        pytest.param(json.dumps({"results": [{"url": 5}]}).encode(), id="url-not-text"),
+        pytest.param(
+            json.dumps({"results": [{"title": "t"}, {"url": 5}, "x"]}).encode(), id="all-bad"
+        ),
+    ],
+)
+def test_a_reply_of_the_wrong_shape_is_a_miss_that_stores_nothing(
+    tmp_path: Path, body: bytes
+) -> None:
+    conn = _search_db(tmp_path)
+    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=_Talk(body))
+    assert outcome == discover.Outcome(discover.MISS, ())
+    assert _rows(conn) == 0
+    conn.close()
+
+
+def test_a_result_without_a_url_is_skipped_and_the_good_one_kept(tmp_path: Path) -> None:
+    body = json.dumps({"results": [{"url": _GOOD}, {"title": "t"}]}).encode()
+    conn = _search_db(tmp_path)
+    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=_Talk(body))
+    assert outcome.notice is None
+    assert [row.url for row in outcome.rows] == ["https://boards.greenhouse.io/newrobotics"]
+    assert _rows(conn) == 1
+    conn.close()
+
+
+def test_an_empty_result_list_is_a_normal_reply(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    talk = _Talk(json.dumps({"results": []}).encode())
+    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=talk)
+    assert outcome == discover.Outcome(None, ())
+    assert len(talk.calls) == 4  # every query was sent; none was a miss
+    conn.close()
+
+
+def test_a_bug_in_our_own_parser_still_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def bug(body: bytes) -> list[str] | None:
+        raise RuntimeError("synthetic bug")
+
+    monkeypatch.setattr(discover, "_result_urls", bug)
+    conn = _search_db(tmp_path)
+    with pytest.raises(RuntimeError, match="synthetic bug"):
+        discover.run(conn, _SEARCH, today="2026-11-02", transport=_Talk(_body([_GOOD])))
+    conn.close()
+
+
+def test_a_reply_that_is_not_utf8_does_not_stop_the_command(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited, hosts=["jobs.example.com"])
+    monkeypatch.setattr(discover, "default_transport", lambda url: (200, b"\xff\xfe\x00{"))
+    assert cli.main(["discover"], probe=probe) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{discover.MISS}\n"
+    assert _count(inited) == 0
+    assert (inited / "logs" / "discover.success").is_file()
+
+
+def test_discovery_has_its_own_30_second_deadline(
+    monkeypatch: pytest.MonkeyPatch, loopback_watchdog: ManualWatchdog
+) -> None:
+    clock = FakeClock()
+    server = FakeServer(Reply(body=_body([_GOOD]), clock=clock, header_cost=31.0))
+    monkeypatch.setattr(loopback, "_clock", clock)
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    with pytest.raises(discover.DiscoverError) as exc:
+        discover.default_transport("http://127.0.0.1:8888/search?q=One&format=json")
+    assert str(exc.value) == discover.MISS
+    assert [a.seconds for a in loopback_watchdog.armed] == [30.0]
+    assert [timeout for *_rest, timeout in server.opened] == [20.0]
+
+
+def test_a_localhost_url_is_resolved_and_must_stay_on_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FakeServer(Reply(body=_body([_GOOD])))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    monkeypatch.setattr(loopback, "_resolver", lambda host, port, timeout: ["::1"])
+    status, _body_bytes = discover.default_transport("http://localhost:8888/search?q=One")
+    assert status == 200
+    assert [(host, address) for host, address, _p, _t in server.opened] == [("localhost", "::1")]
+    monkeypatch.setattr(loopback, "_resolver", lambda host, port, timeout: ["93.184.216.34"])
+    with pytest.raises(discover.DiscoverError):
+        discover.default_transport("http://localhost:8888/search?q=One")
+    assert len(server.opened) == 1  # the refused answer was never dialled
+
+
+def test_a_search_run_logs_how_many_rows_it_queued(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited, hosts=["jobs.example.com"])
+    monkeypatch.setattr(discover, "default_transport", _Talk(_body(URLS)))
+    assert cli.main(["discover"], probe=probe) == 0
+    queued = capsys.readouterr().out.splitlines()
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log == f"discover: {len(queued)} queued\n"
+    assert SNIPPET not in log and TITLE not in log
+
+
+@pytest.mark.parametrize(
+    ("setup", "line"),
+    [
+        (lambda root, mp: (root / "config.yaml").unlink(), "config.yaml is missing"),
+        (
+            lambda root, mp: (root / "search.db").unlink(),
+            "search.db is missing; run careerhunter init",
+        ),
+        (
+            lambda root, mp: mp.setattr(
+                cli.db,
+                "migrate",
+                lambda conn, kind: (_ for _ in ()).throw(db.MigrationError("synthetic")),
+            ),
+            "MigrationError: synthetic",
+        ),
+    ],
+    ids=["no-config", "no-database", "migrate"],
+)
+def test_a_search_run_that_cannot_start_exits_1_with_its_line_in_the_log(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    setup: object,
+    line: str,
+) -> None:
+    _enable(inited)
+    monkeypatch.setattr(discover, "default_transport", lambda url: pytest.fail(url))
+    setup(inited, monkeypatch)  # type: ignore[operator]
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == f"error: {line}\n"
+    assert (inited / "logs" / "discover.log").read_text() == f"discover: aborted: {line}\n"
+    assert not (inited / "logs" / "discover.success").exists()
+
+
+def test_a_search_run_without_a_log_sends_no_query(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited)
+    monkeypatch.setattr(discover, "default_transport", lambda url: pytest.fail(url))
+    (inited / "logs").mkdir(mode=0o700, exist_ok=True)
+    (inited / "logs" / "discover.log").mkdir()
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: run log not writable: IsADirectoryError\n"
+    assert not (inited / "logs" / "discover.success").exists()
+
+
+def test_a_search_run_that_cannot_open_the_database_exits_1(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def cannot_open(path: object) -> object:
+        raise sqlite3.OperationalError("cannot open")
+
+    _enable(inited)
+    monkeypatch.setattr(cli.db, "connect", cannot_open)
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: OperationalError: cannot open\n"
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log == "discover: aborted: OperationalError: cannot open\n"
+
+
+def test_a_search_run_with_an_invalid_config_exits_1(
+    inited: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (inited / "config.yaml").write_text("discovery: 5\n")
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err.startswith("error: ")
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log.startswith("discover: aborted: ConfigError: ")
+
+
+def test_an_unexpected_search_failure_leaves_its_traceback_in_the_log(
+    inited: Path, probe: SystemProbe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("synthetic discover failure")
+
+    monkeypatch.setattr(cli.discover, "run", boom)
+    with pytest.raises(RuntimeError, match="synthetic discover failure"):
+        cli.main(["discover"], probe=probe)
+    log = (inited / "logs" / "discover.log").read_text()
+    assert log.startswith("discover: aborted: traceback\nTraceback (most recent call last):")
+    assert "RuntimeError: synthetic discover failure" in log
+    assert not (inited / "logs" / "discover.success").exists()
+
+
+def test_a_search_run_whose_log_fails_mid_run_exits_1(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from careerhunter.runlog import RunLog
+
+    def refuse(fd: int, data: memoryview) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "RunLog", lambda path: RunLog(path, writer=refuse))
+    assert cli.main(["discover"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == "error: run log not writable: OSError\n"
+    assert not (inited / "logs" / "discover.success").exists()
+
+
+@pytest.mark.parametrize(
+    ("missing", "err"),
+    [
+        ("config.yaml", "error: config.yaml is missing\n"),
+        ("search.db", "error: search.db is missing; run careerhunter init\n"),
+    ],
+)
+def test_list_without_its_files_exits_1_and_writes_no_log(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    missing: str,
+    err: str,
+) -> None:
+    (inited / missing).unlink()
+    assert cli.main(["discover", "list"], probe=probe) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == err
+    assert not (inited / "logs" / "discover.log").exists()

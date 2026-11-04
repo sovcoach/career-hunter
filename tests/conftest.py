@@ -283,3 +283,14 @@ def keep_umask() -> Iterator[None]:
     os.umask(previous)
     yield
     os.umask(previous)
+
+
+@pytest.fixture(autouse=True)
+def loopback_watchdog(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """No test starts a real loopback watchdog timer. Tests can fire this one by hand."""
+    from careerhunter import loopback
+    from tests.fakes import ManualWatchdog
+
+    watchdog = ManualWatchdog()
+    monkeypatch.setattr(loopback, "_timer", watchdog)
+    return watchdog

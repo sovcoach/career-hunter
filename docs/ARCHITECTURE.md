@@ -31,10 +31,13 @@ A small "storage guard" runs before every command and checks that the data folde
 | `export.py` | Builds one claim's EI record for a date range as CSV and PDF, from that claim's file alone. |
 | `bot.py` | The Telegram bot: the chat allowlist, commands, buttons and replies, writing through the ledger; fail-closed startup and the polling loop. On each successful poll it sends one alert per scored watcher posting. |
 | `telegram.py` | A minimal Bot API client (standard library plus `truststore`) whose errors never carry the token. |
-| `fetch.py` | Fetches a link safely: public addresses only, pinned to the checked address on every redirect hop. Keeps a `Retry-After` header when the server sends one. |
+| `fetch.py` | Fetches a link safely: public addresses only, pinned to the checked address on every redirect hop. One 60-second deadline covers the lookup, every hop and the body, and the body is capped. Keeps a `Retry-After` header when the server sends one. |
+| `deadline.py` | A total time limit on a monotonic clock, a body read in chunks that honors it and a size cap, and the per-connection watchdog that shuts a socket down when time runs out. |
+| `loopback.py` | One HTTP exchange with a server on this Mac, used by scoring, embedding and discovery: loopback addresses only, no redirects, a total deadline and a size cap. Not `fetch.py`. |
+| `runlog.py` | A run's log file in `logs/`: each line written as it happens, mode 0600, never through a symlink. |
 | `filters.py` | The decision to keep, skip or flag a posting: exclusions, hard gates, location rules, role filters and schedule limits. A skip reason is a string. No fetching, scoring or alerts. |
-| `score.py` | Scores one kept posting on a local loopback model. The prompt is lanes, location rules, hard gates and `gap_tiers`. Stores gaps, model text and the tier name. Leaves `fit_rating` null. Not `fetch.py`. |
-| `watch.py` | One run of `careerhunter watch`: fetch Greenhouse, Lever and Ashby, filter, then score. Writes `search.db` only. Does not call Telegram. |
+| `score.py` | Scores one kept posting on a local loopback model. The prompt is lanes, location rules, hard gates and `gap_tiers`. Stores gaps, model text and the tier name. Leaves `fit_rating` null. Not `fetch.py`; it talks through `loopback.py` with a 120-second total. |
+| `watch.py` | One run of `careerhunter watch`: fetch Greenhouse, Lever and Ashby, filter, then score, within a 600-second budget. One company's failure is isolated. Writes `search.db` only. Does not call Telegram. |
 | `snapshots.py` | Job-ad snapshots: the page, an ATS's public JSON, or a PDF or screenshot sent to the bot. |
 | `service.py` | User LaunchAgents: the bot, kept running; `org.careerhunter.watch`, which runs `careerhunter watch` once per `schedule.watcher_interval_minutes` and exits; and, when `discovery.searxng_url` is set, `org.careerhunter.discover`, which runs `careerhunter discover` once per `discovery.interval_minutes` and exits. |
 | `scripts/check_no_datadir_paths.py` | Pre-commit hook that blocks staged content pointing into the data folder. |
@@ -53,7 +56,7 @@ A small "storage guard" runs before every command and checks that the data folde
 ├── seed.yaml                             ← one-off import of past history
 ├── exports/                              ← EI reports, timestamped, never overwritten
 ├── snapshots/<YYYY>/                     ← copies of job ads (0600; ADR-017)
-├── logs/                                 ← bot.log, bot.heartbeat, watch.log, watch.success (0600)
+├── logs/                                 ← bot.log, bot.heartbeat, watch.log, discover.log, *.success (0600)
 └── backups/
 ```
 
@@ -94,6 +97,7 @@ companies 1──* postings 1──* applications 1──* decision_history
 - Postings carry the learning fields: `fit_rating`, `gaps`, `llm_output`, `scout_metadata`. Applications carry `reasoning` and `notes`, and skips carry their `reason`.
 - **Posting identity:** the URL, else company + requisition ID, else company + title + location + month first seen.
 - An application's `correlation_id` never changes. Its `ei_claim` can be set once, and is NULL when no claim was active or the application fell outside the claim.
+- `watch_board_attempts` (search migration 0007) holds one row per board the watcher has tried: the key `<ats_type>:<slug>`, with the slug case-folded, and the UTC time of the last attempt. It decides which boards a run fetches first. It never touches `companies` or `postings`, and it adds no triggers.
 
 **`ei_record_<label>.db`**, one per EI claim. It is sanitized and append-only:
 
@@ -163,13 +167,15 @@ CSV cells starting with `= + - @` are prefixed with `'` to stop spreadsheet form
 
 ## The watch pipeline
 
-`careerhunter watch` reads the watchlist once, then:
+`careerhunter watch` reads the watchlist once, then, within one 600-second budget:
 
-1. **Recheck.** Watcher postings that have no skip and no score are filtered again, so a config change can record a skip before any board is fetched.
-2. **Score what is waiting.** A kept posting with no model text is scored before the boards are fetched. A down model or a reply that does not parse leaves it unscored. An embedding for that row uses the stored fields only, because the description was not kept.
-3. **Fetch.** Greenhouse, Lever and Ashby list URLs are built from `ats_slug` and read through `fetch.py` (public addresses only). The same pass also fetches a company whose `source` is `discovery` and whose `watchlist` is 1, when the ATS type is one of those three and the slug is one path segment. A seeded watchlist row with any other source is not fetched by that extra path. A failed board is a log line. Workday and the other ATS types are not fetched.
-4. **Filter.** Each new posting is kept, skipped or flagged. The description is used only for that decision, and only when the list payload included one. It is not stored.
-5. **Score what was just kept.** Same local model. A count at or above `exclude_from_gaps` is a `gap_tier` skip. The same pass stores an embedding cosine when `search.resume` is set. The description is used in memory for that embedding when the board sent one, and is not stored.
+1. **Order the boards.** Entries that cannot be fetched (no ATS type, Workday, a bad slug) come first, because they cost nothing. Then boards never tried, then the one tried longest ago, from `watch_board_attempts`. Ties keep config order.
+2. **Fetch.** Greenhouse, Lever and Ashby list URLs are built from `ats_slug` and read through `fetch.py` (public addresses only). The same pass also fetches a company whose `source` is `discovery` and whose `watchlist` is 1, when the ATS type is one of those three and the slug is one path segment. A seeded watchlist row with any other source is not fetched by that extra path. The board's attempt time is written in its own transaction just before the fetch. A failed board is a log line and stores nothing. Workday and the other ATS types are not fetched.
+3. **Filter.** Each new posting is kept, skipped or flagged. The description is used only for that decision, and only when the list payload included one. It is not stored.
+4. **Score what was just kept.** Same local model. A count at or above `exclude_from_gaps` is a `gap_tier` skip. The same pass stores an embedding cosine when `search.resume` is set. The description is used in memory for that embedding when the board sent one, and is not stored.
+5. **Refresh the embeddings.** Stored cosines are compared again with the resume, locally.
+6. **Recheck.** Watcher postings that have no skip and no score are filtered again, so a config change can record a skip. Postings inserted this run were filtered already.
+7. **Score what is waiting.** A kept posting with no model text is scored, only after the recheck has reached every row. A down model or a reply that does not parse leaves it unscored. An embedding for that row uses the stored fields only, because the description was not kept. A posting already sent to the scorer this run is not sent again.
 
 A skip is one `skips` row: `excluded_company`, `excluded_title`, `excluded_description`, `excluded_role`, `exclude_applied`, `required_language`, `credential`, `shift_pattern`, `pay_structure`, `seniority`, `min_salary`, `location_rule`, `role_filter` or `schedule_limit`. Seniority honors `title_exceptions` and `never_gated_families`. `min_salary` applies only when it is a number, and only when the posting states a yearly figure. `max_commute_km` and `exclude_work_models` are validated and not applied.
 
@@ -177,13 +183,13 @@ A skip is one `skips` row: `excluded_company`, `excluded_title`, `excluded_descr
 
 One `role_filters` block is AND only. It cannot express "this work model, or else that place." A missing work model does not fail `work_models`.
 
-Scoring posts to `http://127.0.0.1:1234/v1/chat/completions` and nowhere else. The model returns gaps. The program applies `gap_tiers` and writes `gaps`, `llm_output` and `scout_metadata` (`{"tier": "<name>"}`). `fit_rating` stays null. A later run scores those still-unscored rows before it fetches again. The watch run does not call Telegram and does not open an EI record.
+Scoring posts to `http://127.0.0.1:1234/v1/chat/completions` and nowhere else. The model returns gaps. The program applies `gap_tiers` and writes `gaps`, `llm_output` and `scout_metadata` (`{"tier": "<name>"}`). `fit_rating` stays null. A later run scores those still-unscored rows after it has fetched the boards. The watch run does not call Telegram and does not open an EI record.
 
-On that same pass, when `search.resume` is a file inside the data folder, the watcher also asks `http://127.0.0.1:1234/v1/embeddings` for one vector of the resume and one vector of the posting (company, title, location, work model, and the description when the board sent one). The client is loopback only, follows no redirects, and is not `fetch.py`. The model id is `local-embedding`. Search migration 0004 stores the float32 BLOBs in `resume_embedding` and `posting_embeddings`, and the cosine in `postings.embedding_score`. The resume text and the posting text are not stored. A missing resume file, a down server, or a different dimension leaves that cosine null and adds one log line, `embedding miss posting <id>: <reason>`. The run still exits 0. A cosine never causes a skip. When the resume bytes change, stored posting vectors are compared again locally and the model is not asked to embed those postings again. `fit_rubric.embedding_weight` is not read. The EI schema stays at version 1.
+On that same pass, when `search.resume` is a file inside the data folder, the watcher also asks `http://127.0.0.1:1234/v1/embeddings` for one vector of the resume and one vector of the posting (company, title, location, work model, and the description when the board sent one). The client is loopback only, follows no redirects, and is not `fetch.py`. The model id is `local-embedding`. Search migration 0004 stores the float32 BLOBs in `resume_embedding` and `posting_embeddings`, and the cosine in `postings.embedding_score`. The resume text and the posting text are not stored. A missing resume file, a down server, or a different dimension leaves that cosine null and adds one log line, `embedding miss posting <id>: <reason>`. The run still exits 0. The client has a 60-second total and its own 1 MB cap. A transport failure (refused, out of time, or too large) means nothing more is sent to the embedding server this run; a reply that arrives but is not a vector is a miss for that posting only. A cosine never causes a skip. When the resume bytes change, stored posting vectors are compared again locally and the model is not asked to embed those postings again. `fit_rubric.embedding_weight` is not read. The EI schema stays at version 1.
 
 `careerhunter embed-eval` reads those stored cosines and tiers. It does not call the model. The report is `evals/embed-eval-<utc>.txt`, mode 0600, and the terminal prints that relative path only. Each row is a posting id, the tier name, the cosine, and applied or skipped. Spearman uses midranks and Pearson correlation on those ranks, from the standard library. The LLM side follows `gap_tiers`, best first, as 1 for the best tier and 0 for the worst. Precision at 5 and at 10 counts an application as a hit among postings that were applied to or skipped. Fewer than two comparable rows, or a rank with no spread, writes `undefined` and the command still exits 0. When `fit_rubric.embedding_weight` is set, the report also ranks `weight * cosine + (1 - weight) * tier`. That blend is not stored and not alerted.
 
-`careerhunter discover` asks a local SearXNG when `discovery.searxng_url` is set. The client is loopback only, follows no redirects, and is not `fetch.py`. Each query is `site:` plus one title and one location, and one run sends at most 12. A hit is kept only when it reduces to a Greenhouse, Lever, or Ashby board, or to https on a host in `discovery.career_hosts`. Search migration 0005 stores that pending row in `discovery_candidates`: the kind, the reduced URL, the slug or host, and the status. The result title, the snippet, and the response body are not stored. The command does not fetch the page and does not open an EI record. A down server, a non-200 status, or a body that is not JSON writes `discovery miss: unreachable` and exits 0 with nothing stored. A null URL makes no request.
+`careerhunter discover` asks a local SearXNG when `discovery.searxng_url` is set. The client is loopback only, follows no redirects, and is not `fetch.py`. Each query is `site:` plus one title and one location, and one run sends at most 12. A hit is kept only when it reduces to a Greenhouse, Lever, or Ashby board, or to https on a host in `discovery.career_hosts`. Search migration 0005 stores that pending row in `discovery_candidates`: the kind, the reduced URL, the slug or host, and the status. The result title, the snippet, and the response body are not stored. The command does not fetch the page and does not open an EI record. Each query has a 30-second total. A `localhost` URL is looked up inside that time, and only a loopback answer is used. A down server, a non-200 status, a body that is not JSON or not UTF-8, a reply with no `results` list, or a non-empty list with no usable url writes `discovery miss: unreachable` and exits 0 with nothing stored. A result without a url is skipped. A null URL makes no request. A search run writes its lines to `logs/discover.log`: the notice, then `discover: <n> queued`.
 
 `careerhunter discover approve` and `careerhunter discover reject` take one pending row id. They write `search.db` only: they do not rewrite `config.yaml` or `exclusions.yaml`, and they do not send Telegram. Approving a board inserts or fills a company with `watchlist` 1. A new company uses `source` discovery. An existing company's source stays as it is, and a stored ATS identity that disagrees is refused. Approving a career page stores `careers_url` with `watchlist` 0, and the watcher does not fetch it. Rejecting a row stores that status and inserts no company. From the board fetch on, the existing filter, score, cosine, and alert path owns the posting. The alert query still selects watcher postings only. The EI schema stays at version 1.
 
@@ -193,7 +199,33 @@ The bot, on each successful poll, sends one alert for each watcher posting that 
 
 `careerhunter service install` also installs `org.careerhunter.watch`. That agent runs `careerhunter watch` once and exits. launchd starts it again after `schedule.watcher_interval_minutes` (default 60, minimum 15). It has no `KeepAlive`. A run that exits 0 writes `logs/watch.success`. Board failures and a down model still exit 0, so they still count. A missing config or database does not update the stamp. `doctor` reports whether the agent is loaded and whether the stamp is within two intervals. Changing the interval means uninstalling the services and installing them again.
 
-When `discovery.searxng_url` is set, `service install` also installs `org.careerhunter.discover`, including when the bot and watch plists are already there. It does not bootstrap those two again. A null URL does not install it, and install still stops when both of those plists exist. The agent runs `careerhunter discover` once and exits. launchd starts it again after `discovery.interval_minutes` (default 1440, minimum 60). It has no `KeepAlive`. A run that exits 0 writes `logs/discover.success`, including a miss and discovery off. Approve, reject, and list do not update that stamp. There is no `discover.log`. `doctor` reports the agent. A null URL with no plist is off. A null URL with a leftover plist is a warning to reinstall. A set URL with no plist is not installed. A loaded agent is compared with the configured interval, and a `discover.success` older than two intervals is a failure. A warning does not fail `doctor`. `service uninstall` removes whichever of the three plists exist.
+When `discovery.searxng_url` is set, `service install` also installs `org.careerhunter.discover`, including when the bot and watch plists are already there. It does not bootstrap those two again. A null URL does not install it, and install still stops when both of those plists exist. The agent runs `careerhunter discover` once and exits. launchd starts it again after `discovery.interval_minutes` (default 1440, minimum 60). It has no `KeepAlive`. A run that exits 0 writes `logs/discover.success`, including a miss and discovery off. Approve, reject, and list do not update that stamp, and write no log file. `doctor` reports the agent. A null URL with no plist is off. A null URL with a leftover plist is a warning to reinstall. A set URL with no plist is not installed. A loaded agent is compared with the configured interval, and a `discover.success` older than two intervals is a failure. A warning does not fail `doctor`. `service uninstall` removes whichever of the three plists exist.
+
+### Run budget
+
+One watch run has 600 seconds. The fetcher, the scoring and embedding clients and the run itself share that budget, and each call is also cut short by its own limit. The boards come first, and the refresh, the recheck and the waiting scores use what is left. Anything the budget does not reach is left for the next run:
+
+- a board not reached is logged `run budget reached; left for the next run`, and its company and postings are untouched;
+- a fetch the budget cuts short is left too, not failed, and its attempt time goes back to what it was, or its row is removed if it had none;
+- a new posting stored after the budget ran out is logged as left and scored by a later run;
+- a pass not reached, or cut partway, is logged with the number of rows left.
+
+Nothing left over counts as fetched or failed. The last line is `watch: <n> boards fetched, <m> failed, <k> left`. A board refused for an ATS identity mismatch counts as failed.
+
+### Failures
+
+| What fails | What happens |
+|---|---|
+| One board, one recheck or scoring row, or the embedding refresh raises | Rolled back, `watch: <who>: <ExceptionType>; continuing`, and the run goes on |
+| `sqlite3.IntegrityError` in one of those | The same: isolated, and the run goes on |
+| Any other database error, at any point | Rolled back; abort line in the log; exit 1, no success stamp |
+| `config.yaml` missing or invalid, `search.db` missing | Abort line in the log; exit 1, no success stamp |
+| The run log cannot be opened or written | `error: run log not writable: …` on stderr; exit 1, no success stamp |
+| The storage guard refuses | Nothing is opened; exit 2 |
+
+### Run logs
+
+`careerhunter watch` and a search run of `careerhunter discover` write each line to `logs/watch.log` or `logs/discover.log` the moment it is produced, then to stderr. launchd discards stderr, so the file is what keeps a trace. It is opened only after the storage guard passes, without following a symlink, and must be a regular file at mode 0600. A crash leaves its traceback in that file only, never on stderr. See ADR-022.
 
 ## The Telegram bot (Phase 2)
 

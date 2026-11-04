@@ -431,7 +431,16 @@ watch service   OK  loaded
 watch           --  no successful run yet
 ```
 
-The bot log is `logs/bot.log` in your data folder. It records events only, never message text or the token. A finished watch writes `logs/watch.success` and appends its log lines to `logs/watch.log`. To stop them: `uv run careerhunter service uninstall`. Changing an interval means uninstalling the services and installing them again.
+The bot log is `logs/bot.log` in your data folder. It records events only, never message text or the token. A finished watch writes `logs/watch.success`. Each line of a run goes to `logs/watch.log` as it happens, and the last line counts the boards. A crash leaves its traceback in that file only. A run looks like this:
+
+```text
+watch: Example Staffing: no ats_type; skipped
+watch: Example Robotics (greenhouse): 1 new, 0 already recorded
+watch: Sample Logistics (lever): 1 new, 0 already recorded
+watch: 2 boards fetched, 0 failed, 0 left
+```
+
+A run has 600 seconds. Boards it does not reach are logged `run budget reached; left for the next run`, and the next run fetches them first. To stop them: `uv run careerhunter service uninstall`. Changing an interval means uninstalling the services and installing them again.
 
 A null `discovery.searxng_url` leaves the discovery agent out. `doctor` then shows `discovery agent --  off`. Set the URL and run `service install` again. It adds `org.careerhunter.discover` and leaves the bot and watch agents as they are. The new line looks like:
 
@@ -439,7 +448,14 @@ A null `discovery.searxng_url` leaves the discovery agent out. `doctor` then sho
 installed ~/Library/LaunchAgents/org.careerhunter.discover.plist; careerhunter discover runs now and every 1440 minutes
 ```
 
-That agent runs once and exits, then waits for `discovery.interval_minutes`. A finished search writes `logs/discover.success`. It does not write `discover.log`. Approve and reject do not refresh that stamp. `doctor` shows the agent and how old the stamp is. A stamp older than two intervals is a failure. A warning, such as a plist left behind after the URL is set back to null, does not fail `doctor`. `service uninstall` removes the bot, the watch agent, and the discovery agent.
+That agent runs once and exits, then waits for `discovery.interval_minutes`. A finished search writes `logs/discover.success`, and its lines go to `logs/discover.log`:
+
+```text
+discovery miss: unreachable
+discover: 0 queued
+```
+
+List, approve and reject write no log. Approve and reject do not refresh that stamp. `doctor` shows the agent and how old the stamp is. A stamp older than two intervals is a failure. A warning, such as a plist left behind after the URL is set back to null, does not fail `doctor`. `service uninstall` removes the bot, the watch agent, and the discovery agent.
 
 ### 10d. Using it
 
@@ -470,6 +486,9 @@ Every date must fall inside your active EI claim, as with `seed`, and future dat
 | `… is before claim 2026-27 started` | A seed date falls outside your claim | Fix the date, or see `--route-out-of-claim-to-search` in Step 8 |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
+| `search.db BAD schema version 6, expected 7` | The code was updated and `search.db` hasn't caught up | Stop the services with `uv run careerhunter service uninstall`, run `uv run careerhunter migrate`, then `uv run careerhunter service install` |
+| `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
+| `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `config.yaml BAD … needs an end date` | A claim that isn't active has no `end` | Add its end date, or check `active_claim` for a typo |
 | `WARNING: FileVault is OFF` | The Mac's own disk isn't encrypted | Step 1 |
 | `uv: command not found` | Terminal hasn't picked up uv yet | Close and reopen Terminal, or re-run the Step 3 installer |

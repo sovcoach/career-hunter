@@ -11,7 +11,8 @@ from typing import Any
 
 import pytest
 
-from careerhunter import db, search_store, watch
+from careerhunter import db, loopback, search_store, watch
+from careerhunter import embed as embedding
 from careerhunter.embed import (
     DEFAULT_URL,
     MODEL_NAME,
@@ -24,7 +25,8 @@ from careerhunter.filters import PostingText
 from careerhunter.models import Posting
 from careerhunter.score import Score
 from careerhunter.storage_guard import DataDir
-from tests.test_score import RUBRIC
+from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
+from tests.test_score import BROKEN, RUBRIC, broken_connection
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, url
 
 RESUME = "Synthetic resume for operations work."
@@ -455,36 +457,18 @@ def test_a_redirect_and_a_bad_body_are_unreachable() -> None:
 def test_the_default_transport_posts_once_and_does_not_follow_a_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, int]] = []
-
-    class Response:
-        status = 302
-
-        def read(self, _n: int) -> bytes:
-            return b"go away"
-
-    class Conn:
-        def __init__(self, host: str, port: int, timeout: float) -> None:
-            calls.append(("open", host, port))
-
-        def request(
-            self, method: str, path: str, body: bytes | None = None, headers: Any = None
-        ) -> None:
-            calls.append((method, path, len(body or b"")))
-
-        def getresponse(self) -> Response:
-            return Response()
-
-        def close(self) -> None:
-            calls.append(("close", "", 0))
-
-    monkeypatch.setattr(http.client, "HTTPConnection", Conn)
+    server = FakeServer(Reply(302, b"go away"))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
     with pytest.raises(EmbedError) as exc:
         embed_text(RESUME)
     assert str(exc.value) == "unreachable"
-    assert calls[0] == ("open", "127.0.0.1", 1234)
-    assert calls[1][0:2] == ("POST", "/v1/embeddings")
-    assert calls[2] == ("close", "", 0)
+    assert [(host, address, port) for host, address, port, _t in server.opened] == [
+        ("127.0.0.1", "127.0.0.1", 1234)
+    ]
+    assert [(method, path) for method, path, _b, _h in server.requests] == [
+        ("POST", "/v1/embeddings")
+    ]
+    assert server.closes == 1
     assert RESUME not in str(exc.value)
 
 
@@ -538,3 +522,191 @@ def test_cosine_of_known_vectors() -> None:
         cosine([1.0], [1.0, 0.0])
     with pytest.raises(EmbedError):
         cosine([0.0, 0.0], [0.0, 0.0])
+
+
+@pytest.mark.parametrize("error", BROKEN, ids=lambda e: type(e).__name__)
+def test_a_broken_reply_from_the_default_transport_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    monkeypatch.setattr(loopback, "LoopbackConnection", broken_connection(error))
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME)
+    assert str(exc.value) == "unreachable"
+    assert RESUME not in str(exc.value)
+
+
+def test_an_injected_transport_that_breaks_is_unreachable() -> None:
+    def broken(url: str, payload: bytes) -> tuple[int, bytes]:
+        raise http.client.RemoteDisconnected("synthetic")
+
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME, transport=broken)
+    assert str(exc.value) == "unreachable"
+    assert RESUME not in str(exc.value)
+
+
+def _vector(value: object) -> bytes:
+    return json.dumps({"data": [{"embedding": value}]}).encode()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(json.dumps({"error": "model not loaded"}).encode(), id="error-object"),
+        pytest.param(json.dumps({"data": []}).encode(), id="no-data"),
+        pytest.param(json.dumps({"data": ["x"]}).encode(), id="data-not-object"),
+        pytest.param(json.dumps({"data": [{}]}).encode(), id="no-vector"),
+        pytest.param(_vector([]), id="empty-vector"),
+        pytest.param(_vector("x"), id="vector-not-list"),
+        pytest.param(_vector([1, "a"]), id="non-numeric"),
+        pytest.param(_vector([True, 1.0]), id="boolean"),
+        pytest.param(b'{"data": [{"embedding": [1e400, 1.0]}]}', id="infinite"),
+    ],
+)
+def test_a_reply_of_the_wrong_shape_is_unreachable(body: bytes) -> None:
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME, transport=lambda url, payload: (200, body))
+    assert str(exc.value) == "unreachable"
+    assert RESUME not in str(exc.value)
+
+
+def test_a_bug_in_our_own_parser_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def bug(status: int, body: bytes) -> list[float]:
+        raise RuntimeError("synthetic bug")
+
+    monkeypatch.setattr(embedding, "_values", bug)
+    with pytest.raises(RuntimeError, match="synthetic bug"):
+        embed_text(RESUME, transport=lambda url, payload: (200, _vector([1.0, 0.0])))
+
+
+def test_a_1536_dimension_reply_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    vector = [round(-0.0123456789 + i * 1e-7, 10) for i in range(1536)]
+    body = json.dumps({"data": [{"embedding": vector}]}).encode()
+    assert len(body) > 20_000  # larger than the scoring cap this client used to share
+    monkeypatch.setattr(loopback, "LoopbackConnection", FakeServer(Reply(body=body)))
+    assert len(embed_text(RESUME)) == 1536
+
+
+def test_a_reply_over_the_embedding_cap_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = b"x" * (embedding.MAX_REPLY + 1)
+    server = FakeServer(Reply(body=body, step=65536))
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME)
+    assert str(exc.value) == "unreachable"
+    assert server.reads == 17  # 16 full chunks, then the one that passes the cap
+
+
+def test_embedding_has_its_own_60_second_deadline(
+    monkeypatch: pytest.MonkeyPatch, loopback_watchdog: ManualWatchdog
+) -> None:
+    clock = FakeClock()
+    server = FakeServer(
+        Reply(body=b'{"data": [{"embedding": [1.0, 0.0]}]}', clock=clock, header_cost=61.0)
+    )
+    monkeypatch.setattr(loopback, "_clock", clock)
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    with pytest.raises(EmbedError) as exc:
+        embed_text(RESUME)
+    assert str(exc.value) == "unreachable"
+    assert [a.seconds for a in loopback_watchdog.armed] == [60.0]
+    assert [timeout for *_rest, timeout in server.opened] == [30.0]
+    assert RESUME not in str(exc.value)
+
+
+# A server that is down stops embedding for the run; a bad reply is one posting's miss.
+
+
+def _two_postings(search: sqlite3.Connection, datadir: DataDir, transport: Any) -> list[str]:
+    slug = "examplerobotics"
+    jobs = [
+        one_greenhouse(slug, title, ident)["jobs"][0]  # type: ignore[index]
+        for title, ident in (("Operations Coordinator", 1001), ("Support Specialist", 1002))
+    ]
+    lines = watch.run(
+        search,
+        [company("Example Robotics", "greenhouse", slug)],
+        today=DAY,
+        fetcher=Scripted({url("greenhouse", slug): fetched({"jobs": jobs})}),
+        config=_config("notes/sample.txt"),
+        scorer=_kept,
+        data_dir=datadir.root,
+        embed_transport=transport,
+    )
+    return lines
+
+
+class ByText:
+    """Answers by input text: a vector, a raw body, or an exception to raise."""
+
+    def __init__(self, answers: dict[str, Any]) -> None:
+        self.answers = answers
+        self.calls: list[str] = []
+
+    def __call__(self, address: str, payload: bytes) -> tuple[int, bytes]:
+        text = json.loads(payload)["input"]
+        self.calls.append(text)
+        answer = self.answers[text]
+        if isinstance(answer, BaseException):
+            raise answer
+        if isinstance(answer, bytes):
+            return 200, answer
+        return 200, json.dumps({"data": [{"embedding": answer}]}).encode()
+
+
+def _misses(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.startswith("embedding miss")]
+
+
+def _scores(search: sqlite3.Connection) -> dict[str, float | None]:
+    return {
+        str(row["title"]): row["embedding_score"]
+        for row in search.execute("SELECT title, embedding_score FROM postings ORDER BY id")
+    }
+
+
+def test_a_wrong_shape_reply_is_one_postings_miss_and_the_next_is_embedded(
+    search: sqlite3.Connection, datadir: DataDir
+) -> None:
+    _write_resume(datadir)
+    first, second = (
+        posting_text(PostingText("Example Robotics", t, "Example City", work_model=None))
+        for t in ("Operations Coordinator", "Support Specialist")
+    )
+    transport = ByText({RESUME: SAME_VEC, first: b'{"data": []}', second: SAME_VEC})
+    lines = _two_postings(search, datadir, transport)
+    assert transport.calls == [RESUME, first, second]
+    scores = _scores(search)
+    assert scores["Operations Coordinator"] is None
+    assert scores["Support Specialist"] == pytest.approx(1.0)  # refresh did not clear it
+    assert len(_misses(lines)) == 1
+    assert _misses(lines)[0].endswith(": unreachable")  # the log text is unchanged
+
+
+def test_a_refused_connection_stops_embedding_for_the_rest_of_the_run(
+    search: sqlite3.Connection, datadir: DataDir
+) -> None:
+    _write_resume(datadir)
+    first, second = (
+        posting_text(PostingText("Example Robotics", t, "Example City", work_model=None))
+        for t in ("Operations Coordinator", "Support Specialist")
+    )
+    transport = ByText(
+        {RESUME: SAME_VEC, first: ConnectionRefusedError("synthetic"), second: SAME_VEC}
+    )
+    lines = _two_postings(search, datadir, transport)
+    assert transport.calls == [RESUME, first]  # no call for the second posting or refresh
+    assert set(_scores(search).values()) == {None}
+    misses = _misses(lines)
+    assert len(misses) == len(set(misses)) == 2  # one line per posting, never repeated
+
+
+def test_a_resume_the_server_cannot_embed_is_asked_once_per_run(
+    search: sqlite3.Connection, datadir: DataDir
+) -> None:
+    _write_resume(datadir)
+    transport = ByText({RESUME: ConnectionRefusedError("synthetic")})
+    lines = _two_postings(search, datadir, transport)
+    assert transport.calls == [RESUME]  # the refresh reused the failure
+    misses = _misses(lines)
+    assert len(misses) == len(set(misses)) == 2

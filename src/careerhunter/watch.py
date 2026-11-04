@@ -9,7 +9,7 @@ scores in `search.db`. It does not call Telegram, write applications, EI rows or
 snapshots. The bot sends an alert for each scored posting when it polls.
 `run` returns the log lines; the CLI prints them to stderr.
 
-A posting that is already stored is not inserted again. Before the fetch, watcher rows
+A posting that is already stored is not inserted again. After the boards, watcher rows
 that still have no skip are filtered again, and rows that are still unscored are
 scored. A network error, a parse error, HTTP 429, or a model that does not answer is
 a log line, not a skip. When `search.resume` is set, the same pass stores a cosine
@@ -19,6 +19,22 @@ not cause a skip.
 
 The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
 one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
+
+One company's failure does not stop the run. An exception while handling one board, or
+one row of the recheck or scoring pass, or the embedding refresh, is rolled back and
+logged as `watch: <who>: <ExceptionType>; continuing`. `sqlite3.IntegrityError` is
+isolated the same way. Any other `sqlite3.Error` is rolled back and re-raised: the
+database itself is failing, so the run stops. A board that is not fetched and parsed
+stores nothing, and its company and postings are left as they were. A run log that
+cannot be written stops the run too. Each line is handed to `emit` as it happens.
+
+A run has a time budget. The boards come first, never-tried boards before the one tried
+longest ago, so the budget cannot leave the same boards out every run. The embedding
+refresh, the recheck and the scoring of waiting rows use what is left. Anything the
+budget does not reach is logged as left for the next run and is not counted as
+fetched or failed. A board's attempt stamp is written just before its fetch; a board
+the budget left out gets its earlier stamp back. A posting is scored at most once per
+run. The last line is `watch: <n> boards fetched, <m> failed, <k> left`.
 """
 
 from __future__ import annotations
@@ -28,20 +44,29 @@ import json
 import re
 import sqlite3
 import urllib.parse
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, NoReturn, Self, SupportsIndex
 
 from careerhunter import db, filters, search_store
+from careerhunter.deadline import Deadline
 from careerhunter.embed import Embedder, miss_line
-from careerhunter.fetch import Fetched, FetchError
+from careerhunter.fetch import Fetched, FetchError, FetchTimeout
 from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
+from careerhunter.runlog import RunLogError
 from careerhunter.score import Score, ScoreError
 
 Fetcher = Callable[[str], Fetched]
 Scorer = Callable[[PostingText], Score | None]
+# Told about each isolated crash, after the rollback and the log line.
+OnCrash = Callable[[str, Exception], None]
+Tally = Literal["fetched", "failed", "left"]
+
+RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
+_LEFT = "run budget reached; left for the next run"
 
 _BOARDS = ("greenhouse", "lever", "ashby")
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -88,6 +113,69 @@ class _Skip:
 
 
 @dataclass(frozen=True)
+class _Parsed:
+    jobs: list[_Job | _Skip]
+
+
+@dataclass(frozen=True)
+class _Failed:
+    kind: str  # the fetch error's type, HTTP 429, HTTP <status>, or the parse error
+
+
+@dataclass(frozen=True)
+class _Left:
+    """The run budget ran out before or during this board's fetch."""
+
+
+@dataclass
+class _Guard:
+    failed: bool = False
+
+
+@dataclass
+class _State:
+    """What one run shares: its lines, its budget, and the postings it already handled."""
+
+    lines: list[str]
+    hook: OnCrash
+    budget: Deadline | None
+    now: Callable[[], dt.datetime]
+    inserted: set[int] = field(default_factory=set)
+    attempted: set[int] = field(default_factory=set)  # sent to the scorer this run
+
+    def out_of_time(self) -> bool:
+        return self.budget is not None and self.budget.expired()
+
+
+class _Emitting(list[str]):
+    """The run's lines. Each one is handed to `emit` before it is kept, in order.
+
+    The watcher only adds lines at the end. `insert` would put a line out of order with
+    what was already emitted, so it is refused.
+    """
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        super().__init__()
+        self._emit = emit
+
+    def append(self, line: str) -> None:
+        self._emit(line)
+        super().append(line)
+
+    def extend(self, lines: Iterable[str]) -> None:
+        for line in lines:
+            self.append(line)
+
+    # Same signature as list.__iadd__; mypy compares it with __add__ for list subclasses.
+    def __iadd__(self, value: Iterable[str]) -> Self:  # type: ignore[override, misc]
+        self.extend(value)
+        return self
+
+    def insert(self, index: SupportsIndex, line: str) -> NoReturn:
+        raise TypeError("watch lines are only ever added at the end")
+
+
+@dataclass(frozen=True)
 class _Aligned:
     ok: bool
     stored_type: str | None = None
@@ -116,38 +204,177 @@ def run(
     scorer: Scorer | None = None,
     data_dir: Path | None = None,
     embed_transport: Callable[[str, bytes], tuple[int, bytes]] | None = None,
+    on_crash: OnCrash | None = None,
+    emit: Callable[[str], None] | None = None,
+    budget: Deadline | None = None,
+    now: Callable[[], dt.datetime] | None = None,
 ) -> list[str]:
-    """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`."""
+    """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`.
+
+    Each log line is handed to `emit` as it happens; the same lines are returned.
+    `budget` bounds the whole run; the caller also gives it to each client it builds.
+    """
     dt.date.fromisoformat(today)
     rules = config or {}
     skipped = exclusions or {}
+    state = _State(
+        lines=_Emitting(emit or _no_emit),
+        hook=on_crash or _no_hook,
+        budget=budget,
+        now=now or _utc_now,
+    )
+    lines = state.lines
     embedder = Embedder(conn, data_dir, rules, transport=embed_transport)
-    lines = embedder.refresh()
-    _recheck(conn, watchlist, rules, skipped, today, lines)
-    _score_waiting(conn, scorer, today, lines, embedder)
     blocked: set[str] = set()
-    for item in _with_discovery_boards(conn, watchlist):
+    counts = {"fetched": 0, "failed": 0, "left": 0}
+    for item in _by_last_attempt(conn, _with_discovery_boards(conn, watchlist)):
         entry = _entry(item)
         if entry is None:
             lines.append("watch: a watchlist entry has no name; skipped")
             continue
         name, ats, slug, role_filters = entry
-        _watch_one(
-            conn,
-            lines,
-            blocked,
-            name,
-            ats,
-            slug,
-            role_filters,
-            rules,
-            skipped,
-            today,
-            fetcher,
-            scorer,
-            embedder,
-        )
+        tally: Tally | None = None
+        with _isolated(conn, lines, name, state.hook) as guard:
+            tally = _watch_one(
+                conn,
+                state,
+                blocked,
+                name,
+                ats,
+                slug,
+                role_filters,
+                rules,
+                skipped,
+                today,
+                fetcher,
+                scorer,
+                embedder,
+            )
+        if guard.failed:
+            tally = "failed"
+        if tally is not None:
+            counts[tally] += 1
+    if embedder.enabled():
+        if state.out_of_time():
+            lines.append(f"watch: embedding refresh: {_LEFT}")
+        else:
+            with _isolated(conn, lines, "embedding refresh", state.hook):
+                lines.extend(embedder.refresh())
+    rechecked = False
+    if state.out_of_time():
+        lines.append(f"watch: recheck: {_LEFT}")
+    else:
+        rechecked = _recheck(conn, watchlist, rules, skipped, today, state)
+    if scorer is not None:
+        if not rechecked or state.out_of_time():
+            # Never score a row the current config has not filtered again.
+            lines.append(f"watch: scoring: {_LEFT}")
+        else:
+            _score_waiting(conn, scorer, today, embedder, state)
+    lines.append(
+        f"watch: {counts['fetched']} boards fetched, {counts['failed']} failed, "
+        f"{counts['left']} left"
+    )
     return lines
+
+
+def _utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
+
+
+def _board_key(ats: str | None, slug: str | None) -> str | None:
+    """`<ats_type>:<slug>`, case-folded, for a board this command can fetch."""
+    if ats is None or not slug or board_url(ats, slug) is None:
+        return None
+    return f"{ats}:{slug.casefold()}"
+
+
+def _by_last_attempt(conn: sqlite3.Connection, items: list[Any]) -> list[Any]:
+    """Unfetchable entries first (they cost nothing), then never-tried boards, then the
+    oldest attempt. Ties keep their order: config entries, then discovery boards."""
+    stamps = {
+        str(row["board_key"]): str(row["last_attempt_at"])
+        for row in conn.execute("SELECT board_key, last_attempt_at FROM watch_board_attempts")
+    }
+
+    def order(pair: tuple[int, Any]) -> tuple[int, str, int]:
+        index, item = pair
+        entry = _entry(item)
+        key = _board_key(entry[1], entry[2]) if entry is not None else None
+        if key is None:
+            return (0, "", index)
+        return (1, stamps.get(key, ""), index)  # "" sorts before every timestamp
+
+    return [item for _index, item in sorted(enumerate(items), key=order)]
+
+
+def _stamp_attempt(conn: sqlite3.Connection, key: str, now: dt.datetime) -> str | None:
+    """Record this attempt in its own transaction. Returns the earlier stamp, if any."""
+    with db.transaction(conn):
+        row = conn.execute(
+            "SELECT last_attempt_at FROM watch_board_attempts WHERE board_key = ?", (key,)
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO watch_board_attempts (board_key, last_attempt_at) VALUES (?, ?) "
+            "ON CONFLICT (board_key) DO UPDATE SET last_attempt_at = excluded.last_attempt_at",
+            (key, now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")),
+        )
+    return None if row is None else str(row["last_attempt_at"])
+
+
+def _restore_attempt(conn: sqlite3.Connection, key: str, previous: str | None) -> None:
+    """A board the budget left out keeps its place: its earlier stamp, or no row."""
+    with db.transaction(conn):
+        if previous is None:
+            conn.execute("DELETE FROM watch_board_attempts WHERE board_key = ?", (key,))
+        else:
+            conn.execute(
+                "UPDATE watch_board_attempts SET last_attempt_at = ? WHERE board_key = ?",
+                (previous, key),
+            )
+
+
+def _no_hook(who: str, exc: Exception) -> None:
+    return None
+
+
+def _no_emit(line: str) -> None:
+    return None
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction:
+        conn.execute("ROLLBACK")
+
+
+@contextmanager
+def _isolated(
+    conn: sqlite3.Connection, lines: list[str], who: str, on_crash: OnCrash
+) -> Iterator[_Guard]:
+    """Roll back and log a crash, then carry on. A database failure is re-raised."""
+    guard = _Guard()
+    try:
+        yield guard
+    except sqlite3.IntegrityError as exc:  # before sqlite3.Error, its base class
+        _crashed(conn, lines, who, exc, on_crash)
+        guard.failed = True
+    except sqlite3.Error:
+        _rollback(conn)
+        raise
+    except RunLogError:  # the run cannot leave a trace, so it does not go on
+        _rollback(conn)
+        raise
+    except Exception as exc:
+        _crashed(conn, lines, who, exc, on_crash)
+        guard.failed = True
+
+
+def _crashed(
+    conn: sqlite3.Connection, lines: list[str], who: str, exc: Exception, on_crash: OnCrash
+) -> None:
+    _rollback(conn)
+    lines.append(f"watch: {who}: {type(exc).__name__}; continuing")
+    on_crash(who, exc)
 
 
 def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -> list[Any]:
@@ -200,7 +427,7 @@ def _entry(item: object) -> tuple[str, str | None, str | None, Mapping[str, Any]
 
 def _watch_one(
     conn: sqlite3.Connection,
-    lines: list[str],
+    state: _State,
     blocked: set[str],
     name: str,
     ats: str | None,
@@ -212,32 +439,45 @@ def _watch_one(
     fetcher: Fetcher,
     scorer: Scorer | None,
     embedder: Embedder,
-) -> None:
+) -> Tally | None:
+    """Whether the board was fetched and parsed, failed, left for the next run, or
+    (None) never attempted."""
+    lines = state.lines
     if ats is None:
         lines.append(_line(name, None, "no ats_type; skipped"))
-        return
+        return None
     if ats == "workday":
         lines.append(_line(name, ats, "not fetched yet; skipped"))
-        return
+        return None
     if ats not in _BOARDS:
         lines.append(_line(name, ats, "not a board this command fetches; skipped"))
-        return
+        return None
     if not slug:
         lines.append(_line(name, ats, "no ats_slug; skipped"))
-        return
+        return None
     url = board_url(ats, slug)
     if url is None:
         lines.append(_line(name, ats, "ats_slug is not a single path segment; skipped"))
-        return
+        return None
     host = urllib.parse.urlsplit(url).hostname or ""
     if host in blocked:
         lines.append(
             _line(name, ats, f"{host} already returned HTTP 429 this run; left for the next run")
         )
-        return
-    jobs = _fetch_jobs(lines, blocked, name, ats, slug, url, host, fetcher)
-    if jobs is None:
-        return
+        return None
+    if state.out_of_time():
+        lines.append(_line(name, ats, _LEFT))
+        return "left"
+    key = f"{ats}:{slug.casefold()}"
+    previous = _stamp_attempt(conn, key, state.now())
+    outcome = _fetch_jobs(state, blocked, name, ats, slug, url, host, fetcher)
+    if isinstance(outcome, _Left):
+        _restore_attempt(conn, key, previous)
+        return "left"
+    if isinstance(outcome, _Failed):
+        return "failed"
+    # One transaction, after a board parsed and before any posting is recorded: a
+    # failed fetch never touches the company, and a disagreement records nothing.
     with db.transaction(conn):
         aligned = _align(conn, name, ats, slug)
     if not aligned.ok:
@@ -250,14 +490,25 @@ def _watch_one(
                 f"ats_slug={_shown(aligned.stored_slug)}); skipped",
             )
         )
-        return
+        return "failed"
     _record_jobs(
-        conn, lines, name, ats, jobs, role_filters, config, exclusions, today, scorer, embedder
+        conn,
+        state,
+        name,
+        ats,
+        outcome.jobs,
+        role_filters,
+        config,
+        exclusions,
+        today,
+        scorer,
+        embedder,
     )
+    return "fetched"
 
 
 def _fetch_jobs(
-    lines: list[str],
+    state: _State,
     blocked: set[str],
     name: str,
     ats: str,
@@ -265,13 +516,18 @@ def _fetch_jobs(
     url: str,
     host: str,
     fetcher: Fetcher,
-) -> list[_Job | _Skip] | None:
-    """Parse one board. None means nothing from this board is stored."""
+) -> _Parsed | _Failed | _Left:
+    """Parse one board. A failure, or a fetch the run budget cut short, stores nothing."""
+    lines = state.lines
     try:
         fetched = fetcher(url)
-    except FetchError:
-        lines.append(_line(name, ats, "FetchError; nothing recorded"))
-        return None
+    except FetchError as exc:
+        if isinstance(exc, FetchTimeout) and state.out_of_time():
+            lines.append(_line(name, ats, _LEFT))
+            return _Left()
+        kind = type(exc).__name__
+        lines.append(_line(name, ats, f"{kind}; nothing recorded"))
+        return _Failed(kind)
     if fetched.status == 429:
         # Do not read the body, sleep, or retry. The next watch tries again.
         blocked.add(host)
@@ -282,20 +538,20 @@ def _fetch_jobs(
                 f"HTTP 429, retry-after {_retry(fetched.retry_after)}; left for the next run",
             )
         )
-        return None
+        return _Failed("HTTP 429")
     if fetched.status != 200:
         lines.append(_line(name, ats, f"HTTP {fetched.status}; nothing recorded"))
-        return None
+        return _Failed(f"HTTP {fetched.status}")
     try:
-        return _parse(ats, slug, fetched.body)
+        return _Parsed(_parse(ats, slug, fetched.body))
     except BoardParseError as exc:
         lines.append(_line(name, ats, f"HTTP 200, {exc}; nothing recorded"))
-        return None
+        return _Failed(str(exc))
 
 
 def _record_jobs(
     conn: sqlite3.Connection,
-    lines: list[str],
+    state: _State,
     name: str,
     ats: str,
     jobs: list[_Job | _Skip],
@@ -306,6 +562,7 @@ def _record_jobs(
     scorer: Scorer | None,
     embedder: Embedder,
 ) -> None:
+    lines = state.lines
     new = 0
     existing = 0
     mismatches: set[str] = set()
@@ -374,6 +631,7 @@ def _record_jobs(
             existing += 1
             continue
         new += 1
+        state.inserted.add(posting_id)
         if verdict.reason:
             lines.append(_line(name, ats, f"{item.title!r} skipped ({verdict.reason})"))
             continue
@@ -385,6 +643,13 @@ def _record_jobs(
             description=item.description,
             requisition_id=item.requisition_id,
         )
+        if scorer is not None and state.out_of_time():
+            # Stored and filtered; the next run scores it from the stored fields.
+            lines.append(
+                _line(name, ats, f"{item.title!r} left for the next run (run budget reached)")
+            )
+            continue
+        state.attempted.add(posting_id)
         _score_one(conn, posting_id, seen, scorer, today, lines, name, ats, embedder)
     lines.append(_line(name, ats, f"{new} new, {existing} already recorded"))
 
@@ -395,9 +660,13 @@ def _recheck(
     config: Mapping[str, Any],
     exclusions: Mapping[str, Any],
     today: str,
-    lines: list[str],
-) -> None:
-    """Filter watcher postings that have no skip and no score yet."""
+    state: _State,
+) -> bool:
+    """Filter watcher postings that have no skip and no score yet. One row at a time.
+
+    Postings inserted this run were filtered with the current config already. Returns
+    whether every row was reached before the run budget ran out.
+    """
     roles = {
         entry[0].casefold(): entry[3] for item in watchlist if (entry := _entry(item)) is not None
     }
@@ -408,66 +677,95 @@ def _recheck(
         "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
     ).fetchall()
-    for row in rows:
-        verdict = filters.decide(
-            PostingText(
-                company=row["company"],
-                title=row["title"],
-                location=row["location"],
-                work_model=row["work_model"],
-                requisition_id=row["requisition_id"],
-            ),
-            config=config,
-            exclusions=exclusions,
-            role_filters=roles.get(str(row["company"]).casefold()),
-            applied=search_store.posting_has_application(conn, int(row["id"])),
-        )
-        with db.transaction(conn):
-            if verdict.reason:
-                if not search_store.posting_has_skip(conn, int(row["id"])):
-                    search_store.insert_skip(conn, int(row["id"]), today, verdict.reason)
-            elif verdict.schedule != row["schedule"]:
-                search_store.set_posting_schedule(conn, int(row["id"]), verdict.schedule)
+    rows = [row for row in rows if int(row["id"]) not in state.inserted]
+    for index, row in enumerate(rows):
+        if state.out_of_time():
+            state.lines.append(_partly("recheck", len(rows) - index))
+            return False
+        with _isolated(conn, state.lines, str(row["company"]), state.hook):
+            _recheck_one(conn, row, roles, config, exclusions, today, state.lines)
+    return True
+
+
+def _partly(label: str, left: int) -> str:
+    return f"watch: {label}: run budget reached; {left} postings left for the next run"
+
+
+def _recheck_one(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    roles: Mapping[str, Mapping[str, Any] | None],
+    config: Mapping[str, Any],
+    exclusions: Mapping[str, Any],
+    today: str,
+    lines: list[str],
+) -> None:
+    verdict = filters.decide(
+        PostingText(
+            company=row["company"],
+            title=row["title"],
+            location=row["location"],
+            work_model=row["work_model"],
+            requisition_id=row["requisition_id"],
+        ),
+        config=config,
+        exclusions=exclusions,
+        role_filters=roles.get(str(row["company"]).casefold()),
+        applied=search_store.posting_has_application(conn, int(row["id"])),
+    )
+    with db.transaction(conn):
         if verdict.reason:
-            lines.append(
-                _line(str(row["company"]), None, f"{row['title']!r} skipped ({verdict.reason})")
-            )
+            if not search_store.posting_has_skip(conn, int(row["id"])):
+                search_store.insert_skip(conn, int(row["id"]), today, verdict.reason)
+        elif verdict.schedule != row["schedule"]:
+            search_store.set_posting_schedule(conn, int(row["id"]), verdict.schedule)
+    if verdict.reason:
+        lines.append(
+            _line(str(row["company"]), None, f"{row['title']!r} skipped ({verdict.reason})")
+        )
 
 
 def _score_waiting(
     conn: sqlite3.Connection,
-    scorer: Scorer | None,
+    scorer: Scorer,
     today: str,
-    lines: list[str],
     embedder: Embedder,
+    state: _State,
 ) -> None:
-    """Score watcher postings that passed the filter and have no model text yet."""
-    if scorer is None:
-        return
+    """Score watcher postings that passed the filter and have no model text yet.
+
+    A posting already sent to the scorer this run is not sent again.
+    """
     rows = conn.execute(
         "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
         "FROM postings p JOIN companies c ON c.id = p.company_id "
         "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
     ).fetchall()
-    for row in rows:
-        _score_one(
-            conn,
-            int(row["id"]),
-            PostingText(
-                company=row["company"],
-                title=row["title"],
-                location=row["location"],
-                work_model=row["work_model"],
-                requisition_id=row["requisition_id"],
-            ),
-            scorer,
-            today,
-            lines,
-            str(row["company"]),
-            None,
-            embedder,
-        )
+    rows = [row for row in rows if int(row["id"]) not in state.attempted | state.inserted]
+    for index, row in enumerate(rows):
+        if state.out_of_time():
+            state.lines.append(_partly("scoring", len(rows) - index))
+            return
+        state.attempted.add(int(row["id"]))
+        with _isolated(conn, state.lines, str(row["company"]), state.hook):
+            _score_one(
+                conn,
+                int(row["id"]),
+                PostingText(
+                    company=row["company"],
+                    title=row["title"],
+                    location=row["location"],
+                    work_model=row["work_model"],
+                    requisition_id=row["requisition_id"],
+                ),
+                scorer,
+                today,
+                state.lines,
+                str(row["company"]),
+                None,
+                embedder,
+            )
 
 
 def _score_one(

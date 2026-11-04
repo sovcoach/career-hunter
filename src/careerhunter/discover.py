@@ -20,12 +20,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from careerhunter import db, search_store
+from careerhunter import db, loopback, search_store
+from careerhunter.deadline import Deadline
 
 MAX_QUERIES = 12
 MAX_BODY = 1_048_576
 MISS = "discovery miss: unreachable"
 OFF = "discovery off"
+_TOTAL = 30.0
 _TIMEOUT = 20.0
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -110,8 +112,8 @@ def request_url(base: str, query: str) -> str:
     return urllib.parse.urlunsplit(("http", parts.netloc, path, qs, ""))
 
 
-def default_transport(url: str) -> tuple[int, bytes]:
-    """GET once. A redirect status is returned as-is and is not followed."""
+def default_transport(url: str, *, budget: Deadline | None = None) -> tuple[int, bytes]:
+    """GET once, within _TOTAL. A redirect status is returned as-is and is not followed."""
     try:
         parts = urllib.parse.urlsplit(url)
         port = parts.port or 80
@@ -128,15 +130,21 @@ def default_transport(url: str) -> tuple[int, bytes]:
     path = parts.path or "/"
     if parts.query:
         path = f"{path}?{parts.query}"
-    conn = http.client.HTTPConnection(host, port, timeout=_TIMEOUT)
     try:
-        conn.request("GET", path, headers={"Accept": "application/json"})
-        response = conn.getresponse()
-        return response.status, response.read(MAX_BODY + 1)
-    except OSError as exc:
+        return loopback.exchange(
+            "GET",
+            host,
+            port,
+            path,
+            body=None,
+            headers={"Accept": "application/json"},
+            total=_TOTAL,
+            per_op=_TIMEOUT,
+            max_bytes=MAX_BODY,
+            budget=budget,
+        )
+    except loopback.LoopbackError as exc:
         raise DiscoverError(MISS) from exc
-    finally:
-        conn.close()
 
 
 def build_queries(config: Mapping[str, Any]) -> list[str]:
@@ -263,7 +271,7 @@ def run(
         try:
             target = request_url(base, query)
             status, body = talk(target)
-        except (DiscoverError, OSError):
+        except (DiscoverError, OSError, http.client.HTTPException):
             return Outcome(MISS, ())
         if status != 200 or len(body) > MAX_BODY:
             return Outcome(MISS, ())
@@ -407,19 +415,26 @@ def _slug(value: str) -> str | None:
 
 
 def _result_urls(body: bytes) -> list[str] | None:
+    """The result URLs, or None when the reply is not a SearXNG result list.
+
+    A result without a string url is skipped. A non-empty list where every result is
+    skipped is not a usable reply either.
+    """
     try:
         payload = json.loads(body)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     if not isinstance(payload, dict):
         return None
-    results = payload.get("results", [])
+    results = payload.get("results")
     if not isinstance(results, list):
         return None
     urls: list[str] = []
     for item in results:
         if isinstance(item, dict) and isinstance(item.get("url"), str):
             urls.append(item["url"])
+    if results and not urls:
+        return None
     return urls
 
 

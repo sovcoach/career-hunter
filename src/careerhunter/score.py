@@ -9,7 +9,8 @@ The prompt is built from lanes, location rules, hard gates and `gap_tiers`, plus
 posting fields. The model lists gaps. This module applies `gap_tiers` and stores the
 tier name. `fit_rating` is left null. There is no mapping onto 0-10.
 
-A down server, a redirect, or a reply that does not parse leaves the posting unscored.
+A down server, a redirect, a broken reply, or a reply that does not parse leaves the
+posting unscored.
 """
 
 from __future__ import annotations
@@ -22,11 +23,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from careerhunter import loopback
+from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/chat/completions"
 MODEL_NAME = "local-model"
-TIMEOUT = 30.0
+# The request does not stream, so no byte arrives until generation ends. One step has
+# to cover that wait, so the step limit is the whole total.
+TOTAL = 120.0
+TIMEOUT = TOTAL
 MAX_OUTPUT = 20_000
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 _FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
@@ -82,23 +88,26 @@ def require_loopback(url: str) -> tuple[str, int, str]:
     return host, parts.port or 80, path
 
 
-def default_transport(url: str, payload: bytes) -> tuple[int, bytes]:
-    """POST once. A redirect status is returned as-is and is not followed."""
+def default_transport(
+    url: str, payload: bytes, *, budget: Deadline | None = None
+) -> tuple[int, bytes]:
+    """POST once, within TOTAL. A redirect status is returned as-is and is not followed."""
     host, port, path = require_loopback(url)
-    conn = http.client.HTTPConnection(host, port, timeout=TIMEOUT)
     try:
-        conn.request(
+        return loopback.exchange(
             "POST",
+            host,
+            port,
             path,
             body=payload,
             headers={"Content-Type": "application/json", "Accept": "application/json"},
+            total=TOTAL,
+            per_op=TIMEOUT,
+            max_bytes=MAX_OUTPUT,
+            budget=budget,
         )
-        response = conn.getresponse()
-        return response.status, response.read(MAX_OUTPUT + 1)
-    except OSError as exc:
+    except loopback.LoopbackError as exc:
         raise ScoreError("the local model could not be reached") from exc
-    finally:
-        conn.close()
 
 
 def score_posting(
@@ -119,7 +128,7 @@ def score_posting(
     try:
         require_loopback(url)
         status, body = send(url, _request_body(posting, config))
-    except (ScoreError, OSError):
+    except (ScoreError, OSError, http.client.HTTPException):
         return None
     content = _content(status, body)
     if content is None:

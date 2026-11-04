@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import http.client
 import json
 import math
 import sqlite3
@@ -23,22 +24,33 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from careerhunter import db, search_store
+from careerhunter import db, loopback, search_store
+from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
-from careerhunter.score import ScoreError, Transport, default_transport, require_loopback
+from careerhunter.score import ScoreError, Transport, require_loopback
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/embeddings"
 MODEL_NAME = "local-embedding"
+TOTAL = 60.0
+TIMEOUT = 30.0
+# A 1536-dimension vector is about 21 KB of JSON; the cap leaves room for larger models.
+MAX_REPLY = 1_048_576
 _REASONS = frozenset({"unreachable", "no-resume", "dim-mismatch"})
 
 
 class EmbedError(Exception):
-    """A closed reason: unreachable, no-resume, or dim-mismatch. The text is that reason."""
+    """A closed reason: unreachable, no-resume, or dim-mismatch. The text is that reason.
 
-    def __init__(self, reason: str) -> None:
+    `down` is True when the server itself could not be used: refused, timed out, out of
+    time, or a reply over the cap. A reply that arrived but was not a vector is not.
+    The text is the same either way.
+    """
+
+    def __init__(self, reason: str, *, down: bool = False) -> None:
         if reason not in _REASONS:
             reason = "unreachable"
         self.reason = reason
+        self.down = down
         super().__init__(reason)
 
 
@@ -62,6 +74,28 @@ def posting_text(posting: PostingText) -> str:
     return "\n".join(lines)
 
 
+def default_transport(
+    url: str, payload: bytes, *, budget: Deadline | None = None
+) -> tuple[int, bytes]:
+    """POST once, within TOTAL. A redirect status is returned as-is and is not followed."""
+    host, port, path = require_loopback(url)
+    try:
+        return loopback.exchange(
+            "POST",
+            host,
+            port,
+            path,
+            body=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            total=TOTAL,
+            per_op=TIMEOUT,
+            max_bytes=MAX_REPLY,
+            budget=budget,
+        )
+    except loopback.LoopbackError:
+        raise EmbedError("unreachable", down=True) from None
+
+
 def embed_text(
     text: str,
     *,
@@ -73,8 +107,8 @@ def embed_text(
     try:
         require_loopback(url)
         status, body = send(url, _request(text))
-    except (ScoreError, OSError):
-        raise EmbedError("unreachable") from None
+    except (ScoreError, OSError, http.client.HTTPException):
+        raise EmbedError("unreachable", down=True) from None
     return _values(status, body)
 
 
@@ -103,7 +137,8 @@ class Embedder:
     """Resume vector for one watch run, then a cosine for each posting.
 
     The resume is embedded at most once per distinct file contents. Stored posting
-    vectors are compared locally. A posting with no vector yet is embedded once.
+    vectors are compared locally. A posting with no vector yet is embedded once. Once
+    the server is down, or the resume cannot be embedded, nothing more is sent this run.
     """
 
     def __init__(
@@ -149,7 +184,13 @@ class Embedder:
         try:
             return self._store(posting_id, posting, resume)
         except EmbedError as exc:
+            if exc.down:  # the server, not this reply: nothing more is sent this run
+                self._failed = exc.reason
             return self._miss(posting_id, exc.reason)
+
+    def enabled(self) -> bool:
+        """Whether a resume is configured, so refresh and attach have work to do."""
+        return self._enabled()
 
     def _enabled(self) -> bool:
         if self.data_dir is None:
@@ -204,6 +245,8 @@ class Embedder:
             if vec and len(vec) == stored[1]:
                 self._cached = (digest, len(vec), vec)
                 return self._cached
+        if self._failed is not None:  # already down this run: do not ask again
+            raise EmbedError(self._failed)
         values = embed_text(text, url=self.url, transport=self.transport)
         cosine(values, values)
         dim, blob = pack(values)
@@ -265,16 +308,18 @@ class Embedder:
                 updates.append((posting_id, cosine(resume_vec, vec)))
             except EmbedError as exc:
                 updates.append((posting_id, None))
-                self._reported.add(posting_id)
-                lines.append(miss_line(posting_id, exc.reason))
+                if posting_id not in self._reported:  # one line per posting per run
+                    self._reported.add(posting_id)
+                    lines.append(miss_line(posting_id, exc.reason))
         self._write_scores(updates)
         return lines
 
     def _clear_stored(self, reason: str) -> list[str]:
         rows = search_store.posting_embeddings(self.conn)
-        self._reported.update(posting_id for posting_id, _dim, _blob in rows)
+        fresh = [posting_id for posting_id, _dim, _blob in rows if posting_id not in self._reported]
+        self._reported.update(fresh)
         self._write_scores([(posting_id, None) for posting_id, _dim, _blob in rows])
-        return [miss_line(posting_id, reason) for posting_id, _dim, _blob in rows]
+        return [miss_line(posting_id, reason) for posting_id in fresh]
 
     def _miss(self, posting_id: int, reason: str) -> str | None:
         """Null the cosine. One log line per posting, including when refresh already wrote it."""
