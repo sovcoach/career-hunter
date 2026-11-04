@@ -68,8 +68,11 @@ def test_empty_lists_and_unused_gates_are_omitted() -> None:
         },
     )
     assert "below 60000" in text
-    assert "These titles stay allowed: Senior Customer Advocate." in text
-    assert "families are gated for seniority only when the title itself" in text
+    assert (
+        "These titles stay allowed, as whole words, ignoring case: Senior Customer Advocate."
+        in text
+    )
+    assert "are gated for seniority only when the title itself" in text
     assert "support" in text
     assert "Sample Logistics, title Night Clerk, location Sample Town, requisition N-1." in text
     assert "already applied" not in text
@@ -88,6 +91,41 @@ def test_a_float_salary_and_a_bool_are_not_invented() -> None:
     assert "yearly pay" not in skipped
     assert "Hard gates" not in skipped
     assert "Hard gates" not in render({"hard_gates": "unused"}, {})
+
+
+def _seniority_sentence(text: str) -> str:
+    found = [line for line in text.splitlines() if "seniority words" in line]
+    assert len(found) == 1
+    return found[0]
+
+
+def test_the_seniority_rule_names_the_title_only_by_default() -> None:
+    text = render({"hard_gates": {"seniority_words": ["Senior", "Director"]}}, {})
+    sentence = _seniority_sentence(text)
+    assert (
+        "Skip a title with any of these seniority words as whole words, ignoring case: "
+        "Senior, Director." in sentence
+    )
+    assert "description" not in sentence
+
+
+@pytest.mark.parametrize(("option", "where"), [(False, "title"), (True, "title or description")])
+def test_the_seniority_rule_follows_the_description_option(option: bool, where: str) -> None:
+    gates = {
+        "seniority_words": ["Senior"],
+        "seniority_in_description": option,
+        "never_gated_families": ["support"],
+    }
+    text = render({"hard_gates": gates}, {})
+    assert (
+        f"Skip a {where} with any of these seniority words as whole words, "
+        "ignoring case: Senior." in _seniority_sentence(text)
+    )
+    # The never-gated wording does not change with the option.
+    assert (
+        "These families, as whole words, ignoring case, are gated for seniority only "
+        "when the title itself contains one of those words: support." in text
+    )
 
 
 def _snapshot(root: Path) -> list[tuple[str, int, int]]:
