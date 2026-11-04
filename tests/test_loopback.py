@@ -13,7 +13,7 @@ import pytest
 
 from careerhunter import fetch, loopback
 from careerhunter.deadline import Deadline
-from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
+from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply, WireResponse, wire
 
 
 def call(server: FakeServer, clock: FakeClock | None = None, **kw: Any) -> tuple[int, bytes]:
@@ -283,3 +283,105 @@ def test_the_watchdog_cuts_off_a_real_drip_feed(
     assert problems == []
     assert dripped.is_set()
     assert aborts == [True]  # the real abort ran on a live socket
+
+
+# A body that ends early, checked against what the reply declared. Real http.client
+# responses read from canned bytes, so no OS reports a closed connection.
+
+
+class Wired:
+    """A connector whose one connection answers with `response`."""
+
+    def __init__(self, response: WireResponse) -> None:
+        self.response = response
+        self.aborts = 0
+
+    def __call__(self, host: str, address: str, port: int, timeout: float) -> Any:
+        wired = self
+
+        class Conn:
+            def request(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def getresponse(self) -> WireResponse:
+                return wired.response
+
+            def set_timeout(self, seconds: float) -> None:
+                pass
+
+            def abort(self) -> None:
+                wired.aborts += 1
+
+            def close(self) -> None:
+                pass
+
+        return Conn()
+
+
+def exchange_wired(response: WireResponse, **kw: Any) -> tuple[int, bytes]:
+    return call(FakeServer(Reply()), connector=Wired(response), max_bytes=1 << 20, **kw)
+
+
+def test_a_declared_length_cut_short_is_a_miss() -> None:
+    with pytest.raises(loopback.LoopbackError):
+        exchange_wired(WireResponse(wire("Content-Length: 100", b"abc")))
+
+
+def test_a_declared_length_cut_short_after_a_fire_is_a_miss(
+    loopback_watchdog: ManualWatchdog,
+) -> None:
+    response = WireResponse(wire("Content-Length: 100", b"abc"), loopback_watchdog.fire_all)
+    with pytest.raises(loopback.LoopbackError):
+        exchange_wired(response)
+
+
+def test_a_complete_declared_length_is_kept_when_the_deadline_passes_during_it() -> None:
+    clock = FakeClock()
+    response = WireResponse(wire("Content-Length: 10", b"0123456789"), lambda: clock.advance(61))
+    assert exchange_wired(response, clock=clock) == (200, b"0123456789")
+
+
+def test_a_complete_chunked_body_is_kept_when_the_deadline_passes_at_its_last_chunk() -> None:
+    clock = FakeClock()
+    reads: list[int] = []
+
+    def late_on_the_final_chunk() -> None:
+        reads.append(1)
+        if len(reads) == 2:  # the read that finds the 0-size chunk
+            clock.advance(61)
+
+    body = b"5\r\nhello\r\n0\r\n\r\n"
+    response = WireResponse(wire("Transfer-Encoding: chunked", body), late_on_the_final_chunk)
+    assert exchange_wired(response, clock=clock) == (200, b"hello")
+    assert response.reads == 2
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"a\r\n0123", b"3\r\nabc\r\n"],
+    ids=["mid-chunk", "at-a-chunk-boundary"],
+)
+def test_a_chunked_body_cut_short_is_a_miss(body: bytes) -> None:
+    with pytest.raises(loopback.LoopbackError):
+        exchange_wired(WireResponse(wire("Transfer-Encoding: chunked", body)))
+
+
+def test_a_body_of_unknown_length_ending_after_a_fire_is_a_miss(
+    loopback_watchdog: ManualWatchdog,
+) -> None:
+    response = WireResponse(wire("Content-Type: text/plain", b"abc"), loopback_watchdog.fire_all)
+    with pytest.raises(loopback.LoopbackError):
+        exchange_wired(response)
+
+
+@pytest.mark.parametrize(
+    ("headers", "body", "expected"),
+    [
+        ("Content-Length: 5", b"hello", b"hello"),
+        ("Transfer-Encoding: chunked", b"5\r\nhello\r\n0\r\n\r\n", b"hello"),
+        ("Content-Type: text/plain", b"hello", b"hello"),
+    ],
+    ids=["declared-length", "chunked", "until-close"],
+)
+def test_a_complete_body_is_returned_whole(headers: str, body: bytes, expected: bytes) -> None:
+    assert exchange_wired(WireResponse(wire(headers, body))) == (200, expected)

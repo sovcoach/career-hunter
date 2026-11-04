@@ -18,6 +18,7 @@ import pytest
 
 from careerhunter import fetch as f
 from careerhunter.deadline import Deadline
+from tests.fakes import WireResponse, wire
 
 PUBLIC = "93.184.216.34"  # documentation-style public address; nothing is contacted
 
@@ -820,3 +821,79 @@ def test_the_watchdog_cuts_off_a_real_tls_drip_feed(
     assert dripped.is_set()  # the handshake and the headers really went over TLS
     assert aborts == [True]  # the real abort ran on a live TLS socket
     _armed_once_each(dog, 1)
+
+
+# A body that ends early: checked against what the reply declared, not against how the OS
+# reports a closed connection. These replies are real http.client responses read from
+# canned bytes, so the stdlib's own Content-Length and chunked rules apply.
+
+
+SITE = "https://jobs.example.com/"
+
+
+def fetch_wired(response: WireResponse, **kw: Any) -> f.Fetched:
+    web = FakeWeb({SITE: response})  # type: ignore[dict-item]
+    return f.fetch(
+        SITE, resolver=resolver({"jobs.example.com": [PUBLIC]}), connector=web.connector, **kw
+    )
+
+
+def test_a_declared_length_cut_short_is_a_failed_fetch() -> None:
+    with pytest.raises(f.FetchFailed, match="body cut short"):
+        fetch_wired(WireResponse(wire("Content-Length: 100", b"abc")))
+
+
+def test_a_declared_length_cut_short_after_a_fire_is_a_timeout(dog: ManualWatchdog) -> None:
+    with pytest.raises(f.FetchTimeout):
+        fetch_wired(WireResponse(wire("Content-Length: 100", b"abc"), on_read=dog.fire_all))
+
+
+def test_a_complete_declared_length_is_kept_when_the_deadline_passes_during_it() -> None:
+    clock = FakeClock()
+    response = WireResponse(wire("Content-Length: 10", b"0123456789"), lambda: clock.advance(61))
+    got = fetch_wired(response, clock=clock)
+    assert got.body == b"0123456789"
+
+
+def test_a_complete_chunked_body_is_kept_when_the_deadline_passes_at_its_last_chunk() -> None:
+    clock = FakeClock()
+    reads: list[int] = []
+
+    def late_on_the_final_chunk() -> None:
+        reads.append(1)
+        if len(reads) == 2:  # the read that finds the 0-size chunk
+            clock.advance(61)
+
+    body = b"5\r\nhello\r\n0\r\n\r\n"
+    response = WireResponse(wire("Transfer-Encoding: chunked", body), late_on_the_final_chunk)
+    got = fetch_wired(response, clock=clock)
+    assert got.body == b"hello"
+    assert response.reads == 2
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"a\r\n0123", b"3\r\nabc\r\n"],
+    ids=["mid-chunk", "at-a-chunk-boundary"],
+)
+def test_a_chunked_body_cut_short_is_a_failed_fetch(body: bytes) -> None:
+    with pytest.raises(f.FetchFailed, match="IncompleteRead"):
+        fetch_wired(WireResponse(wire("Transfer-Encoding: chunked", body)))
+
+
+def test_a_body_of_unknown_length_ending_after_a_fire_is_a_timeout(dog: ManualWatchdog) -> None:
+    with pytest.raises(f.FetchTimeout):
+        fetch_wired(WireResponse(wire("Content-Type: text/plain", b"abc"), on_read=dog.fire_all))
+
+
+@pytest.mark.parametrize(
+    ("headers", "body", "expected"),
+    [
+        ("Content-Length: 5", b"hello", b"hello"),
+        ("Transfer-Encoding: chunked", b"5\r\nhello\r\n0\r\n\r\n", b"hello"),
+        ("Content-Type: text/plain", b"hello", b"hello"),
+    ],
+    ids=["declared-length", "chunked", "until-close"],
+)
+def test_a_complete_body_is_returned_whole(headers: str, body: bytes, expected: bytes) -> None:
+    assert fetch_wired(WireResponse(wire(headers, body))).body == expected

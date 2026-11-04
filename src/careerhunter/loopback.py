@@ -6,7 +6,8 @@ The scoring, embedding and SearXNG clients talk to loopback only. None of them i
 - one total deadline covers the lookup, the connect, the reply headers and the body;
 - a host name is resolved inside that deadline, and only a loopback answer
   (127.0.0.0/8 or ::1) is used; anything else is refused;
-- the body is read in chunks, with the socket timeout re-armed to the time left;
+- the body is read in chunks, with the socket timeout re-armed to the time left, and a
+  body that ends before its declared length is a failure;
 - a watchdog shuts the socket down when the deadline passes.
 
 Redirects are not followed: a 3xx status is returned as it is. Every failure is one
@@ -23,6 +24,7 @@ from collections.abc import Callable, Mapping
 from typing import Protocol
 
 from careerhunter.deadline import (
+    BodyCutShort,
     BodyTooLarge,
     Clock,
     Controls,
@@ -30,6 +32,7 @@ from careerhunter.deadline import (
     DeadlineExceeded,
     Hop,
     Watchdog,
+    framing,
     read_capped,
 )
 from careerhunter.deadline import start_timer as _timer
@@ -52,6 +55,8 @@ class LoopbackError(Exception):
 class Response(Protocol):
     @property
     def status(self) -> int: ...
+
+    def getheader(self, name: str) -> str | None: ...
 
     def read1(self, n: int = -1) -> bytes: ...
 
@@ -143,15 +148,22 @@ def exchange(
         if hop.fired or limit.expired():
             raise LoopbackError
         response = conn.getresponse()
+        declared, chunked = framing(response.getheader, response.status)
         data = read_capped(
             response,
             max_bytes=max_bytes,
             deadline=limit,
             per_op=per_op,
             rearm=conn.set_timeout,
+            declared=declared,
         )
+        # A declared length that arrived, or a chunked body that reached its last chunk,
+        # is complete. A body that ended at close cannot be checked, so after a fire or
+        # past the deadline it may be cut short.
+        if declared is None and not chunked and (hop.fired or limit.expired()):
+            raise LoopbackError
         return response.status, data
-    except (BodyTooLarge, DeadlineExceeded):
+    except (BodyTooLarge, BodyCutShort, DeadlineExceeded):
         raise LoopbackError from None
     except ValueError as exc:
         # A read on a socket the watchdog shut can raise ValueError. Any other is a bug.

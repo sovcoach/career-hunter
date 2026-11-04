@@ -38,6 +38,7 @@ from typing import Any, Protocol
 import truststore
 
 from careerhunter.deadline import (
+    BodyCutShort,
     BodyTooLarge,
     Clock,
     Controls,
@@ -45,6 +46,7 @@ from careerhunter.deadline import (
     DeadlineExceeded,
     Hop,
     Watchdog,
+    framing,
     read_capped,
 )
 from careerhunter.deadline import start_timer as _timer
@@ -243,16 +245,6 @@ def _too_large(max_bytes: int) -> str:
     return f"the page is larger than {max_bytes // (1024 * 1024)} MB"
 
 
-def _declared_length(response: Response) -> int | None:
-    value = response.getheader("Content-Length")
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
 def fetch(
     url: str,
     *,
@@ -286,8 +278,8 @@ def fetch(
                     raise FetchFailed("a redirect had no destination")
                 url = urllib.parse.urljoin(url, location)
                 continue
-            length = _declared_length(response)
-            if length is not None and length > max_bytes:
+            declared, chunked = framing(response.getheader, response.status)
+            if declared is not None and declared > max_bytes:
                 raise FetchTooLarge(_too_large(max_bytes))
             body = read_capped(
                 response,
@@ -295,7 +287,13 @@ def fetch(
                 deadline=limit,
                 per_op=timeout,
                 rearm=conn.set_timeout,
+                declared=declared,
             )
+            # A declared length that arrived, or a chunked body that reached its last
+            # chunk, is complete. A body that ended at close cannot be checked, so after a
+            # fire or past the deadline it may be cut short: that is a timeout.
+            if declared is None and not chunked and (hop.fired or limit.expired()):
+                raise FetchTimeout(_late(host))
             content_type = response.getheader("Content-Type") or ""
             return Fetched(
                 url, response.status, content_type, body, response.getheader("Retry-After")
@@ -304,6 +302,10 @@ def fetch(
             raise FetchTooLarge(_too_large(max_bytes)) from None
         except DeadlineExceeded:
             raise FetchTimeout(_late(host)) from None
+        except BodyCutShort:
+            if hop.fired or limit.expired():
+                raise FetchTimeout(_late(host)) from None
+            raise FetchFailed(f"couldn't fetch {host}: body cut short") from None
         except ValueError as exc:
             # A read on a socket the watchdog shut can raise ValueError. Any other is a bug.
             if hop.fired or limit.expired():

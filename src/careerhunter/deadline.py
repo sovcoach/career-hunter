@@ -9,6 +9,14 @@ each redirect hop and each chunk of the body.
 call. Before each chunk the socket timeout is set to the time left, so no single
 `recv` can outlast the deadline.
 
+A connection can end before the body does without any error: `http.client`'s `read1`
+returns an empty read when a `Content-Length` body ends early, and TLS suppresses an
+unexpected end-of-file by default. So a body is complete only when it can be checked:
+its declared length arrived, or its chunked encoding reached the final chunk (a
+chunked body that ends early raises `IncompleteRead`). A body that falls short of its
+declared length is `BodyCutShort`. A body with no declared length that ends at close
+cannot be checked; the caller decides what that means.
+
 A socket timeout cannot bound the reply headers, which `http.client` reads in many
 `recv` calls. A `Hop` pairs one connection with a watchdog timer that shuts the socket
 down when the deadline passes, which wakes any blocked read.
@@ -33,6 +41,10 @@ class DeadlineExceeded(Exception):
 
 class BodyTooLarge(Exception):
     """The body is larger than the cap. Nothing past the cap is read."""
+
+
+class BodyCutShort(Exception):
+    """The connection ended before the body reached its declared length."""
 
 
 class Chunked(Protocol):
@@ -135,6 +147,27 @@ class Deadline:
         return other
 
 
+def framing(getheader: Callable[[str], str | None], status: int) -> tuple[int | None, bool]:
+    """The declared body length, and whether the body is chunked.
+
+    Chunked encoding overrides `Content-Length`. A 204 or 304 reply has no body, so its
+    length is 0. A missing or malformed `Content-Length` declares nothing.
+    """
+    if status in (204, 304):
+        return 0, False
+    encoding = (getheader("Transfer-Encoding") or "").lower()
+    if "chunked" in encoding:
+        return None, True
+    value = getheader("Content-Length")
+    if value is None:
+        return None, False
+    try:
+        declared = int(value.strip())
+    except ValueError:
+        return None, False
+    return (declared, False) if declared >= 0 else (None, False)
+
+
 def read_capped(
     response: Chunked,
     *,
@@ -142,16 +175,24 @@ def read_capped(
     deadline: Deadline,
     per_op: float,
     rearm: Callable[[float], None],
+    declared: int | None = None,
 ) -> bytes:
-    """The whole body, or BodyTooLarge past `max_bytes`, or DeadlineExceeded."""
+    """The whole body, or BodyTooLarge past `max_bytes`, DeadlineExceeded, or
+    BodyCutShort when the connection ends before `declared` bytes arrived.
+
+    Once `declared` bytes are in, the body is complete and nothing more is read.
+    """
     parts: list[bytes] = []
     size = 0
-    while True:
+    while declared is None or size < declared:
         rearm(deadline.cap(per_op))
         chunk = response.read1(CHUNK)
         if not chunk:
-            return b"".join(parts)
+            if declared is not None:
+                raise BodyCutShort
+            break
         size += len(chunk)
         if size > max_bytes:
             raise BodyTooLarge
         parts.append(chunk)
+    return b"".join(parts)

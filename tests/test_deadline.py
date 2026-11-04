@@ -96,3 +96,54 @@ def test_a_body_over_the_cap_is_refused_without_reading_further() -> None:
     with pytest.raises(d.BodyTooLarge):
         d.read_capped(response, max_bytes=10, deadline=limit, per_op=20.0, rearm=lambda _: None)
     assert len(response.sizes) == 3  # 4 + 4 + 4 bytes passes 10; nothing more is read
+
+
+def headers(**values: str) -> object:
+    table = {name.replace("_", "-").lower(): value for name, value in values.items()}
+    return lambda name: table.get(name.lower())
+
+
+def test_framing_reads_the_declared_length() -> None:
+    assert d.framing(headers(Content_Length="12"), 200) == (12, False)
+    assert d.framing(headers(), 200) == (None, False)
+    assert d.framing(headers(Content_Length="twelve"), 200) == (None, False)
+    assert d.framing(headers(Content_Length="-1"), 200) == (None, False)
+
+
+def test_chunked_encoding_overrides_a_declared_length() -> None:
+    both = headers(Content_Length="12", Transfer_Encoding="gzip, Chunked")
+    assert d.framing(both, 200) == (None, True)
+
+
+def test_a_reply_that_has_no_body_declares_zero() -> None:
+    assert d.framing(headers(Content_Length="12"), 204) == (0, False)
+    assert d.framing(headers(), 304) == (0, False)
+
+
+def test_reading_stops_once_the_declared_length_is_in() -> None:
+    clock = FakeClock()
+    response = DripResponse(b"abcdefXYZ", clock, step=3, cost=0.0)
+    body = d.read_capped(
+        response,
+        max_bytes=100,
+        deadline=d.Deadline(10.0, clock),
+        per_op=20.0,
+        rearm=lambda _: None,
+        declared=6,
+    )
+    assert body == b"abcdef"
+    assert len(response.sizes) == 2  # no third read waits for an end-of-file
+
+
+def test_an_end_of_file_before_the_declared_length_is_cut_short() -> None:
+    clock = FakeClock()
+    response = DripResponse(b"abc", clock, step=3, cost=0.0)
+    with pytest.raises(d.BodyCutShort):
+        d.read_capped(
+            response,
+            max_bytes=100,
+            deadline=d.Deadline(10.0, clock),
+            per_op=20.0,
+            rearm=lambda _: None,
+            declared=100,
+        )

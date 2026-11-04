@@ -50,6 +50,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The scoring, embedding and SearXNG clients have total deadlines of 120, 60 and 30 seconds. Scoring's step limit is its whole total, because its request does not stream (#30, ADR-019).
 - A broken reply from the local model or SearXNG (`IncompleteRead`, `RemoteDisconnected`, `BadStatusLine`) is a miss instead of ending the run. A discovery reply that is not UTF-8, has no `results` list, or has no usable url is a miss too (#30).
 - Embedding replies have their own 1 MB cap. A 1536-number vector was cut off at the 20,000-byte scoring cap and always missed (#30).
+- A response body that ends before its declared Content-Length is now a failed fetch, and a body of unknown length that ends after the watchdog fired or the deadline passed is now a timeout. Before, a connection cut early could return the partial body as a success: http.client's read1 returns an empty read when a Content-Length body ends early, and TLS suppresses an unexpected end-of-file by default (#30).
 
 ## [0.3.0] - 2026-11-01
 

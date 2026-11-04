@@ -3,6 +3,8 @@ local server that replays one reply. Nothing here opens a socket."""
 
 from __future__ import annotations
 
+import http.client
+import io
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -51,6 +53,7 @@ class Reply:
 
     status: int = 200
     body: bytes = b"{}"
+    headers: dict[str, str] = field(default_factory=dict)
     step: int | None = None  # bytes per read1; None hands out the whole body at once
     clock: FakeClock | None = None
     header_cost: float = 0.0  # seconds before the status line arrives
@@ -89,6 +92,12 @@ class FakeServer:
         class Conn:
             status = reply.status
 
+            def getheader(self, name: str) -> str | None:
+                for key, value in reply.headers.items():
+                    if key.lower() == name.lower():
+                        return value
+                return None
+
             def request(
                 self,
                 method: str,
@@ -126,3 +135,45 @@ class FakeServer:
                     server.on_close()
 
         return Conn()
+
+
+class _Wire:
+    """Stands in for a socket: http.client reads the canned bytes, then end-of-file."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def makefile(self, mode: str) -> io.BufferedReader:
+        return io.BufferedReader(io.BytesIO(self.data))
+
+
+class WireResponse:
+    """A real http.client.HTTPResponse read from canned bytes, so the stdlib's own rules
+    for Content-Length and chunked bodies apply, with no socket and no OS involved.
+
+    `on_read` runs before each read1, for example to advance a clock or fire a watchdog.
+    """
+
+    def __init__(self, wire: bytes, on_read: Callable[[], None] | None = None) -> None:
+        self._response = http.client.HTTPResponse(_Wire(wire))  # type: ignore[arg-type]
+        self._response.begin()
+        self._on_read = on_read
+        self.reads = 0
+
+    @property
+    def status(self) -> int:
+        return self._response.status
+
+    def getheader(self, name: str) -> str | None:
+        return self._response.getheader(name)
+
+    def read1(self, n: int = -1) -> bytes:
+        self.reads += 1
+        if self._on_read is not None:
+            self._on_read()
+        return self._response.read1(n)
+
+
+def wire(headers: str, body: bytes) -> bytes:
+    """An HTTP/1.1 200 reply with these header lines and this body, exactly as sent."""
+    return b"HTTP/1.1 200 OK\r\n" + headers.encode() + b"\r\n\r\n" + body

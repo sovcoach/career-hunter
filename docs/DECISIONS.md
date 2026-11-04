@@ -397,6 +397,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 > - Before each chunk of the body, the socket timeout is set to the time left.
 > - A watchdog on each hop shuts the socket down when the deadline passes, which also wakes a read that is stuck in the headers. Once it has fired, any error from that hop counts as running out of time.
 > - A body whose declared length is over the cap is refused before anything is read.
+> - A body that ends before its declared length is a failure, or out of time after a fire or past the deadline. A body that is complete by its own framing (its declared length arrived, or its chunked encoding reached the final chunk) is kept even if the deadline passed while it was read. A body of unknown length that ends at close after a fire or past the deadline counts as out of time.
 > - A failure is one of four kinds: refused (the link or its address), out of time, too large, or failed (no usable reply).
 
 **Context.**
