@@ -13,11 +13,13 @@ from careerhunter import score as scoring
 from careerhunter.deadline import Deadline
 from careerhunter.fetch import Fetched
 from careerhunter.filters import PostingText, decide
+from careerhunter.resume import Resume
 from careerhunter.score import (
     DEFAULT_URL,
     Score,
     ScoreError,
     default_transport,
+    normalized,
     require_loopback,
     score_posting,
 )
@@ -152,20 +154,31 @@ def test_gap_tiers_name_the_tier_and_a_high_count_skips() -> None:
     )
     assert over is not None and over.excluded and over.tier is None
     assert score_posting(posting(), RUBRIC, transport=lambda url, body: reply("nope")) is None
-    assert score_posting(posting(), RUBRIC, transport=lambda url, body: reply("{}", 302)) is None
 
+
+@pytest.mark.parametrize("status", [302, 404, 500, 503])
+def test_a_status_other_than_200_is_a_score_error(status: int) -> None:
+    """The model did not answer: told apart from a reply that does not parse."""
+    with pytest.raises(ScoreError, match=f"answered HTTP {status}") as caught:
+        score_posting(posting(), RUBRIC, transport=lambda url, body: reply("{}", status))
+    assert caught.value.__cause__ is None
+
+
+def test_a_down_server_is_a_score_error() -> None:
     def down(url: str, body: bytes) -> tuple[int, bytes]:
         raise OSError("synthetic")
 
-    assert score_posting(posting(), RUBRIC, transport=down) is None
+    with pytest.raises(ScoreError, match="could not be reached") as caught:
+        score_posting(posting(), RUBRIC, transport=down)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
 def test_a_non_loopback_url_is_not_requested() -> None:
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         raise AssertionError("transport called")
 
-    missed = score_posting(posting(), RUBRIC, url="http://example.com/v1", transport=transport)
-    assert missed is None
+    with pytest.raises(ScoreError):
+        score_posting(posting(), RUBRIC, url="http://example.com/v1", transport=transport)
     assert score_posting(posting(), {"fit_rubric": {}}, transport=transport) is None
 
 
@@ -343,11 +356,12 @@ def test_a_reply_that_breaks_mid_body_is_a_score_error(monkeypatch: pytest.Monke
         default_transport(DEFAULT_URL, b"{}")
 
 
-def test_an_injected_transport_that_breaks_leaves_the_posting_unscored() -> None:
+def test_an_injected_transport_that_breaks_is_a_score_error() -> None:
     def broken(url: str, payload: bytes) -> tuple[int, bytes]:
         raise http.client.IncompleteRead(b"")
 
-    assert score_posting(posting(), RUBRIC, transport=broken) is None
+    with pytest.raises(ScoreError, match="could not be reached"):
+        score_posting(posting(), RUBRIC, transport=broken)
 
 
 def _message(content: object) -> bytes:
@@ -444,7 +458,8 @@ def test_a_reply_whose_headers_arrive_at_121_seconds_is_a_miss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server, _clock = _model(monkeypatch, header_cost=121.0)
-    assert score_posting(posting(), RUBRIC) is None
+    with pytest.raises(ScoreError, match="could not be reached"):
+        score_posting(posting(), RUBRIC)
     assert server.reads == 0  # the body was never read
     assert server.closes == 1
 
@@ -470,3 +485,105 @@ def test_the_prompt_shows_the_seniority_option() -> None:
     assert score_posting(posting(), config, transport=transport) is not None
     prompt = json.loads(json.loads(seen["body"])["messages"][1]["content"])
     assert prompt["hard_gates"]["seniority_in_description"] is True
+
+
+# --- the resume in the prompt, and D-A1 ------------------------------------------------------
+
+_RESUME_TEXT = (
+    "Avery Example. Coordinated warehouse scheduling for Example Widgets Ltd, "
+    "reducing late shipments across three sites."
+)
+_RESUME = Resume(_RESUME_TEXT, "ab" * 32)
+
+
+def _with_resume(content: str) -> tuple[Score | None, list[bytes]]:
+    sent: list[bytes] = []
+
+    def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        sent.append(payload)
+        return reply(content)
+
+    return score_posting(posting(), RUBRIC, transport=transport, resume=_RESUME), sent
+
+
+def test_the_resume_is_in_the_request_and_not_in_the_score() -> None:
+    result, sent = _with_resume(
+        'Sure! {"gaps":[{"name":"French","kind":"core","type":"language"}]} Hope that helps.'
+    )
+    assert result is not None and result.tier == "possible"
+    view = json.loads(json.loads(sent[0])["messages"][1]["content"])
+    assert view["resume"] == _RESUME_TEXT
+    assert result.llm_output == '{"gaps":[{"kind":"core","name":"French","type":"language"}]}'
+    assert "Hope that helps" not in result.llm_output
+    assert result.resume_sha256 == _RESUME.sha256
+
+
+def test_without_a_resume_the_request_has_none_and_the_reply_is_kept() -> None:
+    sent: list[bytes] = []
+
+    def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        sent.append(payload)
+        return reply('{"gaps":[]} trailing words')
+
+    result = score_posting(posting(), RUBRIC, transport=transport)
+    assert result is not None and result.resume_sha256 is None
+    assert "resume" not in json.loads(json.loads(sent[0])["messages"][1]["content"])
+    assert result.llm_output == '{"gaps":[]} trailing words'
+
+
+def test_canonical_gaps_keep_unicode_and_sort_keys() -> None:
+    result, _sent = _with_resume('{"gaps":[{"type":"langue","kind":"minor","name":"Français"}]}')
+    assert result is not None
+    assert result.llm_output == '{"gaps":[{"kind":"minor","name":"Français","type":"langue"}]}'
+
+
+@pytest.mark.parametrize("field", ["name", "type"])
+def test_a_gap_text_over_120_characters_is_unparseable(field: str) -> None:
+    long = "x" * 121
+    gap = {"name": "Excel", "kind": "minor", field: long}
+    result, _sent = _with_resume(json.dumps({"gaps": [gap]}))
+    assert result is None
+    ok = {"name": "Excel", "kind": "minor", field: "y" * 120}
+    assert _with_resume(json.dumps({"gaps": [ok]}))[0] is not None
+
+
+_RUN_40 = _RESUME_TEXT[10:50]  # exactly 40 characters of the resume
+assert len(_RUN_40) == 40
+
+
+@pytest.mark.parametrize(
+    "copied",
+    [
+        _RUN_40,
+        _RUN_40.upper(),
+        _RUN_40.replace(" ", "\n"),
+        _RUN_40.replace(" ", "\t\t"),
+        _RUN_40.replace(" ", "\u00a0"),
+        "".join(chr(ord(c) + 0xFEE0) if "!" <= c <= "~" else c for c in _RUN_40),
+        "Missing: " + _RUN_40 + " (from the resume)",
+    ],
+    ids=["exact", "upper", "newlines", "tabs", "nbsp", "full-width", "inside"],
+)
+@pytest.mark.parametrize("field", ["name", "type"])
+def test_forty_characters_copied_from_the_resume_is_unparseable(copied: str, field: str) -> None:
+    gap = {"name": "Excel", "kind": "minor", field: copied}
+    result, _sent = _with_resume(json.dumps({"gaps": [gap]}))
+    assert result is None
+
+
+def test_thirty_nine_copied_characters_pass() -> None:
+    gap = {"name": _RUN_40[:39], "kind": "minor"}
+    result, _sent = _with_resume(json.dumps({"gaps": [gap]}))
+    assert result is not None
+
+
+def test_the_copy_check_only_applies_with_a_resume() -> None:
+    gap = {"name": _RUN_40, "kind": "minor"}
+    result = score_posting(
+        posting(), RUBRIC, transport=lambda url, body: reply(json.dumps({"gaps": [gap]}))
+    )
+    assert result is not None
+
+
+def test_normalization_is_nfkc_casefold_and_single_spaces() -> None:
+    assert normalized("  \uff21very\u00a0\t EXAMPLE\nLtd  ") == "avery example ltd"
