@@ -52,7 +52,8 @@ hard_gates:
   credentials: []              # licences, clearances or designations you can't get
   shift_patterns: [overnight]  # e.g. rotating, overnight, 24/7
   pay_structures: [commission_only]
-  seniority_words: [Senior, Director]
+  seniority_words: [Senior, Director]  # whole words of the title, any case
+  seniority_in_description: false     # true also checks the description for those words
   title_exceptions: []         # titles allowed despite containing a seniority word
   never_gated_families: []     # title families gated only when explicitly senior
 

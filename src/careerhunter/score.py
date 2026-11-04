@@ -43,6 +43,7 @@ _GATE_KEYS = (
     "shift_patterns",
     "pay_structures",
     "seniority_words",
+    "seniority_in_description",
     "title_exceptions",
     "never_gated_families",
 )

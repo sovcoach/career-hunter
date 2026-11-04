@@ -11,6 +11,11 @@ The checks run in one order. The first skip wins, and it is the reason stored on
 A description keyword can match only when the list payload included a description.
 Greenhouse list rows have none. The description is not stored.
 
+Seniority words match whole words of the title, ignoring case. The description is
+checked too only when `seniority_in_description` is true. `title_exceptions` and
+`never_gated_families` match whole words of the title the same way. A never-gated
+family is gated only when the title itself has a seniority word.
+
 One `role_filters` block is a set of AND constraints. It cannot say "this work model,
 or else that place." A missing work model does not fail `work_models`, because a
 Greenhouse list row has no work model.
@@ -129,24 +134,30 @@ def _hard_gate(posting: PostingText, gates: Mapping[str, Any]) -> str | None:
     for key, reason in checks:
         if _any(body, gates.get(key)):
             return reason
-    if _seniority(posting.title, body, gates):
+    if _seniority(posting, gates):
         return "seniority"
     if _under_minimum(body, gates.get("min_salary")):
         return "min_salary"
     return None
 
 
-def _seniority(title: str, body: str, gates: Mapping[str, Any]) -> bool:
+def _seniority(posting: PostingText, gates: Mapping[str, Any]) -> bool:
     words = gates.get("seniority_words")
     if not _strings(words):
         return False
-    if _any(title, gates.get("title_exceptions")):
+    title = posting.title
+    if _any_phrase(title, gates.get("title_exceptions")):
         return False
-    in_title = _any(title, words)
-    if not in_title and not _any(body, words):
+    in_title = _any_phrase(title, words)
+    in_description = (
+        gates.get("seniority_in_description") is True
+        and bool(posting.description)
+        and _any_phrase(posting.description or "", words)
+    )
+    if not in_title and not in_description:
         return False
     # A never-gated family is skipped only when the title itself is explicitly senior.
-    return not (_any(title, gates.get("never_gated_families")) and not in_title)
+    return not (_any_phrase(title, gates.get("never_gated_families")) and not in_title)
 
 
 def _under_minimum(body: str, minimum: object) -> bool:
@@ -301,6 +312,10 @@ def _has(haystack: str, needle: str) -> bool:
 
 def _any(haystack: str, needle: object) -> bool:
     return any(_has(haystack, item) for item in _strings(needle))
+
+
+def _any_phrase(haystack: str, needle: object) -> bool:
+    return any(has_phrase(haystack, item) for item in _strings(needle))
 
 
 def has_phrase(text: str, phrase: str) -> bool:

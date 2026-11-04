@@ -454,3 +454,19 @@ def test_the_run_budget_can_end_scoring_sooner(monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(ScoreError):
         default_transport(DEFAULT_URL, b"{}", budget=Deadline(40.0, clock))
     assert [timeout for *_rest, timeout in server.opened] == [40.0]
+
+
+def test_the_prompt_shows_the_seniority_option() -> None:
+    seen: dict[str, bytes] = {}
+
+    def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        seen["body"] = payload
+        return reply('{"gaps":[]}')
+
+    config = {
+        **RUBRIC,
+        "hard_gates": {"seniority_words": ["Senior"], "seniority_in_description": True},
+    }
+    assert score_posting(posting(), config, transport=transport) is not None
+    prompt = json.loads(json.loads(seen["body"])["messages"][1]["content"])
+    assert prompt["hard_gates"]["seniority_in_description"] is True

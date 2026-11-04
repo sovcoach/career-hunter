@@ -95,9 +95,9 @@ def test_hard_gates_and_the_seniority_exceptions() -> None:
     assert verdict("Senior Customer Advocate").reason is None
     assert verdict("Support Specialist").reason is None
     assert verdict("Senior Support Specialist").reason == "seniority"
-    # The family is not explicitly senior in the title, so the description does not gate it.
+    # The description is not checked by default, so a junior title is kept.
     assert verdict("Support Specialist", description="Reports to a Director").reason is None
-    assert verdict("Coordinator", description="Reports to a Director").reason == "seniority"
+    assert verdict("Coordinator", description="Reports to a Director").reason is None
 
 
 def test_min_salary_uses_the_highest_stated_yearly_figure() -> None:
@@ -444,3 +444,58 @@ def test_only_partial_words_do_not_match() -> None:
 @pytest.mark.parametrize("phrase", ["", "   ", "-", "_"])
 def test_a_blank_phrase_matches_nothing(phrase: str) -> None:
     assert not has_phrase("Senior Coordinator", phrase)
+
+
+# Seniority: whole words of the title; the description only when asked for.
+
+DESCRIBED = {"hard_gates": {**GATES["hard_gates"], "seniority_in_description": True}}
+
+
+def test_a_seniority_word_only_in_the_description_does_not_gate_by_default() -> None:
+    assert verdict("Coordinator", description="Works with a Senior Director").reason is None
+
+
+def test_the_description_gates_when_the_option_is_on() -> None:
+    gated = verdict("Coordinator", description="Reports to a Director", config=DESCRIBED)
+    assert gated.reason == "seniority"
+    # A never-gated family is still not gated by the description alone.
+    family = verdict("Support Specialist", description="Reports to a Director", config=DESCRIBED)
+    assert family.reason is None
+    # Its title still gates it.
+    assert verdict("Senior Support Specialist", config=DESCRIBED).reason == "seniority"
+
+
+@pytest.mark.parametrize("config", [GATES, DESCRIBED], ids=["title-only", "with-description"])
+def test_a_seniority_word_never_matches_inside_a_longer_word(config: object) -> None:
+    assert verdict("Seniority Data Coordinator", config=config).reason is None
+    assert (
+        verdict("Coordinator", description="Directors meet monthly", config=config).reason is None
+    )
+    assert verdict("Senior-level Coordinator", config=config).reason == "seniority"
+
+
+@pytest.mark.parametrize("config", [GATES, DESCRIBED], ids=["title-only", "with-description"])
+def test_title_exceptions_and_never_gated_families_match_whole_words(config: object) -> None:
+    assert verdict("Senior Customer Advocate", config=config).reason is None
+    assert verdict("SENIOR customer-advocate", config=config).reason is None
+    assert verdict("Senior Support Specialist", config=config).reason == "seniority"
+
+
+def test_a_short_exception_no_longer_exempts_a_title_that_merely_contains_it() -> None:
+    gates = {
+        "hard_gates": {
+            "seniority_words": ["Senior"],
+            "title_exceptions": ["Art"],
+            "never_gated_families": ["Port"],
+        }
+    }
+    # "Art" was a substring of "Partner"; it is not a word of this title.
+    assert verdict("Senior Partner Coordinator", config=gates).reason == "seniority"
+    assert verdict("Senior Art Coordinator", config=gates).reason is None
+    # "Port" in "Support" no longer marks the never-gated family.
+    described = {"hard_gates": {**gates["hard_gates"], "seniority_in_description": True}}
+    assert (
+        verdict("Support Coordinator", description="Senior team", config=described).reason
+        == "seniority"
+    )
+    assert verdict("Port Coordinator", description="Senior team", config=described).reason is None
