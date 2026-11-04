@@ -354,6 +354,8 @@ def test_a_missing_file_or_a_folder_is_a_fixed_error(tmp_path: Path) -> None:
 def test_messages_carry_no_content_or_path() -> None:
     for reason, message in resume._MESSAGES.items():
         assert str(resume.ResumeError(reason)) == message
-        assert "/" not in message and "Avery" not in message
+        # The only path a message names is the fixed, relative search.resume value.
+        assert "/" not in message.replace(resume.CONFIG_VALUE, "")
+        assert "Avery" not in message
     with pytest.raises(ValueError, match="unknown resume error reason"):
         resume.ResumeError("made up")

@@ -24,6 +24,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from careerhunter import (
     __version__,
     bot,
@@ -32,6 +34,7 @@ from careerhunter import (
     discover,
     embed,
     embed_eval,
+    resume,
     secrets_store,
     service,
     storage_guard,
@@ -900,6 +903,44 @@ def _rollback(conn: sqlite3.Connection) -> None:
             conn.execute("ROLLBACK")
 
 
+def cmd_resume(datadir: DataDir, args: argparse.Namespace) -> int:
+    """Import a PDF or DOCX resume. Prints no content and no path."""
+    if args.resume_action != "import":  # pragma: no cover - argparse limits the choices
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    try:
+        text = resume.extract_text(resume.read_file(args.file))
+    except resume.ResumeError as exc:
+        _err(f"error: {exc}; nothing was imported")
+        return EXIT_ERROR
+    conn = db.connect(datadir.search_db_path)
+    try:
+        db.migrate(conn, "search")
+        imported = resume.import_text(datadir.root, conn, text)
+    except resume.ResumeError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    finally:
+        conn.close()
+    print(f"imported resume: {imported.chars:,} characters")
+    if not _resume_configured(datadir):
+        print(f"set search.resume: {resume.CONFIG_VALUE} in config.yaml to use it")
+    return EXIT_OK
+
+
+def _resume_configured(datadir: DataDir) -> bool:
+    """Whether config.yaml already names the imported file. Unreadable counts as no."""
+    try:
+        doc = load_config(datadir.config_path)
+    except (ConfigError, OSError, yaml.YAMLError, ValueError):
+        return False
+    search = doc.get("search")
+    value = search.get("resume") if isinstance(search, dict) else None
+    return isinstance(value, str) and value.strip() == resume.CONFIG_VALUE
+
+
 def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
     """Rank stored cosines against tiers. The report stays in the data folder."""
     if not datadir.config_path.is_file():
@@ -1150,6 +1191,13 @@ def build_parser() -> argparse.ArgumentParser:
         "scout-prompt",
         help="print a scout prompt from exclusions and the hard gates the watcher skips on",
     )
+    p = sub.add_parser("resume", help="import a resume for scoring; the text stays local")
+    resume_sub = p.add_subparsers(dest="resume_action", required=True)
+    p = resume_sub.add_parser(
+        "import",
+        help="read a PDF or DOCX locally and store its text in the data folder",
+    )
+    p.add_argument("file", type=Path, help="the PDF or DOCX file to import")
     sub.add_parser(
         "embed-eval",
         help="rank stored cosines against LLM tiers; the report stays in the data folder",
@@ -1170,6 +1218,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "watch": cmd_watch,
     "discover": cmd_discover,
     "scout-prompt": cmd_scout_prompt,
+    "resume": cmd_resume,
     "embed-eval": cmd_embed_eval,
     "doctor": cmd_doctor,
 }
