@@ -131,6 +131,44 @@ def latest_version(track: str) -> int:
     return len(load_migrations(track))
 
 
+_LINE_COMMENT = re.compile(r"--[^\n]*")
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def _only_comments(text: str) -> bool:
+    """True when `text` holds nothing but comments, whitespace and semicolons.
+
+    A `--` inside a string literal would also be cut, but what is left of that
+    statement is then not empty, so a real statement is never mistaken for a comment.
+    """
+    rest = _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", text))
+    return not rest.replace(";", "").strip()
+
+
+def split_statements(sql: str) -> list[str]:
+    """Split migration SQL into single statements, in order, for `execute`.
+
+    The text is cut at every `;` and the pieces are joined again until SQLite says the
+    statement is complete. A `;` inside a comment, a string literal or a trigger body
+    therefore does not end a statement, and two statements on one line come out
+    separately. Pieces that hold only comments are dropped. Text after the last
+    complete statement must be comments or whitespace; anything else is refused.
+    """
+    statements: list[str] = []
+    buffer = ""
+    pieces = sql.split(";")
+    for piece in pieces[:-1]:
+        buffer += piece + ";"
+        if sqlite3.complete_statement(buffer):
+            if not _only_comments(buffer):
+                statements.append(buffer.strip())
+            buffer = ""
+    buffer += pieces[-1]
+    if not _only_comments(buffer):
+        raise MigrationError("migration SQL ends with an incomplete statement")
+    return statements
+
+
 _BOOKKEEPING = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INTEGER PRIMARY KEY,

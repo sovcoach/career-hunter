@@ -129,3 +129,104 @@ def test_read_only_connection_cannot_write(
         ro.execute("CREATE TABLE t (x)")
     with pytest.raises(FileNotFoundError):
         db.connect_read_only(tmp_path / "missing.db")
+
+
+# --- splitting migration SQL into statements -------------------------------------------
+
+
+def test_split_keeps_a_one_line_trigger_body_whole() -> None:
+    sql = (
+        "CREATE TABLE t (x INTEGER);\n"
+        "CREATE TRIGGER no_delete BEFORE DELETE ON t\n"
+        "BEGIN SELECT RAISE(ABORT, 'kept'); END;\n"
+    )
+    assert db.split_statements(sql) == [
+        "CREATE TABLE t (x INTEGER);",
+        "CREATE TRIGGER no_delete BEFORE DELETE ON t\nBEGIN SELECT RAISE(ABORT, 'kept'); END;",
+    ]
+
+
+def test_split_keeps_a_multi_line_trigger_body_whole() -> None:
+    sql = (
+        "CREATE TABLE t (x INTEGER);\n"
+        "CREATE TABLE log (x INTEGER);\n"
+        "CREATE TRIGGER audit AFTER UPDATE ON t\n"
+        "BEGIN\n"
+        "    INSERT INTO log (x) VALUES (OLD.x);\n"
+        "    INSERT INTO log (x) VALUES (NEW.x);\n"
+        "END;\n"
+    )
+    statements = db.split_statements(sql)
+    assert len(statements) == 3
+    assert statements[2].startswith("CREATE TRIGGER audit") and statements[2].endswith("END;")
+
+
+def test_split_separates_two_statements_on_one_line() -> None:
+    sql = "CREATE TABLE a (x INTEGER); CREATE TABLE b (y INTEGER);"
+    assert db.split_statements(sql) == [
+        "CREATE TABLE a (x INTEGER);",
+        "CREATE TABLE b (y INTEGER);",
+    ]
+
+
+def test_split_ignores_semicolons_in_comments_and_strings() -> None:
+    sql = (
+        "-- a note; with a semicolon\n"
+        "CREATE TABLE t (x TEXT DEFAULT 'a;b', y TEXT DEFAULT 'it''s; fine');\n"
+        "/* block; comment */\n"
+        "INSERT INTO t (x) VALUES ('c;d'); -- trailing; note\n"
+    )
+    statements = db.split_statements(sql)
+    assert len(statements) == 2
+    assert statements[0].startswith("-- a note; with a semicolon\nCREATE TABLE t")
+    assert "'it''s; fine'" in statements[0]
+    assert statements[1].endswith("VALUES ('c;d');")
+
+
+def test_split_drops_comment_only_and_empty_pieces() -> None:
+    sql = "-- header only\n;\nCREATE TABLE t (x INTEGER);;\n-- footer\n"
+    assert db.split_statements(sql) == ["CREATE TABLE t (x INTEGER);"]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE TABLE t (x INTEGER);\nCREATE TABLE u (y INTEGER)",
+        "CREATE TRIGGER t BEFORE DELETE ON x BEGIN SELECT 1;",
+        "CREATE TABLE t (x TEXT DEFAULT 'open;",
+    ],
+)
+def test_split_refuses_an_incomplete_tail(sql: str) -> None:
+    with pytest.raises(db.MigrationError, match="incomplete statement"):
+        db.split_statements(sql)
+
+
+def test_every_shipped_migration_splits_into_complete_statements(track: str) -> None:
+    for migration in db.load_migrations(track):
+        statements = db.split_statements(migration.sql)
+        assert statements, migration.name
+        for statement in statements:
+            assert sqlite3.complete_statement(statement), (migration.name, statement[:60])
+
+
+def _schema(conn: sqlite3.Connection) -> list[tuple[str, str, str, str | None]]:
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+    ).fetchall()
+    return [tuple(row) for row in rows]
+
+
+def test_split_statements_build_the_same_schema_as_executescript(
+    tmp_path: Path, track: str
+) -> None:
+    whole = sqlite3.connect(tmp_path / "whole.db", isolation_level=None)
+    split = sqlite3.connect(tmp_path / "split.db", isolation_level=None)
+    try:
+        for migration in db.load_migrations(track):
+            whole.executescript(migration.sql)
+            for statement in db.split_statements(migration.sql):
+                split.execute(statement)
+        assert _schema(split) == _schema(whole)
+    finally:
+        whole.close()
+        split.close()
