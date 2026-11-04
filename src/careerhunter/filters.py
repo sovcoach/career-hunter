@@ -27,6 +27,7 @@ excluded it. The word "weekends" on its own does neither.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -282,7 +283,11 @@ def _strings(value: object) -> list[str]:
 
 
 def _fold(value: str) -> str:
-    return _FOLD.sub(" ", value.casefold()).strip()
+    """NFKC, so composed and decomposed accents and ligatures compare alike; then case,
+    then NFKC again, because casefolding can leave a string that is not normalized
+    ("İ" becomes "i" and a combining dot); then runs of separators as one space."""
+    folded = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", value).casefold())
+    return _FOLD.sub(" ", folded).strip()
 
 
 def _same(left: str, right: str) -> bool:
@@ -296,3 +301,37 @@ def _has(haystack: str, needle: str) -> bool:
 
 def _any(haystack: str, needle: object) -> bool:
     return any(_has(haystack, item) for item in _strings(needle))
+
+
+def has_phrase(text: str, phrase: str) -> bool:
+    """True when `phrase` appears in `text` as whole words, ignoring case.
+
+    Both sides are folded the same way as every other match here: NFKC, case, then runs
+    of spaces, underscores, hyphens and dashes become one space, so "Vice President"
+    matches "Vice-President". A match must have no letter, digit or combining mark
+    directly before or after it: "Lead" matches "Team Lead" and "(Lead)", not "Leader",
+    "Misleading", or "Lead" with an accent mark on its last letter. Punctuation inside
+    the phrase is kept, so "Sr." matches "Sr. Manager". A blank phrase matches nothing.
+    """
+    needle = _fold(phrase)
+    if not needle:
+        return False
+    haystack = _fold(text)
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        if not _in_word(haystack, start - 1) and not _in_word(haystack, end):
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _in_word(text: str, index: int) -> bool:
+    """Whether the character at `index` is a letter, a digit or a combining mark.
+
+    Python's \\w leaves combining marks out, so a decomposed accent would otherwise
+    end a word.
+    """
+    if not 0 <= index < len(text):
+        return False
+    return unicodedata.category(text[index])[0] in "LNM"
