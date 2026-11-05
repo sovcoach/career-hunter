@@ -144,7 +144,7 @@ def watched(
 def test_board_url_is_built_only_from_a_safe_slug() -> None:
     assert (
         w.board_url("greenhouse", "examplerobotics")
-        == "https://boards-api.greenhouse.io/v1/boards/examplerobotics/jobs"
+        == "https://boards-api.greenhouse.io/v1/boards/examplerobotics/jobs?content=true"
     )
     assert (
         w.board_url("lever", "samplelogistics")
@@ -156,7 +156,7 @@ def test_board_url_is_built_only_from_a_safe_slug() -> None:
     )
     assert (
         w.board_url("greenhouse", "example-robotics_1")
-        == "https://boards-api.greenhouse.io/v1/boards/example-robotics_1/jobs"
+        == "https://boards-api.greenhouse.io/v1/boards/example-robotics_1/jobs?content=true"
     )
     assert w.board_url("workday", "example") is None
     assert w.board_url("icims", "example") is None
@@ -929,9 +929,11 @@ def test_watch_command_records_the_example_boards_without_a_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
+    caps: list[object] = []
 
-    def fake(board: str, **_kw: object) -> Fetched:
+    def fake(board: str, **kw: object) -> Fetched:
         calls.append(board)
+        caps.append(kw.get("max_bytes"))
         if board == url("greenhouse", "examplerobotics"):
             return fetched(one_greenhouse("examplerobotics"))
         if board == url("lever", "samplelogistics"):
@@ -964,6 +966,7 @@ def test_watch_command_records_the_example_boards_without_a_socket(
         "watch: 2 boards fetched, 0 failed, 0 left\n"
     )
     assert calls == [url("greenhouse", "examplerobotics"), url("lever", "samplelogistics")]
+    assert caps == [w.BOARD_MAX_BYTES, w.BOARD_MAX_BYTES]  # the board cap, not a job ad's
     conn = db.connect(inited / "search.db")
     try:
         assert_untouched(conn, DataDir(root=inited, mount_point=inited))

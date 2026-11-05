@@ -19,6 +19,11 @@ not cause a skip.
 
 The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
 one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
+Greenhouse is fetched with `content=true`, so every gate sees its descriptions; the
+HTML is turned into text with the standard library (`htmltext.py`). A description is
+held in memory for the filter and the scoring prompt, and never stored. A board body
+over BOARD_MAX_BYTES logs `board over the size cap (...); nothing recorded`, stores
+nothing from that board, and counts as failed. Nothing is cut to fit.
 
 One company's failure does not stop the run. An exception while handling one board, or
 one row of the recheck or scoring pass, or the embedding refresh, is rolled back and
@@ -89,11 +94,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Self, SupportsIndex
 
-from careerhunter import db, filters, lanes, search_store
+from careerhunter import db, filters, htmltext, lanes, search_store
 from careerhunter.config import off_lane_min_fit, tier_fits
 from careerhunter.deadline import Deadline
 from careerhunter.embed import Embedder, miss_line
-from careerhunter.fetch import Fetched, FetchError, FetchTimeout
+from careerhunter.fetch import Fetched, FetchError, FetchTimeout, FetchTooLarge
 from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
 from careerhunter.resume import Resume
@@ -107,6 +112,9 @@ OnCrash = Callable[[str, Exception], None]
 Tally = Literal["fetched", "failed", "left"]
 
 RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
+# The body cap for one board. Greenhouse boards carry every description (content=true),
+# so this is larger than a job ad's cap. The CLI passes it to the fetcher.
+BOARD_MAX_BYTES = 20 * 1024 * 1024
 # Inline scoring of new postings stops once less than this is left of the budget.
 SCORE_RESERVE = 240.0
 _LEFT = "run budget reached; left for the next run"
@@ -251,7 +259,7 @@ def board_url(ats_type: str, slug: str) -> str | None:
     if ats_type not in _BOARDS or _SLUG.fullmatch(slug) is None:
         return None
     if ats_type == "greenhouse":
-        return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+        return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
     if ats_type == "lever":
         return f"https://api.lever.co/v0/postings/{slug}?mode=json"
     return f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
@@ -658,6 +666,10 @@ def _fetch_jobs(
         if isinstance(exc, FetchTimeout) and state.out_of_time():
             lines.append(_line(name, ats, _LEFT))
             return _Left()
+        if isinstance(exc, FetchTooLarge):
+            # Nothing from the board is stored, and nothing is cut to fit.
+            lines.append(_line(name, ats, f"board over the size cap ({exc}); nothing recorded"))
+            return _Failed("FetchTooLarge")
         kind = type(exc).__name__
         lines.append(_line(name, ats, f"{kind}; nothing recorded"))
         return _Failed(kind)
@@ -1117,7 +1129,16 @@ def _greenhouse_job(item: object, slug: str) -> _Job | _Skip:
         or _built(f"https://boards.greenhouse.io/{slug}/jobs/", job.get("id")),
         requisition_id=_text(job.get("requisition_id")),
         company_field=_text(job.get("company_name")),
+        description=_greenhouse_text(job.get("content")),
     )
+
+
+def _greenhouse_text(content: object) -> str | None:
+    """`content` (with `?content=true`) is entity-escaped HTML; plain text, or None."""
+    text = _text(content)
+    if text is None:
+        return None
+    return htmltext.to_text(text, escaped=True) or None
 
 
 def _lever_job(item: object, slug: str) -> _Job | _Skip:
