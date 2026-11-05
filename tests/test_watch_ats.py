@@ -363,3 +363,175 @@ def test_a_too_large_detail_is_never_partly_recorded(search: sqlite3.Connection)
     lines = w.run(search, [SR], today=DAY, fetcher=Scripted(routes(board)))
     assert stored(search) == []
     assert any("board over the size cap" in line for line in lines)
+
+
+# --- BambooHR --------------------------------------------------------------------------
+
+BH_SLUG = "examplerobotics"
+BH = company("Example Robotics", "bamboohr", BH_SLUG)
+BH_LIST = f"https://{BH_SLUG}.bamboohr.com/careers/list"
+
+
+def bh_detail(ident: str) -> str:
+    return f"https://{BH_SLUG}.bamboohr.com/careers/{ident}/detail"
+
+
+def bh_job(
+    ident: str,
+    *,
+    title: str = "Operations Coordinator",
+    city: str = "Example City",
+    state: str | None = None,
+    country: str | None = None,
+) -> dict[str, object]:
+    """One list row, in the careers list's own fields."""
+    return {
+        "id": ident,
+        "jobOpeningName": title,
+        "departmentId": "12",
+        "departmentLabel": "Operations",
+        "employmentStatusLabel": "Full-Time",
+        "location": {"city": city or None, "state": state},
+        "atsLocation": {"country": country, "state": None, "province": None, "city": None},
+        "isRemote": None,
+        "locationType": "0",
+    }
+
+
+def bh_list(rows: list[dict[str, object]]) -> dict[str, object]:
+    return {"meta": {"totalCount": len(rows)}, "result": rows}
+
+
+def bh_opening(description: str, pay: str | None = None) -> dict[str, object]:
+    html = f"<p>{description}</p>" + (f"<p>{pay}</p>" if pay else "")
+    return {
+        "meta": {},
+        "result": {
+            "formFields": {},
+            "jobOpening": {
+                "jobOpeningName": "Operations Coordinator",
+                "description": html,
+                "datePosted": "2026-10-30",
+                "location": {"city": "Example City", "state": None},
+                "jobOpeningShareUrl": f"https://{BH_SLUG}.bamboohr.com/careers/41",
+                "compensation": None,
+            },
+        },
+    }
+
+
+def bamboohr_board(
+    slug: str,
+    *,
+    title: str = "Operations Coordinator",
+    location: str = "Example City",
+    model: str = "onsite",
+    description: str = "A friendly team.",
+    pay: str | None = None,
+) -> dict[str, object]:
+    """A one-posting board: its list and its detail, by URL. BambooHR gives no work model."""
+    assert slug == BH_SLUG
+    return {
+        BH_LIST: bh_list([bh_job("41", title=title, city=location)]),
+        bh_detail("41"): bh_opening(description, pay),
+    }
+
+
+def test_bamboohr_list_then_details_are_parsed(search: sqlite3.Connection) -> None:
+    board = {
+        BH_LIST: bh_list(
+            [
+                bh_job("41"),
+                bh_job("42", city="Example Town", state="Example State", country="Exampleland"),
+            ]
+        ),
+        bh_detail("41"): bh_opening("A friendly team."),
+        bh_detail("42"): bh_opening("A friendly team."),
+    }
+    fetcher = Scripted(routes(board))
+    lines = w.run(search, [BH], today=DAY, fetcher=fetcher)
+    assert fetcher.calls == [BH_LIST, bh_detail("41"), bh_detail("42")]
+    assert stored(search) == [
+        (
+            "Operations Coordinator",
+            "Example City",
+            None,
+            f"https://{BH_SLUG}.bamboohr.com/careers/41",
+            "41",
+        ),
+        (
+            "Operations Coordinator",
+            "Example Town, Example State, Exampleland",
+            None,
+            f"https://{BH_SLUG}.bamboohr.com/careers/42",
+            "42",
+        ),
+    ]
+    assert lines[-1] == "watch: 1 boards fetched, 0 failed, 0 left"
+
+
+def test_bamboohr_stored_postings_get_no_detail_request(search: sqlite3.Connection) -> None:
+    w.run(search, [BH], today=DAY, fetcher=Scripted(routes(bamboohr_board(BH_SLUG))))
+    again = Scripted(routes({BH_LIST: bh_list([bh_job("41")])}))
+    w.run(search, [BH], today=DAY, fetcher=again)
+    assert again.calls == [BH_LIST]
+
+
+def test_an_unknown_bamboohr_company_is_a_bad_reply_and_stores_nothing(
+    search: sqlite3.Connection,
+) -> None:
+    """BambooHR sends an unknown company to its own site; that page is not JSON."""
+    page = fetched(body=b"<html>synthetic marketing page</html>")
+    lines = w.run(search, [BH], today=DAY, fetcher=Scripted({BH_LIST: page}))
+    assert ("watch: Example Robotics (bamboohr): HTTP 200, invalid JSON; nothing recorded") in lines
+    assert lines[-1] == "watch: 0 boards fetched, 1 failed, 0 left"
+    assert search.execute("SELECT count(*) FROM companies").fetchone()[0] == 0
+
+
+def test_bad_bamboohr_payloads_log_and_store_nothing(search: sqlite3.Connection) -> None:
+    for body in ({"meta": {}}, {"result": {"id": "41"}}, [1]):
+        lines = w.run(search, [BH], today=DAY, fetcher=Scripted(routes({BH_LIST: body})))
+        assert (
+            "watch: Example Robotics (bamboohr): HTTP 200, unexpected JSON shape; nothing recorded"
+        ) in lines
+    board = {BH_LIST: bh_list([bh_job("41")]), bh_detail("41"): {"result": {}}}
+    lines = w.run(search, [BH], today=DAY, fetcher=Scripted(routes(board)))
+    assert (
+        "watch: Example Robotics (bamboohr): 'Operations Coordinator': detail unexpected "
+        "JSON shape; not recorded"
+    ) in lines
+    assert stored(search) == []
+
+
+def test_bad_bamboohr_rows_are_skip_lines(search: sqlite3.Connection) -> None:
+    rows: list[object] = ["x", {"id": "43"}, {"jobOpeningName": "No Id", "id": "a/b"}]
+    lines = w.run(search, [BH], today=DAY, fetcher=Scripted(routes({BH_LIST: {"result": rows}})))
+    who = "watch: Example Robotics (bamboohr): "
+    assert f"{who}a job was not an object; skipped" in lines
+    assert f"{who}a job has no title; skipped" in lines
+    assert f"{who}'No Id' has no usable id; skipped" in lines
+
+
+def test_a_bamboohr_slug_must_be_one_dns_label(search: sqlite3.Connection) -> None:
+    assert ats.board_url("bamboohr", "example_robotics") is None
+    assert ats.board_url("bamboohr", "-example") is None
+    lines = w.run(
+        search,
+        [company("Example Robotics", "bamboohr", "example_robotics")],
+        today=DAY,
+        fetcher=Scripted({}),
+    )
+    assert (
+        "watch: Example Robotics (bamboohr): ats_slug is not a single path segment; skipped"
+    ) in lines
+
+
+def test_a_bamboohr_board_over_the_cap_as_a_whole_stores_nothing(
+    search: sqlite3.Connection, monkeypatch: Any
+) -> None:
+    board = routes(bamboohr_board(BH_SLUG))
+    sizes = [len(reply.body) for reply in board.values() if isinstance(reply, Fetched)]
+    monkeypatch.setattr(ats, "BOARD_MAX_BYTES", sum(sizes) - 1)
+    lines = w.run(search, [BH], today=DAY, fetcher=Scripted(board))
+    assert any("board over the size cap" in line for line in lines)
+    assert stored(search) == []

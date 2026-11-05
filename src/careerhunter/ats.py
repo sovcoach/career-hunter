@@ -46,8 +46,10 @@ DETAIL_LIMIT = 40
 MAX_PAGES = 25
 SMARTRECRUITERS_PAGE = 100
 
-BOARDS = ("greenhouse", "lever", "ashby", "smartrecruiters")
+BOARDS = ("greenhouse", "lever", "ashby", "smartrecruiters", "bamboohr")
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
+# A BambooHR slug is the company's subdomain: one DNS label.
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 # The public postings API says "on-site"; the hire API says "onsite".
 _LEVER_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite", "on-site": "onsite"}
 _ASHBY_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite"}
@@ -141,6 +143,10 @@ def board_url(ats_type: str, slug: str) -> str | None:
     """The (first) list URL for one board, built only from a single safe path segment."""
     if ats_type not in BOARDS or _SLUG.fullmatch(slug) is None:
         return None
+    if ats_type == "bamboohr":
+        if _HOST_LABEL.fullmatch(slug) is None:
+            return None
+        return f"https://{slug}.bamboohr.com/careers/list"
     if ats_type == "greenhouse":
         return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
     if ats_type == "lever":
@@ -175,12 +181,15 @@ def read(
     url = board_url(board.ats, board.slug)
     if url is None:
         raise BoardParseError("not a board this module reads")
+    limit = DETAIL_LIMIT if detail_limit is None else detail_limit
     if board.ats == "smartrecruiters":
         stubs, notes = _smartrecruiters_list_pages(board.slug, client)
-        limit = DETAIL_LIMIT if detail_limit is None else detail_limit
         found = _with_details(stubs, client, known, limit, _smartrecruiters_detail)
         found.notes[:0] = notes
         return found
+    if board.ats == "bamboohr":
+        stubs = _bamboohr_list(board.slug, client.get_json(url))
+        return _with_details(stubs, client, known, limit, _bamboohr_detail)
     return BoardRead(_parse(board.ats, board.slug, client.get_json(url)))
 
 
@@ -326,6 +335,69 @@ def _smartrecruiters_detail(stub: Job, data: object) -> Job:
     # The posting URL stays the one built from the list, so the next run knows it is
     # stored without asking for its detail again.
     return replace(stub, description=_joined(parts), detail_url=None)
+
+
+# --- BambooHR ---------------------------------------------------------------------------
+# The public careers site of each company, checked against a live public board (BambooHR
+# documents no public careers API; its documented job API needs credentials):
+# GET https://{company}.bamboohr.com/careers/list answers {meta, result}, each job with
+# id (a string), jobOpeningName, location {city, state}, atsLocation {country, state,
+# province, city}, isRemote and locationType. The list has no description: GET
+# /careers/{id}/detail has result.jobOpening with description (HTML), datePosted and
+# jobOpeningShareUrl. The posting page is https://{company}.bamboohr.com/careers/{id}.
+# What isRemote and the locationType codes mean could not be verified, so no work model
+# is read. An unknown company is redirected to BambooHR's own site, which is not JSON.
+
+
+def _bamboohr_list(slug: str, data: object) -> list[Job | Skip]:
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, list):
+        raise BoardParseError("unexpected JSON shape")
+    return [_bamboohr_job(item, slug) for item in result]
+
+
+def _bamboohr_job(item: object, slug: str) -> Job | Skip:
+    job = _mapping(item)
+    if job is None:
+        return Skip("a job was not an object")
+    title = _text(job.get("jobOpeningName"))
+    if title is None:
+        return Skip("a job has no title")
+    ident = _path_id(job.get("id"))
+    if ident is None:
+        return Skip(f"{title!r} has no usable id")
+    return Job(
+        title=title,
+        location=_bamboohr_place(job),
+        work_model=None,
+        url=f"https://{slug}.bamboohr.com/careers/{ident}",
+        requisition_id=ident,
+        company_field=None,
+        detail_url=f"https://{slug}.bamboohr.com/careers/{ident}/detail",
+    )
+
+
+def _bamboohr_place(job: dict[str, Any]) -> str:
+    """City and state, then the country when the ATS location gives one."""
+    location = _mapping(job.get("location")) or {}
+    ats_location = _mapping(job.get("atsLocation")) or {}
+    parts = [
+        _text(location.get("city")) or _text(ats_location.get("city")),
+        _text(location.get("state"))
+        or _text(ats_location.get("state"))
+        or _text(ats_location.get("province")),
+        _text(ats_location.get("country")),
+    ]
+    return ", ".join(part for part in parts if part)
+
+
+def _bamboohr_detail(stub: Job, data: object) -> Job:
+    result = _mapping(data.get("result")) if isinstance(data, dict) else None
+    opening = _mapping(result.get("jobOpening")) if result is not None else None
+    if opening is None:
+        raise BoardParseError("unexpected JSON shape")
+    html = _text(opening.get("description"))
+    return replace(stub, description=htmltext.to_text(html) if html else None, detail_url=None)
 
 
 def _parse(ats: str, slug: str, data: object) -> list[Job | Skip]:

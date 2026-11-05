@@ -9,7 +9,7 @@ import pytest
 from careerhunter import watch as w
 from careerhunter.fetch import FetchTooLarge
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, url
-from tests.test_watch_ats import smartrecruiters_board
+from tests.test_watch_ats import bamboohr_board, smartrecruiters_board
 
 GREENHOUSE = company("Example Robotics", "greenhouse", "examplerobotics")
 
@@ -92,7 +92,8 @@ def _board(
 ) -> tuple[dict[str, object], dict[str, object]]:
     """One job on a board of `ats`, in that board's own fields, and every URL the board
     is read from with its payload. `pay` goes where that board keeps pay: Greenhouse
-    content, a Lever list, the Ashby salary summary, a SmartRecruiters ad section."""
+    content, a Lever list, the Ashby salary summary, a SmartRecruiters ad section, the
+    BambooHR description."""
     slug = "examplerobotics"
     item = company("Example Robotics", ats, slug)
     if ats == "greenhouse":
@@ -118,6 +119,10 @@ def _board(
         if pay:
             job["lists"] = [{"text": "Compensation", "content": f"<li>{pay}</li>"}]
         return item, {url(ats, slug): [job]}
+    if ats == "bamboohr":
+        return item, bamboohr_board(
+            slug, title=title, location=location, model=model, description=description, pay=pay
+        )
     if ats == "smartrecruiters":
         return item, smartrecruiters_board(
             slug, title=title, location=location, model=model, description=description, pay=pay
@@ -150,7 +155,7 @@ def _reason(conn: sqlite3.Connection, ats: str, config: object = None, **job: st
     return reasons[0] if reasons else None
 
 
-ATS = ("greenhouse", "lever", "ashby", "smartrecruiters")
+ATS = ("greenhouse", "lever", "ashby", "smartrecruiters", "bamboohr")
 GATE_CASES: dict[str, tuple[dict[str, str], str | None]] = {
     "kept": ({}, None),
     "description_keyword": ({"description": "An unpaid trial week."}, "excluded_description"),
@@ -198,6 +203,8 @@ def test_seniority_in_the_description_runs_on_every_ats(
         ("lever", {"location": "Other Region", "model": "remote"}, "location_rule"),
         ("ashby", {"location": "Other Region", "model": "remote"}, "location_rule"),
         ("greenhouse", {"location": "Remote - Example Region"}, None),
+        ("bamboohr", {"location": "Remote - Other Region"}, "location_rule"),
+        ("bamboohr", {"location": "Remote - Example Region"}, None),
         ("lever", {"location": "Example Region", "model": "remote"}, None),
         ("ashby", {"location": "Example Region", "model": "remote"}, None),
         ("smartrecruiters", {"location": "Other Region", "model": "remote"}, "location_rule"),
@@ -207,8 +214,10 @@ def test_seniority_in_the_description_runs_on_every_ats(
         # Hybrid is checked like on-site.
         ("lever", {"location": "Other City", "model": "hybrid"}, "location_rule"),
         ("ashby", {"location": "Other City", "model": "hybrid"}, "location_rule"),
-        # Blank location: Greenhouse has no work model, so it is empty; the others give one.
+        # Blank location: Greenhouse and BambooHR give no work model, so it is empty; the
+        # others give one.
         ("greenhouse", {"location": ""}, "empty_location"),
+        ("bamboohr", {"location": ""}, "empty_location"),
         ("lever", {"location": "", "model": "remote"}, None),
         ("ashby", {"location": "", "model": "remote"}, None),
     ],

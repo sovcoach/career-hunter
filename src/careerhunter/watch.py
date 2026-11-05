@@ -1,7 +1,7 @@
 """Fetch ATS boards, filter the new postings, then score them.
 
 One `careerhunter watch` run reads the watchlist and fetches its Greenhouse, Lever,
-Ashby and SmartRecruiters boards, one company after another, through `fetch.py`. It
+Ashby, SmartRecruiters and BambooHR boards, one company after another, through `fetch.py`. It
 also fetches companies stored with `source` discovery and `watchlist` 1 when the ATS
 type is one of those and the slug is one path segment. A seeded watchlist row with
 any other source is not fetched by that extra path. It writes companies, postings,
@@ -26,7 +26,7 @@ stored. A board whose replies together pass BOARD_MAX_BYTES logs `board over the
 cap (...); nothing recorded`, stores nothing from that board, and counts as failed.
 Nothing is cut to fit.
 
-A SmartRecruiters list has no descriptions, so each posting not stored yet gets one
+A SmartRecruiters or BambooHR list has no descriptions, so each posting not stored yet gets one
 detail request, at most `ats.DETAIL_LIMIT` per board per run; the rest are logged and
 left out, to be read as new next run. A detail that answers with another status or a
 bad body leaves out that posting only. A fetch error or HTTP 429 on a detail stops
