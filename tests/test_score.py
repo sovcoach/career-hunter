@@ -596,3 +596,89 @@ def test_the_copy_check_only_applies_with_a_resume() -> None:
 
 def test_normalization_is_nfkc_casefold_and_single_spaces() -> None:
     assert normalized("  \uff21very\u00a0\t EXAMPLE\nLtd  ") == "avery example ltd"
+
+
+# --- key requirements (#39) ----------------------------------------------------------------
+
+
+def requirements(content: object, resume: Resume | None = None) -> tuple[str, ...]:
+    text = content if isinstance(content, str) else json.dumps(content)
+    result = score_posting(
+        posting(), RUBRIC, transport=lambda url, body: reply(text), resume=resume
+    )
+    assert result is not None  # requirements never make a reply unparseable
+    return result.key_requirements
+
+
+def test_the_prompt_asks_for_requirements_apart_from_the_gaps() -> None:
+    seen: dict[str, bytes] = {}
+
+    def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        seen["body"] = payload
+        return reply('{"gaps":[]}')
+
+    score_posting(posting(), RUBRIC, transport=transport)
+    system = json.loads(seen["body"])["messages"][0]["content"]
+    assert '"requirements":["..."]' in system and "up to three" in system
+
+
+def test_up_to_three_requirements_are_kept_cleaned_and_deduplicated() -> None:
+    found = requirements(
+        {
+            "gaps": [],
+            "requirements": [
+                "  Forklift\nlicence ",
+                "forklift   LICENCE",  # the same phrase again
+                "Weekend\x07 availability",
+                42,
+                "",
+                "Valid driver's licence",
+                "A fourth one",
+            ],
+        }
+    )
+    assert found == ("Forklift licence", "Weekend availability", "Valid driver's licence")
+
+
+def test_a_long_requirement_is_cut_at_a_word() -> None:
+    long = "Experience coordinating inbound and outbound freight across several sites"
+    (found,) = requirements({"gaps": [], "requirements": [long]})
+    assert len(found) <= scoring.MAX_REQUIREMENT and found.endswith("…")
+    assert found == "Experience coordinating inbound and outbound freight…"
+
+
+@pytest.mark.parametrize("value", [None, "Forklift licence", {"a": 1}, [None], []], ids=repr)
+def test_a_missing_or_malformed_list_gives_none_and_keeps_the_score(value: object) -> None:
+    payload: dict[str, object] = {"gaps": []}
+    if value is not None:
+        payload["requirements"] = value
+    assert requirements(payload) == ()
+
+
+def test_a_requirement_that_names_a_gap_is_dropped() -> None:
+    found = requirements(
+        {
+            "gaps": [{"name": "Class 1 licence", "kind": "minor"}],
+            "requirements": ["A valid CLASS 1 licence", "Bilingual service", "Class 1"],
+        }
+    )
+    # "Class 1" alone does not contain the gap name, so it is posting text and stays.
+    assert found == ("Bilingual service", "Class 1")
+
+
+def test_a_requirement_that_copies_the_resume_is_dropped() -> None:
+    resume = Resume(
+        text="Avery Example. Coordinated forty warehouse staff across two night shifts.",
+        sha256="0" * 64,
+    )
+    found = requirements(
+        {
+            "gaps": [],
+            "requirements": [
+                "Coordinated forty warehouse staff across two night shifts",
+                "Forklift licence",
+            ],
+        },
+        resume=resume,
+    )
+    assert found == ("Forklift licence",)
