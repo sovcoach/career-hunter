@@ -43,11 +43,33 @@ stops once less than SCORE_RESERVE seconds of the budget are left, so the passes
 the boards always get time. A stored posting on a fetched board whose score was made
 with another resume (or none) is queued for re-scoring with its description, which
 stays in memory only. After the boards, under the budget, come never-scored postings,
-then the queued re-scores, then re-scores from the stored fields. Within each pass the
-order is the last score attempt (never-tried first), then the oldest posting, so a
-posting that keeps failing goes behind the others. A posting with a skip or an
-application keeps its score and is not re-scored. An alerted posting is re-scored and
-not alerted again. A failed re-score keeps the old score and hash.
+then the queued re-scores, then re-scores from the stored fields. Never-scored postings
+go first come, first served: by the last score attempt, or by when the posting was
+stored (`created_at`) if it was never tried, then by id. A posting that keeps failing
+goes behind what was stored before its last attempt, and new arrivals can't push it
+back forever. Within each re-score pass the order is the last score attempt
+(never-tried first), then the oldest posting. A posting with a skip or an application
+keeps its score and is not re-scored. An alerted posting is re-scored and not alerted
+again. A failed re-score keeps the old score, fit and hash.
+
+The fit. A score stores the fit of its tier, from that tier's `fit` key in config
+(`config.tier_fits`), in the same UPDATE as the score. A tier name that is not in
+config gets no fit, so that posting is held. Every run first fills in the fit of
+scored, unalerted postings stored without one, by their stored tier name.
+
+Lanes (#33). With `search.lanes` set, a posting's title is checked against the lanes
+when it is stored, skipped ones included, and the best-priority lane that matches is
+stored with it, or none (off-lane). Every run then checks any posting not yet checked,
+from any source, so postings stored before lanes existed get theirs. Both writes are
+set once (`... WHERE lane_checked = 0`). A changed lane list does not move a posting
+already checked. An off-lane posting is still gated and scored like any other. Without
+`search.lanes`, nothing is checked and no posting is off-lane.
+
+The run record. Each run writes a `watch_runs` row when it starts, in its own
+transaction, and finishes it just before the last line: the board counts, whether the
+budget left anything for the next run, and the postings still held (unscored, scored
+with no fit, off-lane), read from search.db at that moment. A run that crashes, is
+killed or stops on a database error never finishes its row, so its counts stay null.
 
 A model that does not answer (ScoreError) stops all scoring for the rest of the run;
 the posting it happened on keeps its place, and one line counts what is left. A reply
@@ -67,7 +89,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Self, SupportsIndex
 
-from careerhunter import db, filters, search_store
+from careerhunter import db, filters, lanes, search_store
+from careerhunter.config import off_lane_min_fit, tier_fits
 from careerhunter.deadline import Deadline
 from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout
@@ -163,7 +186,10 @@ class _State:
     inserted: set[int] = field(default_factory=set)
     attempted: set[int] = field(default_factory=set)  # sent to the scorer this run
     resume: Resume | None = None
+    fits: Mapping[str, str] = field(default_factory=dict)  # tier name -> fit, from config
+    lanes_on: bool = False  # search.lanes is set: titles are checked against the lanes
     model_down: bool = False
+    budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
     # reserve left for the passes after the boards. Never written anywhere.
     queued: dict[int, PostingText] = field(default_factory=dict)
@@ -171,6 +197,11 @@ class _State:
 
     def out_of_time(self) -> bool:
         return self.budget is not None and self.budget.expired()
+
+    def left_by_budget(self, line: str) -> None:
+        """Log what the budget left for the next run, and remember that it did."""
+        self.budget_cut = True
+        self.lines.append(line)
 
     def in_reserve(self) -> bool:
         return self.budget is not None and self.budget.remaining() < SCORE_RESERVE
@@ -260,8 +291,17 @@ def run(
         budget=budget,
         now=now or _utc_now,
         resume=resume,
+        fits=tier_fits(rules),
+        lanes_on=lanes.configured(rules) is not None,
     )
     lines = state.lines
+    with db.transaction(conn):
+        run_id = search_store.start_watch_run(conn, _iso(state.now()))
+    with _isolated(conn, lines, "fit fill-in", state.hook):
+        _fill_fits(conn, state)
+    if state.lanes_on:
+        with _isolated(conn, lines, "lane fill-in", state.hook):
+            _fill_lanes(conn, state, rules)
     if scorer is not None and resume_problem is not None:
         lines.append(f"watch: scoring: resume not usable ({resume_problem}); left for the next run")
         scorer = None
@@ -297,21 +337,22 @@ def run(
             counts[tally] += 1
     if embedder.enabled():
         if state.out_of_time():
-            lines.append(f"watch: embedding refresh: {_LEFT}")
+            state.left_by_budget(f"watch: embedding refresh: {_LEFT}")
         else:
             with _isolated(conn, lines, "embedding refresh", state.hook):
                 lines.extend(embedder.refresh())
     rechecked = False
     if state.out_of_time():
-        lines.append(f"watch: recheck: {_LEFT}")
+        state.left_by_budget(f"watch: recheck: {_LEFT}")
     else:
         rechecked = _recheck(conn, watchlist, rules, skipped, today, state)
     if scorer is not None:
         if not rechecked or state.out_of_time():
             # Never score a row the current config has not filtered again.
-            lines.append(f"watch: scoring: {_LEFT}")
+            state.left_by_budget(f"watch: scoring: {_LEFT}")
         else:
             _score_passes(conn, scorer, today, embedder, state)
+    _finish_run(conn, state, run_id, counts, rules)
     lines.append(
         f"watch: {counts['fetched']} boards fetched, {counts['failed']} failed, "
         f"{counts['left']} left"
@@ -321,6 +362,57 @@ def run(
 
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+def _finish_run(
+    conn: sqlite3.Connection,
+    state: _State,
+    run_id: int,
+    counts: Mapping[str, int],
+    config: Mapping[str, Any],
+) -> None:
+    """Finish this run's `watch_runs` row with its counts and the postings still held.
+
+    The held counts are read from search.db now, so they are true for a run the budget
+    cut short too. A run that never gets here keeps its row unfinished, with no counts.
+    """
+    min_fit = off_lane_min_fit(config) if state.lanes_on else None
+    with db.transaction(conn):
+        held = search_store.held_counts(conn, off_lane_min_fit=min_fit)
+        search_store.finish_watch_run(
+            conn,
+            run_id,
+            finished_at=_iso(state.now()),
+            budget_reached=state.budget_cut or counts["left"] > 0,
+            boards_fetched=counts["fetched"],
+            boards_failed=counts["failed"],
+            boards_left=counts["left"],
+            held=held,
+        )
+
+
+def _fill_lanes(conn: sqlite3.Connection, state: _State, config: Mapping[str, Any]) -> None:
+    """Check every posting not yet checked against the lanes. Safe to run twice."""
+    with db.transaction(conn):
+        filled = sum(
+            search_store.set_posting_lane(conn, posting_id, _lane_name(title, config))
+            for posting_id, title in search_store.unchecked_lane_titles(conn)
+        )
+    if filled:
+        state.lines.append(f"watch: lanes filled in from config for {filled} postings")
+
+
+def _lane_name(title: str, config: Mapping[str, Any]) -> str | None:
+    found = lanes.match(title, config)
+    return None if found is None else found.name
+
+
+def _fill_fits(conn: sqlite3.Connection, state: _State) -> None:
+    """Give scored, unalerted postings stored without a fit the fit of their tier name."""
+    with db.transaction(conn):
+        filled = search_store.fill_missing_fits(conn, state.fits)
+    if filled:
+        state.lines.append(f"watch: fit filled in from config for {filled} scored postings")
 
 
 def _board_key(ats: str | None, slug: str | None) -> str | None:
@@ -663,6 +755,8 @@ def _record_jobs(
                     and not search_store.posting_has_skip(conn, posting_id)
                 ):
                     search_store.insert_skip(conn, posting_id, today, verdict.reason)
+                if inserted and state.lanes_on:  # skipped postings get a lane too
+                    search_store.set_posting_lane(conn, posting_id, _lane_name(item.title, config))
         except search_store.IdentityConflict as exc:
             lines.append(
                 _line(name, ats, f"identity conflict on {item.title!r}; continuing: {exc}")
@@ -690,7 +784,7 @@ def _record_jobs(
             continue
         if state.out_of_time():
             # Stored and filtered; the next run scores it from the stored fields.
-            lines.append(
+            state.left_by_budget(
                 _line(name, ats, f"{item.title!r} left for the next run (run budget reached)")
             )
             continue
@@ -735,7 +829,7 @@ def _recheck(
     rows = [row for row in rows if int(row["id"]) not in state.inserted]
     for index, row in enumerate(rows):
         if state.out_of_time():
-            state.lines.append(_partly("recheck", len(rows) - index))
+            state.left_by_budget(_partly("recheck", len(rows) - index))
             return False
         with _isolated(conn, state.lines, str(row["company"]), state.hook):
             _recheck_one(conn, row, roles, config, exclusions, today, state.lines)
@@ -780,14 +874,18 @@ def _recheck_one(
         )
 
 
-# The three scoring queries, written out in full. Within a pass: never-tried first, then
-# the oldest attempt, then the oldest posting.
+# The three scoring queries, written out in full. Never-scored postings are first come,
+# first served: each one waits from its last attempt, or from when it was stored if it
+# was never tried, so a retry stamped at T goes ahead of every posting stored after T
+# and new arrivals can't push it back forever. Both stamps are UTC to the second. The
+# re-score passes keep never-tried first, then the oldest attempt, then the oldest
+# posting.
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
-    "ORDER BY p.score_attempted_at IS NOT NULL, p.score_attempted_at, p.first_seen, p.id"
+    "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
@@ -859,7 +957,7 @@ def _score_passes(
             )
             return
         if state.out_of_time():
-            state.lines.append(_partly("scoring", left))
+            state.left_by_budget(_partly("scoring", left))
             return
         with _isolated(conn, state.lines, str(row["company"]), state.hook):
             _attempt(
@@ -906,7 +1004,9 @@ def _attempt(
         with db.transaction(conn):
             search_store.set_score_attempted_at(conn, posting_id, previous)
         if state.out_of_time():
-            lines.append(_line(name, ats, f"{title} left for the next run (run budget reached)"))
+            state.left_by_budget(
+                _line(name, ats, f"{title} left for the next run (run budget reached)")
+            )
         else:
             state.model_down = True
             kept = "; old score kept" if rescore else ""
@@ -917,6 +1017,7 @@ def _attempt(
         lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
     else:
         metadata = None if result.tier is None else json.dumps({"tier": result.tier})
+        fit = None if result.tier is None else state.fits.get(result.tier)
         with db.transaction(conn):
             search_store.set_posting_score(
                 conn,
@@ -924,6 +1025,7 @@ def _attempt(
                 gaps=result.gaps,
                 llm_output=result.llm_output,
                 scout_metadata=metadata,
+                fit=fit,
                 resume_sha256=state.resume_sha256,
             )
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):

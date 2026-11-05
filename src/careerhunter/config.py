@@ -14,8 +14,12 @@ implemented. `schedule.watcher_interval_minutes` is how often the watch
 LaunchAgent runs, default 60 and at least 15.
 
 - search.lanes: named groups of target titles, by priority, optionally a fallback;
+- search.off_lane_min_fit: the lowest fit (low, medium or high, default high) at which
+  a posting whose title matches no lane still alerts;
 - search.location_rules: places for on-site and hybrid work, regions for remote;
-- fit_rubric.gap_tiers: a rating from the number of missing requirements;
+- fit_rubric.gap_tiers: a rating from the number of missing requirements. Every tier
+  names its fit (low, medium or high), and a boundary outcome takes the fit of the
+  tier it names;
 - hard_gates: language, credential, shift-pattern, pay-structure and seniority gates,
   with title exceptions;
 - schedule_limits: a cap on weekend work, flagged rather than excluded;
@@ -47,19 +51,21 @@ import datetime as dt
 import re
 import urllib.parse
 import zoneinfo
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypeGuard
 
 import yaml
 
 from careerhunter.claims import validate_section
-from careerhunter.enums import ATS_TYPES, WORK_MODELS
+from careerhunter.enums import ATS_TYPES, FIT_LEVELS, WORK_MODELS
 
 DEFAULT_WATCH_INTERVAL_MINUTES = 60
 MIN_WATCH_INTERVAL_MINUTES = 15
 DEFAULT_DISCOVERY_INTERVAL_MINUTES = 1440
 MIN_DISCOVERY_INTERVAL_MINUTES = 60
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
+DEFAULT_OFF_LANE_MIN_FIT = "high"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _CAREER_HOST = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -278,6 +284,7 @@ def _validate_gap_tiers(rubric: Any, problems: list[str]) -> None:
     tiers = rubric.get("tiers")
     names: list[str] = []
     maxes: list[int] = []
+    unmapped: list[str] = []
     if not isinstance(tiers, list) or not tiers:
         problems.append(f"{where}.tiers must be a non-empty list, best tier first")
     else:
@@ -290,6 +297,13 @@ def _validate_gap_tiers(rubric: Any, problems: list[str]) -> None:
                 problems.append(f"{where}.tiers[{i}].max_gaps must be an integer >= 0")
             else:
                 maxes.append(tier["max_gaps"])
+            if tier.get("fit") not in FIT_LEVELS:
+                unmapped.append(tier["name"])
+        if unmapped:
+            problems.append(
+                f"{where}.tiers need fit: {' | '.join(FIT_LEVELS)}; "
+                f"missing or not one of those on {unmapped}"
+            )
         if maxes != sorted(maxes) or len(set(maxes)) != len(maxes):
             problems.append(f"{where}.tiers must be ordered by increasing max_gaps")
         if len(set(names)) != len(names):
@@ -393,6 +407,11 @@ def validate_config(doc: Any) -> list[str]:
             _validate_location_rules(rules, problems)
         if "resume" in search:
             _resume_path(search["resume"], problems)
+        if search.get("off_lane_min_fit", DEFAULT_OFF_LANE_MIN_FIT) not in FIT_LEVELS:
+            problems.append(
+                f"search.off_lane_min_fit must be one of {' | '.join(FIT_LEVELS)} "
+                f"(default {DEFAULT_OFF_LANE_MIN_FIT})"
+            )
 
     gates = _section(doc, "hard_gates", problems)
     extra = set(gates) - _HARD_GATES
@@ -521,6 +540,35 @@ def telegram_chat_id(doc: dict[str, Any]) -> int | None:
     section = doc.get("telegram") or {}
     value = section.get("chat_id")
     return int(value) if value is not None else None
+
+
+def off_lane_min_fit(doc: Mapping[str, Any] | None) -> str:
+    """The lowest fit an off-lane posting needs to alert. `high` when it is not set."""
+    search = doc.get("search") if isinstance(doc, Mapping) else None
+    value = search.get("off_lane_min_fit") if isinstance(search, Mapping) else None
+    return value if isinstance(value, str) and value in FIT_LEVELS else DEFAULT_OFF_LANE_MIN_FIT
+
+
+def tier_fits(doc: Mapping[str, Any] | None) -> dict[str, str]:
+    """Each gap tier's name and its fit, from an already validated config.
+
+    A tier without a valid fit is left out, so a name missing here has no fit. With no
+    gap tiers the mapping is empty.
+    """
+    if not isinstance(doc, Mapping):
+        return {}
+    rubric = doc.get("fit_rubric")
+    gap_tiers = rubric.get("gap_tiers") if isinstance(rubric, dict) else None
+    tiers = gap_tiers.get("tiers") if isinstance(gap_tiers, dict) else None
+    if not isinstance(tiers, list):
+        return {}
+    return {
+        tier["name"]: tier["fit"]
+        for tier in tiers
+        if isinstance(tier, dict)
+        and isinstance(tier.get("name"), str)
+        and tier.get("fit") in FIT_LEVELS
+    }
 
 
 _UTC_OFFSET = re.compile(r"UTC(?:([+-])(\d{1,2})(?::([0-5]\d))?)?")

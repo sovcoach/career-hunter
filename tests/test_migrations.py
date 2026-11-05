@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": [1, 2, 3, 4, 5, 6, 7, 8], "ei_record": [1]}[track]
+    expected = {"search": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -502,11 +502,60 @@ def test_0008_keeps_existing_postings_and_leaves_them_unstamped(tmp_path: Path) 
             "VALUES (?, 'Coordinator', '2026-10-01', 'watcher', '[]', 'text')",
             (company,),
         )
-        assert db.migrate(conn, "search") == [8]
+        assert db.migrate(conn, "search", db.load_migrations("search")[:8]) == [8]
         row = conn.execute(
             "SELECT title, llm_output, scored_resume_sha256, score_attempted_at FROM postings"
         ).fetchone()
         assert tuple(row) == ("Coordinator", "text", None, None)
         assert conn.execute("SELECT count(*) FROM resume_import").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_0009_keeps_scored_postings_and_leaves_their_fit_null(tmp_path: Path) -> None:
+    """A schema-8 file with a scored posting moves to 9 with no fit and no runs."""
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        assert db.migrate(conn, "search", db.load_migrations("search")[:8]) == list(range(1, 9))
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source, gaps, llm_output, "
+            "scout_metadata) VALUES (?, 'Coordinator', '2026-10-01', 'watcher', '[]', 'text', "
+            '\'{"tier": "strong"}\')',
+            (company,),
+        )
+        assert db.migrate(conn, "search", db.load_migrations("search")[:9]) == [9]
+        row = conn.execute("SELECT title, scout_metadata, fit FROM postings").fetchone()
+        assert tuple(row) == ("Coordinator", '{"tier": "strong"}', None)
+        assert conn.execute("SELECT count(*) FROM watch_runs").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_0010_leaves_every_existing_posting_unchecked(tmp_path: Path) -> None:
+    """A schema-9 file moves to 10 with no lane and lane_checked 0, skipped ones too."""
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        assert db.migrate(conn, "search", db.load_migrations("search")[:9]) == list(range(1, 10))
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        for title in ("Coordinator", "Skipped Coordinator"):
+            conn.execute(
+                "INSERT INTO postings (company_id, title, first_seen, source) "
+                "VALUES (?, ?, '2026-10-01', 'watcher')",
+                (company, title),
+            )
+        conn.execute(
+            "INSERT INTO skips (posting_id, date, reason) VALUES (2, '2026-10-01', 'manual')"
+        )
+        assert db.migrate(conn, "search") == [10]
+        rows = conn.execute("SELECT title, lane, lane_checked FROM postings ORDER BY id")
+        assert [tuple(row) for row in rows] == [
+            ("Coordinator", None, 0),
+            ("Skipped Coordinator", None, 0),
+        ]
     finally:
         conn.close()

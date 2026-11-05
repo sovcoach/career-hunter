@@ -345,6 +345,79 @@ def test_new_posting_columns_start_null(search: sqlite3.Connection) -> None:
     )
 
 
+def test_fit_takes_the_three_levels_only(search: sqlite3.Connection) -> None:
+    p = _posting(search, _company(search))
+    assert search.execute("SELECT fit FROM postings WHERE id = ?", (p,)).fetchone()[0] is None
+    for level in enums.FIT_LEVELS:
+        search.execute("UPDATE postings SET fit = ? WHERE id = ?", (level, p))
+    search.execute("UPDATE postings SET fit = NULL WHERE id = ?", (p,))
+    for bad in ("High", "great", "", "strong"):
+        with pytest.raises(sqlite3.IntegrityError):
+            search.execute("UPDATE postings SET fit = ? WHERE id = ?", (bad, p))
+
+
+_COUNTS = (
+    "boards_fetched",
+    "boards_failed",
+    "boards_left",
+    "held_unscored",
+    "held_no_fit",
+    "held_off_lane",
+)
+
+
+def _finish(search: sqlite3.Connection, run: int, **cols: object) -> None:
+    values: dict[str, object] = {"finished_at": "2026-11-04T12:09:00Z", "budget_reached": 0}
+    values |= dict.fromkeys(_COUNTS, 0)
+    values |= cols
+    assignments = ", ".join(f"{key} = :{key}" for key in values)
+    search.execute(
+        f"UPDATE watch_runs SET {assignments} WHERE id = :id",  # noqa: S608 - fixed names
+        values | {"id": run},
+    )
+
+
+def _start(search: sqlite3.Connection, started_at: str = "2026-11-04T12:00:00Z") -> int:
+    cur = search.execute("INSERT INTO watch_runs (started_at) VALUES (?)", (started_at,))
+    return int(cur.lastrowid or 0)
+
+
+def test_a_started_run_has_no_counts_until_it_finishes(search: sqlite3.Connection) -> None:
+    run = _start(search)
+    row = search.execute("SELECT * FROM watch_runs WHERE id = ?", (run,)).fetchone()
+    assert row["finished_at"] is None
+    assert row["budget_reached"] == 0
+    assert all(row[key] is None for key in _COUNTS)
+    _finish(search, run, held_unscored=3, budget_reached=1)
+    row = search.execute("SELECT * FROM watch_runs WHERE id = ?", (run,)).fetchone()
+    assert (row["held_unscored"], row["budget_reached"]) == (3, 1)
+
+
+@pytest.mark.parametrize(
+    "cols",
+    [
+        {"finished_at": None, "held_unscored": 0},  # counts without a finish
+        {"finished_at": None, "budget_reached": 1, **dict.fromkeys(_COUNTS, None)},
+        {"held_no_fit": None},  # a finish missing a count
+        {"held_off_lane": -1},
+        {"boards_left": -1},
+        {"budget_reached": 2},
+        {"finished_at": "2026-11-04T11:59:59Z"},  # before it started
+        {"finished_at": "2026-11-04 12:09:00"},
+    ],
+)
+def test_watch_run_rows_are_checked(search: sqlite3.Connection, cols: dict[str, object]) -> None:
+    run = _start(search)
+    with pytest.raises(sqlite3.IntegrityError):
+        _finish(search, run, **cols)
+
+
+def test_a_run_needs_a_utc_start(search: sqlite3.Connection) -> None:
+    for bad in ("2026-11-04T12:00:00", "yesterday", None):
+        with pytest.raises(sqlite3.IntegrityError):
+            search.execute("INSERT INTO watch_runs (started_at) VALUES (?)", (bad,))
+
+
 @pytest.mark.parametrize(
     ("column", "value"),
     [
@@ -360,3 +433,49 @@ def test_new_posting_columns_are_checked(
     p = _posting(search, _company(search))
     with pytest.raises(sqlite3.IntegrityError):
         search.execute(f"UPDATE postings SET {column} = ? WHERE id = ?", (value, p))  # noqa: S608
+
+
+# --- 0010: the lane, set once ---------------------------------------------------------------
+
+
+def _lane(search: sqlite3.Connection, posting: int) -> tuple[object, object]:
+    row = search.execute("SELECT lane, lane_checked FROM postings WHERE id = ?", (posting,))
+    found = row.fetchone()
+    return found["lane"], found["lane_checked"]
+
+
+def test_a_new_posting_is_unchecked_with_no_lane(search: sqlite3.Connection) -> None:
+    assert _lane(search, _posting(search, _company(search))) == (None, 0)
+
+
+@pytest.mark.parametrize(("lane", "other"), [("operations", "support"), (None, "support")])
+def test_a_lane_is_set_once_and_not_changed(
+    search: sqlite3.Connection, lane: str | None, other: str
+) -> None:
+    p = _posting(search, _company(search))
+    search.execute("UPDATE postings SET lane = ?, lane_checked = 1 WHERE id = ?", (lane, p))
+    assert _lane(search, p) == (lane, 1)
+    # Writing the same values again is allowed: the fill-in is safe to repeat.
+    search.execute("UPDATE postings SET lane = ?, lane_checked = 1 WHERE id = ?", (lane, p))
+    for sql, params in (
+        ("UPDATE postings SET lane = ? WHERE id = ?", (other, p)),
+        ("UPDATE postings SET lane_checked = 0, lane = NULL WHERE id = ?", (p,)),
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="set once"):
+            search.execute(sql, params)
+    search.execute("UPDATE postings SET title = 'Renamed' WHERE id = ?", (p,))
+    assert _lane(search, p) == (lane, 1)
+
+
+@pytest.mark.parametrize(
+    ("lane", "checked"),
+    [("operations", 0), ("  ", 1), ("", 1), (None, 2)],
+)
+def test_lane_columns_are_checked(
+    search: sqlite3.Connection, lane: str | None, checked: int
+) -> None:
+    p = _posting(search, _company(search))
+    with pytest.raises(sqlite3.IntegrityError):
+        search.execute(
+            "UPDATE postings SET lane = ?, lane_checked = ? WHERE id = ?", (lane, checked, p)
+        )

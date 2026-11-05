@@ -1125,11 +1125,13 @@ def test_watch_fetches_an_approved_discovery_board_only(
     stored = postings(search)
     assert [row["company"] for row in stored] == ["Example Robotics", "newrobotics"]
     assert {row["source"] for row in stored} == {"watcher"}
-    search.execute("UPDATE postings SET llm_output = 'synthetic' WHERE source = 'watcher'")
+    search.execute(
+        "UPDATE postings SET llm_output = 'synthetic', fit = 'high' WHERE source = 'watcher'"
+    )
     other, _inserted = search_store.upsert_company(search, "Example Org", source="discovery")
     search.execute(
-        "INSERT INTO postings (company_id, title, first_seen, source, llm_output) "
-        "VALUES (?, 'Customer Success Specialist', ?, 'discovery', 'synthetic')",
+        "INSERT INTO postings (company_id, title, first_seen, source, llm_output, fit) "
+        "VALUES (?, 'Customer Success Specialist', ?, 'discovery', 'synthetic', 'high')",
         (other, DAY),
     )
     alerted = search_store.pending_alert_ids(search)
@@ -1863,8 +1865,9 @@ def test_the_stamp_is_committed_before_the_fetch_and_kept_on_failure(
         raise FetchFailed("synthetic")
 
     lines = w.run(search, entries("Example A"), today=DAY, fetcher=fetch, now=ticking())
-    assert seen == [{key("Example A"): "2026-11-01T08:01:00Z"}]
-    assert attempts(search) == {key("Example A"): "2026-11-01T08:01:00Z"}
+    # 08:01 is the run's start in watch_runs; the board's stamp is the next tick.
+    assert seen == [{key("Example A"): "2026-11-01T08:02:00Z"}]
+    assert attempts(search) == {key("Example A"): "2026-11-01T08:02:00Z"}
     assert lines[-1] == "watch: 0 boards fetched, 1 failed, 0 left"
 
 
@@ -1876,7 +1879,9 @@ def test_a_board_that_crashes_keeps_its_new_stamp_and_moves_to_the_back(
     crashing = three_boards()
     crashing.mapping[board("Example A")] = RuntimeError("synthetic")
     w.run(search, entries("Example A"), today=DAY, fetcher=crashing, now=now)
-    assert attempts(search)[key("Example A")] == "2026-11-01T08:04:00Z"
+    # The first run ticks for its start, three boards and its finish (08:01 to 08:05);
+    # the second ticks for its start (08:06), then stamps the crashing board.
+    assert attempts(search)[key("Example A")] == "2026-11-01T08:07:00Z"
     fetcher = three_boards()
     w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher, now=now)
     assert fetcher.calls == [board("Example B"), board("Example C"), board("Example A")]

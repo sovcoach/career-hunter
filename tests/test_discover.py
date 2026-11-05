@@ -593,20 +593,21 @@ def test_approve_and_reject_leave_config_and_the_ei_file_alone(
 
 
 def test_the_alert_query_stays_on_watcher_postings(search: sqlite3.Connection) -> None:
-    text = inspect.getsource(search_store.pending_alert_ids)
+    text = inspect.getsource(search_store.pending_alerts)
     assert "p.source = 'watcher'" in text
     assert "discovery" not in text
     watcher, _inserted = search_store.upsert_company(search, "Example Robotics", source="watcher")
     other, _also = search_store.upsert_company(search, "Example Org", source="discovery")
     search.execute(
-        "INSERT INTO postings (company_id, title, first_seen, source, llm_output) "
-        "VALUES (?, 'Operations Coordinator', '2026-11-02', 'watcher', 'synthetic')",
+        "INSERT INTO postings (company_id, title, first_seen, source, llm_output, fit) "
+        "VALUES (?, 'Operations Coordinator', '2026-11-02', 'watcher', 'synthetic', 'high')",
         (watcher,),
     )
     watcher_id = int(search.execute("SELECT last_insert_rowid()").fetchone()[0])
     search.execute(
-        "INSERT INTO postings (company_id, title, first_seen, source, llm_output) "
-        "VALUES (?, 'Customer Success Specialist', '2026-11-02', 'discovery', 'synthetic')",
+        "INSERT INTO postings (company_id, title, first_seen, source, llm_output, fit) "
+        "VALUES (?, 'Customer Success Specialist', '2026-11-02', 'discovery', 'synthetic', "
+        "'high')",
         (other,),
     )
     assert search_store.pending_alert_ids(search) == [watcher_id]

@@ -13,7 +13,9 @@ import yaml
 from careerhunter.config import (
     discovery_enabled,
     discovery_interval_minutes,
+    off_lane_min_fit,
     telegram_chat_id,
+    tier_fits,
     timezone,
     today,
     validate_config,
@@ -234,6 +236,85 @@ def test_problems_are_reported(mutate: Any, message: str) -> None:
     mutate(d)
     problems = validate_config(d)
     assert any(message in p for p in problems), problems
+
+
+def test_a_tier_without_fit_is_reported_by_name() -> None:
+    d = doc()
+    del d["fit_rubric"]["gap_tiers"]["tiers"][0]["fit"]
+    problems = validate_config(d)
+    assert problems == [
+        "fit_rubric.gap_tiers.tiers need fit: low | medium | high; "
+        "missing or not one of those on ['strong']"
+    ]
+
+
+def test_every_tier_without_a_valid_fit_is_listed_in_one_problem() -> None:
+    d = doc()
+    d["fit_rubric"]["gap_tiers"]["tiers"] = [
+        {"name": "top", "max_gaps": 0},
+        {"name": "middle", "max_gaps": 1, "fit": "great"},
+        {"name": "lower", "max_gaps": 2, "fit": "low"},
+        {"name": "bottom", "max_gaps": 3, "fit": True},
+    ]
+    d["fit_rubric"]["gap_tiers"]["exclude_from_gaps"] = 4
+    d["fit_rubric"]["gap_tiers"]["boundary"] = None
+    problems = validate_config(d)
+    assert problems == [
+        "fit_rubric.gap_tiers.tiers need fit: low | medium | high; "
+        "missing or not one of those on ['top', 'middle', 'bottom']"
+    ]
+
+
+def test_an_unknown_boundary_name_is_reported_beside_a_missing_fit() -> None:
+    d = doc()
+    d["fit_rubric"]["gap_tiers"]["boundary"]["any_core"] = "weak"
+    del d["fit_rubric"]["gap_tiers"]["tiers"][1]["fit"]
+    problems = validate_config(d)
+    assert any("boundary.any_core must name one of the tiers" in p for p in problems)
+    assert any("missing or not one of those on ['possible']" in p for p in problems)
+
+
+def test_tier_fits_maps_each_name_and_a_boundary_takes_its_tiers_fit() -> None:
+    d = doc()
+    fits = tier_fits(d)
+    assert fits == {"strong": "high", "possible": "medium"}
+    boundary = d["fit_rubric"]["gap_tiers"]["boundary"]
+    assert fits[boundary["all_minor"]] == "high"
+    assert fits[boundary["any_core"]] == "medium"
+
+
+def test_tier_fits_leaves_out_what_has_no_fit() -> None:
+    d = doc()
+    del d["fit_rubric"]["gap_tiers"]["tiers"][1]["fit"]
+    assert tier_fits(d) == {"strong": "high"}
+    assert tier_fits(None) == {}
+    assert tier_fits({"fit_rubric": {"weights": {"a": 1}}}) == {}
+    assert tier_fits({"fit_rubric": {"gap_tiers": {"tiers": "x"}}}) == {}
+    assert tier_fits({"fit_rubric": {"gap_tiers": {"tiers": ["x", {"fit": "low"}]}}}) == {}
+
+
+def test_off_lane_min_fit_defaults_to_high() -> None:
+    d = doc()
+    assert d["search"]["off_lane_min_fit"] == "high"
+    assert off_lane_min_fit(d) == "high"
+    del d["search"]["off_lane_min_fit"]
+    assert validate_config(d) == []
+    assert off_lane_min_fit(d) == "high"
+    assert off_lane_min_fit(None) == "high"
+    assert off_lane_min_fit({"search": "x"}) == "high"
+    for level in ("low", "medium", "high"):
+        d["search"]["off_lane_min_fit"] = level
+        assert validate_config(d) == []
+        assert off_lane_min_fit(d) == level
+
+
+@pytest.mark.parametrize("value", ["High", "great", "", None, 2, True])
+def test_a_bad_off_lane_min_fit_is_reported(value: object) -> None:
+    d = doc()
+    d["search"]["off_lane_min_fit"] = value
+    assert validate_config(d) == [
+        "search.off_lane_min_fit must be one of low | medium | high (default high)"
+    ]
 
 
 def test_every_problem_is_reported_in_one_pass() -> None:

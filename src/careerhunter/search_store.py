@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
+from dataclasses import dataclass
 
+from careerhunter.enums import FIT_LEVELS
 from careerhunter.models import Application, Dating, Posting
 
 
@@ -201,18 +204,46 @@ def set_posting_score(
     gaps: str,
     llm_output: str,
     scout_metadata: str | None,
+    fit: str | None,
     resume_sha256: str | None = None,
 ) -> None:
-    """Store parsed gaps, model text, the tier and the resume's hash. Not fit_rating.
+    """Store parsed gaps, model text, the tier, its fit and the resume's hash.
 
-    `resume_sha256` is the resume the score was made with, or None without one. It
-    replaces the stored value, so a later resume change is seen as a difference.
+    `fit` is the tier's fit from config, or None when there is no tier or its name is
+    not in config. `fit_rating` is not touched. `resume_sha256` is the resume the score
+    was made with, or None without one. Every value replaces the stored one in a single
+    UPDATE, so the score, its fit and its hash always change together.
     """
     conn.execute(
-        "UPDATE postings SET gaps = ?, llm_output = ?, scout_metadata = ?, "
+        "UPDATE postings SET gaps = ?, llm_output = ?, scout_metadata = ?, fit = ?, "
         "scored_resume_sha256 = ? WHERE id = ?",
-        (gaps, llm_output, scout_metadata, resume_sha256, posting_id),
+        (gaps, llm_output, scout_metadata, fit, resume_sha256, posting_id),
     )
+
+
+def fill_missing_fits(conn: sqlite3.Connection, fits: Mapping[str, str]) -> int:
+    """Give a fit to scored, unalerted watcher postings that have a tier name but no fit.
+
+    The fit is looked up by the stored tier name in `fits` (from the current config).
+    A name that is not there is left alone: that posting stays without a fit and is not
+    alerted. Returns how many postings got a fit. The caller holds the transaction.
+    """
+    rows = conn.execute(
+        "SELECT p.id, json_extract(p.scout_metadata, '$.tier') AS tier FROM postings p "
+        "WHERE p.source = 'watcher' AND p.llm_output IS NOT NULL AND p.fit IS NULL "
+        "AND p.alerted_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+        "ORDER BY p.id"
+    ).fetchall()
+    filled = 0
+    for row in rows:
+        tier = row["tier"]
+        fit = fits.get(tier) if isinstance(tier, str) else None
+        if fit is None:
+            continue
+        conn.execute("UPDATE postings SET fit = ? WHERE id = ? AND fit IS NULL", (fit, row["id"]))
+        filled += 1
+    return filled
 
 
 def score_attempted_at(conn: sqlite3.Connection, posting_id: int) -> str | None:
@@ -227,19 +258,161 @@ def set_score_attempted_at(conn: sqlite3.Connection, posting_id: int, stamp: str
     conn.execute("UPDATE postings SET score_attempted_at = ? WHERE id = ?", (stamp, posting_id))
 
 
-def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
-    """Watcher postings with a score, no skip, and no alert yet. Oldest id first."""
+@dataclass(frozen=True)
+class HeldCounts:
+    """Watcher postings with no skip that are held back from alerts, by why."""
+
+    unscored: int  # no score yet: waiting to be scored or retried
+    no_fit: int  # scored and not alerted, but its tier name has no fit in config
+    off_lane: int = 0  # scored, off-lane, and below search.off_lane_min_fit
+
+
+def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None) -> HeldCounts:
+    """How many watcher postings with no skip are held, read now.
+
+    `off_lane_min_fit` is `search.off_lane_min_fit` while lane checking is on: an
+    off-lane posting with a lower fit is held. None means lane checking is off, and no
+    posting is held for its lane.
+    """
+    row = conn.execute(
+        """
+        SELECT
+          coalesce(sum(p.llm_output IS NULL), 0) AS unscored,
+          coalesce(sum(p.llm_output IS NOT NULL AND p.fit IS NULL AND p.alerted_at IS NULL), 0)
+            AS no_fit
+        FROM postings p
+        WHERE p.source = 'watcher'
+          AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
+        """
+    ).fetchone()
+    off_lane = 0
+    if off_lane_min_fit is not None:
+        off_lane = int(
+            conn.execute(
+                "SELECT count(*) FROM postings p "
+                "WHERE p.source = 'watcher' AND p.llm_output IS NOT NULL "
+                "AND p.alerted_at IS NULL AND p.lane_checked = 1 AND p.lane IS NULL "
+                "AND (CASE p.fit WHEN 'low' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 END) "
+                "< ? "
+                "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)",
+                (FIT_LEVELS.index(off_lane_min_fit),),
+            ).fetchone()[0]
+        )
+    return HeldCounts(unscored=int(row["unscored"]), no_fit=int(row["no_fit"]), off_lane=off_lane)
+
+
+def set_posting_lane(conn: sqlite3.Connection, posting_id: int, lane: str | None) -> bool:
+    """Record the lane a posting matched (None: off-lane), once. False if already set."""
+    cur = conn.execute(
+        "UPDATE postings SET lane = ?, lane_checked = 1 WHERE id = ? AND lane_checked = 0",
+        (lane, posting_id),
+    )
+    return cur.rowcount == 1
+
+
+def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+    """Every posting whose title has not been checked against the lanes, oldest first."""
+    rows = conn.execute("SELECT id, title FROM postings WHERE lane_checked = 0 ORDER BY id")
+    return [(int(row["id"]), str(row["title"])) for row in rows]
+
+
+def start_watch_run(conn: sqlite3.Connection, started_at: str) -> int:
+    """A new, unfinished `watch_runs` row. Its counts stay null until it finishes."""
+    cur = conn.execute("INSERT INTO watch_runs (started_at) VALUES (?)", (started_at,))
+    return int(cur.lastrowid or 0)
+
+
+def finish_watch_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    finished_at: str,
+    budget_reached: bool,
+    boards_fetched: int,
+    boards_failed: int,
+    boards_left: int,
+    held: HeldCounts,
+) -> None:
+    """Set the finish time, the budget flag and every count in one UPDATE."""
+    conn.execute(
+        "UPDATE watch_runs SET finished_at = ?, budget_reached = ?, boards_fetched = ?, "
+        "boards_failed = ?, boards_left = ?, held_unscored = ?, held_no_fit = ?, "
+        "held_off_lane = ? WHERE id = ? AND finished_at IS NULL",
+        (
+            finished_at,
+            int(budget_reached),
+            boards_fetched,
+            boards_failed,
+            boards_left,
+            held.unscored,
+            held.no_fit,
+            held.off_lane,
+            run_id,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class PendingAlert:
+    """A watcher posting the bot may alert: scored, with a fit, no skip, not alerted."""
+
+    posting_id: int
+    fit: str
+    lane: str | None
+    lane_checked: bool
+    first_seen: str
+
+
+def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
+    """Watcher postings with a score and a fit, no skip, and no alert yet. Oldest id first.
+
+    A posting without a fit (unscored, or scored into a tier name not in config) is held.
+    The bot orders these, and holds some for their lane (`lanes.alert_order`).
+    """
     rows = conn.execute(
         """
-        SELECT p.id FROM postings p
+        SELECT p.id, p.fit, p.lane, p.lane_checked, p.first_seen FROM postings p
         WHERE p.source = 'watcher'
           AND p.llm_output IS NOT NULL
+          AND p.fit IS NOT NULL
           AND p.alerted_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
         ORDER BY p.id
         """
     )
-    return [int(row["id"]) for row in rows]
+    return [
+        PendingAlert(
+            posting_id=int(row["id"]),
+            fit=str(row["fit"]),
+            lane=None if row["lane"] is None else str(row["lane"]),
+            lane_checked=bool(row["lane_checked"]),
+            first_seen=str(row["first_seen"]),
+        )
+        for row in rows
+    ]
+
+
+def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
+    """The ids of `pending_alerts`, oldest id first, before any lane ordering."""
+    return [alert.posting_id for alert in pending_alerts(conn)]
+
+
+def alerts_held_since(conn: sqlite3.Connection) -> str | None:
+    """When the bot started holding watcher alerts because config was unreadable."""
+    row = conn.execute("SELECT value FROM bot_state WHERE key = 'alerts_held_since'").fetchone()
+    return None if row is None else str(row["value"])
+
+
+def set_alerts_held_since(conn: sqlite3.Connection, stamp: str | None) -> None:
+    """Record when the hold started, or clear it with None."""
+    if stamp is None:
+        conn.execute("DELETE FROM bot_state WHERE key = 'alerts_held_since'")
+    else:
+        conn.execute(
+            "INSERT INTO bot_state (key, value) VALUES ('alerts_held_since', ?) "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (stamp,),
+        )
 
 
 def mark_alerted(conn: sqlite3.Connection, posting_id: int, alerted_at: str) -> None:

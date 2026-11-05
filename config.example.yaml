@@ -33,6 +33,9 @@ search:
       fallback: true
       titles:
         - Customer Success Specialist
+  # Optional: the lowest fit (low, medium or high) at which a posting whose title
+  # matches no lane still alerts, labelled Off-lane and sent last. Default high.
+  off_lane_min_fit: high
   # Optional: where each work model is acceptable.
   location_rules:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here
@@ -72,8 +75,10 @@ fit_rubric:
   # gap_tiers set, weights and thresholds can be left out.
   gap_tiers:
     tiers:                     # best first, by the most gaps the tier allows
-      - {name: strong, max_gaps: 1}
-      - {name: possible, max_gaps: 2}
+      # fit is required on every tier: low, medium or high. Alerts show it, and a
+      # boundary outcome takes the fit of the tier it names.
+      - {name: strong, max_gaps: 1, fit: high}
+      - {name: possible, max_gaps: 2, fit: medium}
     exclude_from_gaps: 3       # this many gaps or more: skip
     boundary:                  # at exactly this many gaps, decide by the kind of gap
       at_gaps: 1
