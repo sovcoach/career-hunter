@@ -32,7 +32,7 @@ Your information never leaves your machine and is never stored in this code repo
 
 ## What it does *not* do (yet)
 
-- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends the alerts when it polls: company, title, link, the LLM tier, and a similarity line when a cosine is stored. Scoring and embeddings stay on this Mac, at a loopback address.
+- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends the alerts when it polls, in lane order: company, title, link, the fit (High, Medium or Low), the lane or `Off-lane` when lanes are set, the LLM tier, and a similarity line when a cosine is stored. Postings without a fit, and off-lane ones below `search.off_lane_min_fit`, are held. Scoring and embeddings stay on this Mac, at a loopback address.
 - No automatic deletes, ever. Records are kept for at least the 6 years EI requires.
 - No cloud sync and no accounts. It is a local tool.
 

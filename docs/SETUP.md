@@ -168,7 +168,8 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 |---|---|
 | Target titles, in priority groups | `search.lanes` |
 | Where on-site, hybrid, and remote work is acceptable | `search.location_rules` |
-| How many missing requirements still count | `fit_rubric.gap_tiers` |
+| How many missing requirements still count, and the fit each tier means | `fit_rubric.gap_tiers` (every tier needs `fit: low`, `medium` or `high`) |
+| The lowest fit at which a title outside every lane still alerts | `search.off_lane_min_fit` (default `high`) |
 | Your resume, for scoring and a similarity line (see "Import your resume") | `search.resume: resume/current.txt` |
 | Languages, credentials, shifts, pay, seniority (in the title, or also the description), and a minimum salary | `hard_gates` |
 | A cap on weekend days | `schedule_limits` |
@@ -179,6 +180,19 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 The templates use placeholder names such as Example Robotics, Example City, and Example Staffing Mill.
 
 `search.target_titles`, `search.locations`, and `search.work_models` still validate so an older file loads. The watcher does not match them. Use lanes and location rules.
+
+Lanes label and order alerts; they never skip a posting. A title is matched against every title in every lane, as whole words, ignoring case, and the lane with the best (lowest) priority wins. Alerts go off-lane last, then best fit first, then non-fallback lanes before `fallback: true` ones, then by priority, then oldest. A title that matches no lane is still gated and scored, and alerts only at `search.off_lane_min_fit` or better, labelled `Off-lane`. A posting keeps the lane it was given when it was stored, even if you change the lanes later. Without `search.lanes`, lane checking is off and `doctor` says so: alerts go by fit, then oldest. Lanes are separate from `hard_gates.never_gated_families`.
+
+Every alert carries a fit: `Fit: High`, `Medium` or `Low`, from the `fit` of the tier the posting was scored into. A posting the model hasn't scored yet, or scored into a tier name that is no longer in `gap_tiers`, is held and not alerted until it has a fit. `doctor` counts what is held.
+
+**Upgrading to fit tiers and lanes?** Do these in order:
+
+1. Add a `fit` to every tier in `fit_rubric.gap_tiers` in your `config.yaml`. Without one, the config is refused when it is loaded, and the services can't start.
+2. Stop the services: `uv run careerhunter service uninstall`.
+3. Run `uv run careerhunter migrate`. It brings `search.db` to schema 10.
+4. Start the services again: `uv run careerhunter service install`.
+
+Postings that were already scored, and not yet alerted, get their fit from your config on the next watch run, by their tier name. With `search.lanes` set, that run also gives every stored posting its lane.
 
 `fit_rubric.weights` and `fit_rubric.thresholds` are not applied. Scoring uses `gap_tiers` and leaves the numeric rating empty.
 
@@ -385,7 +399,7 @@ Sealing never happens on its own, and the claim you are on can't be sealed. If `
 
 The bot lets you record applications, statuses and activities from your phone. It only ever talks to your own private chat with it, and it has no open ports: it calls Telegram, never the other way round.
 
-**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal: company, title, link, status words and short references like `a7`. It never sends your notes, fit details or EI record details. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
+**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal: company, title, link, the fit word (High, Medium or Low), the tier name, the lane name from your config, status words and short references like `a7`. It never sends your notes, the gaps it found, the numeric fit rating or EI record details. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
 
 ### 10a. Create the bot and store its token
 
@@ -509,7 +523,7 @@ Every date must fall inside your active EI claim, as with `seed`, and future dat
 | `… is before claim 2026-27 started` | A seed date falls outside your claim | Fix the date, or see `--route-out-of-claim-to-search` in Step 8 |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 7, expected 8` | The code was updated and `search.db` hasn't caught up | Stop the services with `uv run careerhunter service uninstall`, run `uv run careerhunter migrate`, then `uv run careerhunter service install` |
+| `search.db BAD schema version 8, expected 10` | The code was updated and `search.db` hasn't caught up | Stop the services with `uv run careerhunter service uninstall`, run `uv run careerhunter migrate`, then `uv run careerhunter service install` |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |
@@ -518,6 +532,12 @@ Every date must fall inside your active EI claim, as with `seed`, and future dat
 | `resume WARN left by an interrupted or running import` | An import stopped part-way, or one is running now | Nothing to fix. The next import removes them |
 | `watch: scoring: resume not usable (…)` | The resume can't be used this run, for the reason shown | Run `uv run careerhunter doctor` and fix what it reports. Nothing is scored until then |
 | `watch: scoring: model unreachable; N postings left for the next run` | The local model stopped answering | Start the model server. The next run scores them |
+| `config.yaml BAD … tiers need fit: low \| medium \| high; missing or not one of those on [...]` | A gap tier has no `fit`, or a value other than those three | Add `fit: low`, `medium` or `high` to each tier it names |
+| `watch held WARN … with no fit` | Postings were scored into a tier name that isn't in `fit_rubric.gap_tiers` any more | Put the tier back, or accept that they stay held. The next run fills in their fit once the name is back |
+| `watch run BAD the last run started N min ago and did not finish` | A watch run crashed, was stopped, or hit a database error | See `logs/watch.log`. Its counts are not used; the next finished run counts again |
+| `bot alerts BAD held since …` | The bot couldn't read `config.yaml` at its last poll, so it sent no watcher alerts | Fix `config.yaml` (`doctor` shows the problem). The next poll sends them |
+| The bot replies `Config can't be read, so nothing was recorded. Run careerhunter doctor.` | `/log` needs `config.yaml` for the date and the claim check | Fix `config.yaml`, then send the link again |
+| `lanes -- not configured` | `search.lanes` isn't set, so lane checking is off | Nothing to fix if you meant it. Add lanes to label and order alerts |
 | `config.yaml BAD … needs an end date` | A claim that isn't active has no `end` | Add its end date, or check `active_claim` for a typo |
 | `WARNING: FileVault is OFF` | The Mac's own disk isn't encrypted | Step 1 |
 | `uv: command not found` | Terminal hasn't picked up uv yet | Close and reopen Terminal, or re-run the Step 3 installer |

@@ -377,6 +377,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 > **Amended by [ADR-019](#adr-019-local-embedding-vectors-live-in-searchdb-beside-the-llm-tier) (Phase 3.5).** A watcher alert also includes the tier name and, when a cosine is stored, that cosine. It still does not send notes, fit ratings, gaps, the model text, vectors, skip reasons, or the claim.
 
+> **Amended for fit tiers and lanes (#38, #33).** Every alert now carries a fit tier word: `Fit: High`, `Fit: Medium` or `Fit: Low`, from the `fit` key of the gap tier the posting was scored into. A job ad sent to the bot is never scored and says `Fit: not scored`. With `search.lanes` set, a watcher alert also carries `Lane: <name>`, the name of a lane from `config.yaml`, or `Off-lane`. The fit word is a coarse, three-level label for the gap tier already named in the alert, and both its levels and the lane names are the operator's own config values. The bot still never sends the 0-10 `fit_rating`, gaps, the model text, vectors, skip reasons, notes or the claim. Alerts are sent in lane order: off-lane last, then the best fit, then non-fallback lanes before fallback ones, then lane priority, then the oldest. An off-lane posting below `search.off_lane_min_fit` (default `high`) stays pending. While the bot can't read `config.yaml` during a poll, it sends no watcher alert, records the hold for `doctor`, and logs only when the hold starts and ends. `/log` still needs config for today's date and the claim check, so with config unreadable it fails closed, writes nothing, and replies with a fixed message: `Config can't be read, so nothing was recorded. Run careerhunter doctor.` That reply has no path and no content.
+
 **Context.**
 - The bot (Phase 2) talks to the operator through Telegram. Bot chats are not end-to-end encrypted: every message, both ways, passes through and is stored on Telegram's servers.
 - Telegram also holds updates the bot hasn't fetched yet for up to 24 hours, and keeps the chat history.
@@ -564,6 +566,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 > **Amended by [ADR-023](#adr-023-scoring-is-grounded-in-an-imported-resume-and-re-scored-when-it-changes) (#37).** Inline scoring of new postings stops once less than 240 seconds of the budget are left. After the boards, scoring runs in three passes, each ordered by its last score attempt. A model that does not answer stops scoring for the rest of the run. The budget, the board rotation and the counting below are unchanged.
 
+> **Amended for the run record (#38).** Search migration 0009 adds `watch_runs`. A run inserts its row first, in its own transaction, and finishes it just before the last line with the board counts, `budget_reached`, and the postings still held: unscored, scored with no fit, and off-lane below the threshold, read from `search.db` at that moment. A run the budget cut short still finishes, with `budget_reached` 1, as this ADR counts it a success. A run that crashes, is killed or stops on a database error never finishes its row, so its counts stay null and are never read as zero. A CHECK keeps an unfinished row free of counts. `doctor` reports a run unfinished for more than the budget plus five minutes as BAD, and the held counts from the last finished run. The table is never pruned: one small row per run.
+
 **Context.**
 - One unexpected exception in one company ended the whole watch run, and the boards after it were never fetched.
 - Log lines were written only when the run finished. launchd discards stderr, so a crash left no trace at all.
@@ -592,6 +596,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-023: Scoring is grounded in an imported resume, and re-scored when it changes
 
+> **Amended for first-come scoring (#38).** The never-scored pass is ordered by `coalesce(score_attempted_at, created_at)`, then id: each posting waits from its last attempt, or from when it was stored if it was never tried. Both are UTC stamps to the second. A retry stamped at T goes ahead of every posting stored after T, so a steady flow of new postings can't push a held posting back forever. The re-score passes keep never-tried first, then the oldest attempt. A score also stores its tier's `fit`, in the same UPDATE as the score and the hash, so a failed re-score keeps the old fit too.
+
 **Context.**
 - The scoring prompt asked the model for missing requirements without giving it the resume, so the gaps were guesses about the posting alone.
 - The resume is the most personal text in the system. It has to reach the local model, and nothing else: no log, no `search.db` column, no exception, no Telegram message.
@@ -617,7 +623,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - **Re-scoring, under the budget.** A score records the hash of the resume it was made with (`postings.scored_resume_sha256`).
   - During the boards, only new postings are scored, and that stops once less than 240 seconds of the budget are left.
   - A stored posting on a fetched board whose hash differs is queued with its description, which stays in memory.
-  - After the boards come never-scored postings, then the queued re-scores, then re-scores from the stored fields. Within each pass the order is the last attempt (`postings.score_attempted_at`, never-tried first), then the oldest posting, so one posting that keeps failing goes behind the others. Anything not reached is left for the next run and not counted.
+  - After the boards come never-scored postings, then the queued re-scores, then re-scores from the stored fields. Within each re-score pass the order is the last attempt (`postings.score_attempted_at`, never-tried first), then the oldest posting, so one posting that keeps failing goes behind the others. The never-scored pass is first come, first served (see the amendment above). Anything not reached is left for the next run and not counted.
   - A posting with a skip or an application keeps its score. An alerted posting is re-scored and not sent again. A failed re-score keeps the old score and hash.
 - **A configured resume that cannot be used holds scoring.** If `search.resume` is set but `load` refuses it, the run scores nothing and logs one line with the fixed reason. It does not score without the resume while the hashes say otherwise.
 
@@ -633,4 +639,5 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - pypdf 6.21.4 was younger than 14 days when it was locked. It is allowed as a listed security fix, with its own `exclude-newer` cutoff (ADR-006), because every older version has known denial-of-service advisories. The mypy pre-commit hook runs in its own environment with `pypdf==6.21.4`. That pin has to move with `uv.lock` whenever pypdf is upgraded.
 - A copy of the resume shorter than 40 characters in a gap name is not caught.
 - Re-scores wait while never-scored postings outnumber what one run can score.
+- A posting that keeps failing to parse is retried in first-come order, so a backlog of postings stored before its last attempt goes first (#38).
 - A re-score from the stored fields has no description, so it can differ from one made with it.
