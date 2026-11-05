@@ -8,6 +8,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- The bot sends watcher postings as one digest per watch run instead of one message each. Each row shows the company, title, location, lane, fit, the number of gaps, the schedule flag, up to three key requirements and the link, with its own Applied and Skipped buttons; tapping one row leaves the others' buttons working. At most `alerts.max_per_poll` (default 10, validated 1-50) go per poll and the rest carry over; older runs go first, and a run's postings wait until it finishes. Every message stays within Telegram's length limit. Gap names are never sent (#39, ADR-015).
+- Scoring asks the local model for up to three key requirements stated in the posting. A phrase is capped at 60 characters and dropped if it contains a gap name or copies 40 characters of the resume. Search migration 0011 stores them in `postings.key_requirements`, with the scoring run in `postings.score_run_id` (#39, ADR-022).
+- Telegram client errors say whether Telegram could not be reached, rate-limited the call, refused it, or sent a reply that isn't the Bot API's JSON. A refused digest is sent again one row per message (#39).
 - Greenhouse boards are fetched with their descriptions (`content=true`), turned from HTML into text with the standard library. Lever adds its lists, closing text and salary description, and Ashby its salary summary (`includeCompensation=true`). Every gate now runs on every supported ATS. The text is used in memory only (#32).
 - A board fetch has a 20 MB cap. A board over it logs `board over the size cap (...); nothing recorded`, stores nothing from that board and counts as failed (#32, ADR-022).
 - With `search.location_rules` set, a posting with no location text and no work model from the board is skipped as `empty_location`. A board work model stands in for the location (#32).

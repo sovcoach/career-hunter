@@ -189,7 +189,7 @@ Every alert carries a fit: `Fit: High`, `Medium` or `Low`, from the `fit` of the
 
 1. Add a `fit` to every tier in `fit_rubric.gap_tiers` in your `config.yaml`. Without one, the config is refused when it is loaded, and the services can't start.
 2. Stop the services: `uv run careerhunter service uninstall`.
-3. Run `uv run careerhunter migrate`. It brings `search.db` to schema 10.
+3. Run `uv run careerhunter migrate`. It brings `search.db` to schema 11 (fit and runs in 9, lanes in 10, key requirements and each score's run in 11).
 4. Start the services again: `uv run careerhunter service install`.
 
 Postings that were already scored, and not yet alerted, get their fit from your config on the next watch run, by their tier name. With `search.lanes` set, that run also gives every stored posting its lane.
@@ -403,7 +403,7 @@ Sealing never happens on its own, and the claim you are on can't be sealed. If `
 
 The bot lets you record applications, statuses and activities from your phone. It only ever talks to your own private chat with it, and it has no open ports: it calls Telegram, never the other way round.
 
-**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal: company, title, link, the fit word (High, Medium or Low), the tier name, the lane name from your config, status words and short references like `a7`. It never sends your notes, the gaps it found, the numeric fit rating or EI record details. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
+**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal. Watcher postings come as one digest per watch run, each row with company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link. A job ad you send with `/log` gets company, title, link, the fit word and, when it was already scored, the tier name and similarity. Status words and short references like `a7` go too. It never sends your notes, the names of the gaps it found (only how many), the numeric fit rating or EI record details. `alerts.max_per_poll` (default 10) caps how many postings go per poll; the rest follow on the next poll. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
 
 ### 10a. Create the bot and store its token
 

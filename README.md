@@ -4,7 +4,7 @@
 
 Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards, filters them, and scores the ones it keeps with a local model. The bot sends one alert for each scored posting.
+> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards, filters them, and scores the ones it keeps with a local model. The bot sends one alert digest per watch run.
 
 ---
 
@@ -25,14 +25,14 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
 | `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits. A set discovery URL also installs a discovery LaunchAgent |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
-| `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist, and approved discovery boards, once. It records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert for each scored posting |
+| `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist, and approved discovery boards, once. It records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert digest per watch run |
 | `careerhunter scout-prompt` | Prints a scout prompt from exclusions and the hard gates the watcher skips on. Writes nothing |
 | `careerhunter embed-eval` | Ranks stored cosines against LLM tiers. Writes a private report under `evals/` and prints only that relative path |
 | `careerhunter discover` | Queues companies from a local SearXNG into `search.db`. `approve` and `reject` update that queue only and do not fetch pages. The bot can approve or reject a pending row from the allowlisted chat. That message is the suggested name and the URL. An approved board is fetched on the next `careerhunter watch`. When the URL is set, `service install` runs this search once per `discovery.interval_minutes` and exits |
 
 ## What it does *not* do (yet)
 
-- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends the alerts when it polls, in lane order: company, title, link, the fit (High, Medium or Low), the lane or `Off-lane` when lanes are set, the LLM tier, and a similarity line when a cosine is stored. Postings without a fit, and off-lane ones below `search.off_lane_min_fit`, are held. Scoring and embeddings stay on this Mac, at a loopback address.
+- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends one digest per watch run when it polls, at most `alerts.max_per_poll` postings per poll, in lane order. Each row has company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link, with its own Applied and Skipped buttons. Gap names never leave the Mac. Postings without a fit, and off-lane ones below `search.off_lane_min_fit`, are held. Scoring and embeddings stay on this Mac, at a loopback address.
 - No automatic deletes, ever. Records are kept for at least the 6 years EI requires.
 - No cloud sync and no accounts. It is a local tool.
 

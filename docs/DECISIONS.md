@@ -20,13 +20,13 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1); amended (local merges); amended (web merges) |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
 | 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
-| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019 |
+| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39) |
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2); amended (#30) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
 | 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023 |
 | 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30) |
-| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023 |
+| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32) |
 | 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37) |
 
 ---
@@ -379,6 +379,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 > **Amended for fit tiers and lanes (#38, #33).** Every alert now carries a fit tier word: `Fit: High`, `Fit: Medium` or `Fit: Low`, from the `fit` key of the gap tier the posting was scored into. A job ad sent to the bot is never scored and says `Fit: not scored`. With `search.lanes` set, a watcher alert also carries `Lane: <name>`, the name of a lane from `config.yaml`, or `Off-lane`. The fit word is a coarse, three-level label for the gap tier already named in the alert, and both its levels and the lane names are the operator's own config values. The bot still never sends the 0-10 `fit_rating`, gaps, the model text, vectors, skip reasons, notes or the claim. Alerts are sent in lane order: off-lane last, then the best fit, then non-fallback lanes before fallback ones, then lane priority, then the oldest. An off-lane posting below `search.off_lane_min_fit` (default `high`) stays pending. While the bot can't read `config.yaml` during a poll, it sends no watcher alert, records the hold for `doctor`, and logs only when the hold starts and ends. `/log` still needs config for today's date and the claim check, so with config unreadable it fails closed, writes nothing, and replies with a fixed message: `Config can't be read, so nothing was recorded. Run careerhunter doctor.` That reply has no path and no content.
 
+> **Amended for the alert digest (#39).** Watcher postings are sent as one digest per watch run, at most `alerts.max_per_poll` (default 10) per poll, and the rest carry over. Each row carries: company, title, location, lane (`Lane: <name>` or `Off-lane`), the fit word, the schedule flag in words (on call, weekend days over the limit), up to three key requirements, the number of gaps, and the link. Key requirements are short phrases (60 characters at most) the local model takes from the posting itself, separate from the gap list; a phrase that contains a gap name, or repeats 40 characters of the resume, is dropped before it is stored. **Gap names stay local:** only their count is sent. A digest row no longer carries the LLM tier name or a cosine; a job ad sent with `/log` still gets its own alert as before. Rows keep the order above: off-lane last, then fit, then non-fallback before fallback lanes, then lane priority, then the oldest. #39 asked for rows "ordered by lane priority"; fit still comes before lane priority, as this ADR set for #33. Each row has its own Applied and Skipped tokens, so tapping one row leaves the others' buttons valid. Every message stays within Telegram's 4096-character limit. The sentinel scan now covers the digest text and its button labels: gap names, `llm_output`, notes, the resume and the claim label must be absent.
+
 **Context.**
 - The bot (Phase 2) talks to the operator through Telegram. Bot chats are not end-to-end encrypted: every message, both ways, passes through and is stored on Telegram's servers.
 - Telegram also holds updates the bot hasn't fetched yet for up to 24 hours, and keeps the chat history.
@@ -569,6 +571,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 > **Amended for the run record (#38).** Search migration 0009 adds `watch_runs`. A run inserts its row first, in its own transaction, and finishes it just before the last line with the board counts, `budget_reached`, and the postings still held: unscored, scored with no fit, and off-lane below the threshold, read from `search.db` at that moment. A run the budget cut short still finishes, with `budget_reached` 1, as this ADR counts it a success. A run that crashes, is killed or stops on a database error never finishes its row, so its counts stay null and are never read as zero. A CHECK keeps an unfinished row free of counts. `doctor` reports a run unfinished for more than the budget plus five minutes as BAD, and the held counts from the last finished run. The table is never pruned: one small row per run.
 
 > **Amended for gates on every ATS (#32).** Greenhouse is fetched with `content=true` and Ashby with `includeCompensation=true`, so the description and pay gates see text on every supported board. The text is held in memory only, as before. A board fetch has its own 20 MB body cap, larger than the 5 MB cap for a job ad (ADR-016), because a Greenhouse board now carries every description. A board over the cap logs `board over the size cap (...); nothing recorded`, stores nothing from that board, keeps its attempt stamp, and counts as failed, never as fetched or as zero postings. Nothing is truncated.
+
+> **Amended for the alert digest (#39).** Each run stores its `watch_runs` id on every posting it scores or gives a fit (`postings.score_run_id`, search migration 0011), in the same UPDATE as the score. The bot sends one digest per run and waits until the run has finished, or started more than twice this budget ago, so a run is not sent half-scored and a killed run does not hold its postings for ever.
 
 **Context.**
 - One unexpected exception in one company ended the whole watch run, and the boards after it were never fetched.

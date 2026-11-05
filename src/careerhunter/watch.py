@@ -6,7 +6,7 @@ company after another, through `fetch.py`. It also fetches companies stored with
 and the slug is one path segment. A seeded watchlist row with any other source is not
 fetched by that extra path. It writes companies, postings, skip reasons and local
 scores in `search.db`. It does not call Telegram, write applications, EI rows or
-snapshots. The bot sends an alert for each scored posting when it polls.
+snapshots. The bot sends one alert digest per watch run when it polls.
 `run` returns the log lines; the CLI prints them to stderr.
 
 A posting that is already stored is not inserted again. After the boards, watcher rows
