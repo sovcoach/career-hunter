@@ -17,15 +17,13 @@ beside the score. A missing resume, a down embedding server, or a bad dimension 
 `embedding miss posting <id>: <reason>`, and the run still finishes. A cosine does
 not cause a skip.
 
-The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
-one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
-Greenhouse is fetched with `content=true`, so every gate sees its descriptions; the
-HTML is turned into text with the standard library (`htmltext.py`). A Lever posting's
-text adds its lists, closing text and salary description; Ashby is fetched with
-`includeCompensation=true` and adds each job's salary summary. A description is
-held in memory for the filter and the scoring prompt, and never stored. A board body
-over BOARD_MAX_BYTES logs `board over the size cap (...); nothing recorded`, stores
-nothing from that board, and counts as failed. Nothing is cut to fit.
+The requests for a board and the parsing of its replies are in `ats.py`. The list URL
+is built only from `ats_slug`. `careers_url` is ignored. A slug has to be one path
+segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched. A
+description is held in memory for the filter and the scoring prompt, and never
+stored. A board whose replies together pass BOARD_MAX_BYTES logs `board over the size
+cap (...); nothing recorded`, stores nothing from that board, and counts as failed.
+Nothing is cut to fit.
 
 One company's failure does not stop the run. An exception while handling one board, or
 one row of the recheck or scoring pass, or the embedding refresh, is rolled back and
@@ -90,7 +88,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import re
 import sqlite3
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -99,7 +96,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Self, SupportsIndex
 
-from careerhunter import db, filters, htmltext, lanes, search_store
+from careerhunter import ats as ats_boards
+from careerhunter import db, filters, lanes, search_store
+from careerhunter.ats import (
+    BoardHTTPError,
+    BoardParseError,
+    Job,
+    Skip,
+    board_url,
+)
 from careerhunter.config import off_lane_min_fit, tier_fits
 from careerhunter.deadline import Deadline
 from careerhunter.embed import Embedder, miss_line
@@ -117,15 +122,12 @@ OnCrash = Callable[[str, Exception], None]
 Tally = Literal["fetched", "failed", "left"]
 
 RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
-# The body cap for one board. Greenhouse boards carry every description (content=true),
-# so this is larger than a job ad's cap. The CLI passes it to the fetcher.
-BOARD_MAX_BYTES = 20 * 1024 * 1024
+# All of one board's replies together (ats.py). The CLI also caps each request with it.
+BOARD_MAX_BYTES = ats_boards.BOARD_MAX_BYTES
 # Inline scoring of new postings stops once less than this is left of the budget.
 SCORE_RESERVE = 240.0
 _LEFT = "run budget reached; left for the next run"
 
-_BOARDS = ("greenhouse", "lever", "ashby")
-_SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 # A board's own company label that carries no information. The watchlist name is used.
 _PLACEHOLDERS = frozenset(
     {
@@ -143,34 +145,11 @@ _PLACEHOLDERS = frozenset(
         "-",
     }
 )
-# The public postings API says "on-site"; the hire API says "onsite".
-_LEVER_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite", "on-site": "onsite"}
-_ASHBY_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite"}
-
-
-class BoardParseError(Exception):
-    """The body is not that board's JSON. Nothing from the board is stored."""
-
-
-@dataclass(frozen=True)
-class _Job:
-    title: str
-    location: str
-    work_model: str | None
-    url: str | None
-    requisition_id: str | None
-    company_field: str | None
-    description: str | None = None
-
-
-@dataclass(frozen=True)
-class _Skip:
-    reason: str
 
 
 @dataclass(frozen=True)
 class _Parsed:
-    jobs: list[_Job | _Skip]
+    jobs: list[Job | Skip]
 
 
 @dataclass(frozen=True)
@@ -258,17 +237,6 @@ class _Aligned:
     ok: bool
     stored_type: str | None = None
     stored_slug: str | None = None
-
-
-def board_url(ats_type: str, slug: str) -> str | None:
-    """The list URL for one board, built only from a single safe path segment."""
-    if ats_type not in _BOARDS or _SLUG.fullmatch(slug) is None:
-        return None
-    if ats_type == "greenhouse":
-        return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
-    if ats_type == "lever":
-        return f"https://api.lever.co/v0/postings/{slug}?mode=json"
-    return f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
 
 
 def run(
@@ -597,7 +565,7 @@ def _watch_one(
     if ats == "workday":
         lines.append(_line(name, ats, "not fetched yet; skipped"))
         return None
-    if ats not in _BOARDS:
+    if ats not in ats_boards.BOARDS:
         lines.append(_line(name, ats, "not a board this command fetches; skipped"))
         return None
     if not slug:
@@ -668,7 +636,7 @@ def _fetch_jobs(
     """Parse one board. A failure, or a fetch the run budget cut short, stores nothing."""
     lines = state.lines
     try:
-        fetched = fetcher(url)
+        return _Parsed(ats_boards.read(ats, slug, ats_boards.Client(fetcher)))
     except FetchError as exc:
         if isinstance(exc, FetchTimeout) and state.out_of_time():
             lines.append(_line(name, ats, _LEFT))
@@ -680,22 +648,20 @@ def _fetch_jobs(
         kind = type(exc).__name__
         lines.append(_line(name, ats, f"{kind}; nothing recorded"))
         return _Failed(kind)
-    if fetched.status == 429:
-        # Do not read the body, sleep, or retry. The next watch tries again.
-        blocked.add(host)
-        lines.append(
-            _line(
-                name,
-                ats,
-                f"HTTP 429, retry-after {_retry(fetched.retry_after)}; left for the next run",
+    except BoardHTTPError as exc:
+        if exc.status == 429:
+            # Do not read the body, sleep, or retry. The next watch tries again.
+            blocked.add(urllib.parse.urlsplit(exc.url).hostname or host)
+            lines.append(
+                _line(
+                    name,
+                    ats,
+                    f"HTTP 429, retry-after {_retry(exc.retry_after)}; left for the next run",
+                )
             )
-        )
-        return _Failed("HTTP 429")
-    if fetched.status != 200:
-        lines.append(_line(name, ats, f"HTTP {fetched.status}; nothing recorded"))
-        return _Failed(f"HTTP {fetched.status}")
-    try:
-        return _Parsed(_parse(ats, slug, fetched.body))
+            return _Failed("HTTP 429")
+        lines.append(_line(name, ats, f"HTTP {exc.status}; nothing recorded"))
+        return _Failed(f"HTTP {exc.status}")
     except BoardParseError as exc:
         lines.append(_line(name, ats, f"HTTP 200, {exc}; nothing recorded"))
         return _Failed(str(exc))
@@ -706,7 +672,7 @@ def _record_jobs(
     state: _State,
     name: str,
     ats: str,
-    jobs: list[_Job | _Skip],
+    jobs: list[Job | Skip],
     role_filters: Mapping[str, Any] | None,
     config: Mapping[str, Any],
     exclusions: Mapping[str, Any],
@@ -720,7 +686,7 @@ def _record_jobs(
     mismatches: set[str] = set()
     dating = Dating("exact", day=today)
     for item in jobs:
-        if isinstance(item, _Skip):
+        if isinstance(item, Skip):
             lines.append(_line(name, ats, f"{item.reason}; skipped"))
             continue
         if item.url is None and item.requisition_id is None:
@@ -1100,145 +1066,6 @@ def _align(conn: sqlite3.Connection, name: str, ats_type: str, ats_slug: str) ->
     return _Aligned(True)
 
 
-def _parse(ats: str, slug: str, body: bytes) -> list[_Job | _Skip]:
-    data = _loads(body)
-    if ats == "lever":
-        if not isinstance(data, list):
-            raise BoardParseError("unexpected JSON shape")
-        return [_lever_job(item, slug) for item in data]
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    if not isinstance(jobs, list):
-        raise BoardParseError("unexpected JSON shape")
-    if ats == "greenhouse":
-        return [_greenhouse_job(item, slug) for item in jobs]
-    return [_ashby_job(item, slug) for item in jobs]
-
-
-def _loads(body: bytes) -> object:
-    try:
-        loaded: object = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise BoardParseError("invalid JSON") from exc
-    return loaded
-
-
-def _greenhouse_job(item: object, slug: str) -> _Job | _Skip:
-    job = _mapping(item)
-    if job is None:
-        return _Skip("a job was not an object")
-    title = _text(job.get("title"))
-    if title is None:
-        return _Skip("a job has no title")
-    # The list payload has no documented company field. Honor company_name when present.
-    return _Job(
-        title=title,
-        location=_nested_text(job.get("location"), "name"),
-        work_model=None,
-        url=_http_url(job.get("absolute_url"))
-        or _built(f"https://boards.greenhouse.io/{slug}/jobs/", job.get("id")),
-        requisition_id=_text(job.get("requisition_id")),
-        company_field=_text(job.get("company_name")),
-        description=_greenhouse_text(job.get("content")),
-    )
-
-
-def _greenhouse_text(content: object) -> str | None:
-    """`content` (with `?content=true`) is entity-escaped HTML; plain text, or None."""
-    text = _text(content)
-    if text is None:
-        return None
-    return htmltext.to_text(text, escaped=True) or None
-
-
-def _lever_job(item: object, slug: str) -> _Job | _Skip:
-    job = _mapping(item)
-    if job is None:
-        return _Skip("a job was not an object")
-    title = _text(job.get("text"))
-    if title is None:
-        return _Skip("a job has no title")
-    return _Job(
-        title=title,
-        location=_nested_text(job.get("categories"), "location"),
-        work_model=_mapped(job.get("workplaceType"), _LEVER_WORK),
-        url=_http_url(job.get("hostedUrl"))
-        or _built(f"https://jobs.lever.co/{slug}/", job.get("id")),
-        requisition_id=_id_text(job.get("id")),
-        company_field=None,
-        description=_lever_text(job),
-    )
-
-
-def _lever_text(job: dict[str, Any]) -> str | None:
-    """The description, the extra lists, the closing text and the salary description.
-
-    Field names from the Lever postings API README (github.com/lever/postings-api):
-    `descriptionPlain`, `lists` (`{text, content}` with HTML content),
-    `additionalPlain` and `salaryDescriptionPlain`. `salaryRange` is not read: the
-    README does not document its `interval` values.
-    """
-    parts = [_text(job.get("descriptionPlain"))]
-    for item in job.get("lists") or []:
-        if isinstance(item, dict):
-            parts.append(_text(item.get("text")))
-            content = _text(item.get("content"))
-            parts.append(htmltext.to_text(content) if content else None)
-    parts.append(_text(job.get("additionalPlain")))
-    parts.append(_text(job.get("salaryDescriptionPlain")))
-    return _joined(parts)
-
-
-def _ashby_text(job: dict[str, Any]) -> str | None:
-    """The description and, with `includeCompensation=true`, the salary summary.
-
-    Field names from Ashby's public job posting API docs
-    (developers.ashbyhq.com/docs/public-job-posting-api): `descriptionPlain` and
-    `compensation.scrapeableCompensationSalarySummary` on each job, such as
-    "$120K - $150K". The summary gets a "Salary:" label so it reads as pay.
-    """
-    compensation = job.get("compensation")
-    summary = (
-        _text(compensation.get("scrapeableCompensationSalarySummary"))
-        if isinstance(compensation, dict)
-        else None
-    )
-    return _joined([_text(job.get("descriptionPlain")), f"Salary: {summary}" if summary else None])
-
-
-def _joined(parts: list[str | None]) -> str | None:
-    """Non-empty parts, one per line (so a sentence never runs into the next); or None."""
-    return "\n".join(part for part in parts if part) or None
-
-
-def _ashby_job(item: object, slug: str) -> _Job | _Skip:
-    job = _mapping(item)
-    if job is None:
-        return _Skip("a job was not an object")
-    title = _text(job.get("title"))
-    if title is None:
-        return _Skip("a job has no title")
-    return _Job(
-        title=title,
-        location=_text(job.get("location")) or "",
-        work_model=_ashby_work(job),
-        url=_http_url(job.get("jobUrl"))
-        or _built(f"https://jobs.ashbyhq.com/{slug}/", job.get("id")),
-        requisition_id=_id_text(job.get("id")),
-        company_field=None,
-        description=_ashby_text(job),
-    )
-
-
-def _ashby_work(job: dict[str, Any]) -> str | None:
-    # Ashby sets isRemote for hybrid as well as remote, so workplaceType wins when
-    # the board sends it. isRemote is only the fallback when that field is absent.
-    if "workplaceType" in job:
-        return _mapped(job.get("workplaceType"), _ASHBY_WORK)
-    if job.get("isRemote") is True:
-        return "remote"
-    return None
-
-
 def _company_name(field: str | None, watchlist_name: str) -> tuple[str, str | None]:
     """The name to store, and the posting name when it differs from the watchlist.
 
@@ -1250,66 +1077,6 @@ def _company_name(field: str | None, watchlist_name: str) -> tuple[str, str | No
     if field.casefold() == watchlist_name.casefold():
         return watchlist_name, None
     return field, field
-
-
-def _built(prefix: str, ident: object) -> str | None:
-    text = _path_id(ident)
-    if text is None:
-        return None
-    return prefix + text
-
-
-def _path_id(value: object) -> str | None:
-    text = _id_text(value)
-    if text is not None and _SLUG.fullmatch(text):
-        return text
-    return None
-
-
-def _id_text(value: object) -> str | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return str(value)
-    return _text(value)
-
-
-def _http_url(value: object) -> str | None:
-    text = _text(value)
-    if text is None:
-        return None
-    parts = urllib.parse.urlsplit(text)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        return None
-    if parts.username is not None or parts.password is not None:
-        return None
-    return text
-
-
-def _nested_text(value: object, key: str) -> str:
-    if isinstance(value, dict):
-        return _text(value.get(key)) or ""
-    return ""
-
-
-def _mapped(value: object, table: dict[str, str]) -> str | None:
-    text = _text(value)
-    if text is None:
-        return None
-    return table.get(text.casefold())
-
-
-def _mapping(value: object) -> dict[str, Any] | None:
-    if isinstance(value, dict):
-        return value
-    return None
-
-
-def _text(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    stripped = value.strip()
-    return stripped or None
 
 
 def _line(name: str, ats: str | None, message: str) -> str:
