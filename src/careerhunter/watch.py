@@ -73,9 +73,12 @@ already checked. An off-lane posting is still gated and scored like any other. W
 `search.lanes`, nothing is checked and no posting is off-lane.
 
 The run record. Each run writes a `watch_runs` row when it starts, in its own
-transaction, and finishes it just before the last line: the board counts, whether the
-budget left anything for the next run, and the postings still held (unscored, scored
-with no fit, off-lane), read from search.db at that moment. A run that crashes, is
+transaction, and stores its id with every score it makes and every fit it fills in
+(`postings.score_run_id`, search migration 0011), beside the score's checked key
+requirements; the bot sends one digest per run from that id. The row is finished
+just before the last line: the board counts, whether the budget left anything for the
+next run, and the postings still held (unscored, scored with no fit, off-lane), read
+from search.db at that moment. A run that crashes, is
 killed or stops on a database error never finishes its row, so its counts stay null.
 
 A model that does not answer (ScoreError) stops all scoring for the rest of the run;
@@ -198,6 +201,7 @@ class _State:
     resume: Resume | None = None
     fits: Mapping[str, str] = field(default_factory=dict)  # tier name -> fit, from config
     lanes_on: bool = False  # search.lanes is set: titles are checked against the lanes
+    run_id: int | None = None  # this run's watch_runs row, stored with each score
     model_down: bool = False
     budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
@@ -307,6 +311,7 @@ def run(
     lines = state.lines
     with db.transaction(conn):
         run_id = search_store.start_watch_run(conn, _iso(state.now()))
+    state.run_id = run_id
     with _isolated(conn, lines, "fit fill-in", state.hook):
         _fill_fits(conn, state)
     if state.lanes_on:
@@ -420,7 +425,7 @@ def _lane_name(title: str, config: Mapping[str, Any]) -> str | None:
 def _fill_fits(conn: sqlite3.Connection, state: _State) -> None:
     """Give scored, unalerted postings stored without a fit the fit of their tier name."""
     with db.transaction(conn):
-        filled = search_store.fill_missing_fits(conn, state.fits)
+        filled = search_store.fill_missing_fits(conn, state.fits, state.run_id)
     if filled:
         state.lines.append(f"watch: fit filled in from config for {filled} scored postings")
 
@@ -1041,6 +1046,8 @@ def _attempt(
                 scout_metadata=metadata,
                 fit=fit,
                 resume_sha256=state.resume_sha256,
+                key_requirements=result.key_requirements,
+                run_id=state.run_id,
             )
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):
                 search_store.insert_skip(conn, posting_id, today, "gap_tier")
