@@ -57,6 +57,12 @@ The fit. A score stores the fit of its tier, from that tier's `fit` key in confi
 config gets no fit, so that posting is held. Every run first fills in the fit of
 scored, unalerted postings stored without one, by their stored tier name.
 
+The run record. Each run writes a `watch_runs` row when it starts, in its own
+transaction, and finishes it just before the last line: the board counts, whether the
+budget left anything for the next run, and the postings still held (unscored, scored
+with no fit, off-lane), read from search.db at that moment. A run that crashes, is
+killed or stops on a database error never finishes its row, so its counts stay null.
+
 A model that does not answer (ScoreError) stops all scoring for the rest of the run;
 the posting it happened on keeps its place, and one line counts what is left. A reply
 that does not parse leaves that posting as it was, behind the others next time.
@@ -174,6 +180,7 @@ class _State:
     resume: Resume | None = None
     fits: Mapping[str, str] = field(default_factory=dict)  # tier name -> fit, from config
     model_down: bool = False
+    budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
     # reserve left for the passes after the boards. Never written anywhere.
     queued: dict[int, PostingText] = field(default_factory=dict)
@@ -181,6 +188,11 @@ class _State:
 
     def out_of_time(self) -> bool:
         return self.budget is not None and self.budget.expired()
+
+    def left_by_budget(self, line: str) -> None:
+        """Log what the budget left for the next run, and remember that it did."""
+        self.budget_cut = True
+        self.lines.append(line)
 
     def in_reserve(self) -> bool:
         return self.budget is not None and self.budget.remaining() < SCORE_RESERVE
@@ -273,6 +285,8 @@ def run(
         fits=tier_fits(rules),
     )
     lines = state.lines
+    with db.transaction(conn):
+        run_id = search_store.start_watch_run(conn, _iso(state.now()))
     with _isolated(conn, lines, "fit fill-in", state.hook):
         _fill_fits(conn, state)
     if scorer is not None and resume_problem is not None:
@@ -310,21 +324,22 @@ def run(
             counts[tally] += 1
     if embedder.enabled():
         if state.out_of_time():
-            lines.append(f"watch: embedding refresh: {_LEFT}")
+            state.left_by_budget(f"watch: embedding refresh: {_LEFT}")
         else:
             with _isolated(conn, lines, "embedding refresh", state.hook):
                 lines.extend(embedder.refresh())
     rechecked = False
     if state.out_of_time():
-        lines.append(f"watch: recheck: {_LEFT}")
+        state.left_by_budget(f"watch: recheck: {_LEFT}")
     else:
         rechecked = _recheck(conn, watchlist, rules, skipped, today, state)
     if scorer is not None:
         if not rechecked or state.out_of_time():
             # Never score a row the current config has not filtered again.
-            lines.append(f"watch: scoring: {_LEFT}")
+            state.left_by_budget(f"watch: scoring: {_LEFT}")
         else:
             _score_passes(conn, scorer, today, embedder, state)
+    _finish_run(conn, state, run_id, counts)
     lines.append(
         f"watch: {counts['fetched']} boards fetched, {counts['failed']} failed, "
         f"{counts['left']} left"
@@ -334,6 +349,28 @@ def run(
 
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+def _finish_run(
+    conn: sqlite3.Connection, state: _State, run_id: int, counts: Mapping[str, int]
+) -> None:
+    """Finish this run's `watch_runs` row with its counts and the postings still held.
+
+    The held counts are read from search.db now, so they are true for a run the budget
+    cut short too. A run that never gets here keeps its row unfinished, with no counts.
+    """
+    with db.transaction(conn):
+        held = search_store.held_counts(conn)
+        search_store.finish_watch_run(
+            conn,
+            run_id,
+            finished_at=_iso(state.now()),
+            budget_reached=state.budget_cut or counts["left"] > 0,
+            boards_fetched=counts["fetched"],
+            boards_failed=counts["failed"],
+            boards_left=counts["left"],
+            held=held,
+        )
 
 
 def _fill_fits(conn: sqlite3.Connection, state: _State) -> None:
@@ -711,7 +748,7 @@ def _record_jobs(
             continue
         if state.out_of_time():
             # Stored and filtered; the next run scores it from the stored fields.
-            lines.append(
+            state.left_by_budget(
                 _line(name, ats, f"{item.title!r} left for the next run (run budget reached)")
             )
             continue
@@ -756,7 +793,7 @@ def _recheck(
     rows = [row for row in rows if int(row["id"]) not in state.inserted]
     for index, row in enumerate(rows):
         if state.out_of_time():
-            state.lines.append(_partly("recheck", len(rows) - index))
+            state.left_by_budget(_partly("recheck", len(rows) - index))
             return False
         with _isolated(conn, state.lines, str(row["company"]), state.hook):
             _recheck_one(conn, row, roles, config, exclusions, today, state.lines)
@@ -884,7 +921,7 @@ def _score_passes(
             )
             return
         if state.out_of_time():
-            state.lines.append(_partly("scoring", left))
+            state.left_by_budget(_partly("scoring", left))
             return
         with _isolated(conn, state.lines, str(row["company"]), state.hook):
             _attempt(
@@ -931,7 +968,9 @@ def _attempt(
         with db.transaction(conn):
             search_store.set_score_attempted_at(conn, posting_id, previous)
         if state.out_of_time():
-            lines.append(_line(name, ats, f"{title} left for the next run (run budget reached)"))
+            state.left_by_budget(
+                _line(name, ats, f"{title} left for the next run (run budget reached)")
+            )
         else:
             state.model_down = True
             kept = "; old score kept" if rescore else ""

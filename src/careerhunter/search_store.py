@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from careerhunter.models import Application, Dating, Posting
 
@@ -254,6 +255,67 @@ def score_attempted_at(conn: sqlite3.Connection, posting_id: int) -> str | None:
 def set_score_attempted_at(conn: sqlite3.Connection, posting_id: int, stamp: str | None) -> None:
     """When the posting was last sent to the model; None clears it."""
     conn.execute("UPDATE postings SET score_attempted_at = ? WHERE id = ?", (stamp, posting_id))
+
+
+@dataclass(frozen=True)
+class HeldCounts:
+    """Watcher postings with no skip that are held back from alerts, by why."""
+
+    unscored: int  # no score yet: waiting to be scored or retried
+    no_fit: int  # scored and not alerted, but its tier name has no fit in config
+    off_lane: int = 0  # scored, off-lane, and below search.off_lane_min_fit
+
+
+def held_counts(conn: sqlite3.Connection) -> HeldCounts:
+    """How many watcher postings with no skip are held, read now."""
+    row = conn.execute(
+        """
+        SELECT
+          coalesce(sum(p.llm_output IS NULL), 0) AS unscored,
+          coalesce(sum(p.llm_output IS NOT NULL AND p.fit IS NULL AND p.alerted_at IS NULL), 0)
+            AS no_fit
+        FROM postings p
+        WHERE p.source = 'watcher'
+          AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
+        """
+    ).fetchone()
+    return HeldCounts(unscored=int(row["unscored"]), no_fit=int(row["no_fit"]))
+
+
+def start_watch_run(conn: sqlite3.Connection, started_at: str) -> int:
+    """A new, unfinished `watch_runs` row. Its counts stay null until it finishes."""
+    cur = conn.execute("INSERT INTO watch_runs (started_at) VALUES (?)", (started_at,))
+    return int(cur.lastrowid or 0)
+
+
+def finish_watch_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    finished_at: str,
+    budget_reached: bool,
+    boards_fetched: int,
+    boards_failed: int,
+    boards_left: int,
+    held: HeldCounts,
+) -> None:
+    """Set the finish time, the budget flag and every count in one UPDATE."""
+    conn.execute(
+        "UPDATE watch_runs SET finished_at = ?, budget_reached = ?, boards_fetched = ?, "
+        "boards_failed = ?, boards_left = ?, held_unscored = ?, held_no_fit = ?, "
+        "held_off_lane = ? WHERE id = ? AND finished_at IS NULL",
+        (
+            finished_at,
+            int(budget_reached),
+            boards_fetched,
+            boards_failed,
+            boards_left,
+            held.unscored,
+            held.no_fit,
+            held.off_lane,
+            run_id,
+        ),
+    )
 
 
 def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:

@@ -1863,8 +1863,9 @@ def test_the_stamp_is_committed_before_the_fetch_and_kept_on_failure(
         raise FetchFailed("synthetic")
 
     lines = w.run(search, entries("Example A"), today=DAY, fetcher=fetch, now=ticking())
-    assert seen == [{key("Example A"): "2026-11-01T08:01:00Z"}]
-    assert attempts(search) == {key("Example A"): "2026-11-01T08:01:00Z"}
+    # 08:01 is the run's start in watch_runs; the board's stamp is the next tick.
+    assert seen == [{key("Example A"): "2026-11-01T08:02:00Z"}]
+    assert attempts(search) == {key("Example A"): "2026-11-01T08:02:00Z"}
     assert lines[-1] == "watch: 0 boards fetched, 1 failed, 0 left"
 
 
@@ -1876,7 +1877,9 @@ def test_a_board_that_crashes_keeps_its_new_stamp_and_moves_to_the_back(
     crashing = three_boards()
     crashing.mapping[board("Example A")] = RuntimeError("synthetic")
     w.run(search, entries("Example A"), today=DAY, fetcher=crashing, now=now)
-    assert attempts(search)[key("Example A")] == "2026-11-01T08:04:00Z"
+    # The first run ticks for its start, three boards and its finish (08:01 to 08:05);
+    # the second ticks for its start (08:06), then stamps the crashing board.
+    assert attempts(search)[key("Example A")] == "2026-11-01T08:07:00Z"
     fetcher = three_boards()
     w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher, now=now)
     assert fetcher.calls == [board("Example B"), board("Example C"), board("Example A")]
