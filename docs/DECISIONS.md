@@ -9,7 +9,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 001 | Data lives outside the repo, on an encrypted external volume | Accepted (Phase 1) |
 | 002 | A mount guard verifies the data volume, not just the path | Accepted (Phase 1) |
 | 003 | Secrets live in the macOS Keychain | Accepted (Phase 1) |
-| 004 | SQLite is the record store | Accepted (Phase 1); amended by 014 |
+| 004 | SQLite is the record store | Accepted (Phase 1); amended by 014; amended (#51) |
 | 005 | The schema is designed around EI record-keeping | Accepted (Phase 1); amended by 014 |
 | 006 | gitleaks via the pinned upstream pre-commit hook, not brew | Accepted (Phase 1); amended (lockfile) |
 | 007 | A dedicated Telegram bot for notifications | Accepted (for Phase 2) |
@@ -24,9 +24,10 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2); amended (#30) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
-| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30) |
+| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023 |
 | 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30) |
-| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30) |
+| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023 |
+| 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37) |
 
 ---
 
@@ -92,6 +93,13 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 ## ADR-004: SQLite is the record store
 
 > **Amended by [ADR-014](#adr-014-two-data-layers-searchdb-and-one-ei-record-file-per-claim) (Phase 1.5).** There are now two kinds of SQLite file, each with its own migration track: `search.db`, and one `ei_record_<label>.db` per EI claim. Everything below still applies to each file.
+
+> **Amended: one migration transaction (#51).** Two processes opening a file with a pending migration could both try it, and the second failed. Now:
+> - When the file has its identity and every migration is applied, `migrate` returns without taking a write lock. Checksums are still checked on that path.
+> - Otherwise all pending migrations run in one `BEGIN IMMEDIATE` transaction. The identity is claimed or checked and the applied versions are re-read inside the lock, so a process that waited applies only what is still pending, or nothing. There is one `COMMIT`, and any error rolls the whole run back, the identity claim on a new file included.
+> - Each migration runs statement by statement through `execute`. Its text is split at `;` and joined again until `sqlite3.complete_statement` says a statement is complete, so a `;` in a comment, a string or a trigger body does not split it. `executescript` is not used, because it commits a held transaction.
+> - The connection must be plain autocommit with no transaction open. A process waits up to 60 seconds for another one's lock, and then fails with a `MigrationError` that says nothing was applied.
+> - SQLite ignores `PRAGMA foreign_keys` inside a transaction, so a migration cannot switch foreign keys off. A table rebuild uses `PRAGMA defer_foreign_keys = ON`, or a design that needs neither.
 
 **Context.** One user, one machine, a few thousand rows over years. The record must survive for 6+ years and be easy to back up.
 
@@ -494,7 +502,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - **The cosine is stored beside the LLM tier and never replaces it.** The existing skip rules stay as they are. A cosine does not cause a skip. The alert keeps company, title, and link, and adds `LLM: <tier>`. When a cosine is present, one more line is `similarity: 0.82`.
 - **A miss fails closed for that posting only.** If the resume file is missing, the embedding server is down, or a vector has the wrong dimension, that posting's cosine stays null. The watch log gets `embedding miss posting <id>: <reason>` and nothing else: no resume text, no posting text, and no vector. The run continues and still exits 0. The alert then has the LLM line only.
 - **The description is still not a column.** The first score pass embeds the in-memory text: company, title, location, work model, and the description when the board sent one. A later pass has only the stored fields. The vector is the only kept trace of that description. When the resume bytes change, stored posting vectors are compared again locally, without calling the model.
-- **`search.resume` is an optional path relative to the data folder.** The example is null. An absolute path or a `..` segment is invalid. The real path stays in the data-folder config.
+- **`search.resume` is an optional path relative to the data folder.** The example is null. An absolute path or a `..` segment is invalid. The real path stays in the data-folder config. *Amended by [ADR-023](#adr-023-scoring-is-grounded-in-an-imported-resume-and-re-scored-when-it-changes):* the embedder reads the resume only through `resume.load`, so `search.resume` must be `resume/current.txt`, the file `careerhunter resume import` writes, unchanged since its import.
 - **`fit_rubric.embedding_weight` is validated and the watcher does not apply it.** It is an optional number from 0 to 1. The example is null. The watcher does not read it for skips, alerts, or what it stores.
 - **Evaluation reads stored scores only.** `careerhunter embed-eval` does not call the model. The report is a mode 0600 file under `evals/` in the data folder. The terminal prints the relative path only. Spearman uses midranks and Pearson correlation on those ranks, from the standard library. LLM rank comes from the order of `gap_tiers`, best first. Precision at 5 and at 10 counts an application as a hit. Fewer than two comparable rows writes `undefined` and exits 0. If `embedding_weight` is set, the report also ranks `weight * cosine + (1 - weight) * tier`. That blend is not stored and not alerted.
 
@@ -554,6 +562,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-022: A watch run isolates failures, logs as it goes, and has a time budget
 
+> **Amended by [ADR-023](#adr-023-scoring-is-grounded-in-an-imported-resume-and-re-scored-when-it-changes) (#37).** Inline scoring of new postings stops once less than 240 seconds of the budget are left. After the boards, scoring runs in three passes, each ordered by its last score attempt. A model that does not answer stops scoring for the rest of the run. The budget, the board rotation and the counting below are unchanged.
+
 **Context.**
 - One unexpected exception in one company ended the whole watch run, and the boards after it were never fetched.
 - Log lines were written only when the run finished. launchd discards stderr, so a crash left no trace at all.
@@ -579,3 +589,48 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A posting stored after the budget ran out is scored on a later run from its stored fields only, without the description.
 - A database error that would have affected only one company still stops the run.
 - The log files grow without limit. There is no rotation yet.
+
+## ADR-023: Scoring is grounded in an imported resume, and re-scored when it changes
+
+**Context.**
+- The scoring prompt asked the model for missing requirements without giving it the resume, so the gaps were guesses about the posting alone.
+- The resume is the most personal text in the system. It has to reach the local model, and nothing else: no log, no `search.db` column, no exception, no Telegram message.
+- A resume is a PDF or a DOCX, made by other software. Parsing it is parsing untrusted input, and both formats can be made to expand far beyond their size on disk.
+- A changed resume makes every stored score stale, but a watch run has a 600-second budget, and the boards must still be fetched first (ADR-022).
+
+**Decision.**
+- **Import, locally.** `careerhunter resume import <file>` decides the format from the bytes: `%PDF-` is a PDF, and a zip holding `[Content_Types].xml` and `word/document.xml` is a DOCX. Anything else is refused.
+  - PDF is read with pypdf. An encrypted PDF is refused before any page is touched, and so is one with more than 200 pages.
+  - DOCX is read with the standard library. More than 100 zip entries is refused. `word/document.xml` is read with a bounded read, never trusting the zip header. Its bytes must be UTF-8 with no NUL byte and no DOCTYPE anywhere, and the parser reads exactly those bytes.
+  - Caps are refused, never truncated: a 10 MB file, a 5 MB `document.xml`, and 50,000 characters, checked as the text is collected.
+  - Every failure is a `ResumeError` with one of a fixed set of messages, no content and no path, raised `from None`. Nothing is stored.
+- **One file, one hash.** The text is written to `resume/current.txt` in the data folder (folder 0700, file 0600, created with `O_EXCL` and `fchmod`). Only its SHA-256 and the time go into `search.db` (`resume_import`, search migration 0008).
+  - One import runs at a time, under an exclusive lock on `resume/.import.lock`.
+  - The file is renamed into place inside the database transaction. The file it replaces is kept as `resume/.previous.txt` until the COMMIT succeeds, then removed.
+  - If the COMMIT fails after the rename, the previous file is put back. If that fails too, or the process stops in between, the file no longer matches its recorded hash. Then the resume is refused wherever it is read, and `doctor` reports it, so a mismatch is never used silently.
+- **One way to read it.** `resume.load` returns the text only when `search.resume` is exactly `resume/current.txt` and the file matches the latest import. Scoring and embeddings both read the resume through it. `doctor` checks the modes, any leftover temporary or `.previous.txt` file, the hash, and the config value.
+- **The resume goes in the scoring prompt, and the reply does not come back out (D-A1).** While a resume is in use:
+  - `llm_output` stores canonical JSON of the parsed gaps, never the model's reply.
+  - A reply is treated as one that does not parse when a gap name or type is longer than 120 characters, or when 40 characters in a row of one also appear in the resume. Both sides are compared after NFKC, case folding, and turning every run of whitespace into one space.
+  - Such a posting stays unscored and is tried again.
+- **A down model is told apart from a bad reply.** A refused URL, no connection, a timeout, or any HTTP status other than 200 is a `ScoreError`. It stops all scoring for the rest of the run, and the posting it happened on keeps its place. A 200 that does not parse leaves that posting as it was.
+- **Re-scoring, under the budget.** A score records the hash of the resume it was made with (`postings.scored_resume_sha256`).
+  - During the boards, only new postings are scored, and that stops once less than 240 seconds of the budget are left.
+  - A stored posting on a fetched board whose hash differs is queued with its description, which stays in memory.
+  - After the boards come never-scored postings, then the queued re-scores, then re-scores from the stored fields. Within each pass the order is the last attempt (`postings.score_attempted_at`, never-tried first), then the oldest posting, so one posting that keeps failing goes behind the others. Anything not reached is left for the next run and not counted.
+  - A posting with a skip or an application keeps its score. An alerted posting is re-scored and not sent again. A failed re-score keeps the old score and hash.
+- **A configured resume that cannot be used holds scoring.** If `search.resume` is set but `load` refuses it, the run scores nothing and logs one line with the fixed reason. It does not score without the resume while the hashes say otherwise.
+
+**Alternatives.**
+- Storing the resume text in `search.db`. Rejected: `search.db` is read by the bot, `doctor`, export and every backup, and the text does not need to be there.
+- Storing the model's reply as before. Rejected: a model can quote its prompt, and the reply would carry the resume into `search.db`.
+- A subprocess with a hard time and memory limit around pypdf. Rejected for now: the file is the operator's own, pypdf 6.21.4 limits stream decompression, and macOS does not enforce `RLIMIT_AS`, so the memory limit would hold on Linux only.
+- defusedxml. Rejected: a DOCTYPE is refused before parsing, so no entity can be declared, and ElementTree never fetches an external one. It would be one more dependency for no gain.
+- Re-scoring everything inline during the boards. Rejected: model calls would use the budget before later boards were fetched.
+- Scoring without the resume when it cannot be loaded. Rejected: the stored hashes would then say a score used a resume it did not.
+
+**Trade-offs.**
+- pypdf 6.21.4 was younger than 14 days when it was locked. It is allowed as a listed security fix, with its own `exclude-newer` cutoff (ADR-006), because every older version has known denial-of-service advisories. The mypy pre-commit hook runs in its own environment with `pypdf==6.21.4`. That pin has to move with `uv.lock` whenever pypdf is upgraded.
+- A copy of the resume shorter than 40 characters in a gap name is not caught.
+- Re-scores wait while never-scored postings outnumber what one run can score.
+- A re-score from the stored fields has no description, so it can differ from one made with it.
