@@ -401,13 +401,16 @@ def test_a_bug_in_our_own_parser_still_raises(monkeypatch: pytest.MonkeyPatch) -
         score_posting(posting(), RUBRIC, transport=lambda url, payload: reply('{"gaps": []}'))
 
 
-def test_a_broken_model_reply_leaves_postings_unscored_and_the_run_finishes(
+def test_a_model_that_stops_answering_is_not_asked_again_this_run(
     search: sqlite3.Connection,
 ) -> None:
+    """The first failure stops scoring; both postings stay unscored and the run finishes."""
     first = url("greenhouse", "examplerobotics")
     second = url("greenhouse", "samplelogistics")
+    calls: list[str] = []
 
     def broken(address: str, payload: bytes) -> tuple[int, bytes]:
+        calls.append(address)
         raise http.client.RemoteDisconnected("synthetic")
 
     def scorer(text: PostingText) -> Score | None:
@@ -430,8 +433,14 @@ def test_a_broken_model_reply_leaves_postings_unscored_and_the_run_finishes(
         scorer=scorer,
     )
     assert len(postings(search)) == 2
-    assert sum("left unscored" in line for line in lines) == 2
+    assert len(calls) == 1
+    assert sum("left unscored (model unreachable)" in line for line in lines) == 1
+    assert sum("left for the next run (model unreachable)" in line for line in lines) == 1
     assert all(row["llm_output"] is None for row in postings(search))
+    # The posting the failure happened on keeps its place for the next run.
+    stamps = search.execute("SELECT score_attempted_at FROM postings").fetchall()
+    assert [row[0] for row in stamps] == [None, None]
+    assert lines[-1] == "watch: 2 boards fetched, 0 failed, 0 left"
 
 
 def _model(monkeypatch: pytest.MonkeyPatch, header_cost: float) -> tuple[FakeServer, FakeClock]:

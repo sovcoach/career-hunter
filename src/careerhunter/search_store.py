@@ -201,12 +201,30 @@ def set_posting_score(
     gaps: str,
     llm_output: str,
     scout_metadata: str | None,
+    resume_sha256: str | None = None,
 ) -> None:
-    """Store parsed gaps, model text and the tier. Does not set fit_rating."""
+    """Store parsed gaps, model text, the tier and the resume's hash. Not fit_rating.
+
+    `resume_sha256` is the resume the score was made with, or None without one. It
+    replaces the stored value, so a later resume change is seen as a difference.
+    """
     conn.execute(
-        "UPDATE postings SET gaps = ?, llm_output = ?, scout_metadata = ? WHERE id = ?",
-        (gaps, llm_output, scout_metadata, posting_id),
+        "UPDATE postings SET gaps = ?, llm_output = ?, scout_metadata = ?, "
+        "scored_resume_sha256 = ? WHERE id = ?",
+        (gaps, llm_output, scout_metadata, resume_sha256, posting_id),
     )
+
+
+def score_attempted_at(conn: sqlite3.Connection, posting_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT score_attempted_at FROM postings WHERE id = ?", (posting_id,)
+    ).fetchone()
+    return None if row is None or row[0] is None else str(row[0])
+
+
+def set_score_attempted_at(conn: sqlite3.Connection, posting_id: int, stamp: str | None) -> None:
+    """When the posting was last sent to the model; None clears it."""
+    conn.execute("UPDATE postings SET score_attempted_at = ? WHERE id = ?", (stamp, posting_id))
 
 
 def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:

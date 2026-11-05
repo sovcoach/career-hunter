@@ -738,9 +738,6 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
     # One budget for the whole run, shared by every client the run calls.
     budget = Deadline(watch.RUN_BUDGET)
 
-    def scorer(posting: PostingText) -> Score | None:
-        return score_posting(posting, doc, transport=partial(score_transport, budget=budget))
-
     def on_crash(who: str, exc: Exception) -> None:
         log.note(_with_traceback(f"watch: {who}", exc))
 
@@ -750,6 +747,23 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
         return _db_abort(log, "watch", exc)
     try:
         db.migrate(conn, "search")
+        # The resume is loaded once and given to both the scorer and the run, so the
+        # hash the run stores is the one the prompt was built with.
+        loaded: resume.Resume | None = None
+        problem: str | None = None
+        try:
+            loaded = resume.load(datadir.root, conn, doc)
+        except resume.ResumeError as exc:
+            problem = str(exc)
+
+        def scorer(posting: PostingText) -> Score | None:
+            return score_posting(
+                posting,
+                doc,
+                transport=partial(score_transport, budget=budget),
+                resume=loaded,
+            )
+
         watch.run(
             conn,
             entries,
@@ -763,6 +777,8 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             on_crash=on_crash,
             emit=log.append,
             budget=budget,
+            resume=loaded,
+            resume_problem=problem,
         )
     except (sqlite3.Error, db.MigrationError) as exc:
         _rollback(conn)

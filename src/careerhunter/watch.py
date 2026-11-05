@@ -35,6 +35,23 @@ budget does not reach is logged as left for the next run and is not counted as
 fetched or failed. A board's attempt stamp is written just before its fetch; a board
 the budget left out gets its earlier stamp back. A posting is scored at most once per
 run. The last line is `watch: <n> boards fetched, <m> failed, <k> left`.
+
+Scoring and the resume (ADR-023). The caller loads the resume once and passes it in,
+or passes the reason it could not be used; then nothing is scored this run, and one
+line says why. Only new postings are scored while the boards are fetched, and that
+stops once less than SCORE_RESERVE seconds of the budget are left, so the passes after
+the boards always get time. A stored posting on a fetched board whose score was made
+with another resume (or none) is queued for re-scoring with its description, which
+stays in memory only. After the boards, under the budget, come never-scored postings,
+then the queued re-scores, then re-scores from the stored fields. Within each pass the
+order is the last score attempt (never-tried first), then the oldest posting, so a
+posting that keeps failing goes behind the others. A posting with a skip or an
+application keeps its score and is not re-scored. An alerted posting is re-scored and
+not alerted again. A failed re-score keeps the old score and hash.
+
+A model that does not answer (ScoreError) stops all scoring for the rest of the run;
+the posting it happened on keeps its place, and one line counts what is left. A reply
+that does not parse leaves that posting as it was, behind the others next time.
 """
 
 from __future__ import annotations
@@ -56,6 +73,7 @@ from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout
 from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
+from careerhunter.resume import Resume
 from careerhunter.runlog import RunLogError
 from careerhunter.score import Score, ScoreError
 
@@ -66,6 +84,8 @@ OnCrash = Callable[[str, Exception], None]
 Tally = Literal["fetched", "failed", "left"]
 
 RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
+# Inline scoring of new postings stops once less than this is left of the budget.
+SCORE_RESERVE = 240.0
 _LEFT = "run budget reached; left for the next run"
 
 _BOARDS = ("greenhouse", "lever", "ashby")
@@ -142,9 +162,22 @@ class _State:
     now: Callable[[], dt.datetime]
     inserted: set[int] = field(default_factory=set)
     attempted: set[int] = field(default_factory=set)  # sent to the scorer this run
+    resume: Resume | None = None
+    model_down: bool = False
+    # In memory only: re-scores queued from fetched boards, and new postings the
+    # reserve left for the passes after the boards. Never written anywhere.
+    queued: dict[int, PostingText] = field(default_factory=dict)
+    held_new: dict[int, PostingText] = field(default_factory=dict)
 
     def out_of_time(self) -> bool:
         return self.budget is not None and self.budget.expired()
+
+    def in_reserve(self) -> bool:
+        return self.budget is not None and self.budget.remaining() < SCORE_RESERVE
+
+    @property
+    def resume_sha256(self) -> str | None:
+        return None if self.resume is None else self.resume.sha256
 
 
 class _Emitting(list[str]):
@@ -208,11 +241,15 @@ def run(
     emit: Callable[[str], None] | None = None,
     budget: Deadline | None = None,
     now: Callable[[], dt.datetime] | None = None,
+    resume: Resume | None = None,
+    resume_problem: str | None = None,
 ) -> list[str]:
     """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`.
 
     Each log line is handed to `emit` as it happens; the same lines are returned.
     `budget` bounds the whole run; the caller also gives it to each client it builds.
+    `resume` is the resume the scorer was given, or None. `resume_problem` is the
+    fixed reason a configured resume could not be used; then nothing is scored.
     """
     dt.date.fromisoformat(today)
     rules = config or {}
@@ -222,8 +259,12 @@ def run(
         hook=on_crash or _no_hook,
         budget=budget,
         now=now or _utc_now,
+        resume=resume,
     )
     lines = state.lines
+    if scorer is not None and resume_problem is not None:
+        lines.append(f"watch: scoring: resume not usable ({resume_problem}); left for the next run")
+        scorer = None
     embedder = Embedder(conn, data_dir, rules, transport=embed_transport)
     blocked: set[str] = set()
     counts = {"fetched": 0, "failed": 0, "left": 0}
@@ -270,7 +311,7 @@ def run(
             # Never score a row the current config has not filtered again.
             lines.append(f"watch: scoring: {_LEFT}")
         else:
-            _score_waiting(conn, scorer, today, embedder, state)
+            _score_passes(conn, scorer, today, embedder, state)
     lines.append(
         f"watch: {counts['fetched']} boards fetched, {counts['failed']} failed, "
         f"{counts['left']} left"
@@ -627,14 +668,6 @@ def _record_jobs(
                 _line(name, ats, f"identity conflict on {item.title!r}; continuing: {exc}")
             )
             continue
-        if not inserted:
-            existing += 1
-            continue
-        new += 1
-        state.inserted.add(posting_id)
-        if verdict.reason:
-            lines.append(_line(name, ats, f"{item.title!r} skipped ({verdict.reason})"))
-            continue
         seen = PostingText(
             company=company,
             title=item.title,
@@ -643,14 +676,36 @@ def _record_jobs(
             description=item.description,
             requisition_id=item.requisition_id,
         )
-        if scorer is not None and state.out_of_time():
+        if not inserted:
+            existing += 1
+            if scorer is not None and _needs_rescore(conn, posting_id, state.resume_sha256):
+                state.queued[posting_id] = seen  # scored after the boards
+            continue
+        new += 1
+        state.inserted.add(posting_id)
+        if verdict.reason:
+            lines.append(_line(name, ats, f"{item.title!r} skipped ({verdict.reason})"))
+            continue
+        if scorer is None:
+            continue
+        if state.out_of_time():
             # Stored and filtered; the next run scores it from the stored fields.
             lines.append(
                 _line(name, ats, f"{item.title!r} left for the next run (run budget reached)")
             )
             continue
-        state.attempted.add(posting_id)
-        _score_one(conn, posting_id, seen, scorer, today, lines, name, ats, embedder)
+        if state.model_down:
+            lines.append(
+                _line(name, ats, f"{item.title!r} left for the next run (model unreachable)")
+            )
+            continue
+        if state.in_reserve():
+            state.held_new[posting_id] = seen
+            lines.append(
+                _line(name, ats, f"{item.title!r} left for scoring after the boards (reserve)")
+            )
+            continue
+        _attempt(conn, state, posting_id, seen, scorer, today, name, ats, embedder)
     lines.append(_line(name, ats, f"{new} new, {existing} already recorded"))
 
 
@@ -725,68 +780,141 @@ def _recheck_one(
         )
 
 
-def _score_waiting(
+# The three scoring queries, written out in full. Within a pass: never-tried first, then
+# the oldest attempt, then the oldest posting.
+_NEVER_SCORED_SQL = (
+    "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
+    "FROM postings p JOIN companies c ON c.id = p.company_id "
+    "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
+    "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+    "ORDER BY p.score_attempted_at IS NOT NULL, p.score_attempted_at, p.first_seen, p.id"
+)
+_RESCORE_SQL = (
+    "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
+    "FROM postings p JOIN companies c ON c.id = p.company_id "
+    "WHERE p.source = 'watcher' AND p.llm_output IS NOT NULL "
+    "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
+    "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+    "ORDER BY p.score_attempted_at IS NOT NULL, p.score_attempted_at, p.first_seen, p.id"
+)
+_NEEDS_RESCORE_SQL = (
+    "SELECT 1 FROM postings p "
+    "WHERE p.id = ? AND p.source = 'watcher' AND p.llm_output IS NOT NULL "
+    "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
+    "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)"
+)
+
+
+def _needs_rescore(conn: sqlite3.Connection, posting_id: int, sha256: str | None) -> bool:
+    """A scored watcher posting with no skip or application, scored with another resume."""
+    if sha256 is None:
+        return False
+    row = conn.execute(_NEEDS_RESCORE_SQL, (posting_id, sha256)).fetchone()
+    return row is not None
+
+
+def _stored_text(row: sqlite3.Row) -> PostingText:
+    return PostingText(
+        company=row["company"],
+        title=row["title"],
+        location=row["location"],
+        work_model=row["work_model"],
+        requisition_id=row["requisition_id"],
+    )
+
+
+def _score_passes(
     conn: sqlite3.Connection,
     scorer: Scorer,
     today: str,
     embedder: Embedder,
     state: _State,
 ) -> None:
-    """Score watcher postings that passed the filter and have no model text yet.
+    """Never-scored postings, then queued re-scores, then re-scores from stored fields.
 
-    A posting already sent to the scorer this run is not sent again.
+    A posting already sent to the scorer this run is not sent again. Within a pass the
+    order is the last attempt (never-tried first), then the oldest posting.
     """
-    rows = conn.execute(
-        "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
-        "FROM postings p JOIN companies c ON c.id = p.company_id "
-        "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
-        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
-    ).fetchall()
-    rows = [row for row in rows if int(row["id"]) not in state.attempted | state.inserted]
-    for index, row in enumerate(rows):
-        if state.out_of_time():
-            state.lines.append(_partly("scoring", len(rows) - index))
+    never = conn.execute(_NEVER_SCORED_SQL).fetchall()
+    work: list[tuple[sqlite3.Row, PostingText]] = [
+        (row, state.held_new.get(int(row["id"])) or _stored_text(row))
+        for row in never
+        if int(row["id"]) not in state.attempted
+    ]
+    sha256 = state.resume_sha256
+    if sha256 is not None:
+        rescores = conn.execute(_RESCORE_SQL, (sha256,)).fetchall()
+        fresh = [row for row in rescores if int(row["id"]) not in state.attempted]
+        work += [
+            (row, state.queued[int(row["id"])]) for row in fresh if int(row["id"]) in state.queued
+        ]
+        work += [(row, _stored_text(row)) for row in fresh if int(row["id"]) not in state.queued]
+    for index, (row, text) in enumerate(work):
+        left = len(work) - index
+        if state.model_down:
+            state.lines.append(
+                f"watch: scoring: model unreachable; {left} postings left for the next run"
+            )
             return
-        state.attempted.add(int(row["id"]))
+        if state.out_of_time():
+            state.lines.append(_partly("scoring", left))
+            return
         with _isolated(conn, state.lines, str(row["company"]), state.hook):
-            _score_one(
+            _attempt(
                 conn,
+                state,
                 int(row["id"]),
-                PostingText(
-                    company=row["company"],
-                    title=row["title"],
-                    location=row["location"],
-                    work_model=row["work_model"],
-                    requisition_id=row["requisition_id"],
-                ),
+                text,
                 scorer,
                 today,
-                state.lines,
                 str(row["company"]),
                 None,
                 embedder,
             )
 
 
-def _score_one(
+def _attempt(
     conn: sqlite3.Connection,
+    state: _State,
     posting_id: int,
     posting: PostingText,
-    scorer: Scorer | None,
+    scorer: Scorer,
     today: str,
-    lines: list[str],
     name: str,
     ats: str | None,
     embedder: Embedder,
 ) -> None:
-    if scorer is None:
-        return
+    """Send one posting to the scorer and store what comes back.
+
+    The attempt is stamped first, in its own transaction. A model that does not answer
+    gives the stamp back and stops scoring for the run; a budget that ran out during
+    the call gives it back too. A reply that does not parse keeps the stamp, so the
+    posting goes behind the others, and leaves the stored score as it was.
+    """
+    lines = state.lines
+    state.attempted.add(posting_id)
+    rescore = _scored(conn, posting_id)  # it has a score: this is a re-score
+    with db.transaction(conn):
+        previous = search_store.score_attempted_at(conn, posting_id)
+        search_store.set_score_attempted_at(conn, posting_id, _iso(state.now()))
+    title = repr(posting.title)
     try:
         result = scorer(posting)
     except (ScoreError, OSError):
-        result = None
+        with db.transaction(conn):
+            search_store.set_score_attempted_at(conn, posting_id, previous)
+        if state.out_of_time():
+            lines.append(_line(name, ats, f"{title} left for the next run (run budget reached)"))
+        else:
+            state.model_down = True
+            kept = "; old score kept" if rescore else ""
+            lines.append(_line(name, ats, f"{title} left unscored (model unreachable){kept}"))
+        return
     if result is None:
-        lines.append(_line(name, ats, f"{posting.title!r} left unscored"))
+        kept = "; old score kept" if rescore else ""
+        lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
     else:
         metadata = None if result.tier is None else json.dumps({"tier": result.tier})
         with db.transaction(conn):
@@ -796,14 +924,26 @@ def _score_one(
                 gaps=result.gaps,
                 llm_output=result.llm_output,
                 scout_metadata=metadata,
+                resume_sha256=state.resume_sha256,
             )
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):
                 search_store.insert_skip(conn, posting_id, today, "gap_tier")
         if result.excluded:
-            lines.append(_line(name, ats, f"{posting.title!r} skipped (gap_tier)"))
+            lines.append(_line(name, ats, f"{title} skipped (gap_tier)"))
+        elif rescore:
+            lines.append(_line(name, ats, f"{title} re-scored"))
     reason = embedder.attach(posting_id, posting)
     if reason is not None:
         lines.append(miss_line(posting_id, reason))
+
+
+def _scored(conn: sqlite3.Connection, posting_id: int) -> bool:
+    row = conn.execute("SELECT llm_output FROM postings WHERE id = ?", (posting_id,)).fetchone()
+    return row is not None and row[0] is not None
+
+
+def _iso(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _align(conn: sqlite3.Connection, name: str, ats_type: str, ats_slug: str) -> _Aligned:
