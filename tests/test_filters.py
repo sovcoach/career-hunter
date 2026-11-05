@@ -100,19 +100,120 @@ def test_hard_gates_and_the_seniority_exceptions() -> None:
     assert verdict("Coordinator", description="Reports to a Director").reason is None
 
 
-def test_min_salary_uses_the_highest_stated_yearly_figure() -> None:
-    priced = {"hard_gates": {"min_salary": 60000}}
-    low = verdict("Coordinator", description="Salary $40,000", config=priced)
-    assert low.reason == "min_salary"
-    spanned = verdict("Coordinator", description="$40,000-$80,000", config=priced)
-    assert spanned.reason is None
-    thousands = verdict("Coordinator", description="45k plus bonus", config=priced)
-    assert thousands.reason == "min_salary"
-    assert verdict("Coordinator", description="80k", config=priced).reason is None
-    assert verdict("Coordinator", description="$25/hour", config=priced).reason is None
-    assert verdict("Coordinator", description="salary 2026 review", config=priced).reason is None
-    assert verdict("Coordinator", config=priced).reason is None
+PRICED = {"hard_gates": {"min_salary": 60000}}
+
+
+def salary(description: str) -> str | None:
+    return verdict("Coordinator", description=description, config=PRICED).reason
+
+
+def test_min_salary_uses_the_top_of_the_highest_stated_range() -> None:
+    assert salary("Salary $40,000") == "min_salary"
+    assert salary("Salary range $40,000-$80,000") is None
+    assert salary("Salary 45k plus bonus") == "min_salary"
+    assert salary("Salary 80k") is None
+    assert salary("salary 2026 review") is None
+    assert verdict("Coordinator", config=PRICED).reason is None
     assert verdict("Coordinator", description="Salary $40,000", config=GATES).reason is None
+    # Two ranges: the top of the higher one decides.
+    assert salary("Pay range $40,000-$50,000 in one office, $55,000-$65,000 in another") is None
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "$40,000-$50,000",  # no pay word and no unit
+        "45k",
+        "We raised $50,000,000 in funding.",
+        "Signing bonus of $5,000.",
+        "A $10,000 signing bonus.",
+        "Relocation support up to $8,000 is offered.",
+        "Equity: $20,000 in RSUs.",
+        "Pay includes a one-time bonus of $2,000.",
+        "Generous 401k matching, salary negotiable.",
+    ],
+)
+def test_a_figure_outside_a_pay_context_does_not_count(description: str) -> None:
+    assert salary(description) is None
+
+
+def test_bonus_figures_beside_pay_are_left_out_and_pay_still_counts() -> None:
+    assert salary("Base salary $40,000, signing bonus $90,000") == "min_salary"
+    assert salary("Salary $40,000 plus a $90,000 equity grant") == "min_salary"
+    assert salary("Salary $90,000 plus annual bonus") is None
+
+
+@pytest.mark.parametrize(
+    ("description", "reason"),
+    [
+        ("Pay range: $20 - $25 per hour", "min_salary"),  # below: top 52,000
+        ("Pay range: $25 - $35 per hour", None),  # straddles: top 72,800
+        ("Pay range: $30 - $40/hr", None),  # above
+        ("Pay range: $20 \u2013 $25 per hour", "min_salary"),  # an en dash joins a range
+        ("Hourly pay: $26 to $28.", "min_salary"),  # unit named once in the sentence
+        ("$25/hour", "min_salary"),  # a single hourly figure: 52,000
+        ("$30 an hour", None),  # 62,400
+        ("Pay is 29 per hour", None),  # no currency mark, but a unit: 60,320
+        ("$22.50/hr", "min_salary"),
+    ],
+)
+def test_hourly_figures_become_yearly_at_forty_hours_a_week(
+    description: str, reason: str | None
+) -> None:
+    assert salary(description) == reason
+
+
+@pytest.mark.parametrize(
+    ("description", "reason"),
+    [
+        ("Salary $4,000 per month", "min_salary"),  # x 12 = 48,000
+        ("Salary $5,500 monthly", None),  # 66,000
+        ("$1,100 per week", "min_salary"),  # x 52 = 57,200
+        ("$1,200 weekly", None),  # 62,400
+        ("$220 per day", "min_salary"),  # x 260 = 57,200
+        ("$240 daily", None),  # 62,400
+        ("Salary $55,000 per year", "min_salary"),
+        ("Salary range $50k-$70k annually", None),
+        ("Pay 50-55k", "min_salary"),  # the k covers both ends
+    ],
+)
+def test_each_pay_unit_is_converted_to_yearly(description: str, reason: str | None) -> None:
+    assert salary(description) == reason
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Salary: USD 40,000",
+        "Salary US$40,000",
+        "Salary $40,000 USD",
+        "Salary €40,000",
+        "Salary £40k",
+        "Salary range EUR 30,000 - 40,000",
+        "Salary $30,000 - $40,000 USD",  # a code on one end marks the whole range
+        "Salary 40,000 GBP",
+    ],
+)
+def test_a_figure_in_another_currency_is_ignored_so_the_posting_passes(description: str) -> None:
+    assert salary(description) is None
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Salary $40,000",
+        "Salary C$40,000",
+        "Salary CA$40,000",
+        "Salary CAD 40,000",
+        "Salary 40k CAD",
+    ],
+)
+def test_cad_and_a_plain_dollar_sign_count(description: str) -> None:
+    assert salary(description) == "min_salary"
+
+
+def test_two_different_units_in_a_sentence_with_none_attached_count_for_nothing() -> None:
+    assert salary("Paid hourly or monthly, $20 to start.") is None
 
 
 def test_location_rules_and_role_filters() -> None:
