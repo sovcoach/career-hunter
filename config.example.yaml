@@ -149,3 +149,8 @@ ei:
 # with `careerhunter bot discover` (see docs/SETUP.md).
 telegram:
   chat_id: null                # e.g. 123456789
+
+# Optional: watcher alerts. The bot sends one digest per watch run, at most this many
+# postings per poll (1-50, default 10); the rest carry over to the next poll.
+alerts:
+  max_per_poll: 10

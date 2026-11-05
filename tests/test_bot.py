@@ -11,6 +11,7 @@ import datetime as dt
 import itertools
 import json
 import logging
+import re
 import shutil
 import sqlite3
 import urllib.error
@@ -989,6 +990,21 @@ def _sends(env: Env) -> list[dict[str, Any]]:
     return [params for method, params in env.api.calls if method == "sendMessage"]
 
 
+def _digests(env: Env) -> list[dict[str, Any]]:
+    return [p for p in _sends(env) if p["text"].startswith("New postings:")]
+
+
+def _rows(env: Env) -> list[list[str]]:
+    """Every digest row sent so far, as its lines, the row number taken off the first."""
+    rows = []
+    for params in _digests(env):
+        for block in params["text"].split("\n\n")[1:]:
+            lines = block.split("\n")
+            lines[0] = re.sub(r"^\d+\. ", "", lines[0])
+            rows.append(lines)
+    return rows
+
+
 def test_company_label_marks_only_the_agency_itself() -> None:
     doc = {
         "watchlist": [
@@ -1018,20 +1034,20 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
     assert _poll(env) == 0
     sends = _sends(env)
     assert [p["text"] for p in sends] == [
-        "Example Robotics — Operations Coordinator\n"
-        "https://jobs.example.com/ads/robotics\n"
-        "Fit: High\n"
-        "Lane: operations\n"
-        "LLM: strong",
-        "Example Staffing (agency) — Support Coordinator\n"
-        "https://jobs.example.com/ads/staffing\n"
-        "Fit: High\n"
-        "Lane: operations\n"
-        "LLM: strong",
+        "New postings: 2\n\n"
+        "1. Example Robotics — Operations Coordinator\n"
+        "Lane: operations | Fit: High | 1 gap\n"
+        "Schedule: weekend days over your limit, on call\n"
+        "https://jobs.example.com/ads/robotics\n\n"
+        "2. Example Staffing (agency) — Support Coordinator\n"
+        "Lane: operations | Fit: High | 1 gap\n"
+        "https://jobs.example.com/ads/staffing"
     ]
-    for params in sends:
-        labels = [b["text"] for row in params["reply_markup"]["inline_keyboard"] for b in row]
-        assert labels == ["Applied", "Skipped"]
+    keyboard = sends[0]["reply_markup"]["inline_keyboard"]
+    assert [[b["text"] for b in row] for row in keyboard] == [
+        ["Applied 1", "Skipped 1"],
+        ["Applied 2", "Skipped 2"],
+    ]
     sent = env.api.everything_sent()
     for hidden in (
         "SENTINEL-gaps-alert",
@@ -1039,6 +1055,7 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
         "on_call",
         "over_weekend_limit",
         "similarity:",
+        "LLM:",
     ):
         assert hidden not in sent
     conn = env.search()
@@ -1055,7 +1072,7 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
     assert len(_sends(env)) == before
 
 
-def test_alert_adds_similarity_only_when_a_cosine_is_stored(env: Env, keep_umask: None) -> None:
+def test_a_digest_row_sends_no_tier_name_or_cosine(env: Env, keep_umask: None) -> None:
     robotics = _insert(
         env,
         "Example Robotics",
@@ -1073,21 +1090,13 @@ def test_alert_adds_similarity_only_when_a_cosine_is_stored(env: Env, keep_umask
     conn.execute("UPDATE postings SET embedding_score = ? WHERE id = ?", (-1.0, logistics))
     conn.close()
     assert _poll(env) == 0
-    assert [p["text"] for p in _sends(env)] == [
-        "Example Robotics — Operations Coordinator\n"
-        "https://jobs.example.com/ads/robotics\n"
-        "Fit: High\n"
-        "Lane: operations\n"
-        "LLM: strong\n"
-        "similarity: 0.82",
-        "Sample Logistics — Support Coordinator\n"
-        "https://jobs.example.com/ads/logistics\n"
-        "Fit: High\n"
-        "Lane: operations\n"
-        "LLM: strong\n"
-        "similarity: -1.00",
+    assert [row[0] for row in _rows(env)] == [
+        "Example Robotics — Operations Coordinator",
+        "Sample Logistics — Support Coordinator",
     ]
     sent = env.api.everything_sent()
+    assert "similarity" not in sent and "0.82" not in sent and "LLM:" not in sent
+    assert "strong" not in sent
     assert "SENTINEL-gaps-alert" not in sent
     assert "SENTINEL-llm-alert" not in sent
 
@@ -1144,11 +1153,11 @@ def test_a_failed_send_is_retried_without_logging_the_posting(env: Env, keep_uma
     assert conn.execute("SELECT alerted_at FROM postings").fetchone()[0] is None
     conn.close()
     log_text = (env.datadir.logs / "bot.log").read_text()
-    assert "alert failed (TelegramError)" in log_text
+    assert "alert digest failed (TelegramError); left for the next poll" in log_text
     assert "Example Robotics" not in log_text
     assert "Operations Coordinator" not in log_text
     assert _poll(env) == 0
-    assert _sends(env)[-1]["text"].startswith("Example Robotics — Operations Coordinator")
+    assert _rows(env)[-1][0] == "Example Robotics — Operations Coordinator"
     conn = env.search()
     assert conn.execute("SELECT alerted_at FROM postings").fetchone()[0] == "2026-10-28T16:00:00Z"
     conn.close()
@@ -1475,9 +1484,7 @@ def test_a_held_posting_is_never_alerted_is_retried_and_alerts_once_scored(
     _watch(env, retry, config)
     assert [text.title for text in retry.calls] == ["Operations Coordinator"]
     assert _poll(env) == 0
-    assert [p["text"].split("\n")[0] for p in _sends(env)] == [
-        "Examplerobotics — Operations Coordinator"
-    ]
+    assert _heads(env) == ["Examplerobotics — Operations Coordinator"]
     assert "Fit: High" in _sends(env)[0]["text"]
     assert _poll(env) == 0
     assert len(_sends(env)) == 1
@@ -1514,7 +1521,7 @@ def _set_search(env: Env, **values: Any) -> None:
 
 
 def _heads(env: Env) -> list[str]:
-    return [p["text"].split("\n")[0] for p in _sends(env)]
+    return [row[0] for row in _rows(env)]
 
 
 def test_alerts_go_in_lane_order_with_their_lane_line(env: Env, keep_umask: None) -> None:
@@ -1535,7 +1542,7 @@ def test_alerts_go_in_lane_order_with_their_lane_line(env: Env, keep_umask: None
         "Example Org — Medium Ops",
         "Example Org — Off Lane",
     ]
-    lane_lines = [p["text"].split("\n")[3] for p in _sends(env)]
+    lane_lines = [row[1].split(" | ")[0] for row in _rows(env)]
     assert lane_lines == [
         "Lane: operations",
         "Lane: customer_success",

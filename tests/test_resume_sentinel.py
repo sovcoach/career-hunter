@@ -93,7 +93,9 @@ class FakeModel:
         if view["posting"]["company"] == "Example Robotics":
             content = (
                 f"From the resume ({SENTINEL}) I see one gap: "
-                '{"gaps":[{"name":"Forklift licence","kind":"minor"}]}'
+                '{"gaps":[{"name":"Forklift licence","kind":"minor"}],'
+                f'"requirements":["Knows {SENTINEL}","Forklift licence course",'
+                '"Weekend shifts"]}'
             )
         else:
             content = json.dumps({"gaps": [{"name": f"Has {SENTINEL}", "kind": "core"}]})
@@ -180,6 +182,12 @@ def test_the_resume_reaches_the_model_and_nothing_else(
     )
     sent = [params for method, params in api.calls if method == "sendMessage"]
     assert len(sent) == 1  # the copied-gap reply was refused, so only one posting is scored
+    # One digest. Of the key requirements, the one copying the resume and the one naming
+    # the gap were dropped; the gap is a count, never its name.
+    digest = sent[0]["text"]
+    assert digest.startswith("New postings: 1\n\n1. Example Robotics")
+    assert "| 1 gap" in digest and "Needs: Weekend shifts" in digest
+    assert "Forklift" not in digest
     assert_absent("a Telegram message", json.dumps([params for _m, params in api.calls]))
 
     # Nothing else holds it.

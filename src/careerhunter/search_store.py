@@ -376,6 +376,9 @@ class PendingAlert:
     lane: str | None
     lane_checked: bool
     first_seen: str
+    run_id: int | None = None  # the watch run that scored it (search migration 0011)
+    run_finished: bool = False  # that run has finished its watch_runs row
+    run_started_at: str | None = None
 
 
 def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
@@ -386,7 +389,9 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
     """
     rows = conn.execute(
         """
-        SELECT p.id, p.fit, p.lane, p.lane_checked, p.first_seen FROM postings p
+        SELECT p.id, p.fit, p.lane, p.lane_checked, p.first_seen, p.score_run_id,
+               r.finished_at, r.started_at
+        FROM postings p LEFT JOIN watch_runs r ON r.id = p.score_run_id
         WHERE p.source = 'watcher'
           AND p.llm_output IS NOT NULL
           AND p.fit IS NOT NULL
@@ -402,9 +407,74 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
             lane=None if row["lane"] is None else str(row["lane"]),
             lane_checked=bool(row["lane_checked"]),
             first_seen=str(row["first_seen"]),
+            run_id=None if row["score_run_id"] is None else int(row["score_run_id"]),
+            run_finished=row["finished_at"] is not None,
+            run_started_at=None if row["started_at"] is None else str(row["started_at"]),
         )
         for row in rows
     ]
+
+
+@dataclass(frozen=True)
+class DigestFields:
+    """What one digest row shows. Never the gap names, the model text or notes."""
+
+    posting_id: int
+    company: str
+    title: str
+    location: str
+    url: str | None
+    schedule: str | None
+    fit: str | None
+    gap_count: int | None  # None when the stored gaps are not a JSON list
+    key_requirements: tuple[str, ...]
+
+
+def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[int, DigestFields]:
+    """The digest fields of these postings, by id. A posting no longer stored is absent.
+
+    The gap count is read from the stored gap list in SQL, so the gap names themselves
+    never leave the database here.
+    """
+    found: dict[int, DigestFields] = {}
+    for posting_id in posting_ids:
+        row = conn.execute(
+            """
+            SELECT p.id, c.name AS company, p.title, p.location, p.url, p.schedule, p.fit,
+                   CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
+                        THEN json_array_length(p.gaps) END AS gap_count,
+                   p.key_requirements
+            FROM postings p JOIN companies c ON c.id = p.company_id
+            WHERE p.id = ?
+            """,
+            (posting_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        found[posting_id] = DigestFields(
+            posting_id=posting_id,
+            company=str(row["company"]),
+            title=str(row["title"]),
+            location=str(row["location"] or ""),
+            url=None if row["url"] is None else str(row["url"]),
+            schedule=None if row["schedule"] is None else str(row["schedule"]),
+            fit=None if row["fit"] is None else str(row["fit"]),
+            gap_count=None if row["gap_count"] is None else int(row["gap_count"]),
+            key_requirements=_requirements(row["key_requirements"]),
+        )
+    return found
+
+
+def _requirements(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, str):
+        return ()
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(loaded, list):
+        return ()
+    return tuple(item for item in loaded if isinstance(item, str) and item.strip())
 
 
 def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
