@@ -30,13 +30,21 @@ from dataclasses import dataclass
 from typing import Any
 
 from careerhunter import db, loopback, search_store
-from careerhunter.ats import Board, PostingRef, posting_url
+from careerhunter.ats import (
+    Board,
+    BoardHTTPError,
+    BoardParseError,
+    Confirmed,
+    PostingRef,
+    posting_url,
+)
 from careerhunter.config import (
     discovery_interval_minutes,
     discovery_queries_per_run,
     discovery_query_delay_seconds,
 )
 from careerhunter.deadline import Deadline
+from careerhunter.fetch import FetchError
 
 MAX_BODY = 1_048_576
 MISS = "discovery miss: unreachable"
@@ -82,6 +90,8 @@ _BOARD_URL = {
 }
 
 Transport = Callable[[str], tuple[int, bytes]]
+Confirm = Callable[[Board], Confirmed]  # one board-API request (ats.confirm_board)
+CONFIRM_PER_PASS = 10  # boards confirmed in one pass; the rest wait to be found again
 
 
 class DiscoverError(Exception):
@@ -126,6 +136,7 @@ class Outcome:
     notice: str | None
     rows: tuple[Queued, ...]
     postings: tuple[PostingRef, ...] = ()
+    notes: tuple[str, ...] = ()  # boards not queued and why: excluded, gone, unconfirmed
 
 
 @dataclass(frozen=True)
@@ -279,11 +290,15 @@ def pending(conn: sqlite3.Connection) -> list[Queued]:
 
 
 def due(conn: sqlite3.Connection, *, notified_before: str) -> list[Queued]:
-    """Pending rows never sent, or last sent at or before `notified_before`."""
+    """Pending boards never sent, or last sent at or before `notified_before`.
+
+    Career pages are no longer sent (#41); old pending ones stay listed by `pending`.
+    """
     rows = conn.execute(
         "SELECT id, kind, suggested_name, ats_type, ats_slug, url "
         "FROM discovery_candidates "
-        "WHERE status = 'pending' AND (notified_at IS NULL OR notified_at <= ?) "
+        "WHERE status = 'pending' AND kind = 'board' "
+        "AND (notified_at IS NULL OR notified_at <= ?) "
         "ORDER BY id",
         (notified_before,),
     )
@@ -337,12 +352,20 @@ def run(
     transport: Transport | None = None,
     sleep: Callable[[float], None] | None = None,
     now: Callable[[], dt.datetime] | None = None,
+    confirm: Confirm | None = None,
+    exclusions: Mapping[str, Any] | None = None,
 ) -> Outcome:
     """Search, then insert new pending rows. A miss or a stop writes nothing.
 
     A pass inside a backoff sends nothing and says until when. `sleep` waits between
     queries; `now` stamps the backoff. Both default to the module's own, looked up at
     each call.
+
+    The queue (#41): a board hit is queued only after `confirm` (one board-API request)
+    says it exists, and never when it, or a company name the confirming reply gives,
+    is in `exclusions.companies`. A board that does not exist is stored as `gone` and
+    never queued again. Career pages are not queued: `discovery.career_hosts` only adds
+    `site:` hosts. Without `confirm`, no board is queued.
     """
     clock = now or _utc_now
     base = _configured_url(config)
@@ -383,8 +406,87 @@ def run(
             hits.append(hit)
     # The queue rows and the moved cursor go in one transaction: a miss moves neither,
     # so the same queries are asked again next time.
-    stored = _store(conn, config, hits, today, career_hosts, cursor=after)
-    return Outcome(None, tuple(stored), tuple(postings.values()))
+    boards = [hit for hit in hits if hit.kind == "board"]
+    accepted, gone, notes = _confirmed(conn, config, boards, confirm, exclusions or {})
+    stored = _store(conn, config, accepted, today, career_hosts, cursor=after, gone=gone)
+    return Outcome(None, tuple(stored), tuple(postings.values()), tuple(notes))
+
+
+def _folded(text: str) -> str:
+    """Case-folded letters and digits only: how company names are compared."""
+    return "".join(ch for ch in text.casefold() if ch.isalnum())
+
+
+def _excluded_names(exclusions: Mapping[str, Any]) -> set[str]:
+    raw = exclusions.get("companies")
+    return (
+        {_folded(name) for name in raw if isinstance(name, str) and _folded(name)}
+        if isinstance(raw, list)
+        else set()
+    )
+
+
+def _confirmed(
+    conn: sqlite3.Connection,
+    config: Mapping[str, Any],
+    boards: Sequence[Hit],
+    confirm: Confirm | None,
+    exclusions: Mapping[str, Any],
+) -> tuple[list[Hit], list[Hit], list[str]]:
+    """The new boards to queue and the gone ones to record, with a note for each other.
+
+    Runs before the queue's transaction, so no write lock is held across a request.
+    """
+    watched = _watched_boards(config)
+    known = _known_boards(conn)
+    excluded = _excluded_names(exclusions)
+    accepted: list[Hit] = []
+    gone: list[Hit] = []
+    notes: list[str] = []
+    asked = 0
+    for hit in boards:
+        if hit.ats_type is None or hit.ats_slug is None:
+            continue
+        key = _board_key(hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site)
+        if key in watched or key in known:
+            continue
+        known.add(key)
+        who = f"discover: {hit.suggested_name} ({hit.ats_type})"
+        if {_folded(hit.ats_slug), _folded(hit.suggested_name)} & excluded:
+            notes.append(f"{who}: excluded; not queued")
+            continue
+        if confirm is None or asked >= CONFIRM_PER_PASS:
+            notes.append(f"{who}: not confirmed this pass; not queued")
+            continue
+        asked += 1
+        board = Board(hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site)
+        try:
+            answer = confirm(board)
+        except (FetchError, BoardHTTPError, BoardParseError) as exc:
+            kind = f"HTTP {exc.status}" if isinstance(exc, BoardHTTPError) else type(exc).__name__
+            notes.append(f"{who}: not confirmed ({kind}); not queued")
+            continue
+        if answer.exists is False:
+            gone.append(hit)
+            notes.append(f"{who}: the board does not exist; never queued")
+        elif {_folded(name) for name in answer.names} & excluded:
+            notes.append(f"{who}: excluded; not queued")
+        elif answer.exists is None:
+            notes.append(f"{who}: no postings to confirm it; not queued")
+        else:
+            accepted.append(hit)
+    return accepted, gone, notes
+
+
+def _known_boards(conn: sqlite3.Connection) -> set[tuple[str, ...]]:
+    """Every board key already in the queue, whatever its status (gone included)."""
+    return {
+        _board_key(str(row["ats_type"]), str(row["ats_slug"]), row["ats_host"], row["ats_site"])
+        for row in conn.execute(
+            "SELECT ats_type, ats_slug, ats_host, ats_site FROM discovery_candidates "
+            "WHERE kind = 'board'"
+        )
+    }
 
 
 def posting(url: str) -> PostingRef | None:
@@ -724,16 +826,12 @@ def _store(
     career_hosts: Sequence[str],
     *,
     cursor: int | None = None,
+    gone: Sequence[Hit] = (),
 ) -> list[Queued]:
+    """Insert new pending rows, and `gone` rows for boards that do not exist."""
     watched_boards = _watched_boards(config)
     watched_careers = _watched_careers(config, career_hosts)
-    known_boards = {
-        _board_key(str(row["ats_type"]), str(row["ats_slug"]), row["ats_host"], row["ats_site"])
-        for row in conn.execute(
-            "SELECT ats_type, ats_slug, ats_host, ats_site FROM discovery_candidates "
-            "WHERE kind = 'board'"
-        )
-    }
+    known_boards = _known_boards(conn)
     known_careers = {
         str(row["url"])
         for row in conn.execute("SELECT url FROM discovery_candidates WHERE kind = 'career'")
@@ -745,6 +843,21 @@ def _store(
                 "UPDATE discovery_state SET cursor = ?, failures = 0, backoff_until = NULL "
                 "WHERE id = 1",
                 (cursor,),
+            )
+        for hit in gone:
+            conn.execute(
+                "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, ats_host, "
+                "ats_site, suggested_name, status, first_seen) "
+                "VALUES ('board', ?, ?, ?, ?, ?, ?, 'gone', ?)",
+                (
+                    hit.url,
+                    hit.ats_type,
+                    hit.ats_slug,
+                    hit.ats_host,
+                    hit.ats_site,
+                    hit.suggested_name,
+                    today,
+                ),
             )
         for hit in hits:
             if hit.kind == "board":

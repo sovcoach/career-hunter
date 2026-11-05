@@ -28,6 +28,7 @@ import yaml
 
 from careerhunter import (
     __version__,
+    ats,
     bot,
     claims,
     db,
@@ -776,7 +777,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             budget=budget,
             resume=loaded,
             resume_problem=problem,
-            discovery=partial(_discovery_pass, datadir, doc, budget),
+            discovery=partial(_discovery_pass, datadir, doc, exclusions, budget),
         )
     except (sqlite3.Error, db.MigrationError) as exc:
         _rollback(conn)
@@ -791,8 +792,25 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
 BUSY = "discover: another pass started less than 150 seconds ago; skipped"
 
 
+def _confirmer(share: Deadline) -> discover.Confirm:
+    """One board-API request per discovered board, under the pass's share of the budget."""
+
+    def confirm(board: ats.Board) -> ats.Confirmed:
+        client = ats.Client(
+            partial(fetch_url, budget=share, max_bytes=ats.BOARD_MAX_BYTES),
+            poster=partial(post_json, budget=share, max_bytes=ats.BOARD_MAX_BYTES),
+        )
+        return ats.confirm_board(board, client)
+
+    return confirm
+
+
 def _discovery_pass(
-    datadir: DataDir, doc: dict[str, Any], budget: Deadline, conn: sqlite3.Connection
+    datadir: DataDir,
+    doc: dict[str, Any],
+    exclusions: dict[str, Any],
+    budget: Deadline,
+    conn: sqlite3.Connection,
 ) -> discover.Pass:
     """One discovery pass inside the watch run, when it is on and due (#40).
 
@@ -811,8 +829,11 @@ def _discovery_pass(
         doc,
         today=config_today(doc).isoformat(),
         transport=partial(discover.default_transport, budget=share),
+        confirm=_confirmer(share),
+        exclusions=exclusions,
     )
     lines = [outcome.notice] if outcome.notice else []
+    lines += outcome.notes
     lines.append(f"discover: {len(outcome.rows)} queued, {len(outcome.postings)} postings found")
     _record_discover_success(datadir)
     return discover.Pass(lines, outcome.postings)
@@ -871,7 +892,16 @@ def _discover_run(datadir: DataDir, log: RunLog) -> int:
         if discovery_enabled(doc) and not discover.claim_pass(conn, discover._utc_now(), recent):
             log.append(BUSY)
             return EXIT_OK
-        outcome = discover.run(conn, doc, today=config_today(doc).isoformat())
+        exclusions: dict[str, Any] = {}
+        if datadir.exclusions_path.is_file():
+            exclusions = load_exclusions(datadir.exclusions_path)
+        outcome = discover.run(
+            conn,
+            doc,
+            today=config_today(doc).isoformat(),
+            confirm=_confirmer(Deadline(discover.PASS_SECONDS)),
+            exclusions=exclusions,
+        )
     except (sqlite3.Error, db.MigrationError) as exc:
         _rollback(conn)
         return _db_abort(log, "discover", exc)
@@ -880,6 +910,8 @@ def _discover_run(datadir: DataDir, log: RunLog) -> int:
         conn.close()
     if outcome.notice:
         log.append(outcome.notice)
+    for note in outcome.notes:
+        log.append(note)
     log.note(f"discover: {len(outcome.rows)} queued")
     for row in outcome.rows:
         print(discover.format_row(row))

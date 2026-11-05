@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from careerhunter import cli, db, discover, loopback, search_store
+from careerhunter import ats, cli, db, discover, loopback, search_store
 from careerhunter.platform_checks import SystemProbe
 from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
 from tests.test_score import BROKEN, broken_connection
@@ -273,8 +273,7 @@ def test_the_command_queues_reduced_urls_and_drops_the_snippet(
         "1 board newrobotics greenhouse newrobotics",
         "2 board freshlogistics lever freshlogistics",
         "3 board exampleorg ashby exampleorg",
-        "4 career jobs.example.com - https://jobs.example.com/careers",
-    ]
+    ]  # a career page is not queued (#41); its host is only a site: host
     assert len(talk.calls) == 12
     assert all("format=json" in call for call in talk.calls)
     asked = [
@@ -719,6 +718,10 @@ _SEARCH = {
 _GOOD = "https://job-boards.greenhouse.io/newrobotics/jobs/42"
 
 
+def _exists(board: object) -> ats.Confirmed:
+    return ats.Confirmed(True)
+
+
 def _clear_backoff(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE discovery_state SET failures = 0, backoff_until = NULL")
 
@@ -777,7 +780,9 @@ def test_a_reply_of_the_wrong_shape_is_a_miss_that_stores_nothing(
 def test_a_result_without_a_url_is_skipped_and_the_good_one_kept(tmp_path: Path) -> None:
     body = json.dumps({"results": [{"url": _GOOD}, {"title": "t"}]}).encode()
     conn = _search_db(tmp_path)
-    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=_Talk(body))
+    outcome = discover.run(
+        conn, _SEARCH, today="2026-11-02", transport=_Talk(body), confirm=_exists
+    )
     assert outcome.notice is None
     assert [row.url for row in outcome.rows] == ["https://boards.greenhouse.io/newrobotics"]
     assert _rows(conn) == 1
@@ -1300,7 +1305,9 @@ def test_another_engine_error_is_not_a_stop(tmp_path: Path) -> None:
     body = json.dumps(
         {"results": [{"url": _GOOD}], "unresponsive_engines": [["example engine", "timeout"]]}
     ).encode()
-    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=_Talk(body))
+    outcome = discover.run(
+        conn, _ETIQUETTE, today="2026-11-02", transport=_Talk(body), confirm=_exists
+    )
     assert outcome.notice is None
     assert _rows(conn) == 1
     conn.close()

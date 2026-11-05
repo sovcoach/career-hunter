@@ -169,7 +169,13 @@ class Client:
         return self._poster is not None
 
     def get_json(self, url: str) -> object:
-        return _loads(self._checked(url, self._fetcher(url)))
+        return _loads(self.get(url).body)
+
+    def get(self, url: str) -> Fetched:
+        """One GET, checked and counted like the others, with the reply as it came."""
+        fetched = self._fetcher(url)
+        self._checked(url, fetched)
+        return fetched
 
     def post_json(self, url: str, payload: object) -> object:
         if self._poster is None:
@@ -329,6 +335,85 @@ def _workday_posting(data: object, board: Board, ref: str, today: dt.date | None
         posted_min_days=at_least,
     )
     return _workday_detail(stub, data)
+
+
+@dataclass(frozen=True)
+class Confirmed:
+    """What one board-API request says about a discovered board (#41).
+
+    `exists` is True for a board that answered, False for one that does not exist
+    (gone), and None when the answer cannot tell: SmartRecruiters answers an unknown
+    company with an empty list, the same as a company with no openings. `names` are the
+    company names the reply gives, for the exclusion check.
+    """
+
+    exists: bool | None
+    names: tuple[str, ...] = ()
+
+
+def confirm_board(board: Board, client: Client) -> Confirmed:
+    """One request to the board's API: does it exist, and what is it called?
+
+    Gone is HTTP 404 on every ATS (checked on live public boards), HTTP 422 from Workday
+    (an unknown tenant), and a BambooHR reply that was redirected off the company's
+    own subdomain (BambooHR sends an unknown company to its own site). Any other status
+    raises BoardHTTPError, a fetch error passes through, and a body that is not the
+    board's JSON raises BoardParseError.
+    """
+    url = list_url(board)
+    if url is None:
+        raise BoardParseError("not a board this module reads")
+    gone_statuses = (404, 422) if board.ats == "workday" else (404,)
+    try:
+        if board.ats == "workday":
+            data = client.post_json(
+                url, {"appliedFacets": {}, "limit": 1, "offset": 0, "searchText": ""}
+            )
+            if not isinstance(data, dict) or not isinstance(data.get("jobPostings"), list):
+                raise BoardParseError("unexpected JSON shape")
+            return Confirmed(True)
+        if board.ats == "bamboohr":
+            fetched = client.get(url)
+            if (urllib.parse.urlsplit(fetched.url).hostname or "") != f"{board.slug}.bamboohr.com":
+                return Confirmed(False)
+            _bamboohr_list(board.slug, _loads(fetched.body))
+            return Confirmed(True)
+        if board.ats == "greenhouse":
+            data = client.get_json(f"https://boards-api.greenhouse.io/v1/boards/{board.slug}")
+            name = _text(data.get("name")) if isinstance(data, dict) else None
+            if not isinstance(data, dict):
+                raise BoardParseError("unexpected JSON shape")
+            return Confirmed(True, (name,) if name else ())
+        if board.ats == "lever":
+            data = client.get_json(
+                f"https://api.lever.co/v0/postings/{board.slug}?mode=json&limit=1"
+            )
+            if not isinstance(data, list):
+                raise BoardParseError("unexpected JSON shape")
+            return Confirmed(True)
+        if board.ats == "smartrecruiters":
+            data = client.get_json(
+                f"https://api.smartrecruiters.com/v1/companies/{board.slug}/postings?limit=1"
+            )
+            content = data.get("content") if isinstance(data, dict) else None
+            if not isinstance(content, list):
+                raise BoardParseError("unexpected JSON shape")
+            names = tuple(
+                name
+                for row in content
+                if isinstance(row, dict)
+                and isinstance(row.get("company"), dict)
+                and (name := _text(row["company"].get("name")))
+            )
+            return Confirmed(True if content else None, names)
+        data = client.get_json(f"https://api.ashbyhq.com/posting-api/job-board/{board.slug}")
+        if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+            raise BoardParseError("unexpected JSON shape")
+        return Confirmed(True)
+    except BoardHTTPError as exc:
+        if exc.status in gone_statuses:
+            return Confirmed(False)
+        raise
 
 
 def _nothing_known(url: str) -> bool:

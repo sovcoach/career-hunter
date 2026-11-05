@@ -1234,11 +1234,10 @@ def test_a_discovery_message_is_the_name_and_url_only(env: Env, keep_umask: None
     career = _candidate(env, "jobs.example.com", "https://jobs.example.com/careers", kind="career")
     assert _poll(env) == 0
     sends = _sends(env)
-    assert [item["text"] for item in sends] == [
+    assert [item["text"] for item in sends] == [  # a career page is no longer sent (#41)
         "newrobotics\nhttps://boards.greenhouse.io/newrobotics",
-        "jobs.example.com\nhttps://jobs.example.com/careers",
     ]
-    for params, row_id in zip(sends, (board, career), strict=True):
+    for params, row_id in zip(sends, (board,), strict=True):
         assert _keyboard_labels(params) == ["Approve", "Reject"]
         for row in params["reply_markup"]["inline_keyboard"]:
             for button in row:
@@ -1272,7 +1271,7 @@ def test_a_discovery_message_is_the_name_and_url_only(env: Env, keep_umask: None
     assert search_store.pending_alert_ids(conn) == [watcher, found]  # discovery alerts (#41)
     assert found != watcher
     conn.close()
-    assert noticed == {board: "2026-10-28T16:00:00Z", career: "2026-10-28T16:00:00Z"}
+    assert noticed == {board: "2026-10-28T16:00:00Z", career: None}
     assert env.datadir.config_path.read_bytes() == config_bytes
     assert exclusions.read_bytes() == exclusion_bytes
     assert ei_path.read_bytes() == b"synthetic-ei\n"
@@ -1309,7 +1308,7 @@ def test_telegram_approve_and_reject_follow_the_cli(
     assert _poll(env) == 0
     messages = {params["text"].split("\n", 1)[0]: mid for mid, params in env.api.sent()}
     assert _press_at(env, messages["newrobotics"], "Approve") == "callback:discover_approve"
-    assert _press_at(env, messages["jobs.example.com"], "Approve") == "callback:discover_approve"
+    assert "jobs.example.com" not in messages  # career pages are no longer sent (#41)
     assert _press_at(env, messages["sampletown"], "Reject") == "callback:discover_reject"
     with caplog.at_level(logging.INFO, logger="careerhunter.bot"):
         assert (
@@ -1335,17 +1334,14 @@ def test_telegram_approve_and_reject_follow_the_cli(
     assert companies["newrobotics"]["watchlist"] == 1
     assert companies["newrobotics"]["ats_type"] == "greenhouse"
     assert companies["newrobotics"]["ats_slug"] == "newrobotics"
-    assert companies["jobs.example.com"]["source"] == "discovery"
-    assert companies["jobs.example.com"]["watchlist"] == 0
-    assert companies["jobs.example.com"]["careers_url"] == "https://jobs.example.com/careers"
-    assert companies["jobs.example.com"]["ats_type"] is None
+    assert "jobs.example.com" not in companies
     assert "sampletown" not in companies
     assert companies["exampleorg"]["source"] == "manual"
     assert companies["exampleorg"]["ats_type"] == "greenhouse"
     assert companies["exampleorg"]["ats_slug"] == "exampleorg"
     assert statuses == {
         board: "approved",
-        career: "approved",
+        career: "pending",  # still listed by `discover list`, and approvable there
         rejected: "rejected",
         refused: "pending",
     }

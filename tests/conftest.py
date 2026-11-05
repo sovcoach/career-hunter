@@ -306,3 +306,25 @@ def no_discovery_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     # A fixed wall clock for the discovery backoff, so no test depends on today.
     monkeypatch.setattr(discover, "_utc_now", lambda: dt.datetime(2026, 11, 2, 9, tzinfo=dt.UTC))
     return pauses
+
+
+@pytest.fixture(autouse=True)
+def confirmed_boards(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """No test asks a real board API to confirm a discovered board: every board exists.
+
+    The boards asked about are recorded. A test that needs another answer replaces
+    `cli._confirmer` itself, or passes `confirm` to `discover.run`.
+    """
+    from careerhunter import ats, cli
+
+    asked: list[object] = []
+
+    def confirmer(share: object) -> object:
+        def confirm(board: ats.Board) -> ats.Confirmed:
+            asked.append(board)
+            return ats.Confirmed(True)
+
+        return confirm
+
+    monkeypatch.setattr(cli, "_confirmer", confirmer)
+    return asked
