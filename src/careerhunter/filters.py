@@ -5,11 +5,26 @@ The checks run in one order. The first skip wins, and it is the reason stored on
 
 1. exclusions: company, title keyword, description keyword, one role, already applied
 2. hard gates: language, credential, shift, pay, seniority, then minimum salary
-3. location rules, then the watchlist entry's role filters
+3. location: an empty location, then the location rules; then the watchlist
+   entry's role filters
 4. schedule limits
 
-A description keyword can match only when the list payload included a description.
-Greenhouse list rows have none. The description is not stored.
+A description keyword can match only when the board sent a description. The
+description is held in memory for the decision and is not stored, so a recheck of a
+stored posting runs the description checks without it.
+
+The work model. A board that gives one (Lever, Ashby) is used as given. With none
+(Greenhouse), a location that has the whole word "remote" is inferred remote;
+otherwise the location rules treat the posting as on-site. On-site and hybrid must
+match `search.location_rules.onsite_hybrid`, remote must match `remote`. An inferred
+remote posting may match either list, because "Example City or Remote" can be
+either. A list that is unset or empty does not constrain its work models.
+
+With `search.location_rules` set, a posting with blank location text and no work
+model from the board is skipped as `empty_location`. A work model from the board
+stands in for the location: such a posting is not skipped as empty, and with no text
+there is nothing to match against the lists, so they do not skip it either. Without
+location rules an empty location is not a reason to skip.
 
 Seniority words match whole words of the title, ignoring case. The description is
 checked too only when `seniority_in_description` is true. `title_exceptions` and
@@ -17,11 +32,14 @@ checked too only when `seniority_in_description` is true. `title_exceptions` and
 family is gated only when the title itself has a seniority word.
 
 One `role_filters` block is a set of AND constraints. It cannot say "this work model,
-or else that place." A missing work model does not fail `work_models`, because a
-Greenhouse list row has no work model.
+or else that place." `work_models` checks the board's work model, or remote when it is
+inferred from the location. Otherwise the work model is unknown, and an unknown work
+model does not fail `work_models`: the on-site default is for the location rules only.
 
-`min_salary` applies only when it is a number. A posting that states no yearly pay is
-kept. `max_commute_km` and `exclude_work_models` are not applied.
+`min_salary` applies only when it is a number, and only to figures in a pay context,
+converted to yearly CAD (`_yearly_amounts` has the rules). A posting is skipped only
+when the top of its highest stated range is below the minimum; a posting with no
+countable figure is kept. `max_commute_km` and `exclude_work_models` are not applied.
 
 A stated weekend-day count above `weekend_days_per_month` follows `over_limit`:
 `flag` sets `schedule` and keeps the posting, `exclude` skips it. An "on-call"
@@ -40,12 +58,61 @@ from typing import Any
 _FOLD = re.compile(r"[\s_\-\u2010-\u2015]+")
 _WEEKEND_COUNT = re.compile(r"\b(\d+)\s+weekend")
 _ON_CALL = re.compile(r"\bon call\b|\boncall\b")
-_MONEY = re.compile(
-    r"\$\s*(?P<dollar>\d{1,3}(?:,\d{3})+|\d+)(?P<dollar_k>\s*[kK])?"
-    r"|(?P<k>\d{2,3})\s*[kK]\b"
-    r"|(?P<label>salary|pay|compensation)\D{0,24}(?P<amount>\d{1,3}(?:,\d{3})+|\d+)",
+# Salary parsing (`_yearly_amounts`). A sentence ends at a line break, after ! ? or ;,
+# or at a full stop followed by a space and a capital, so "$22.50" stays whole.
+_SENTENCE = re.compile(r"[\n\r]+|(?<=[!?;])\s+|(?<=\.)\s+(?=[A-Z])")
+# A figure, with what marks it as money: a currency before it (`$`, `C$`, `US$`, `€`,
+# `£`, or a three-letter code), a `k` after it, or a three-letter code after it.
+_FIGURE = re.compile(
+    r"(?P<pre>\b[A-Z]{1,3}\$\s?|\b[A-Z]{3}\s?[$€£]?\s?|[$€£]\s?)?"
+    r"(?<![\w.,])(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?![\d,]*\d)"
+    r"(?P<k>\s?[kK](?![A-Za-z(]))?"
+    r"(?P<post>\s?[A-Z]{3}\b)?"
+)
+_RANGE_JOIN = re.compile(r"\s*(?:-|\u2013|\u2014|to)\s*", re.IGNORECASE)
+_UNITS = {
+    "hour": "hour",
+    "hr": "hour",
+    "h": "hour",
+    "hourly": "hour",
+    "year": "year",
+    "yr": "year",
+    "annum": "year",
+    "annually": "year",
+    "yearly": "year",
+    "annual": "year",
+    "month": "month",
+    "mo": "month",
+    "monthly": "month",
+    "week": "week",
+    "wk": "week",
+    "weekly": "week",
+    "day": "day",
+    "daily": "day",
+}
+_UNIT_AFTER = re.compile(
+    r"\s*(?:(?:/|per|an?|each)\s*(?P<unit>hour|hr|h|year|yr|annum|month|mo|week|wk|day)\b"
+    r"|(?P<adverb>hourly|annually|yearly|monthly|weekly|daily)\b)",
     re.IGNORECASE,
 )
+_UNIT_IN_SENTENCE = re.compile(
+    r"\b(?:hourly|annually|yearly|monthly|weekly|daily"
+    r"|(?:per|an?)\s+(?:hour|year|annum|month|week|day))\b|/\s?(?:hr|hour|yr|year)\b",
+    re.IGNORECASE,
+)
+# 40 hours a week, 52 weeks a year, and 260 working days a year.
+_PER_YEAR = {"hour": 2080.0, "day": 260.0, "week": 52.0, "month": 12.0, "year": 1.0}
+_PAY_WORD = re.compile(
+    r"\b(?:salary|salaries|pay|pays|paid|compensation|base|wages?|earnings|range)\b",
+    re.IGNORECASE,
+)
+_NOT_PAY = r"(?:bonus(?:es)?|signing|sign[- ]on|relocation|equity|stock|rsus?|options)"
+_NOT_PAY_BEFORE = re.compile(rf"\b{_NOT_PAY}\b", re.IGNORECASE)
+_NOT_PAY_AFTER = re.compile(
+    rf"\s*(?:(?:annual|one[- ]time|target|cash|performance)\s+)?{_NOT_PAY}\b", re.IGNORECASE
+)
+# Where the words before a figure stop belonging to it.
+_CLAUSE_BREAK = re.compile(r"[,;(+]|\bplus\b|\band\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -172,53 +239,176 @@ def _under_minimum(body: str, minimum: object) -> bool:
     return bool(amounts) and max(amounts) < float(minimum)
 
 
+@dataclass(frozen=True)
+class _Figure:
+    value: float
+    start: int
+    end: int
+    marked: bool  # a currency or a `k` marks it as money
+    foreign: bool  # marked as a currency other than CAD
+    k: bool  # written with a `k` for thousands
+
+
 def _yearly_amounts(text: str) -> list[float]:
+    """Every pay figure in `text`, as yearly CAD.
+
+    Only a figure in a pay context counts: its sentence has a pay word (salary, pay,
+    compensation, base, wage, range...), or a unit follows it (per hour, /yr, annually...).
+    A bonus, signing, relocation or equity amount is not pay, whether the word comes
+    just before the figure in the same clause or right after it. A figure marked as
+    another currency (USD, US$, €, £, any three-letter code but CAD) is left out. A
+    plain `$` is taken as CAD. A range shares its unit, currency and `k`.
+
+    The unit after a figure wins; otherwise a single unit named in the sentence applies;
+    otherwise the figure is yearly. Hourly x 2080 (40 h x 52), daily x 260, weekly x 52,
+    monthly x 12. A yearly figure under 1000, or a bare number under 10000 with no
+    currency, `k` or unit, is a fragment and is left out.
+    """
     found: list[float] = []
-    for match in _MONEY.finditer(text):
-        if match.group("dollar") is not None:
-            amount = _number(match.group("dollar"), thousands=match.group("dollar_k") is not None)
-            # A dollar amount under 1000 is hourly or a fragment, not yearly pay.
-            if amount is not None and (match.group("dollar_k") or amount >= 1000):
-                found.append(amount)
-        elif match.group("k") is not None:
-            amount = _number(match.group("k"), thousands=True)
-            if amount is not None:
-                found.append(amount)
-        else:
-            amount = _number(match.group("amount") or "", thousands=False)
-            if amount is not None and amount >= 10000:
-                found.append(amount)
+    for sentence in _SENTENCE.split(text):
+        found.extend(_sentence_amounts(sentence))
     return found
 
 
-def _number(raw: str, *, thousands: bool) -> float | None:
-    try:
-        value = float(raw.replace(",", ""))
-    except ValueError:
-        return None
-    if thousands:
-        value *= 1000
-    return value
+def _sentence_amounts(sentence: str) -> list[float]:
+    figures = _figures(sentence)
+    found: list[float] = []
+    pay_word = _PAY_WORD.search(sentence) is not None
+    named = {_UNITS[_unit_word(m.group(0))] for m in _UNIT_IN_SENTENCE.finditer(sentence)}
+    index = 0
+    while index < len(figures):
+        group = [figures[index]]
+        join = _RANGE_JOIN.match(sentence, figures[index].end)
+        if join is not None and index + 1 < len(figures) and figures[index + 1].start == join.end():
+            group.append(figures[index + 1])
+        index += len(group)
+        found.extend(_group_amounts(sentence, group, pay_word, named))
+    return found
+
+
+def _group_amounts(
+    sentence: str, group: list[_Figure], pay_word: bool, named: set[str]
+) -> list[float]:
+    """One figure, or both ends of a range, as yearly amounts; [] when they don't count."""
+    first, last = group[0], group[-1]
+    if any(figure.foreign for figure in group):
+        return []
+    after = _UNIT_AFTER.match(sentence, last.end)
+    tail = after.end() if after is not None else last.end
+    if _NOT_PAY_AFTER.match(sentence, tail) or _not_pay_before(sentence[: first.start]):
+        return []
+    if after is not None:
+        unit: str | None = _UNITS[(after.group("unit") or after.group("adverb")).casefold()]
+    elif len(named) == 1:
+        unit = next(iter(named))
+    elif named:
+        return []  # two different units in one sentence, neither attached: unclear
+    else:
+        unit = None
+    if not pay_word and unit is None:
+        return []  # no pay context
+    marked = any(figure.marked for figure in group)
+    values = [figure.value for figure in group]
+    if len(group) == 2 and last.k and not first.k and values[0] < 1000:
+        values[0] *= 1000  # "80-100k"
+    if unit is None or unit == "year":
+        explicit = after is not None
+        floor = 1000.0 if marked or explicit else 10000.0
+        return [value for value in values if value >= floor]
+    return [value * _PER_YEAR[unit] for value in values if value > 0]
+
+
+def _figures(sentence: str) -> list[_Figure]:
+    figures: list[_Figure] = []
+    for match in _FIGURE.finditer(sentence):
+        raw = match.group("num")
+        k = match.group("k") is not None
+        if raw == "401" and k:
+            continue  # a retirement plan, not pay
+        try:
+            value = float(raw.replace(",", ""))
+        except ValueError:  # pragma: no cover - the pattern only matches numbers
+            continue
+        if k:
+            value *= 1000
+        pre = (match.group("pre") or "").strip()
+        post = (match.group("post") or "").strip()
+        figures.append(
+            _Figure(
+                value=value,
+                start=match.start(),
+                end=match.end(),
+                marked=bool(pre or post or k),
+                foreign=_foreign(pre) or _foreign(post),
+                k=k,
+            )
+        )
+    return figures
+
+
+def _foreign(marker: str) -> bool:
+    """A currency marker that is not CAD. A plain `$` is CAD."""
+    if not marker:
+        return False
+    if "€" in marker or "£" in marker:
+        return True
+    letters = "".join(ch for ch in marker if ch.isalpha())
+    if "$" in marker:
+        return letters not in ("", "C", "CA", "CAD")
+    return letters != "CAD"
+
+
+def _unit_word(text: str) -> str:
+    word = re.sub(r"^(?:per|an?)\s+|^/\s?", "", text.strip(), flags=re.IGNORECASE)
+    return word.casefold()
+
+
+def _not_pay_before(before: str) -> bool:
+    window = before[-40:]
+    breaks = list(_CLAUSE_BREAK.finditer(window))
+    if breaks:
+        window = window[breaks[-1].end() :]
+    return _NOT_PAY_BEFORE.search(window) is not None
 
 
 def _location(posting: PostingText, rules: Mapping[str, Any]) -> str | None:
     if not rules:
         return None
-    places = _places_for(posting.work_model, rules)
-    if places and not _any(posting.location, places):
+    blank = not posting.location.strip()
+    if blank and posting.work_model is None:
+        return "empty_location"
+    if not blank and not _place_allowed(posting, rules):
         return "location_rule"
     if rules.get("allow_travel_outside") is False and _outside_travel(posting, rules):
         return "location_rule"
     return None
 
 
-def _places_for(work_model: str | None, rules: Mapping[str, Any]) -> list[str] | None:
-    """Places the work model has to match, or None when this model is not constrained."""
-    if work_model in ("onsite", "hybrid"):
-        return _strings(rules.get("onsite_hybrid"))
-    if work_model == "remote":
-        return _strings(rules.get("remote"))
-    return None
+def _place_allowed(posting: PostingText, rules: Mapping[str, Any]) -> bool:
+    """Whether the location matches the list for its work model. An empty list allows all."""
+    onsite = _strings(rules.get("onsite_hybrid"))
+    remote = _strings(rules.get("remote"))
+    if posting.work_model in ("onsite", "hybrid"):
+        return not onsite or _any(posting.location, onsite)
+    if posting.work_model == "remote":
+        return not remote or _any(posting.location, remote)
+    if posting.work_model is None and inferred_remote(posting.location):
+        # Inferred, not given: "Example City or Remote" may be either kind of job.
+        return not remote or _any(posting.location, remote) or _any(posting.location, onsite)
+    # No work model from the board and no "remote": treated as on-site.
+    return not onsite or _any(posting.location, onsite)
+
+
+def inferred_remote(location: str) -> bool:
+    """True when the location text has the whole word "remote", ignoring case."""
+    return has_phrase(location, "remote")
+
+
+def _role_work_model(posting: PostingText) -> str | None:
+    """The board's work model, or remote when inferred; None when unknown."""
+    if posting.work_model is not None:
+        return posting.work_model
+    return "remote" if inferred_remote(posting.location) else None
 
 
 def _outside_travel(posting: PostingText, rules: Mapping[str, Any]) -> bool:
@@ -235,7 +425,8 @@ def _role(posting: PostingText, filters: Mapping[str, Any] | None) -> str | None
     if families and not _any(posting.title, families):
         return "role_filter"
     models = _strings(filters.get("work_models"))
-    if models and posting.work_model is not None and posting.work_model not in models:
+    work_model = _role_work_model(posting)
+    if models and work_model is not None and work_model not in models:
         return "role_filter"
     places = _strings(filters.get("locations"))
     if places and not _any(posting.location, places):

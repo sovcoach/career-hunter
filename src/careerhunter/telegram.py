@@ -7,6 +7,18 @@ The bot token is part of every API URL (`/bot<token>/<method>`), and `urllib` er
 include the URL. So every failure is re-raised as a TelegramError whose message has been
 passed through `redact()`, with the original exception suppressed, and the token can
 never reach a log or an error message.
+
+Failures come in four kinds, all TelegramError, so a caller that only needs "it
+failed" catches the base class:
+
+- TelegramUnreachable: no answer from Telegram (a network error, a timeout, a TLS
+  failure, or HTTP 5xx). A sent message may or may not have arrived.
+- TelegramRateLimited: HTTP 429. Nothing was done; try again later.
+- TelegramRejected: Telegram answered and refused the call (HTTP 4xx other than 429,
+  or a reply with `ok` false). A message was not sent; sending it again unchanged
+  will be refused again.
+- TelegramBadReply: an answer that is not the Bot API's JSON. Whether a sent message
+  arrived is unknown.
 """
 
 from __future__ import annotations
@@ -27,6 +39,22 @@ TOKEN_SHAPE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
 
 class TelegramError(Exception):
     """A failed Bot API call. The message is safe to log: it never contains the token."""
+
+
+class TelegramUnreachable(TelegramError):
+    """No answer: the network, a timeout, TLS, or HTTP 5xx."""
+
+
+class TelegramRateLimited(TelegramError):
+    """HTTP 429: Telegram asked us to slow down. Nothing was done."""
+
+
+class TelegramRejected(TelegramError):
+    """Telegram answered and refused the call: HTTP 4xx (not 429), or `ok` false."""
+
+
+class TelegramBadReply(TelegramError):
+    """An answer that is not the Bot API's JSON."""
 
 
 def redact(text: str, token: str | None = None) -> str:
@@ -56,10 +84,18 @@ class HttpTelegram:
             ) as response:
                 return bytes(response.read())
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")[:300]
-            raise TelegramError(redact(f"{what}: HTTP {exc.code} {body}", self._token)) from None
+            try:
+                body = exc.read().decode("utf-8", "replace")[:300]
+            except OSError:
+                body = ""
+            message = redact(f"{what}: HTTP {exc.code} {body}", self._token)
+            if exc.code == 429:
+                raise TelegramRateLimited(message) from None
+            if 400 <= exc.code < 500:
+                raise TelegramRejected(message) from None
+            raise TelegramUnreachable(message) from None
         except (OSError, ValueError) as exc:
-            raise TelegramError(
+            raise TelegramUnreachable(
                 redact(f"{what}: {type(exc).__name__}: {exc}", self._token)
             ) from None
 
@@ -73,10 +109,15 @@ class HttpTelegram:
         try:
             reply = json.loads(raw)
         except ValueError:
-            raise TelegramError(f"{method}: the reply was not JSON") from None
-        if not isinstance(reply, dict) or not reply.get("ok"):
-            description = reply.get("description") if isinstance(reply, dict) else None
-            raise TelegramError(redact(f"{method}: {description or 'not ok'}", self._token))
+            raise TelegramBadReply(f"{method}: the reply was not JSON") from None
+        if not isinstance(reply, dict):
+            raise TelegramBadReply(f"{method}: the reply was not a JSON object")
+        if not reply.get("ok"):
+            description = reply.get("description")
+            message = redact(f"{method}: {description or 'not ok'}", self._token)
+            if reply.get("error_code") == 429:
+                raise TelegramRateLimited(message)
+            raise TelegramRejected(message)
         return reply.get("result")
 
     def download(self, file_path: str, max_bytes: int) -> bytes:

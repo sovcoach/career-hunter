@@ -479,3 +479,37 @@ def test_lane_columns_are_checked(
         search.execute(
             "UPDATE postings SET lane = ?, lane_checked = ? WHERE id = ?", (lane, checked, p)
         )
+
+
+# --- 0011: key requirements and the scoring run ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    ['["Forklift licence"]', '["One", "Two", "Three"]', None],
+)
+def test_key_requirements_accept_one_to_three_phrases(
+    search: sqlite3.Connection, value: str | None
+) -> None:
+    p = _posting(search, _company(search))
+    search.execute("UPDATE postings SET key_requirements = ? WHERE id = ?", (value, p))
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["[]", '["1", "2", "3", "4"]', '{"a": 1}', "not json", '"one phrase"'],
+)
+def test_key_requirements_refuse_any_other_shape(search: sqlite3.Connection, value: str) -> None:
+    p = _posting(search, _company(search))
+    with pytest.raises(sqlite3.IntegrityError):
+        search.execute("UPDATE postings SET key_requirements = ? WHERE id = ?", (value, p))
+
+
+def test_a_scoring_run_must_exist(search: sqlite3.Connection) -> None:
+    p = _posting(search, _company(search))
+    with pytest.raises(sqlite3.IntegrityError):
+        search.execute("UPDATE postings SET score_run_id = 999 WHERE id = ?", (p,))
+    run = search.execute(
+        "INSERT INTO watch_runs (started_at) VALUES ('2026-11-01T09:00:00Z')"
+    ).lastrowid
+    search.execute("UPDATE postings SET score_run_id = ? WHERE id = ?", (run, p))

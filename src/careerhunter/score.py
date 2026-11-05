@@ -22,6 +22,16 @@ a gap name or type is longer than 120 characters, or when 40 characters in a row
 gap name or type also appear in the resume. Both sides are compared after NFKC, case
 folding, and turning every run of whitespace into one space. A copied run shorter than
 40 characters is not caught.
+
+Key requirements (#39). The model also lists up to three short requirements stated in
+the posting itself, separate from the gaps. They are sent to Telegram in the alert
+digest, so each is checked here: it must be text; whitespace becomes single spaces,
+and control characters go; it is cut to MAX_REQUIREMENT characters at a word, with
+"…"; a phrase that contains a gap name (after the same normalizing as above) is
+dropped, so gap names never reach the digest; with a resume in use, a phrase that
+repeats COPY_RUN characters of the resume is dropped. Duplicates go, and at most three
+are kept. A `requirements` field that is missing or the wrong shape gives none. It
+never makes the reply unparseable: the score stands either way.
 """
 
 from __future__ import annotations
@@ -50,6 +60,9 @@ MAX_OUTPUT = 20_000
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 MAX_GAP_TEXT = 120
 COPY_RUN = 40
+MAX_REQUIREMENT = 60
+MAX_REQUIREMENTS = 3
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _SPACES = re.compile(r"\s+")
 _FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 _GATE_KEYS = (
@@ -83,6 +96,7 @@ class Score:
     tier: str | None
     excluded: bool = False
     resume_sha256: str | None = None  # the resume this score was made with
+    key_requirements: tuple[str, ...] = ()  # checked phrases from the posting, at most 3
 
 
 @dataclass(frozen=True)
@@ -174,6 +188,7 @@ def score_posting(
         tier=tier,
         excluded=excluded,
         resume_sha256=None if resume is None else resume.sha256,
+        key_requirements=_requirements(content, parsed, None if resume is None else resume.text),
     )
 
 
@@ -234,9 +249,13 @@ def _request_body(
                 "role": "system",
                 "content": (
                     "Reply with one JSON object only, of the form "
-                    '{"gaps":[{"name":"...","kind":"minor"|"core","type":"..."}]}. '
+                    '{"gaps":[{"name":"...","kind":"minor"|"core","type":"..."}],'
+                    '"requirements":["..."]}. '
                     "kind is minor or core. List missing requirements. "
-                    "Use an empty gaps array when nothing is missing. No prose."
+                    "Use an empty gaps array when nothing is missing. "
+                    "requirements: up to three key requirements the posting itself "
+                    f"states, each a short phrase of at most {MAX_REQUIREMENT} characters, "
+                    "whether or not they are gaps. No prose."
                 ),
             },
             {"role": "user", "content": json.dumps(view)},
@@ -323,6 +342,50 @@ def _json_object(content: str) -> object | None:
         except json.JSONDecodeError:
             return None
     return loaded
+
+
+def _requirements(content: str, gaps: list[_Gap], resume_text: str | None) -> tuple[str, ...]:
+    """Up to three checked key requirements from the reply; () when there are none."""
+    raw = _json_object(content)
+    items = raw.get("requirements") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        return ()
+    names = [normalized(gap.name) for gap in gaps]
+    haystack = normalized(resume_text) if resume_text is not None else None
+    kept: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        phrase = " ".join(_CONTROL.sub(" ", item).split())
+        folded = normalized(phrase)
+        if not folded or folded in seen:
+            continue
+        if any(name and name in folded for name in names):
+            continue  # it names a gap
+        if haystack is not None and _repeats(folded, haystack):
+            continue
+        seen.add(folded)
+        kept.append(_capped(phrase))
+        if len(kept) == MAX_REQUIREMENTS:
+            break
+    return tuple(kept)
+
+
+def _repeats(needle: str, haystack: str) -> bool:
+    return any(
+        needle[start : start + COPY_RUN] in haystack for start in range(len(needle) - COPY_RUN + 1)
+    )
+
+
+def _capped(phrase: str) -> str:
+    """At most MAX_REQUIREMENT characters, cut at a word, with "…" when cut."""
+    if len(phrase) <= MAX_REQUIREMENT:
+        return phrase
+    cut = phrase[: MAX_REQUIREMENT - 1]
+    if " " in cut:
+        cut = cut[: cut.rindex(" ")]
+    return cut.rstrip(" ,;:-") + "…"
 
 
 def _apply_tiers(

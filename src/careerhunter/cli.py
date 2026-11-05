@@ -771,7 +771,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             conn,
             entries,
             today=config_today(doc).isoformat(),
-            fetcher=partial(fetch_url, budget=budget),
+            fetcher=partial(fetch_url, budget=budget, max_bytes=watch.BOARD_MAX_BYTES),
             config=doc,
             exclusions=exclusions,
             scorer=scorer,

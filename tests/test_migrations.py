@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "ei_record": [1]}[track]
+    expected = {"search": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -551,11 +551,31 @@ def test_0010_leaves_every_existing_posting_unchecked(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO skips (posting_id, date, reason) VALUES (2, '2026-10-01', 'manual')"
         )
-        assert db.migrate(conn, "search") == [10]
+        assert db.migrate(conn, "search", db.load_migrations("search")[:10]) == [10]
         rows = conn.execute("SELECT title, lane, lane_checked FROM postings ORDER BY id")
         assert [tuple(row) for row in rows] == [
             ("Coordinator", None, 0),
             ("Skipped Coordinator", None, 0),
         ]
+    finally:
+        conn.close()
+
+
+def test_0011_leaves_existing_postings_without_requirements_or_a_run(tmp_path: Path) -> None:
+    """A schema-10 file moves to 11 with no key requirements and no scoring run."""
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        assert db.migrate(conn, "search", db.load_migrations("search")[:10]) == list(range(1, 11))
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source, llm_output, fit) "
+            "VALUES (?, 'Coordinator', '2026-10-01', 'watcher', '{}', 'high')",
+            (company,),
+        )
+        assert db.migrate(conn, "search") == [11]
+        row = conn.execute("SELECT title, fit, key_requirements, score_run_id FROM postings")
+        assert tuple(row.fetchone()) == ("Coordinator", "high", None, None)
     finally:
         conn.close()

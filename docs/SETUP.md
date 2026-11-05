@@ -189,7 +189,7 @@ Every alert carries a fit: `Fit: High`, `Medium` or `Low`, from the `fit` of the
 
 1. Add a `fit` to every tier in `fit_rubric.gap_tiers` in your `config.yaml`. Without one, the config is refused when it is loaded, and the services can't start.
 2. Stop the services: `uv run careerhunter service uninstall`.
-3. Run `uv run careerhunter migrate`. It brings `search.db` to schema 10.
+3. Run `uv run careerhunter migrate`. It brings `search.db` to schema 11 (fit and runs in 9, lanes in 10, key requirements and each score's run in 11).
 4. Start the services again: `uv run careerhunter service install`.
 
 Postings that were already scored, and not yet alerted, get their fit from your config on the next watch run, by their tier name. With `search.lanes` set, that run also gives every stored posting its lane.
@@ -200,9 +200,13 @@ Postings that were already scored, and not yet alerted, get their fit from your 
 
 `hard_gates.max_commute_km` and `hard_gates.exclude_work_models` are not applied.
 
+`hard_gates.min_salary` is yearly pay in CAD. A figure counts only when its sentence mentions pay (salary, pay, compensation, base, wage, range) or a pay unit follows it (per hour, /yr, annually). Bonus, signing, relocation and equity amounts don't count. Hourly figures are converted at 40 hours a week, daily at 260 days a year, weekly at 52 and monthly at 12. A figure marked as another currency (USD, US$, €, £ or any three-letter code but CAD) is ignored, and a plain `$` is read as CAD. A posting is skipped only when the top of its highest range is below your minimum; a posting with no salary passes.
+
+`search.location_rules`: Greenhouse gives no work model, so a location containing the word "remote" is treated as remote and anything else as on-site. Lever and Ashby give one, and it is used as given. With location rules set, a posting with no location text and no work model is skipped as `empty_location`; a Lever or Ashby posting with a work model but no location text is kept.
+
 `hard_gates.seniority_words`, `title_exceptions` and `never_gated_families` match whole words of the title, ignoring case: "Lead" matches "Team Lead" and "(Lead)", but not "Leader". List a plural on its own if it should count. `hard_gates.seniority_in_description: true` also checks the description for seniority words; it is false by default, so a junior title whose description mentions senior colleagues is kept. A key under `hard_gates` that career-hunter does not know, such as a misspelled option, is refused when the config is loaded.
 
-One `role_filters` block requires every family, work model, and place it lists. It cannot say "remote, or else Example City." Treating that as an AND would hide roles that should stay. There is no field for that or-rule yet.
+One `role_filters` block requires every family, work model, and place it lists. Its `work_models` check uses remote when it is inferred from the location; with no work model and no "remote", the work model is unknown and passes. It cannot say "remote, or else Example City." Treating that as an AND would hide roles that should stay. There is no field for that or-rule yet.
 
 ### Import your resume
 
@@ -399,7 +403,7 @@ Sealing never happens on its own, and the claim you are on can't be sealed. If `
 
 The bot lets you record applications, statuses and activities from your phone. It only ever talks to your own private chat with it, and it has no open ports: it calls Telegram, never the other way round.
 
-**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal: company, title, link, the fit word (High, Medium or Low), the tier name, the lane name from your config, status words and short references like `a7`. It never sends your notes, the gaps it found, the numeric fit rating or EI record details. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
+**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal. Watcher postings come as one digest per watch run, each row with company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link. A job ad you send with `/log` gets company, title, link, the fit word and, when it was already scored, the tier name and similarity. Status words and short references like `a7` go too. It never sends your notes, the names of the gaps it found (only how many), the numeric fit rating or EI record details. `alerts.max_per_poll` (default 10) caps how many postings go per poll; the rest follow on the next poll. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
 
 ### 10a. Create the bot and store its token
 

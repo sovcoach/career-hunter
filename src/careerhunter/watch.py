@@ -6,7 +6,7 @@ company after another, through `fetch.py`. It also fetches companies stored with
 and the slug is one path segment. A seeded watchlist row with any other source is not
 fetched by that extra path. It writes companies, postings, skip reasons and local
 scores in `search.db`. It does not call Telegram, write applications, EI rows or
-snapshots. The bot sends an alert for each scored posting when it polls.
+snapshots. The bot sends one alert digest per watch run when it polls.
 `run` returns the log lines; the CLI prints them to stderr.
 
 A posting that is already stored is not inserted again. After the boards, watcher rows
@@ -19,6 +19,13 @@ not cause a skip.
 
 The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
 one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
+Greenhouse is fetched with `content=true`, so every gate sees its descriptions; the
+HTML is turned into text with the standard library (`htmltext.py`). A Lever posting's
+text adds its lists, closing text and salary description; Ashby is fetched with
+`includeCompensation=true` and adds each job's salary summary. A description is
+held in memory for the filter and the scoring prompt, and never stored. A board body
+over BOARD_MAX_BYTES logs `board over the size cap (...); nothing recorded`, stores
+nothing from that board, and counts as failed. Nothing is cut to fit.
 
 One company's failure does not stop the run. An exception while handling one board, or
 one row of the recheck or scoring pass, or the embedding refresh, is rolled back and
@@ -66,9 +73,12 @@ already checked. An off-lane posting is still gated and scored like any other. W
 `search.lanes`, nothing is checked and no posting is off-lane.
 
 The run record. Each run writes a `watch_runs` row when it starts, in its own
-transaction, and finishes it just before the last line: the board counts, whether the
-budget left anything for the next run, and the postings still held (unscored, scored
-with no fit, off-lane), read from search.db at that moment. A run that crashes, is
+transaction, and stores its id with every score it makes and every fit it fills in
+(`postings.score_run_id`, search migration 0011), beside the score's checked key
+requirements; the bot sends one digest per run from that id. The row is finished
+just before the last line: the board counts, whether the budget left anything for the
+next run, and the postings still held (unscored, scored with no fit, off-lane), read
+from search.db at that moment. A run that crashes, is
 killed or stops on a database error never finishes its row, so its counts stay null.
 
 A model that does not answer (ScoreError) stops all scoring for the rest of the run;
@@ -89,11 +99,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Self, SupportsIndex
 
-from careerhunter import db, filters, lanes, search_store
+from careerhunter import db, filters, htmltext, lanes, search_store
 from careerhunter.config import off_lane_min_fit, tier_fits
 from careerhunter.deadline import Deadline
 from careerhunter.embed import Embedder, miss_line
-from careerhunter.fetch import Fetched, FetchError, FetchTimeout
+from careerhunter.fetch import Fetched, FetchError, FetchTimeout, FetchTooLarge
 from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
 from careerhunter.resume import Resume
@@ -107,6 +117,9 @@ OnCrash = Callable[[str, Exception], None]
 Tally = Literal["fetched", "failed", "left"]
 
 RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
+# The body cap for one board. Greenhouse boards carry every description (content=true),
+# so this is larger than a job ad's cap. The CLI passes it to the fetcher.
+BOARD_MAX_BYTES = 20 * 1024 * 1024
 # Inline scoring of new postings stops once less than this is left of the budget.
 SCORE_RESERVE = 240.0
 _LEFT = "run budget reached; left for the next run"
@@ -188,6 +201,7 @@ class _State:
     resume: Resume | None = None
     fits: Mapping[str, str] = field(default_factory=dict)  # tier name -> fit, from config
     lanes_on: bool = False  # search.lanes is set: titles are checked against the lanes
+    run_id: int | None = None  # this run's watch_runs row, stored with each score
     model_down: bool = False
     budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
@@ -251,10 +265,10 @@ def board_url(ats_type: str, slug: str) -> str | None:
     if ats_type not in _BOARDS or _SLUG.fullmatch(slug) is None:
         return None
     if ats_type == "greenhouse":
-        return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+        return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
     if ats_type == "lever":
         return f"https://api.lever.co/v0/postings/{slug}?mode=json"
-    return f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
+    return f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
 
 
 def run(
@@ -297,6 +311,7 @@ def run(
     lines = state.lines
     with db.transaction(conn):
         run_id = search_store.start_watch_run(conn, _iso(state.now()))
+    state.run_id = run_id
     with _isolated(conn, lines, "fit fill-in", state.hook):
         _fill_fits(conn, state)
     if state.lanes_on:
@@ -410,7 +425,7 @@ def _lane_name(title: str, config: Mapping[str, Any]) -> str | None:
 def _fill_fits(conn: sqlite3.Connection, state: _State) -> None:
     """Give scored, unalerted postings stored without a fit the fit of their tier name."""
     with db.transaction(conn):
-        filled = search_store.fill_missing_fits(conn, state.fits)
+        filled = search_store.fill_missing_fits(conn, state.fits, state.run_id)
     if filled:
         state.lines.append(f"watch: fit filled in from config for {filled} scored postings")
 
@@ -658,6 +673,10 @@ def _fetch_jobs(
         if isinstance(exc, FetchTimeout) and state.out_of_time():
             lines.append(_line(name, ats, _LEFT))
             return _Left()
+        if isinstance(exc, FetchTooLarge):
+            # Nothing from the board is stored, and nothing is cut to fit.
+            lines.append(_line(name, ats, f"board over the size cap ({exc}); nothing recorded"))
+            return _Failed("FetchTooLarge")
         kind = type(exc).__name__
         lines.append(_line(name, ats, f"{kind}; nothing recorded"))
         return _Failed(kind)
@@ -1027,6 +1046,8 @@ def _attempt(
                 scout_metadata=metadata,
                 fit=fit,
                 resume_sha256=state.resume_sha256,
+                key_requirements=result.key_requirements,
+                run_id=state.run_id,
             )
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):
                 search_store.insert_skip(conn, posting_id, today, "gap_tier")
@@ -1117,7 +1138,16 @@ def _greenhouse_job(item: object, slug: str) -> _Job | _Skip:
         or _built(f"https://boards.greenhouse.io/{slug}/jobs/", job.get("id")),
         requisition_id=_text(job.get("requisition_id")),
         company_field=_text(job.get("company_name")),
+        description=_greenhouse_text(job.get("content")),
     )
+
+
+def _greenhouse_text(content: object) -> str | None:
+    """`content` (with `?content=true`) is entity-escaped HTML; plain text, or None."""
+    text = _text(content)
+    if text is None:
+        return None
+    return htmltext.to_text(text, escaped=True) or None
 
 
 def _lever_job(item: object, slug: str) -> _Job | _Skip:
@@ -1135,8 +1165,49 @@ def _lever_job(item: object, slug: str) -> _Job | _Skip:
         or _built(f"https://jobs.lever.co/{slug}/", job.get("id")),
         requisition_id=_id_text(job.get("id")),
         company_field=None,
-        description=_text(job.get("descriptionPlain")),
+        description=_lever_text(job),
     )
+
+
+def _lever_text(job: dict[str, Any]) -> str | None:
+    """The description, the extra lists, the closing text and the salary description.
+
+    Field names from the Lever postings API README (github.com/lever/postings-api):
+    `descriptionPlain`, `lists` (`{text, content}` with HTML content),
+    `additionalPlain` and `salaryDescriptionPlain`. `salaryRange` is not read: the
+    README does not document its `interval` values.
+    """
+    parts = [_text(job.get("descriptionPlain"))]
+    for item in job.get("lists") or []:
+        if isinstance(item, dict):
+            parts.append(_text(item.get("text")))
+            content = _text(item.get("content"))
+            parts.append(htmltext.to_text(content) if content else None)
+    parts.append(_text(job.get("additionalPlain")))
+    parts.append(_text(job.get("salaryDescriptionPlain")))
+    return _joined(parts)
+
+
+def _ashby_text(job: dict[str, Any]) -> str | None:
+    """The description and, with `includeCompensation=true`, the salary summary.
+
+    Field names from Ashby's public job posting API docs
+    (developers.ashbyhq.com/docs/public-job-posting-api): `descriptionPlain` and
+    `compensation.scrapeableCompensationSalarySummary` on each job, such as
+    "$120K - $150K". The summary gets a "Salary:" label so it reads as pay.
+    """
+    compensation = job.get("compensation")
+    summary = (
+        _text(compensation.get("scrapeableCompensationSalarySummary"))
+        if isinstance(compensation, dict)
+        else None
+    )
+    return _joined([_text(job.get("descriptionPlain")), f"Salary: {summary}" if summary else None])
+
+
+def _joined(parts: list[str | None]) -> str | None:
+    """Non-empty parts, one per line (so a sentence never runs into the next); or None."""
+    return "\n".join(part for part in parts if part) or None
 
 
 def _ashby_job(item: object, slug: str) -> _Job | _Skip:
@@ -1154,7 +1225,7 @@ def _ashby_job(item: object, slug: str) -> _Job | _Skip:
         or _built(f"https://jobs.ashbyhq.com/{slug}/", job.get("id")),
         requisition_id=_id_text(job.get("id")),
         company_field=None,
-        description=_text(job.get("descriptionPlain")),
+        description=_ashby_text(job),
     )
 
 

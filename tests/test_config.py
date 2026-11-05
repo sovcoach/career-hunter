@@ -7,6 +7,7 @@ import yaml
 
 from careerhunter.config import (
     ConfigError,
+    alerts_max_per_poll,
     load_config,
     load_exclusions,
     validate_config,
@@ -77,3 +78,29 @@ def test_non_mapping_documents() -> None:
     assert validate_config([]) == ["top level must be a mapping"]
     assert validate_exclusions("x") == ["top level must be a mapping"]
     assert validate_exclusions({"companies": [1]}) != []
+
+
+@pytest.mark.parametrize(
+    ("section", "message"),
+    [
+        ("10", "alerts must be a mapping"),
+        ({"max_per_poll": 0}, "alerts.max_per_poll must be an integer from 1 to 50"),
+        ({"max_per_poll": 51}, "alerts.max_per_poll"),
+        ({"max_per_poll": 2.5}, "alerts.max_per_poll"),
+        ({"max_per_poll": True}, "alerts.max_per_poll"),
+        ({"max_per_pol": 5}, "alerts has unknown keys"),
+    ],
+)
+def test_alerts_section_is_checked(section: object, message: str) -> None:
+    doc = example()
+    doc["alerts"] = section
+    assert any(message in problem for problem in validate_config(doc))
+
+
+def test_alerts_max_per_poll_defaults_to_ten() -> None:
+    doc = example()
+    assert validate_config({**doc, "alerts": None}) == []
+    assert validate_config({**doc, "alerts": {"max_per_poll": 50}}) == []
+    assert alerts_max_per_poll({}) == 10
+    assert alerts_max_per_poll({"alerts": None}) == 10
+    assert alerts_max_per_poll({"alerts": {"max_per_poll": 3}}) == 3

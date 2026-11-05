@@ -100,19 +100,120 @@ def test_hard_gates_and_the_seniority_exceptions() -> None:
     assert verdict("Coordinator", description="Reports to a Director").reason is None
 
 
-def test_min_salary_uses_the_highest_stated_yearly_figure() -> None:
-    priced = {"hard_gates": {"min_salary": 60000}}
-    low = verdict("Coordinator", description="Salary $40,000", config=priced)
-    assert low.reason == "min_salary"
-    spanned = verdict("Coordinator", description="$40,000-$80,000", config=priced)
-    assert spanned.reason is None
-    thousands = verdict("Coordinator", description="45k plus bonus", config=priced)
-    assert thousands.reason == "min_salary"
-    assert verdict("Coordinator", description="80k", config=priced).reason is None
-    assert verdict("Coordinator", description="$25/hour", config=priced).reason is None
-    assert verdict("Coordinator", description="salary 2026 review", config=priced).reason is None
-    assert verdict("Coordinator", config=priced).reason is None
+PRICED = {"hard_gates": {"min_salary": 60000}}
+
+
+def salary(description: str) -> str | None:
+    return verdict("Coordinator", description=description, config=PRICED).reason
+
+
+def test_min_salary_uses_the_top_of_the_highest_stated_range() -> None:
+    assert salary("Salary $40,000") == "min_salary"
+    assert salary("Salary range $40,000-$80,000") is None
+    assert salary("Salary 45k plus bonus") == "min_salary"
+    assert salary("Salary 80k") is None
+    assert salary("salary 2026 review") is None
+    assert verdict("Coordinator", config=PRICED).reason is None
     assert verdict("Coordinator", description="Salary $40,000", config=GATES).reason is None
+    # Two ranges: the top of the higher one decides.
+    assert salary("Pay range $40,000-$50,000 in one office, $55,000-$65,000 in another") is None
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "$40,000-$50,000",  # no pay word and no unit
+        "45k",
+        "We raised $50,000,000 in funding.",
+        "Signing bonus of $5,000.",
+        "A $10,000 signing bonus.",
+        "Relocation support up to $8,000 is offered.",
+        "Equity: $20,000 in RSUs.",
+        "Pay includes a one-time bonus of $2,000.",
+        "Generous 401k matching, salary negotiable.",
+    ],
+)
+def test_a_figure_outside_a_pay_context_does_not_count(description: str) -> None:
+    assert salary(description) is None
+
+
+def test_bonus_figures_beside_pay_are_left_out_and_pay_still_counts() -> None:
+    assert salary("Base salary $40,000, signing bonus $90,000") == "min_salary"
+    assert salary("Salary $40,000 plus a $90,000 equity grant") == "min_salary"
+    assert salary("Salary $90,000 plus annual bonus") is None
+
+
+@pytest.mark.parametrize(
+    ("description", "reason"),
+    [
+        ("Pay range: $20 - $25 per hour", "min_salary"),  # below: top 52,000
+        ("Pay range: $25 - $35 per hour", None),  # straddles: top 72,800
+        ("Pay range: $30 - $40/hr", None),  # above
+        ("Pay range: $20 \u2013 $25 per hour", "min_salary"),  # an en dash joins a range
+        ("Hourly pay: $26 to $28.", "min_salary"),  # unit named once in the sentence
+        ("$25/hour", "min_salary"),  # a single hourly figure: 52,000
+        ("$30 an hour", None),  # 62,400
+        ("Pay is 29 per hour", None),  # no currency mark, but a unit: 60,320
+        ("$22.50/hr", "min_salary"),
+    ],
+)
+def test_hourly_figures_become_yearly_at_forty_hours_a_week(
+    description: str, reason: str | None
+) -> None:
+    assert salary(description) == reason
+
+
+@pytest.mark.parametrize(
+    ("description", "reason"),
+    [
+        ("Salary $4,000 per month", "min_salary"),  # x 12 = 48,000
+        ("Salary $5,500 monthly", None),  # 66,000
+        ("$1,100 per week", "min_salary"),  # x 52 = 57,200
+        ("$1,200 weekly", None),  # 62,400
+        ("$220 per day", "min_salary"),  # x 260 = 57,200
+        ("$240 daily", None),  # 62,400
+        ("Salary $55,000 per year", "min_salary"),
+        ("Salary range $50k-$70k annually", None),
+        ("Pay 50-55k", "min_salary"),  # the k covers both ends
+    ],
+)
+def test_each_pay_unit_is_converted_to_yearly(description: str, reason: str | None) -> None:
+    assert salary(description) == reason
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Salary: USD 40,000",
+        "Salary US$40,000",
+        "Salary $40,000 USD",
+        "Salary €40,000",
+        "Salary £40k",
+        "Salary range EUR 30,000 - 40,000",
+        "Salary $30,000 - $40,000 USD",  # a code on one end marks the whole range
+        "Salary 40,000 GBP",
+    ],
+)
+def test_a_figure_in_another_currency_is_ignored_so_the_posting_passes(description: str) -> None:
+    assert salary(description) is None
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Salary $40,000",
+        "Salary C$40,000",
+        "Salary CA$40,000",
+        "Salary CAD 40,000",
+        "Salary 40k CAD",
+    ],
+)
+def test_cad_and_a_plain_dollar_sign_count(description: str) -> None:
+    assert salary(description) == "min_salary"
+
+
+def test_two_different_units_in_a_sentence_with_none_attached_count_for_nothing() -> None:
+    assert salary("Paid hourly or monthly, $20 to start.") is None
 
 
 def test_location_rules_and_role_filters() -> None:
@@ -135,9 +236,9 @@ def test_location_rules_and_role_filters() -> None:
         verdict("Coordinator", location="Other City", work_model="hybrid", config=config).reason
         == "location_rule"
     )
-    # No work model: the location lists do not apply. Travel outside them does.
+    # No work model and no "remote" in the location: treated as on-site.
     unset = verdict("Coordinator", location="Other City", work_model=None, config=config)
-    assert unset.reason is None
+    assert unset.reason == "location_rule"
     assert (
         verdict(
             "Coordinator",
@@ -183,6 +284,97 @@ def test_location_rules_and_role_filters() -> None:
             role_filters=filters,
             config={},
         ).reason
+        is None
+    )
+
+
+RULES = {
+    "search": {"location_rules": {"onsite_hybrid": ["Example City"], "remote": ["Example Region"]}}
+}
+
+
+@pytest.mark.parametrize(
+    ("location", "reason"),
+    [
+        ("Example City", None),  # treated as on-site, and on the on-site list
+        ("Other City", "location_rule"),
+        ("Example Region", "location_rule"),  # on-site default: the remote list does not apply
+        ("Remote - Example Region", None),  # inferred remote, on the remote list
+        ("Remote, Other Region", "location_rule"),
+        ("Example City or Remote", None),  # inferred remote may match either list
+        ("Remote-first, Example City", None),
+        ("Remotely located team, Other City", "location_rule"),  # not the whole word
+    ],
+)
+def test_without_a_work_model_remote_is_inferred_and_otherwise_on_site(
+    location: str, reason: str | None
+) -> None:
+    assert verdict("Coordinator", location=location, work_model=None, config=RULES).reason == (
+        reason
+    )
+
+
+def test_a_given_work_model_is_strict() -> None:
+    assert (
+        verdict("Coordinator", location="Example City", work_model="remote", config=RULES).reason
+        == "location_rule"
+    )
+    assert (
+        verdict(
+            "Coordinator", location="Remote - Example Region", work_model="hybrid", config=RULES
+        ).reason
+        == "location_rule"
+    )
+
+
+def test_an_empty_location_is_skipped_only_with_location_rules_and_no_work_model() -> None:
+    for blank in ("", "   "):
+        assert verdict("Coordinator", location=blank, work_model=None, config=RULES).reason == (
+            "empty_location"
+        )
+        # No location rules: an empty location is not a reason.
+        assert verdict("Coordinator", location=blank, work_model=None, config={}).reason is None
+        # A work model from the board stands in for the location (a remote Lever or Ashby row).
+        for model in ("remote", "onsite", "hybrid"):
+            assert (
+                verdict("Coordinator", location=blank, work_model=model, config=RULES).reason
+                is None
+            )
+
+
+def test_an_empty_location_comes_before_the_role_filters() -> None:
+    picky = {"locations": ["Example City"]}
+    assert (
+        verdict(
+            "Coordinator", location="", work_model=None, config=RULES, role_filters=picky
+        ).reason
+        == "empty_location"
+    )
+
+
+def test_role_filter_work_models_use_only_a_positive_inference() -> None:
+    remote_only = {"work_models": ["remote"]}
+    onsite_only = {"work_models": ["onsite"]}
+    # No "remote" in the location: the work model is unknown, and unknown passes.
+    assert (
+        verdict(
+            "Coordinator", location="Example City", work_model=None, role_filters=remote_only
+        ).reason
+        is None
+    )
+    assert (
+        verdict(
+            "Coordinator", location="Example City", work_model=None, role_filters=onsite_only
+        ).reason
+        is None
+    )
+    # "Remote" found: the inferred model is checked.
+    assert (
+        verdict("Coordinator", location="Remote", work_model=None, role_filters=onsite_only).reason
+        == "role_filter"
+    )
+    assert (
+        verdict("Coordinator", location="Remote", work_model=None, role_filters=remote_only).reason
         is None
     )
 
@@ -499,3 +691,34 @@ def test_a_short_exception_no_longer_exempts_a_title_that_merely_contains_it() -
         == "seniority"
     )
     assert verdict("Port Coordinator", description="Senior team", config=described).reason is None
+
+
+def test_an_empty_location_from_a_board_is_skipped_and_logged(search: sqlite3.Connection) -> None:
+    board = url("greenhouse", "examplerobotics")
+    payload = one_greenhouse("examplerobotics", title="Operations Coordinator")
+    payload["jobs"][0]["location"] = {"name": "  "}  # type: ignore[index]
+    lines = watch.run(
+        search,
+        [company("Example Robotics", "greenhouse", "examplerobotics")],
+        today=DAY,
+        fetcher=Scripted({board: fetched(payload)}),
+        config=RULES,
+    )
+    assert any("'Operations Coordinator' skipped (empty_location)" in line for line in lines)
+    assert [r["reason"] for r in search.execute("SELECT reason FROM skips")] == ["empty_location"]
+
+
+def test_a_recheck_skips_a_stored_empty_location_once_rules_are_set(
+    search: sqlite3.Connection,
+) -> None:
+    board = url("greenhouse", "examplerobotics")
+    item = company("Example Robotics", "greenhouse", "examplerobotics")
+    payload = one_greenhouse("examplerobotics", title="Operations Coordinator")
+    payload["jobs"][0]["location"] = {}  # type: ignore[index]
+    watch.run(search, [item], today=DAY, fetcher=Scripted({board: fetched(payload)}), config={})
+    assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 0
+    lines = watch.run(
+        search, [item], today=DAY, fetcher=Scripted({board: fetched(payload)}), config=RULES
+    )
+    assert any("skipped (empty_location)" in line for line in lines)
+    assert [r["reason"] for r in search.execute("SELECT reason FROM skips")] == ["empty_location"]

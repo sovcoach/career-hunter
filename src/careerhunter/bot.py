@@ -17,13 +17,16 @@ Trust boundary (ADR-016):
   Before every EI-bearing write the bot re-reads config and re-checks the claims,
   as the CLI does. A discovery approve or reject opens `search.db` only.
 
-Privacy (ADR-015, amended by ADR-019 and ADR-020): messages the bot sends carry
-company, title, link, the fit tier (`Fit: High`, `Medium`, `Low`, or `not scored` for a
-job ad sent to the bot), the LLM tier name, a cosine when one is stored, status
-words and references. A discovery row sends the suggested name and the reduced
-URL only. A watchlist agency with no separate employer stored is labelled
-" (agency)". Never notes, 0-10 fit ratings, gaps, model text, vectors, snippets,
-queries, EI record details or claim labels.
+Privacy (ADR-015, amended by ADR-019, ADR-020 and #39): watcher postings go out as
+one digest per watch run. A digest row carries the company, title, location, lane,
+fit word (`Fit: High`, `Medium` or `Low`), the number of gaps, the schedule flag in
+words, up to three key requirements the model took from the posting, and the link.
+A job ad sent with /log gets its own alert: company, title, link, `Fit: not scored`,
+the LLM tier name and a cosine when one is stored. Status words and references are
+sent too. A discovery row sends the suggested name and the reduced URL only. A
+watchlist agency with no separate employer stored is labelled " (agency)". Never
+notes, 0-10 fit ratings, gap names, model text, vectors, snippets, queries, EI
+record details or claim labels.
 
 Dates: after Applied and a method, the bot asks when, with buttons (today, yesterday,
 this week, last week, or another date typed as YYYY-MM-DD). Exact days record precision
@@ -48,7 +51,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import yaml
@@ -56,7 +59,7 @@ import yaml
 from careerhunter import claims, db, enums, lanes, ledger, search_store, snapshots
 from careerhunter import discover as discovery
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating
-from careerhunter.config import ConfigError, load_config, telegram_chat_id
+from careerhunter.config import ConfigError, alerts_max_per_poll, load_config, telegram_chat_id
 from careerhunter.config import today as config_today
 from careerhunter.fetch import Fetched, FetchError, fetch
 from careerhunter.ledger import PartialWriteError
@@ -65,7 +68,14 @@ from careerhunter.search_store import IdentityConflict
 from careerhunter.secrets_store import SecretError, get_secret
 from careerhunter.seed import monday_of
 from careerhunter.storage_guard import DataDir
-from careerhunter.telegram import HttpTelegram, TelegramAPI, TelegramError, redact
+from careerhunter.telegram import (
+    HttpTelegram,
+    TelegramAPI,
+    TelegramError,
+    TelegramRejected,
+    redact,
+)
+from careerhunter.watch import RUN_BUDGET
 
 log = logging.getLogger("careerhunter.bot")
 # The /log reply when config.yaml can't be read. No path and no content.
@@ -218,7 +228,6 @@ def _alert_text(
     title: str,
     url: str | None,
     fit: object,
-    lane_line: str | None,
     tier: str | None,
     score: float | None,
 ) -> str:
@@ -226,13 +235,112 @@ def _alert_text(
     if url:
         lines.append(url)
     lines.append(f"Fit: {_fit_label(fit)}")
-    if lane_line:
-        lines.append(" ".join(lane_line.split()))  # one line, whatever the lane name holds
     if tier:
         lines.append(f"LLM: {tier}")
     if score is not None:
         lines.append(f"similarity: {score:.2f}")
     return "\n".join(lines)
+
+
+# The digest (#39). Telegram allows 4096 characters of message text, counted in UTF-16
+# code units; each message also stays at ten rows, twenty buttons.
+TEXT_LIMIT = 4096
+ROWS_PER_MESSAGE = 10
+# A run not finished this long after it started was killed or crashed. Twice the run
+# budget, so a slow run that is still going is never cut in half.
+STALE_RUN = dt.timedelta(seconds=2 * RUN_BUDGET)
+_CAPS = {"company": 80, "title": 120, "location": 80, "lane": 60, "requirement": 60}
+MAX_URL = 1000
+_SCHEDULE_WORDS = {"on_call": "on call", "over_weekend_limit": "weekend days over your limit"}
+
+
+@dataclass(frozen=True)
+class _DigestEntry:
+    fields: search_store.DigestFields
+    label: str  # the company, with " (agency)" when the watchlist says so
+    order: lanes.Ordered
+
+
+@dataclass(frozen=True)
+class _Numbered:
+    number: int  # 1-based, through the whole digest
+    entry: _DigestEntry
+
+
+def _units(text: str) -> int:
+    """Length as Telegram counts it: UTF-16 code units."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _clip(text: str, limit: int) -> str:
+    """One line, at most `limit` characters, with "…" when cut."""
+    line = " ".join(text.split())
+    return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+
+
+def _digest_row(numbered: _Numbered) -> str:
+    """Company, title, location, lane, fit, gap count, schedule, key requirements, URL.
+
+    Never gap names, the model text, notes, the tier name or a cosine.
+    """
+    fields = numbered.entry.fields
+    company = _clip(numbered.entry.label, _CAPS["company"])
+    lines = [f"{numbered.number}. {company} — {_clip(fields.title, _CAPS['title'])}"]
+    facts = []
+    if fields.location.strip():
+        facts.append(_clip(fields.location, _CAPS["location"]))
+    if numbered.entry.order.lane_line:
+        facts.append(_clip(numbered.entry.order.lane_line, _CAPS["lane"]))
+    facts.append(f"Fit: {_fit_label(fields.fit)}")
+    if fields.gap_count is not None:
+        facts.append(f"{fields.gap_count} gap" + ("" if fields.gap_count == 1 else "s"))
+    lines.append(" | ".join(facts))
+    if fields.schedule:
+        words = [_SCHEDULE_WORDS.get(mark, "") for mark in fields.schedule.split()]
+        shown = [word for word in words if word]
+        if shown:
+            lines.append("Schedule: " + ", ".join(shown))
+    if fields.key_requirements:
+        needs = [_clip(item, _CAPS["requirement"]) for item in fields.key_requirements[:3]]
+        lines.append("Needs: " + "; ".join(needs))
+    if fields.url and len(fields.url) <= MAX_URL and fields.url.isprintable():
+        lines.append(fields.url)
+    elif fields.url:
+        lines.append("(link too long to send)")
+    return "\n".join(lines)
+
+
+def _digest_header(count: int, part: tuple[int, int] | None) -> str:
+    head = f"New postings: {count}"
+    return head if part is None else f"{head} (part {part[0]} of {part[1]})"
+
+
+def _digest_text(message: list[_Numbered], part: tuple[int, int] | None, total: int) -> str:
+    rows = "\n\n".join(_digest_row(numbered) for numbered in message)
+    return f"{_digest_header(total, part)}\n\n{rows}"
+
+
+def _pack(entries: list[_DigestEntry]) -> list[list[_Numbered]]:
+    """Rows into messages of at most ROWS_PER_MESSAGE rows and TEXT_LIMIT units.
+
+    The header is measured at its longest, so every message fits whatever its part
+    number. A row is capped well under the limit, so each message holds at least one.
+    """
+    numbered = [_Numbered(index, entry) for index, entry in enumerate(entries, start=1)]
+    reserve = _units(_digest_header(len(entries), (len(entries), len(entries)))) + 2
+    messages: list[list[_Numbered]] = []
+    current: list[_Numbered] = []
+    used = reserve
+    for item in numbered:
+        size = _units(_digest_row(item)) + 2
+        if current and (len(current) == ROWS_PER_MESSAGE or used + size > TEXT_LIMIT):
+            messages.append(current)
+            current, used = [], reserve
+        current.append(item)
+        used += size
+    if current:
+        messages.append(current)
+    return messages
 
 
 class Bot:
@@ -250,6 +358,8 @@ class Bot:
         self.chat_id = chat_id
         self.clock = clock
         self.fetcher = fetcher
+        # Watcher postings Telegram refused on their own; they go behind the others.
+        self._refused: set[int] = set()
 
     # --- plumbing ------------------------------------------------------------------
 
@@ -410,19 +520,30 @@ class Bot:
             return company
 
     def send_pending_alerts(self) -> None:
-        """Send each scored watcher posting that has not been alerted, in lane order.
+        """Send pending watcher postings as one digest per watch run, within the cap.
 
-        Config is read once per poll, for the lanes, the off-lane threshold and the
-        agency labels. If it can't be read, no watcher alert is sent this poll: the
+        Config is read once per poll, for the lanes, the off-lane threshold, the cap and
+        the agency labels. If it can't be read, no watcher alert is sent this poll: the
         hold is recorded in ``bot_state`` (for doctor) and logged only when it starts
         and when it ends, and the next poll tries again. Job ads sent to the bot are
         not held by this.
 
-        The message goes out first. ``alerted_at`` is set only after Telegram accepts
-        it. If the process stops between those two steps, the next poll sends it again.
-        A failed send leaves ``alerted_at`` null. Skips, unscored rows and rows without
-        a fit are not sent: they are held until the watcher gives them a fit. Off-lane
-        rows below ``search.off_lane_min_fit`` stay pending (``lanes.alert_order``).
+        Which postings: scored watcher postings with a fit, no skip and no alert, in
+        ``lanes.alert_order`` (off-lane below ``search.off_lane_min_fit`` and postings
+        not yet lane-checked stay pending). A run's postings wait until that run has
+        finished, or started more than STALE_RUN ago (killed or crashed), so a run is
+        never sent half-scored and a dead one never blocks its postings. Postings with
+        no run (scored before search migration 0011) go first, then runs oldest first,
+        so a later run cannot push an earlier run's postings back. At most
+        ``alerts.max_per_poll`` postings go per poll; the rest carry over in order.
+        A posting Telegram refused on its own goes behind the others for as long as
+        this bot runs, so it can't take the same slot every poll.
+
+        Each message goes out first and ``alerted_at`` is set only after Telegram
+        accepts it. No answer, a bad reply or HTTP 429 stops the poll with everything
+        unsent left pending; if the process or the answer was lost after Telegram
+        accepted a message, the next poll sends it again. A message Telegram refused is
+        sent again one posting per message, so one bad row cannot hold back the rest.
         """
         doc = self._alert_config()
         if doc is None:
@@ -433,12 +554,122 @@ class Bot:
         except (OSError, sqlite3.Error) as exc:
             log.warning("pending alerts could not be read (%s)", type(exc).__name__)
             return
+        digests = self._digests(pending, doc)
+        for rows in digests:
+            if not self._send_digest(rows, doc):
+                return
+
+    def _digests(
+        self, pending: list[search_store.PendingAlert], doc: Mapping[str, Any]
+    ) -> list[list[lanes.Ordered]]:
+        """This poll's digests: one per run, runs in order, at most the cap in all."""
+        by_id = {alert.posting_id: alert for alert in pending}
+        stale_before = _utc(self.clock() - STALE_RUN)
+        groups: dict[tuple[int, int], list[lanes.Ordered]] = {}
+        refused: list[tuple[tuple[int, int], lanes.Ordered]] = []
         for item in lanes.alert_order(pending, doc):
+            alert = by_id[item.posting_id]
+            if alert.run_id is not None and not (
+                alert.run_finished
+                or (alert.run_started_at is not None and alert.run_started_at <= stale_before)
+            ):
+                continue  # its run is still going: wait for it
+            key = (0, 0) if alert.run_id is None else (1, alert.run_id)
+            if item.posting_id in self._refused:
+                refused.append((key, item))
+            else:
+                groups.setdefault(key, []).append(item)
+        ordered = [(key, item) for key in sorted(groups) for item in groups[key]] + refused
+        chosen = ordered[: alerts_max_per_poll(doc)]
+        digests: dict[tuple[int, int], list[lanes.Ordered]] = {}
+        for key, item in chosen:
+            digests.setdefault(key, []).append(item)
+        return list(digests.values())
+
+    def _send_digest(self, rows: list[lanes.Ordered], doc: Mapping[str, Any]) -> bool:
+        """Send one run's digest. False when the poll should stop."""
+        try:
+            with self._search() as search:
+                fields = search_store.digest_fields(search, [row.posting_id for row in rows])
+        except (OSError, sqlite3.Error) as exc:
+            log.warning("alert digest could not be read (%s)", type(exc).__name__)
+            return False
+        entries = [
+            _DigestEntry(
+                fields[row.posting_id], company_label(fields[row.posting_id].company, doc), row
+            )
+            for row in rows
+            if row.posting_id in fields
+        ]
+        messages = _pack(entries)
+        for index, message in enumerate(messages, start=1):
+            part = (index, len(messages)) if len(messages) > 1 else None
             try:
-                with self._search() as search:
-                    self.alert(search, item.posting_id, doc=doc, lane_line=item.lane_line)
-            except (Refusal, TelegramError, OSError, sqlite3.Error) as exc:
-                log.warning("alert failed (%s); left for the next poll", type(exc).__name__)
+                self._send_rows(message, part, total=len(entries))
+            except TelegramRejected:
+                log.warning("alert digest refused (TelegramRejected); sending its rows one by one")
+                if not self._send_one_by_one(message, total=len(entries)):
+                    return False
+            except (TelegramError, OSError, sqlite3.Error) as exc:
+                log.warning("alert digest failed (%s); left for the next poll", type(exc).__name__)
+                return False
+        return True
+
+    def _send_one_by_one(self, message: list[_Numbered], total: int) -> bool:
+        for entry in message:
+            try:
+                self._send_rows([entry], None, total=total)
+            except TelegramRejected:
+                self._refused.add(entry.entry.fields.posting_id)
+                log.warning("an alert was refused (TelegramRejected); left for the next poll")
+            except (TelegramError, OSError, sqlite3.Error) as exc:
+                log.warning("alert digest failed (%s); left for the next poll", type(exc).__name__)
+                return False
+        return True
+
+    def _send_rows(
+        self, message: list[_Numbered], part: tuple[int, int] | None, *, total: int
+    ) -> None:
+        """One message: its rows, each with its own Applied and Skipped keyboard.
+
+        Each row's two tokens share a keyboard id of their own, so a tap spends only
+        that row's buttons. The tokens are written first; the message ids and
+        ``alerted_at`` only once Telegram has accepted the message, in one transaction.
+        """
+        text = _digest_text(message, part, total)
+        expires = self._later(ALERT_TTL)
+        keyboards: list[str] = []
+        markup: list[list[dict[str, str]]] = []
+        with self._search() as search:
+            with db.transaction(search):
+                for numbered in message:
+                    keyboard_id = secrets.token_urlsafe(9)
+                    keyboards.append(keyboard_id)
+                    payload = json.dumps({"posting_id": numbered.entry.fields.posting_id})
+                    buttons = []
+                    for label, action in (("Applied", "apply"), ("Skipped", "skip")):
+                        token = secrets.token_urlsafe(16)
+                        search.execute(
+                            "INSERT INTO bot_tokens (token, keyboard, chat_id, action, payload, "
+                            "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            (token, keyboard_id, self.chat_id, action, payload, expires),
+                        )
+                        buttons.append(
+                            {"text": f"{label} {numbered.number}", "callback_data": token}
+                        )
+                    markup.append(buttons)
+            message_id = self.send(text, markup)
+            now = self._now()
+            with db.transaction(search):
+                for keyboard_id in keyboards:
+                    search.execute(
+                        "UPDATE bot_tokens SET message_id = ? WHERE keyboard = ?",
+                        (message_id, keyboard_id),
+                    )
+                for numbered in message:
+                    search_store.mark_alerted(search, numbered.entry.fields.posting_id, now)
+        for numbered in message:
+            self._refused.discard(numbered.entry.fields.posting_id)
 
     def _alert_config(self) -> dict[str, Any] | None:
         """This poll's config, or None while it can't be read (the hold is recorded)."""
@@ -625,28 +856,18 @@ class Bot:
                 raise Refusal("That link is already recorded for another company.") from None
             self.alert(search, posting_id)
 
-    def alert(
-        self,
-        search: sqlite3.Connection,
-        posting_id: int,
-        *,
-        doc: dict[str, Any] | None = None,
-        lane_line: str | None = None,
-    ) -> None:
-        """Company, title, link, the fit, the lane, the LLM tier, and a cosine if stored.
+    def alert(self, search: sqlite3.Connection, posting_id: int) -> None:
+        """A job ad sent with /log: company, title, link, the fit, the tier, a cosine.
 
-        A posting with no fit, such as a job ad sent to the bot, says `Fit: not scored`.
-        `doc` is the config this poll already read. Without it (a job ad), config is read
-        here, and if it can't be, the company is shown without an agency label.
-        `lane_line` is `Lane: <name>` or `Off-lane`, or None to leave it out.
+        Watcher postings go out in the digest instead (`send_pending_alerts`). A job ad
+        is never scored, so it says `Fit: not scored`, unless the link was already a
+        scored watcher posting. Config is read here for the agency label, and if it
+        can't be, the company is shown without one.
         """
         posting = search_store.posting_by_id(search, posting_id)
         if posting is None:
             raise Refusal("That posting isn't in search.db any more.")
-        if doc is None:
-            label = self._labelled_company(posting.company)
-        else:
-            label = company_label(posting.company, doc)
+        label = self._labelled_company(posting.company)
         row = search.execute(
             "SELECT fit, scout_metadata, embedding_score FROM postings WHERE id = ?",
             (posting_id,),
@@ -654,7 +875,7 @@ class Bot:
         fit = row["fit"] if row is not None else None
         tier = _tier_name(row["scout_metadata"]) if row is not None else None
         score = _cosine(row["embedding_score"]) if row is not None else None
-        text = _alert_text(label, posting.title, posting.url, fit, lane_line, tier, score)
+        text = _alert_text(label, posting.title, posting.url, fit, tier, score)
         payload = {"posting_id": posting_id}
         self._keyboard(
             search, text, [[("Applied", "apply", payload), ("Skipped", "skip", payload)]], ALERT_TTL
@@ -761,6 +982,40 @@ class Bot:
             payload = json.loads(row["payload"])
         return str(row["action"]), payload if isinstance(payload, dict) else {}
 
+    def _live_buttons(self, message: Mapping[str, Any]) -> list[list[dict[str, str]]]:
+        """The message's buttons whose tokens are still unused: a digest's other rows.
+
+        A button is kept only when its token is in ``bot_tokens`` for this chat and
+        message, unused and unexpired; its label is the one Telegram echoes back from
+        the bot's own message. A plain alert or step keyboard is spent whole, so it
+        comes back empty.
+        """
+        markup = message.get("reply_markup")
+        rows = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+        if not isinstance(rows, list):
+            return []
+        with self._search() as search:
+            live = {
+                str(row["token"])
+                for row in search.execute(
+                    "SELECT token FROM bot_tokens WHERE chat_id = ? AND message_id = ? "
+                    "AND used_at IS NULL AND expires_at > ?",
+                    (self.chat_id, message.get("message_id"), self._now()),
+                )
+            }
+        kept: list[list[dict[str, str]]] = []
+        for row in rows:
+            if not isinstance(row, list):
+                continue
+            buttons = [
+                {"text": str(button.get("text", "")), "callback_data": button["callback_data"]}
+                for button in row
+                if isinstance(button, dict) and button.get("callback_data") in live
+            ]
+            if buttons:
+                kept.append(buttons)
+        return kept
+
     def _callback(self, query: Any) -> str:
         if not isinstance(query, dict):
             return "ignored:malformed"
@@ -787,7 +1042,7 @@ class Bot:
                 {
                     "chat_id": self.chat_id,
                     "message_id": message.get("message_id"),
-                    "reply_markup": {"inline_keyboard": []},
+                    "reply_markup": {"inline_keyboard": self._live_buttons(message)},
                 },
             )
         action, payload = taken
