@@ -291,3 +291,63 @@ def test_the_real_confirmer_asks_through_the_board_capped_fetcher(
     confirm = real_confirmer(Deadline(150))
     assert confirm(Board("greenhouse", "newrobotics")) == Confirmed(True, ("New Robotics",))
     assert caps == [(ats.BOARD_MAX_BYTES, True)]
+
+
+# --- every pass makes progress on new boards -------------------------------------------
+
+
+def _board_hits(count: int) -> list[str]:
+    return [f"https://jobs.lever.co/examplecorp{n:02d}" for n in range(count)]
+
+
+def test_board_hits_over_the_limit_in_the_same_order_each_pass_reach_every_board(
+    conn: sqlite3.Connection,
+) -> None:
+    hits = _board_hits(discover.CONFIRM_PER_PASS + 3)
+    first = Asked()
+    run(conn, first, *hits)
+    assert len(first.boards) == discover.CONFIRM_PER_PASS
+    second = Asked()
+    run(conn, second, *hits)  # the same hits, in the same order
+    assert len(second.boards) == 3  # queued boards are left out before the limit counts
+    assert len(rows(conn)) == discover.CONFIRM_PER_PASS + 3
+
+
+def test_gone_rejected_and_excluded_boards_do_not_count_against_the_limit(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(discover, "CONFIRM_PER_PASS", 1)
+    hits = _board_hits(4)
+    run(conn, Asked({"examplecorp00": Confirmed(False)}), *hits)  # gone
+    conn.execute("UPDATE discovery_candidates SET status = 'gone'")
+    run(conn, Asked(), *hits)  # examplecorp01 queued
+    conn.execute(
+        "UPDATE discovery_candidates SET status = 'rejected' WHERE ats_slug = 'examplecorp01'"
+    )
+    asked = Asked()
+    run(conn, asked, *hits, exclusions={"companies": ["examplecorp02"]})
+    assert [board.slug for board in asked.boards] == ["examplecorp03"]
+
+
+def test_boards_that_keep_failing_cannot_take_the_limit_every_pass(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(discover, "CONFIRM_PER_PASS", 1)
+    hits = _board_hits(3)
+    failing = Asked(
+        {
+            "examplecorp00": FetchFailed("couldn't fetch api.lever.co: OSError"),
+            "examplecorp01": FetchFailed("couldn't fetch api.lever.co: OSError"),
+        }
+    )
+    for cursor in range(3):  # the cursor moves on every pass
+        conn.execute("UPDATE discovery_state SET failures = 0, backoff_until = NULL")
+        discover.run(
+            conn,
+            CONFIG,
+            today="2026-11-02",
+            transport=answer(*hits),
+            confirm=failing,
+        )
+        assert conn.execute("SELECT cursor FROM discovery_state").fetchone()[0] == cursor + 1
+    assert rows(conn) == [("board", "lever", "examplecorp02", "pending")]

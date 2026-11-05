@@ -99,6 +99,9 @@ class Job:
     # how many days old it is at least. Both None: the board gave no date it could read.
     posted: dt.date | None = None
     posted_min_days: int | None = None
+    # `<ats_type>:<board>:<posting id>`: the posting's identity on its board, however
+    # its URL reads (search migration 0015).
+    key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +229,15 @@ def board_url(ats_type: str, slug: str) -> str | None:
     return f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
 
 
+def posting_key(posting: PostingRef) -> str:
+    """The posting's identity on its board, the same as `Job.key` for that posting."""
+    return f"{posting.board.key}:{posting.ref}"
+
+
+def _key(ats: str, slug: str, ident: str | None) -> str | None:
+    return None if ident is None else f"{ats}:{slug.casefold()}:{ident}"
+
+
 def posting_url(posting: PostingRef) -> str | None:
     """The URL the watcher stores for this posting when it reads it from its board, so a
     posting found by discovery and later on its board is one posting. None when the
@@ -311,6 +323,7 @@ def _bamboohr_posting(data: object, slug: str, ref: str) -> Job | Skip:
         url=f"https://{slug}.bamboohr.com/careers/{ref}",
         requisition_id=ref,
         company_field=None,
+        key=_key("bamboohr", slug, ref),
     )
     return _bamboohr_detail(stub, data)
 
@@ -333,6 +346,7 @@ def _workday_posting(data: object, board: Board, ref: str, today: dt.date | None
         company_field=None,
         posted=posted,
         posted_min_days=at_least,
+        key=f"{board.key}:{ref}",
     )
     return _workday_detail(stub, data)
 
@@ -578,6 +592,7 @@ def _smartrecruiters_job(item: object, slug: str) -> Job | Skip:
         company_field=_text(company.get("name")),
         detail_url=f"https://api.smartrecruiters.com/v1/companies/{slug}/postings/{ident}",
         posted=_utc_date(job.get("releasedDate")),
+        key=_key("smartrecruiters", slug, ident),
     )
 
 
@@ -651,6 +666,7 @@ def _bamboohr_job(item: object, slug: str) -> Job | Skip:
         requisition_id=ident,
         company_field=None,
         detail_url=f"https://{slug}.bamboohr.com/careers/{ident}/detail",
+        key=_key("bamboohr", slug, ident),
     )
 
 
@@ -742,6 +758,7 @@ def _workday_job(item: object, board: Board, today: dt.date | None) -> Job | Ski
         detail_url=f"{_workday_base(board)}{path}",
         posted=posted,
         posted_min_days=at_least,
+        key=f"{board.key}:{path}",
     )
 
 
@@ -816,6 +833,7 @@ def _greenhouse_job(item: object, slug: str) -> Job | Skip:
         company_field=_text(job.get("company_name")),
         description=_greenhouse_text(job.get("content")),
         posted=_utc_date(job.get("first_published")),
+        key=_key("greenhouse", slug, _path_id(job.get("id"))),
     )
 
 
@@ -844,6 +862,7 @@ def _lever_job(item: object, slug: str) -> Job | Skip:
         company_field=None,
         description=_lever_text(job),
         posted=_epoch_ms_date(job.get("createdAt")),
+        key=_key("lever", slug, _path_id(job.get("id"))),
     )
 
 
@@ -905,6 +924,7 @@ def _ashby_job(item: object, slug: str) -> Job | Skip:
         company_field=None,
         description=_ashby_text(job),
         posted=_utc_date(job.get("publishedAt")),
+        key=_key("ashby", slug, _path_id(job.get("id"))),
     )
 
 

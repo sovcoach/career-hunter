@@ -389,3 +389,95 @@ def test_postings_the_run_budget_cannot_reach_are_left(search: sqlite3.Connectio
     lines = run(search, fetcher, LEVER, budget=Deadline(0, FakeClock()))
     assert fetcher.calls == []
     assert "watch: discovery: 1 postings run budget reached; left for the next run" in lines
+
+
+# --- every pass makes progress on new postings -----------------------------------------
+
+
+def _many(count: int) -> tuple[list[PostingRef], dict[str, Fetched | Exception]]:
+    refs: list[PostingRef] = []
+    replies: dict[str, Fetched | Exception] = {}
+    for n in range(count):
+        ident = f"{n:08d}-3e4f-4a5b-8c9d-0e1f2a3b4c5d"
+        refs.append(PostingRef(Board("lever", "freshlogistics"), ident))
+        posting = lever_posting(f"Coordinator {n}")
+        posting.update(id=ident, hostedUrl=f"https://jobs.lever.co/freshlogistics/{ident}")
+        replies[f"https://api.lever.co/v0/postings/freshlogistics/{ident}?mode=json"] = fetched(
+            posting
+        )
+    return refs, replies
+
+
+def test_hits_over_the_limit_in_the_same_order_each_pass_reach_every_posting(
+    search: sqlite3.Connection,
+) -> None:
+    refs, replies = _many(w.DISCOVERED_PER_RUN + 5)
+    first = Scripted(replies)
+    run(search, first, *refs)
+    assert len(first.calls) == w.DISCOVERED_PER_RUN
+    second = Scripted(replies)
+    lines = run(search, second, *refs)  # the same hits, in the same order
+    assert len(second.calls) == 5  # stored postings do not count against the limit
+    assert len(stored(search)) == w.DISCOVERED_PER_RUN + 5
+    assert not any("postings left" in line for line in lines)
+
+
+def test_postings_that_keep_failing_cannot_take_the_limit_every_pass(
+    search: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(w, "DISCOVERED_PER_RUN", 2)
+    refs, replies = _many(4)
+    for ref in refs[:2]:  # the first two hits are gone for good
+        replies[f"https://api.lever.co/v0/postings/freshlogistics/{ref.ref}?mode=json"] = fetched(
+            status=404, body=b"{}"
+        )
+    for _pass in range(4):
+        run(search, Scripted(replies), *refs)
+    assert sorted(row[0] for row in stored(search)) == ["Coordinator 2", "Coordinator 3"]
+
+
+def test_a_greenhouse_posting_on_the_companys_own_domain_is_known_by_board_and_id(
+    search: sqlite3.Connection,
+) -> None:
+    """Its absolute_url is not the board URL, so the URL alone would miss it."""
+    job = {
+        "id": 4242,
+        "title": "Operations Coordinator",
+        "absolute_url": "https://careers.example.com/jobs?gh_jid=4242",
+        "location": {"name": "Example City"},
+        "content": "&lt;p&gt;A friendly team.&lt;/p&gt;",
+        "first_published": "2026-10-30T09:00:00-04:00",
+    }
+    board = url("greenhouse", "newrobotics")
+    w.run(
+        search,
+        [{"name": "New Robotics", "ats_type": "greenhouse", "ats_slug": "newrobotics"}],
+        today=DAY,
+        fetcher=Scripted({board: fetched({"jobs": [job]})}),
+        config=FITS,
+        scorer=always_strong,
+    )
+    key = search.execute("SELECT ats_key, url FROM postings").fetchone()
+    assert tuple(key) == ("greenhouse:newrobotics:4242", job["absolute_url"])
+    found = Scripted({})
+    run(search, found, PostingRef(Board("greenhouse", "NewRobotics"), "4242"))
+    assert found.calls == []  # known by its identity on the board: not fetched again
+    assert len(stored(search)) == 1
+
+
+def test_a_posting_stored_before_its_key_gets_it_when_met_again(
+    search: sqlite3.Connection,
+) -> None:
+    run(search, Scripted({LEVER_API: fetched(lever_posting())}), LEVER)
+    search.execute("UPDATE postings SET ats_key = NULL")
+    run(search, Scripted({LEVER_API: fetched(lever_posting())}), LEVER)  # met by its URL
+    assert search.execute("SELECT ats_key FROM postings").fetchone()[0] is None  # not fetched
+    w.run(
+        search,
+        [{"name": "freshlogistics", "ats_type": "lever", "ats_slug": "freshlogistics"}],
+        today=DAY,
+        fetcher=Scripted({url("lever", "freshlogistics"): fetched([lever_posting()])}),
+    )
+    assert search.execute("SELECT ats_key FROM postings").fetchone()[0] == (
+        f"lever:freshlogistics:{LEVER_ID}"
+    )

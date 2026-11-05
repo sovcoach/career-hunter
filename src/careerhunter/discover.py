@@ -407,7 +407,9 @@ def run(
     # The queue rows and the moved cursor go in one transaction: a miss moves neither,
     # so the same queries are asked again next time.
     boards = [hit for hit in hits if hit.kind == "board"]
-    accepted, gone, notes = _confirmed(conn, config, boards, confirm, exclusions or {})
+    accepted, gone, notes = _confirmed(
+        conn, config, boards, confirm, exclusions or {}, start=_cursor(conn)
+    )
     stored = _store(conn, config, accepted, today, career_hosts, cursor=after, gone=gone)
     return Outcome(None, tuple(stored), tuple(postings.values()), tuple(notes))
 
@@ -432,10 +434,17 @@ def _confirmed(
     boards: Sequence[Hit],
     confirm: Confirm | None,
     exclusions: Mapping[str, Any],
+    *,
+    start: int = 0,
 ) -> tuple[list[Hit], list[Hit], list[str]]:
     """The new boards to queue and the gone ones to record, with a note for each other.
 
-    Runs before the queue's transaction, so no write lock is held across a request.
+    Boards already watched or in the queue (pending, approved, rejected or gone) and
+    boards excluded by their slug are left out before CONFIRM_PER_PASS counts, so every
+    pass reaches new boards. The rest are asked about from `start` (the cursor), so
+    boards that keep failing at the front of the same results cannot take the limit
+    every pass. Runs before the queue's transaction, so no write lock is held across a
+    request.
     """
     watched = _watched_boards(config)
     known = _known_boards(conn)
@@ -444,6 +453,7 @@ def _confirmed(
     gone: list[Hit] = []
     notes: list[str] = []
     asked = 0
+    candidates: list[tuple[Hit, str, str]] = []
     for hit in boards:
         if hit.ats_type is None or hit.ats_slug is None:
             continue
@@ -451,15 +461,20 @@ def _confirmed(
         if key in watched or key in known:
             continue
         known.add(key)
-        who = f"discover: {hit.suggested_name} ({hit.ats_type})"
         if {_folded(hit.ats_slug), _folded(hit.suggested_name)} & excluded:
-            notes.append(f"{who}: excluded; not queued")
+            notes.append(f"discover: {hit.suggested_name} ({hit.ats_type}): excluded; not queued")
             continue
+        candidates.append((hit, hit.ats_type, hit.ats_slug))
+    if candidates:
+        first = start % len(candidates)
+        candidates = candidates[first:] + candidates[:first]
+    for hit, ats_type, slug in candidates:
+        who = f"discover: {hit.suggested_name} ({ats_type})"
         if confirm is None or asked >= CONFIRM_PER_PASS:
             notes.append(f"{who}: not confirmed this pass; not queued")
             continue
         asked += 1
-        board = Board(hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site)
+        board = Board(ats_type, slug, hit.ats_host, hit.ats_site)
         try:
             answer = confirm(board)
         except (FetchError, BoardHTTPError, BoardParseError) as exc:

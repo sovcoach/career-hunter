@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 15)), "ei_record": [1]}[track]
+    expected = {"search": list(range(1, 16)), "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -790,5 +790,34 @@ def test_0014_starts_discovery_at_the_first_query_with_no_backoff(tmp_path: Path
         ):
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute(sql)
+    finally:
+        conn.close()
+
+
+def test_0015_keeps_one_posting_per_ats_key(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:15])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        for title in ("One", "Two"):
+            conn.execute(
+                "INSERT INTO postings (company_id, title, first_seen, source) "
+                "VALUES (?, ?, '2026-10-30', 'watcher')",
+                (company, title),
+            )
+        assert (
+            conn.execute("SELECT count(*) FROM postings WHERE ats_key IS NULL").fetchone()[0] == 2
+        )
+        conn.execute(
+            "UPDATE postings SET ats_key = 'greenhouse:examplewidgets:1' WHERE title = 'One'"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE postings SET ats_key = 'greenhouse:examplewidgets:1' WHERE title = 'Two'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE postings SET ats_key = '' WHERE title = 'Two'")
     finally:
         conn.close()

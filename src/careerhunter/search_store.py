@@ -192,6 +192,23 @@ def set_posted_date(conn: sqlite3.Connection, posting_id: int, posted: str | Non
     conn.execute("UPDATE postings SET posted_date = ? WHERE id = ?", (posted, posting_id))
 
 
+def posting_key_known(conn: sqlite3.Connection, key: str) -> bool:
+    """Whether a posting with this ATS identity (search migration 0015) is stored."""
+    found = conn.execute("SELECT 1 FROM postings WHERE ats_key = ?", (key,)).fetchone()
+    return found is not None
+
+
+def set_ats_key(conn: sqlite3.Connection, posting_id: int, key: str) -> bool:
+    """Record a posting's ATS identity once. False when it has one already, or another
+    posting holds that key (two stored rows for one posting are left as they are)."""
+    cur = conn.execute(
+        "UPDATE postings SET ats_key = ? WHERE id = ? AND ats_key IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM postings WHERE ats_key = ?)",
+        (key, posting_id, key),
+    )
+    return cur.rowcount == 1
+
+
 def posting_url_known(conn: sqlite3.Connection, url: str) -> bool:
     """Whether a posting with this exact URL is stored, from any source."""
     return conn.execute("SELECT 1 FROM postings WHERE url = ?", (url,)).fetchone() is not None

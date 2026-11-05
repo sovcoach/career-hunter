@@ -750,11 +750,19 @@ def _record_discovered(
     host for the rest of the run, boards included.
     """
     day = dt.date.fromisoformat(today)
+    # Stored postings are left out before the limit counts, by their identity on the
+    # board as well as their URL, so every pass reaches new postings.
     fresh = [
         ref
         for ref in postings
-        if not search_store.posting_url_known(conn, ats_boards.posting_url(ref) or "")
+        if not search_store.posting_key_known(conn, ats_boards.posting_key(ref))
+        and not search_store.posting_url_known(conn, ats_boards.posting_url(ref) or "")
     ]
+    # Start at a different place each run, so postings that keep failing at the front
+    # of the same results cannot take the limit every time.
+    if fresh:
+        start = ((state.run_id or 1) - 1) % len(fresh)
+        fresh = fresh[start:] + fresh[:start]
     for index, ref in enumerate(fresh):
         name = ref.board.slug
         if index >= DISCOVERED_PER_RUN:
@@ -947,6 +955,8 @@ def _record_jobs(
                     search_store.insert_skip(conn, posting_id, today, reason)
                 if inserted and item.posted is not None:
                     search_store.set_posted_date(conn, posting_id, item.posted.isoformat())
+                if item.key is not None:  # new or met again: its identity on the board
+                    search_store.set_ats_key(conn, posting_id, item.key)
                 if inserted and state.lanes_on:  # skipped postings get a lane too
                     search_store.set_posting_lane(conn, posting_id, _lane_name(item.title, config))
         except search_store.IdentityConflict as exc:
