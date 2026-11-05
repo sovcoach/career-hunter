@@ -21,6 +21,7 @@ in memory for the filter and the scoring prompt, and never stored.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import re
 import urllib.parse
@@ -56,6 +57,7 @@ _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _WORKDAY_HOST = re.compile(r"^wd[0-9]{1,3}$")
 # A Workday posting path: /job/<location>/<title>_<id>, URL-safe segments only.
 _WORKDAY_PATH = re.compile(r"^/job(?:/[A-Za-z0-9._~%+-]+)+$")
+_WORKDAY_DAYS_AGO = re.compile(r"Posted ([0-9]{1,3}) Days Ago")
 # The public postings API says "on-site"; the hire API says "onsite".
 _LEVER_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite", "on-site": "onsite"}
 _ASHBY_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite"}
@@ -93,11 +95,18 @@ class Job:
     company_field: str | None
     description: str | None = None
     detail_url: str | None = None  # where the description is, when the list has none
+    # The posted date the board gives, in UTC; or, for Workday's "30+ Days Ago", only
+    # how many days old it is at least. Both None: the board gave no date it could read.
+    posted: dt.date | None = None
+    posted_min_days: int | None = None
 
 
 @dataclass(frozen=True)
 class Skip:
     reason: str
+
+
+TooOld = Callable[[Job], bool]  # a posting already too old from its list date
 
 
 @dataclass(frozen=True)
@@ -204,12 +213,18 @@ def _nothing_known(url: str) -> bool:
     return False
 
 
+def _never_too_old(job: Job) -> bool:
+    return False
+
+
 def read(
     board: Board,
     client: Client,
     *,
     known: Known = _nothing_known,
     detail_limit: int | None = None,
+    today: dt.date | None = None,
+    too_old: TooOld = _never_too_old,
 ) -> BoardRead:
     """Every job on one board this run.
 
@@ -221,6 +236,10 @@ def read(
     only, with a note. A fetch
     error or HTTP 429 stops the details: see `BoardRead.stopped`. Going over the byte
     budget always raises, so a board over the cap stores nothing.
+
+    `today` turns Workday's relative dates into dates. A posting the list already shows
+    as `too_old` gets no detail request either: it is returned without a description,
+    to be stored with its skip.
     """
     url = list_url(board)
     if url is None:
@@ -228,15 +247,15 @@ def read(
     limit = DETAIL_LIMIT if detail_limit is None else detail_limit
     if board.ats == "smartrecruiters":
         stubs, notes = _smartrecruiters_list_pages(board.slug, client)
-        found = _with_details(stubs, client, known, limit, _smartrecruiters_detail)
+        found = _with_details(stubs, client, known, too_old, limit, _smartrecruiters_detail)
         found.notes[:0] = notes
         return found
     if board.ats == "bamboohr":
         stubs = _bamboohr_list(board.slug, client.get_json(url))
-        return _with_details(stubs, client, known, limit, _bamboohr_detail)
+        return _with_details(stubs, client, known, too_old, limit, _bamboohr_detail)
     if board.ats == "workday":
-        stubs, notes = _workday_list_pages(board, url, client)
-        found = _with_details(stubs, client, known, limit, _workday_detail)
+        stubs, notes = _workday_list_pages(board, url, client, today)
+        found = _with_details(stubs, client, known, too_old, limit, _workday_detail)
         found.notes[:0] = notes
         return found
     return BoardRead(_parse(board.ats, board.slug, client.get_json(url)))
@@ -246,6 +265,7 @@ def _with_details(
     stubs: list[Job | Skip],
     client: Client,
     known: Known,
+    too_old: TooOld,
     limit: int,
     parse_detail: Callable[[Job, object], Job],
 ) -> BoardRead:
@@ -257,8 +277,8 @@ def _with_details(
         if isinstance(item, Skip) or item.detail_url is None:
             out.jobs.append(item)
             continue
-        if item.url is not None and known(item.url):
-            out.jobs.append(item)  # stored already: no detail needed
+        if (item.url is not None and known(item.url)) or too_old(item):
+            out.jobs.append(item)  # stored already, or skipped for its age: no detail
             continue
         if out.stopped is not None or fetched >= limit:
             left += 1
@@ -350,6 +370,7 @@ def _smartrecruiters_job(item: object, slug: str) -> Job | Skip:
         requisition_id=ident,
         company_field=_text(company.get("name")),
         detail_url=f"https://api.smartrecruiters.com/v1/companies/{slug}/postings/{ident}",
+        posted=_utc_date(job.get("releasedDate")),
     )
 
 
@@ -446,7 +467,12 @@ def _bamboohr_detail(stub: Job, data: object) -> Job:
     if opening is None:
         raise BoardParseError("unexpected JSON shape")
     html = _text(opening.get("description"))
-    return replace(stub, description=htmltext.to_text(html) if html else None, detail_url=None)
+    return replace(
+        stub,
+        description=htmltext.to_text(html) if html else None,
+        detail_url=None,
+        posted=_plain_date(opening.get("datePosted")),
+    )
 
 
 # --- Workday ----------------------------------------------------------------------------
@@ -471,7 +497,7 @@ def _workday_base(board: Board) -> str:
 
 
 def _workday_list_pages(
-    board: Board, url: str, client: Client
+    board: Board, url: str, client: Client, today: dt.date | None
 ) -> tuple[list[Job | Skip], list[str]]:
     jobs: list[Job | Skip] = []
     offset = 0
@@ -481,14 +507,14 @@ def _workday_list_pages(
         rows = data.get("jobPostings") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             raise BoardParseError("unexpected JSON shape")
-        jobs.extend(_workday_job(item, board) for item in rows)
+        jobs.extend(_workday_job(item, board, today) for item in rows)
         offset += len(rows)
         if len(rows) < WORKDAY_PAGE:
             return jobs, []
     return jobs, [f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"]
 
 
-def _workday_job(item: object, board: Board) -> Job | Skip:
+def _workday_job(item: object, board: Board, today: dt.date | None) -> Job | Skip:
     job = _mapping(item)
     if job is None:
         return Skip("a job was not an object")
@@ -498,6 +524,7 @@ def _workday_job(item: object, board: Board) -> Job | Skip:
     path = _text(job.get("externalPath"))
     if path is None or _WORKDAY_PATH.fullmatch(path) is None or "/../" in f"{path}/":
         return Skip(f"{title!r} has no usable path")
+    posted, at_least = _workday_posted(job.get("postedOn"), today)
     return Job(
         title=title,
         location=_text(job.get("locationsText")) or "",
@@ -506,7 +533,25 @@ def _workday_job(item: object, board: Board) -> Job | Skip:
         requisition_id=None,  # the URL is the identity; bulletFields are not documented
         company_field=None,
         detail_url=f"{_workday_base(board)}{path}",
+        posted=posted,
+        posted_min_days=at_least,
     )
+
+
+def _workday_posted(value: object, today: dt.date | None) -> tuple[dt.date | None, int | None]:
+    """A date from the forms seen on a live board: "Posted Today", "Posted N Days Ago"
+    and "Posted 30+ Days Ago" (at least 30 days old). Any other text gives no date."""
+    text = _text(value)
+    if text is None or today is None:
+        return None, None
+    if text == "Posted Today":
+        return today, None
+    if text == "Posted 30+ Days Ago":
+        return None, 30
+    match = _WORKDAY_DAYS_AGO.fullmatch(text)
+    if match is None:
+        return None, None
+    return today - dt.timedelta(days=int(match.group(1))), None
 
 
 def _workday_detail(stub: Job, data: object) -> Job:
@@ -563,6 +608,7 @@ def _greenhouse_job(item: object, slug: str) -> Job | Skip:
         requisition_id=_text(job.get("requisition_id")),
         company_field=_text(job.get("company_name")),
         description=_greenhouse_text(job.get("content")),
+        posted=_utc_date(job.get("first_published")),
     )
 
 
@@ -590,6 +636,7 @@ def _lever_job(item: object, slug: str) -> Job | Skip:
         requisition_id=_id_text(job.get("id")),
         company_field=None,
         description=_lever_text(job),
+        posted=_epoch_ms_date(job.get("createdAt")),
     )
 
 
@@ -650,6 +697,7 @@ def _ashby_job(item: object, slug: str) -> Job | Skip:
         requisition_id=_id_text(job.get("id")),
         company_field=None,
         description=_ashby_text(job),
+        posted=_utc_date(job.get("publishedAt")),
     )
 
 
@@ -721,3 +769,41 @@ def _text(value: object) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+# --- posted dates ---------------------------------------------------------------------
+# Greenhouse first_published, Ashby publishedAt and SmartRecruiters releasedDate are ISO
+# timestamps with an offset; Lever createdAt is milliseconds since the epoch; BambooHR
+# datePosted is a plain date. A value that does not read as one gives no date.
+
+
+def _utc_date(value: object) -> dt.date | None:
+    text = _text(value)
+    if text is None:
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None  # no offset: the day is not known for sure
+    return moment.astimezone(dt.UTC).date()
+
+
+def _epoch_ms_date(value: object) -> dt.date | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(value / 1000, dt.UTC).date()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _plain_date(value: object) -> dt.date | None:
+    text = _text(value)
+    if text is None or len(text) != 10:
+        return None
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError:
+        return None

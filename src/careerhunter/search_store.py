@@ -187,6 +187,11 @@ def add_decision(
     )
 
 
+def set_posted_date(conn: sqlite3.Connection, posting_id: int, posted: str | None) -> None:
+    """The posting's own posted date, YYYY-MM-DD (search migration 0013), or null."""
+    conn.execute("UPDATE postings SET posted_date = ? WHERE id = ?", (posted, posting_id))
+
+
 def posting_url_known(conn: sqlite3.Connection, url: str) -> bool:
     """Whether a posting with this exact URL is stored, from any source."""
     return conn.execute("SELECT 1 FROM postings WHERE url = ?", (url,)).fetchone() is not None

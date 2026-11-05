@@ -116,7 +116,7 @@ from careerhunter.ats import (
     Skip,
 )
 from careerhunter.ats import board_url as board_url  # the tests build list URLs with it
-from careerhunter.config import off_lane_min_fit, tier_fits
+from careerhunter.config import max_posting_age_days, off_lane_min_fit, tier_fits
 from careerhunter.deadline import Deadline
 from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout, FetchTooLarge
@@ -193,6 +193,8 @@ class _State:
     fits: Mapping[str, str] = field(default_factory=dict)  # tier name -> fit, from config
     lanes_on: bool = False  # search.lanes is set: titles are checked against the lanes
     run_id: int | None = None  # this run's watch_runs row, stored with each score
+    max_age: int = 7  # search.max_posting_age_days
+    today: str = ""  # the configured date, YYYY-MM-DD
     model_down: bool = False
     budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
@@ -309,6 +311,8 @@ def run(
         resume=resume,
         fits=tier_fits(rules),
         lanes_on=lanes.configured(rules) is not None,
+        max_age=max_posting_age_days(rules),
+        today=today,
     )
     lines = state.lines
     with db.transaction(conn):
@@ -718,8 +722,13 @@ def _fetch_jobs(
     def known(url: str) -> bool:
         return search_store.posting_url_known(conn, url)
 
+    day = dt.date.fromisoformat(state.today)
+
+    def too_old(job: Job) -> bool:
+        return filters.too_old(job.posted, job.posted_min_days, day, state.max_age) is True
+
     try:
-        return _Parsed(ats_boards.read(board, client, known=known))
+        return _Parsed(ats_boards.read(board, client, known=known, today=day, too_old=too_old))
     except FetchError as exc:
         if isinstance(exc, FetchTimeout) and state.out_of_time():
             lines.append(_line(name, ats, _LEFT))
@@ -802,13 +811,19 @@ def _record_jobs(
             role_filters=role_filters,
             applied=False,
         )
+        reason = verdict.reason
+        aged = filters.too_old(
+            item.posted, item.posted_min_days, dt.date.fromisoformat(today), state.max_age
+        )
+        if reason is None and aged:
+            reason = "too_old"
         posting = Posting(
             company=company,
             title=item.title,
             first_seen=today,
             location=item.location,
             work_model=item.work_model,
-            schedule=None if verdict.reason else verdict.schedule,
+            schedule=None if reason else verdict.schedule,
             url=item.url,
             requisition_id=item.requisition_id,
             source="watcher",
@@ -817,12 +832,10 @@ def _record_jobs(
             with db.transaction(conn):
                 found = search_store.find_or_create_posting(conn, posting, dating)
                 posting_id, inserted = found[1], found[3]
-                if (
-                    inserted
-                    and verdict.reason
-                    and not search_store.posting_has_skip(conn, posting_id)
-                ):
-                    search_store.insert_skip(conn, posting_id, today, verdict.reason)
+                if inserted and reason and not search_store.posting_has_skip(conn, posting_id):
+                    search_store.insert_skip(conn, posting_id, today, reason)
+                if inserted and item.posted is not None:
+                    search_store.set_posted_date(conn, posting_id, item.posted.isoformat())
                 if inserted and state.lanes_on:  # skipped postings get a lane too
                     search_store.set_posting_lane(conn, posting_id, _lane_name(item.title, config))
         except search_store.IdentityConflict as exc:
@@ -845,8 +858,10 @@ def _record_jobs(
             continue
         new += 1
         state.inserted.add(posting_id)
-        if verdict.reason:
-            lines.append(_line(name, ats, f"{item.title!r} skipped ({verdict.reason})"))
+        if aged is None:
+            lines.append(_line(name, ats, f"{item.title!r}: no posted date; first_seen used"))
+        if reason:
+            lines.append(_line(name, ats, f"{item.title!r} skipped ({reason})"))
             continue
         if scorer is None:
             continue
@@ -889,7 +904,7 @@ def _recheck(
     }
     rows = conn.execute(
         "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, "
-        "p.requisition_id, p.schedule FROM postings p "
+        "p.requisition_id, p.schedule, p.posted_date, p.first_seen FROM postings p "
         "JOIN companies c ON c.id = p.company_id "
         "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
@@ -900,7 +915,7 @@ def _recheck(
             state.left_by_budget(_partly("recheck", len(rows) - index))
             return False
         with _isolated(conn, state.lines, str(row["company"]), state.hook):
-            _recheck_one(conn, row, roles, config, exclusions, today, state.lines)
+            _recheck_one(conn, row, roles, config, exclusions, today, state.lines, state.max_age)
     return True
 
 
@@ -916,6 +931,7 @@ def _recheck_one(
     exclusions: Mapping[str, Any],
     today: str,
     lines: list[str],
+    max_age: int,
 ) -> None:
     verdict = filters.decide(
         PostingText(
@@ -930,16 +946,19 @@ def _recheck_one(
         role_filters=roles.get(str(row["company"]).casefold()),
         applied=search_store.posting_has_application(conn, int(row["id"])),
     )
+    reason = verdict.reason
+    # The stored posted date, or first_seen when the board gave none.
+    posted = dt.date.fromisoformat(str(row["posted_date"] or row["first_seen"])[:10])
+    if reason is None and filters.too_old(posted, None, dt.date.fromisoformat(today), max_age):
+        reason = "too_old"
     with db.transaction(conn):
-        if verdict.reason:
+        if reason:
             if not search_store.posting_has_skip(conn, int(row["id"])):
-                search_store.insert_skip(conn, int(row["id"]), today, verdict.reason)
+                search_store.insert_skip(conn, int(row["id"]), today, reason)
         elif verdict.schedule != row["schedule"]:
             search_store.set_posting_schedule(conn, int(row["id"]), verdict.schedule)
-    if verdict.reason:
-        lines.append(
-            _line(str(row["company"]), None, f"{row['title']!r} skipped ({verdict.reason})")
-        )
+    if reason:
+        lines.append(_line(str(row["company"]), None, f"{row['title']!r} skipped ({reason})"))
 
 
 # The three scoring queries, written out in full. Never-scored postings are first come,

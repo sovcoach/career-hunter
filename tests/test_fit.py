@@ -109,7 +109,7 @@ def _scored_without_fit(conn: sqlite3.Connection, title: str, tier: str | None) 
     metadata = None if tier is None else f'{{"tier": "{tier}"}}'
     cur = conn.execute(
         "INSERT INTO postings (company_id, title, first_seen, source, gaps, llm_output, "
-        "scout_metadata) VALUES (?, ?, '2026-10-01', 'watcher', '[]', '{}', ?)",
+        "scout_metadata) VALUES (?, ?, '2026-10-30', 'watcher', '[]', '{}', ?)",
         (company_id, title, metadata),
     )
     return int(cur.lastrowid or 0)

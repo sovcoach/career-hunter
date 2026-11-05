@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 13)), "ei_record": [1]}[track]
+    expected = {"search": list(range(1, 14)), "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -749,5 +749,27 @@ def test_0012_company_workday_identity_is_checked(
         else:
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute(insert, (ats, host, site))
+    finally:
+        conn.close()
+
+
+def test_0013_leaves_existing_postings_without_a_posted_date(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:12])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (?, 'Coordinator', '2026-10-01', 'watcher')",
+            (company,),
+        )
+        assert db.migrate(conn, "search", db.load_migrations("search")[:13]) == [13]
+        assert conn.execute("SELECT posted_date FROM postings").fetchone()[0] is None
+        conn.execute("UPDATE postings SET posted_date = '2026-10-30'")
+        for bad in ("2026-10-30T10:00:00Z", "2026-13-01", "yesterday"):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute("UPDATE postings SET posted_date = ?", (bad,))
     finally:
         conn.close()

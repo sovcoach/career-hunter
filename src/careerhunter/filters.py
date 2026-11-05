@@ -49,6 +49,7 @@ excluded it. The word "weekends" on its own does neither.
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -541,3 +542,19 @@ def _in_word(text: str, index: int) -> bool:
     if not 0 <= index < len(text):
         return False
     return unicodedata.category(text[index])[0] in "LNM"
+
+
+def too_old(
+    posted: dt.date | None, at_least: int | None, today: dt.date, max_days: int
+) -> bool | None:
+    """Whether a posting is older than `max_days` (#36); None when its age is not known.
+
+    `posted` is the board's posted date. `at_least` is a lower bound on the age in days
+    when the board gives only that (Workday's "30+ Days Ago"): it decides only when it
+    is already over the limit. A date in the future is not too old.
+    """
+    if posted is not None:
+        return (today - posted).days > max_days
+    if at_least is not None and at_least > max_days:
+        return True
+    return None

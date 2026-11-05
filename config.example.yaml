@@ -38,6 +38,9 @@ search:
   off_lane_min_fit: high
   # Optional: where each work model is acceptable. With no work model from the board,
   # a location saying "remote" counts as remote and anything else as on-site.
+  # Optional. Postings older than this many days (by the board's posted date, or
+  # the day first seen when the board gives none) are skipped as too_old. 1 to 365.
+  max_posting_age_days: 7
   location_rules:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here
     remote: [Canada]                    # fully remote only within these regions

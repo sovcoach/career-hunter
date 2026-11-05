@@ -68,6 +68,8 @@ DEFAULT_DISCOVERY_INTERVAL_MINUTES = 1440
 MIN_DISCOVERY_INTERVAL_MINUTES = 60
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 DEFAULT_OFF_LANE_MIN_FIT = "high"
+DEFAULT_MAX_POSTING_AGE_DAYS = 7
+MAX_POSTING_AGE_LIMIT = 365
 DEFAULT_MAX_PER_POLL = 10
 MAX_PER_POLL_LIMIT = 50
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -452,6 +454,12 @@ def validate_config(doc: Any) -> list[str]:
             _validate_location_rules(rules, problems)
         if "resume" in search:
             _resume_path(search["resume"], problems)
+        age = search.get("max_posting_age_days", DEFAULT_MAX_POSTING_AGE_DAYS)
+        if not _int(age) or not 1 <= age <= MAX_POSTING_AGE_LIMIT:
+            problems.append(
+                f"search.max_posting_age_days must be an integer from 1 to "
+                f"{MAX_POSTING_AGE_LIMIT} (default {DEFAULT_MAX_POSTING_AGE_DAYS})"
+            )
         if search.get("off_lane_min_fit", DEFAULT_OFF_LANE_MIN_FIT) not in FIT_LEVELS:
             problems.append(
                 f"search.off_lane_min_fit must be one of {' | '.join(FIT_LEVELS)} "
@@ -595,6 +603,15 @@ def alerts_max_per_poll(doc: Mapping[str, Any] | None) -> int:
     if _int(value) and 1 <= value <= MAX_PER_POLL_LIMIT:
         return value
     return DEFAULT_MAX_PER_POLL
+
+
+def max_posting_age_days(doc: Mapping[str, Any] | None) -> int:
+    """How many days old a posting may be (#36). 7 when it is not set."""
+    search = doc.get("search") if isinstance(doc, Mapping) else None
+    value = search.get("max_posting_age_days") if isinstance(search, Mapping) else None
+    if _int(value) and 1 <= value <= MAX_POSTING_AGE_LIMIT:
+        return value
+    return DEFAULT_MAX_POSTING_AGE_DAYS
 
 
 def off_lane_min_fit(doc: Mapping[str, Any] | None) -> str:
