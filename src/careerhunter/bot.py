@@ -53,7 +53,7 @@ from typing import Any
 
 import yaml
 
-from careerhunter import claims, db, enums, ledger, search_store, snapshots
+from careerhunter import claims, db, enums, lanes, ledger, search_store, snapshots
 from careerhunter import discover as discovery
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating
 from careerhunter.config import ConfigError, load_config, telegram_chat_id
@@ -68,6 +68,8 @@ from careerhunter.storage_guard import DataDir
 from careerhunter.telegram import HttpTelegram, TelegramAPI, TelegramError, redact
 
 log = logging.getLogger("careerhunter.bot")
+# The /log reply when config.yaml can't be read. No path and no content.
+CONFIG_UNREADABLE = "Config can't be read, so nothing was recorded. Run careerhunter doctor."
 
 POLL_TIMEOUT = 50
 TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_-]{16,64}")
@@ -216,6 +218,7 @@ def _alert_text(
     title: str,
     url: str | None,
     fit: object,
+    lane_line: str | None,
     tier: str | None,
     score: float | None,
 ) -> str:
@@ -223,6 +226,8 @@ def _alert_text(
     if url:
         lines.append(url)
     lines.append(f"Fit: {_fit_label(fit)}")
+    if lane_line:
+        lines.append(" ".join(lane_line.split()))  # one line, whatever the lane name holds
     if tier:
         lines.append(f"LLM: {tier}")
     if score is not None:
@@ -405,25 +410,61 @@ class Bot:
             return company
 
     def send_pending_alerts(self) -> None:
-        """Send each scored watcher posting that has not been alerted.
+        """Send each scored watcher posting that has not been alerted, in lane order.
+
+        Config is read once per poll, for the lanes, the off-lane threshold and the
+        agency labels. If it can't be read, no watcher alert is sent this poll: the
+        hold is recorded in ``bot_state`` (for doctor) and logged only when it starts
+        and when it ends, and the next poll tries again. Job ads sent to the bot are
+        not held by this.
 
         The message goes out first. ``alerted_at`` is set only after Telegram accepts
         it. If the process stops between those two steps, the next poll sends it again.
         A failed send leaves ``alerted_at`` null. Skips, unscored rows and rows without
-        a fit are not sent: they are held until the watcher gives them a fit.
+        a fit are not sent: they are held until the watcher gives them a fit. Off-lane
+        rows below ``search.off_lane_min_fit`` stay pending (``lanes.alert_order``).
         """
+        doc = self._alert_config()
+        if doc is None:
+            return
         try:
             with self._search() as search:
-                posting_ids = search_store.pending_alert_ids(search)
+                pending = search_store.pending_alerts(search)
         except (OSError, sqlite3.Error) as exc:
             log.warning("pending alerts could not be read (%s)", type(exc).__name__)
             return
-        for posting_id in posting_ids:
+        for item in lanes.alert_order(pending, doc):
             try:
                 with self._search() as search:
-                    self.alert(search, posting_id)
+                    self.alert(search, item.posting_id, doc=doc, lane_line=item.lane_line)
             except (Refusal, TelegramError, OSError, sqlite3.Error) as exc:
                 log.warning("alert failed (%s); left for the next poll", type(exc).__name__)
+
+    def _alert_config(self) -> dict[str, Any] | None:
+        """This poll's config, or None while it can't be read (the hold is recorded)."""
+        try:
+            doc = self._config()
+        except (ConfigError, OSError, yaml.YAMLError, ValueError) as exc:
+            self._record_hold(self._now(), type(exc).__name__)
+            return None
+        self._record_hold(None, None)
+        return doc
+
+    def _record_hold(self, stamp: str | None, reason: str | None) -> None:
+        """Start or end the alert hold in ``bot_state``, logging only a change."""
+        try:
+            with self._search() as search:
+                held = search_store.alerts_held_since(search)
+                if (held is None) == (stamp is None):
+                    return  # no change: nothing to write or log
+                search_store.set_alerts_held_since(search, stamp)
+        except (OSError, sqlite3.Error) as exc:
+            log.warning("alert hold could not be recorded (%s)", type(exc).__name__)
+            return
+        if stamp is None:
+            log.info("config.yaml can be read again; watcher alerts resumed")
+        else:
+            log.warning("config.yaml could not be read (%s); watcher alerts held", reason)
 
     def send_pending_discovery(self) -> None:
         """Send pending discovery rows that are due. Name and URL only.
@@ -546,7 +587,11 @@ class Bot:
             raise Refusal("Send: /log <link>, or /log <link> | Company | Title")
         if len(url) > 2000 or len(" ".join(extra)) > MAX_TEXT:
             raise Refusal("That's too long.")
-        doc = self._config()
+        try:
+            doc = self._config()
+        except (ConfigError, OSError, yaml.YAMLError, ValueError):
+            # Fail closed: no date and no claim check without config. Fixed text only.
+            raise Refusal(CONFIG_UNREADABLE) from None
         today = self._today(doc)
         info = snapshots.PostingInfo()
         try:
@@ -580,15 +625,28 @@ class Bot:
                 raise Refusal("That link is already recorded for another company.") from None
             self.alert(search, posting_id)
 
-    def alert(self, search: sqlite3.Connection, posting_id: int) -> None:
-        """Company, title, link, the fit, the LLM tier, and a similarity line with a cosine.
+    def alert(
+        self,
+        search: sqlite3.Connection,
+        posting_id: int,
+        *,
+        doc: dict[str, Any] | None = None,
+        lane_line: str | None = None,
+    ) -> None:
+        """Company, title, link, the fit, the lane, the LLM tier, and a cosine if stored.
 
         A posting with no fit, such as a job ad sent to the bot, says `Fit: not scored`.
+        `doc` is the config this poll already read. Without it (a job ad), config is read
+        here, and if it can't be, the company is shown without an agency label.
+        `lane_line` is `Lane: <name>` or `Off-lane`, or None to leave it out.
         """
         posting = search_store.posting_by_id(search, posting_id)
         if posting is None:
             raise Refusal("That posting isn't in search.db any more.")
-        label = self._labelled_company(posting.company)
+        if doc is None:
+            label = self._labelled_company(posting.company)
+        else:
+            label = company_label(posting.company, doc)
         row = search.execute(
             "SELECT fit, scout_metadata, embedding_score FROM postings WHERE id = ?",
             (posting_id,),
@@ -596,7 +654,7 @@ class Bot:
         fit = row["fit"] if row is not None else None
         tier = _tier_name(row["scout_metadata"]) if row is not None else None
         score = _cosine(row["embedding_score"]) if row is not None else None
-        text = _alert_text(label, posting.title, posting.url, fit, tier, score)
+        text = _alert_text(label, posting.title, posting.url, fit, lane_line, tier, score)
         payload = {"posting_id": posting_id}
         self._keyboard(
             search, text, [[("Applied", "apply", payload), ("Skipped", "skip", payload)]], ALERT_TTL

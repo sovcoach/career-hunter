@@ -593,7 +593,7 @@ def test_approve_and_reject_leave_config_and_the_ei_file_alone(
 
 
 def test_the_alert_query_stays_on_watcher_postings(search: sqlite3.Connection) -> None:
-    text = inspect.getsource(search_store.pending_alert_ids)
+    text = inspect.getsource(search_store.pending_alerts)
     assert "p.source = 'watcher'" in text
     assert "discovery" not in text
     watcher, _inserted = search_store.upsert_company(search, "Example Robotics", source="watcher")

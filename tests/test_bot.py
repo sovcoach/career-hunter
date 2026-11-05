@@ -6,6 +6,7 @@ tries to open a connection.
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import itertools
 import json
@@ -956,6 +957,7 @@ def _insert(
     skip: str | None = None,
     schedule: str | None = None,
     fit: str | None = "high",
+    lane: str | None = "operations",
 ) -> int:
     conn = db.connect(env.datadir.search_db_path)
     db.migrate(conn, "search")
@@ -976,6 +978,7 @@ def _insert(
     )
     if scored and fit is not None:
         conn.execute("UPDATE postings SET fit = ? WHERE id = ?", (fit, posting_id))
+    conn.execute("UPDATE postings SET lane = ?, lane_checked = 1 WHERE id = ?", (lane, posting_id))
     if skip:
         search_store.insert_skip(conn, posting_id, "2026-10-28", skip)
     conn.close()
@@ -1018,10 +1021,12 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
         "Example Robotics — Operations Coordinator\n"
         "https://jobs.example.com/ads/robotics\n"
         "Fit: High\n"
+        "Lane: operations\n"
         "LLM: strong",
         "Example Staffing (agency) — Support Coordinator\n"
         "https://jobs.example.com/ads/staffing\n"
         "Fit: High\n"
+        "Lane: operations\n"
         "LLM: strong",
     ]
     for params in sends:
@@ -1072,11 +1077,13 @@ def test_alert_adds_similarity_only_when_a_cosine_is_stored(env: Env, keep_umask
         "Example Robotics — Operations Coordinator\n"
         "https://jobs.example.com/ads/robotics\n"
         "Fit: High\n"
+        "Lane: operations\n"
         "LLM: strong\n"
         "similarity: 0.82",
         "Sample Logistics — Support Coordinator\n"
         "https://jobs.example.com/ads/logistics\n"
         "Fit: High\n"
+        "Lane: operations\n"
         "LLM: strong\n"
         "similarity: -1.00",
     ]
@@ -1427,6 +1434,11 @@ def test_an_expired_discovery_button_writes_nothing_and_a_later_poll_sends_again
 # --- held postings (#38): no fit, no alert -----------------------------------------------------
 
 
+def _bot_config(env: Env) -> dict[str, Any]:
+    loaded: dict[str, Any] = yaml.safe_load(env.datadir.config_path.read_text())
+    return loaded
+
+
 def _watch(env: Env, scorer: Any, config: dict[str, Any]) -> list[str]:
     from careerhunter import watch as w
     from tests.test_rescore import board, lever, watched
@@ -1439,7 +1451,7 @@ def _watch(env: Env, scorer: Any, config: dict[str, Any]) -> list[str]:
             watched("examplerobotics"),
             today="2026-10-28",
             fetcher=lambda address: {
-                board("examplerobotics"): lever("examplerobotics", ("r1", "Held Coordinator"))
+                board("examplerobotics"): lever("examplerobotics", ("r1", "Operations Coordinator"))
             }[address],
             scorer=scorer,
             config=config,
@@ -1451,19 +1463,21 @@ def _watch(env: Env, scorer: Any, config: dict[str, Any]) -> list[str]:
 def test_a_held_posting_is_never_alerted_is_retried_and_alerts_once_scored(
     env: Env, keep_umask: None
 ) -> None:
-    from tests.test_fit import FITS
     from tests.test_rescore import Recorder
 
+    config = _bot_config(env)
     scorer = Recorder()
-    scorer.replies["Held Coordinator"] = None  # the reply does not parse: held
-    _watch(env, scorer, FITS)
+    scorer.replies["Operations Coordinator"] = None  # the reply does not parse: held
+    _watch(env, scorer, config)
     assert _poll(env) == 0
     assert _sends(env) == []
     retry = Recorder()  # the next run tries it again, and this time it scores
-    _watch(env, retry, FITS)
-    assert [text.title for text in retry.calls] == ["Held Coordinator"]
+    _watch(env, retry, config)
+    assert [text.title for text in retry.calls] == ["Operations Coordinator"]
     assert _poll(env) == 0
-    assert [p["text"].split("\n")[0] for p in _sends(env)] == ["Examplerobotics — Held Coordinator"]
+    assert [p["text"].split("\n")[0] for p in _sends(env)] == [
+        "Examplerobotics — Operations Coordinator"
+    ]
     assert "Fit: High" in _sends(env)[0]["text"]
     assert _poll(env) == 0
     assert len(_sends(env)) == 1
@@ -1473,18 +1487,169 @@ def test_a_tier_name_missing_from_config_is_held_until_it_is_back(
     env: Env, keep_umask: None
 ) -> None:
     from careerhunter.score import Score
-    from tests.test_fit import FITS
     from tests.test_rescore import Recorder
 
+    config = _bot_config(env)
     scorer = Recorder()
-    scorer.replies["Held Coordinator"] = Score(llm_output="{}", gaps="[]", tier="renamed")
-    _watch(env, scorer, FITS)
+    scorer.replies["Operations Coordinator"] = Score(llm_output="{}", gaps="[]", tier="renamed")
+    _watch(env, scorer, config)
     assert _poll(env) == 0
     assert _sends(env) == []
-    renamed = json.loads(json.dumps(FITS))
+    renamed = copy.deepcopy(config)
     renamed["fit_rubric"]["gap_tiers"]["tiers"][1]["name"] = "renamed"
     lines = _watch(env, Recorder(), renamed)  # already scored: not sent to the model again
     assert "watch: fit filled in from config for 1 scored postings" in lines
     assert _poll(env) == 0
     assert len(_sends(env)) == 1
     assert "Fit: Medium" in _sends(env)[0]["text"]
+
+
+# --- lane order, off-lane holds, and an unreadable config (#33) --------------------------------
+
+
+def _set_search(env: Env, **values: Any) -> None:
+    doc = _bot_config(env)
+    doc["search"] |= values
+    env.datadir.config_path.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+
+def _heads(env: Env) -> list[str]:
+    return [p["text"].split("\n")[0] for p in _sends(env)]
+
+
+def test_alerts_go_in_lane_order_with_their_lane_line(env: Env, keep_umask: None) -> None:
+    _set_search(env, off_lane_min_fit="medium")
+    _insert(env, "Example Org", "Off Lane", "https://jobs.example.com/ads/1", lane=None)
+    _insert(
+        env, "Example Org", "Fallback", "https://jobs.example.com/ads/2", lane="customer_success"
+    )
+    _insert(env, "Example Org", "Retired", "https://jobs.example.com/ads/3", lane="retired_lane")
+    _insert(env, "Example Org", "Medium Ops", "https://jobs.example.com/ads/4", fit="medium")
+    _insert(env, "Example Org", "Top Ops", "https://jobs.example.com/ads/5")
+    _insert(env, "Example Org", "Low Off", "https://jobs.example.com/ads/6", lane=None, fit="low")
+    assert _poll(env) == 0
+    assert _heads(env) == [
+        "Example Org — Top Ops",
+        "Example Org — Fallback",
+        "Example Org — Retired",
+        "Example Org — Medium Ops",
+        "Example Org — Off Lane",
+    ]
+    lane_lines = [p["text"].split("\n")[3] for p in _sends(env)]
+    assert lane_lines == [
+        "Lane: operations",
+        "Lane: customer_success",
+        "Lane: retired_lane",
+        "Lane: operations",
+        "Off-lane",
+    ]
+
+
+def test_an_off_lane_posting_waits_until_the_threshold_is_lowered(
+    env: Env, keep_umask: None
+) -> None:
+    _insert(env, "Example Org", "Off Lane", "https://jobs.example.com/ads/1", lane=None, fit="low")
+    assert _poll(env) == 0
+    assert _sends(env) == []
+    conn = env.search()
+    assert conn.execute("SELECT alerted_at FROM postings").fetchone()[0] is None
+    conn.close()
+    _set_search(env, off_lane_min_fit="low")
+    assert _poll(env) == 0
+    assert _heads(env) == ["Example Org — Off Lane"]
+    assert "Off-lane" in _sends(env)[0]["text"]
+
+
+def test_without_lanes_alerts_go_by_fit_with_no_lane_line(env: Env, keep_umask: None) -> None:
+    doc = _bot_config(env)
+    del doc["search"]["lanes"]
+    doc["search"]["target_titles"] = ["Example Role"]
+    env.datadir.config_path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    _insert(env, "Example Org", "Medium", "https://jobs.example.com/ads/1", fit="medium")
+    _insert(env, "Example Org", "Unchecked", "https://jobs.example.com/ads/2", lane=None)
+    assert _poll(env) == 0
+    assert _heads(env) == ["Example Org — Unchecked", "Example Org — Medium"]
+    assert all("Lane:" not in p["text"] and "Off-lane" not in p["text"] for p in _sends(env))
+
+
+def test_a_posting_not_yet_lane_checked_waits_for_the_watcher(env: Env, keep_umask: None) -> None:
+    posting = _insert(env, "Example Org", "Fresh", "https://jobs.example.com/ads/1")
+    conn = db.connect(env.datadir.search_db_path)
+    conn.execute("DROP TRIGGER posting_lane_set_once")  # rewind the row to unchecked
+    conn.execute("UPDATE postings SET lane = NULL, lane_checked = 0 WHERE id = ?", (posting,))
+    conn.close()
+    assert _poll(env) == 0
+    assert _sends(env) == []
+
+
+def _break_config(env: Env) -> None:
+    env.datadir.config_path.write_text("search: [unclosed\n")
+
+
+def _held_since(env: Env) -> str | None:
+    conn = env.search()
+    try:
+        return search_store.alerts_held_since(conn)
+    finally:
+        conn.close()
+
+
+def test_an_unreadable_config_holds_watcher_alerts_and_logs_only_the_changes(
+    env: Env, keep_umask: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    _insert(env, "Example Org", "Waiting", "https://jobs.example.com/ads/1")
+    _break_config(env)
+    with caplog.at_level(logging.INFO, logger="careerhunter.bot"):
+        env.bot.send_pending_alerts()
+        env.bot.send_pending_alerts()
+    assert _sends(env) == []
+    held = [r.getMessage() for r in caplog.records if "alerts held" in r.getMessage()]
+    assert held == ["config.yaml could not be read (ParserError); watcher alerts held"]
+    assert _held_since(env) == "2026-10-28T16:00:00Z"
+    conn = env.search()
+    assert conn.execute("SELECT alerted_at FROM postings").fetchone()[0] is None
+    conn.close()
+    caplog.clear()
+    shutil.copyfile(ROOT / "config.example.yaml", env.datadir.config_path)
+    write_config(env.datadir)
+    with caplog.at_level(logging.INFO, logger="careerhunter.bot"):
+        env.bot.send_pending_alerts()
+        env.bot.send_pending_alerts()
+    resumed = [r.getMessage() for r in caplog.records if "resumed" in r.getMessage()]
+    assert resumed == ["config.yaml can be read again; watcher alerts resumed"]
+    assert _heads(env) == ["Example Org — Waiting"]
+    assert _held_since(env) is None
+
+
+def test_a_job_ad_is_not_held_and_uses_the_company_fallback(
+    env: Env, keep_umask: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Config turns unreadable after /log read it: the job ad still gets its reply."""
+    reads = {"n": 0}
+    real = Bot._config
+
+    def flaky(self: Bot) -> dict[str, Any]:
+        reads["n"] += 1
+        if reads["n"] > 1:
+            raise botmod.ConfigError(self.datadir.config_path, ["synthetic"])
+        return real(self)
+
+    monkeypatch.setattr(Bot, "_config", flaky)
+    env.say(f"/log {AD_URL}")
+    assert reads["n"] >= 2  # the alert read config again, and it failed
+    assert env.api.texts()[-1] == f"Example Robotics — Synthetic Analyst\n{AD_URL}\nFit: not scored"
+    env.bot.send_pending_alerts()  # the watcher side is held meanwhile
+    assert _held_since(env) is not None
+
+
+def test_a_job_ad_with_config_unreadable_from_the_start_is_refused_and_writes_nothing(
+    env: Env, keep_umask: None
+) -> None:
+    """/log needs config for today's date and the claim check, so it fails closed."""
+    _break_config(env)
+    env.say(f"/log {AD_URL}")
+    reply = env.api.texts()[-1]
+    assert reply == "Config can't be read, so nothing was recorded. Run careerhunter doctor."
+    assert reply == botmod.CONFIG_UNREADABLE
+    assert str(env.datadir.root) not in reply and "unclosed" not in reply
+    assert not env.datadir.search_db_path.exists() or env.counts()["search.postings"] == 0

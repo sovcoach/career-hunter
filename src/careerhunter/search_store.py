@@ -352,14 +352,26 @@ def finish_watch_run(
     )
 
 
-def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
+@dataclass(frozen=True)
+class PendingAlert:
+    """A watcher posting the bot may alert: scored, with a fit, no skip, not alerted."""
+
+    posting_id: int
+    fit: str
+    lane: str | None
+    lane_checked: bool
+    first_seen: str
+
+
+def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
     """Watcher postings with a score and a fit, no skip, and no alert yet. Oldest id first.
 
     A posting without a fit (unscored, or scored into a tier name not in config) is held.
+    The bot orders these, and holds some for their lane (`lanes.alert_order`).
     """
     rows = conn.execute(
         """
-        SELECT p.id FROM postings p
+        SELECT p.id, p.fit, p.lane, p.lane_checked, p.first_seen FROM postings p
         WHERE p.source = 'watcher'
           AND p.llm_output IS NOT NULL
           AND p.fit IS NOT NULL
@@ -368,7 +380,39 @@ def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
         ORDER BY p.id
         """
     )
-    return [int(row["id"]) for row in rows]
+    return [
+        PendingAlert(
+            posting_id=int(row["id"]),
+            fit=str(row["fit"]),
+            lane=None if row["lane"] is None else str(row["lane"]),
+            lane_checked=bool(row["lane_checked"]),
+            first_seen=str(row["first_seen"]),
+        )
+        for row in rows
+    ]
+
+
+def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
+    """The ids of `pending_alerts`, oldest id first, before any lane ordering."""
+    return [alert.posting_id for alert in pending_alerts(conn)]
+
+
+def alerts_held_since(conn: sqlite3.Connection) -> str | None:
+    """When the bot started holding watcher alerts because config was unreadable."""
+    row = conn.execute("SELECT value FROM bot_state WHERE key = 'alerts_held_since'").fetchone()
+    return None if row is None else str(row["value"])
+
+
+def set_alerts_held_since(conn: sqlite3.Connection, stamp: str | None) -> None:
+    """Record when the hold started, or clear it with None."""
+    if stamp is None:
+        conn.execute("DELETE FROM bot_state WHERE key = 'alerts_held_since'")
+    else:
+        conn.execute(
+            "INSERT INTO bot_state (key, value) VALUES ('alerts_held_since', ?) "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (stamp,),
+        )
 
 
 def mark_alerted(conn: sqlite3.Connection, posting_id: int, alerted_at: str) -> None:
