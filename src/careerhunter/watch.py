@@ -57,6 +57,14 @@ The fit. A score stores the fit of its tier, from that tier's `fit` key in confi
 config gets no fit, so that posting is held. Every run first fills in the fit of
 scored, unalerted postings stored without one, by their stored tier name.
 
+Lanes (#33). With `search.lanes` set, a posting's title is checked against the lanes
+when it is stored, skipped ones included, and the best-priority lane that matches is
+stored with it, or none (off-lane). Every run then checks any posting not yet checked,
+from any source, so postings stored before lanes existed get theirs. Both writes are
+set once (`... WHERE lane_checked = 0`). A changed lane list does not move a posting
+already checked. An off-lane posting is still gated and scored like any other. Without
+`search.lanes`, nothing is checked and no posting is off-lane.
+
 The run record. Each run writes a `watch_runs` row when it starts, in its own
 transaction, and finishes it just before the last line: the board counts, whether the
 budget left anything for the next run, and the postings still held (unscored, scored
@@ -81,8 +89,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Self, SupportsIndex
 
-from careerhunter import db, filters, search_store
-from careerhunter.config import tier_fits
+from careerhunter import db, filters, lanes, search_store
+from careerhunter.config import off_lane_min_fit, tier_fits
 from careerhunter.deadline import Deadline
 from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout
@@ -179,6 +187,7 @@ class _State:
     attempted: set[int] = field(default_factory=set)  # sent to the scorer this run
     resume: Resume | None = None
     fits: Mapping[str, str] = field(default_factory=dict)  # tier name -> fit, from config
+    lanes_on: bool = False  # search.lanes is set: titles are checked against the lanes
     model_down: bool = False
     budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
@@ -283,12 +292,16 @@ def run(
         now=now or _utc_now,
         resume=resume,
         fits=tier_fits(rules),
+        lanes_on=lanes.configured(rules) is not None,
     )
     lines = state.lines
     with db.transaction(conn):
         run_id = search_store.start_watch_run(conn, _iso(state.now()))
     with _isolated(conn, lines, "fit fill-in", state.hook):
         _fill_fits(conn, state)
+    if state.lanes_on:
+        with _isolated(conn, lines, "lane fill-in", state.hook):
+            _fill_lanes(conn, state, rules)
     if scorer is not None and resume_problem is not None:
         lines.append(f"watch: scoring: resume not usable ({resume_problem}); left for the next run")
         scorer = None
@@ -339,7 +352,7 @@ def run(
             state.left_by_budget(f"watch: scoring: {_LEFT}")
         else:
             _score_passes(conn, scorer, today, embedder, state)
-    _finish_run(conn, state, run_id, counts)
+    _finish_run(conn, state, run_id, counts, rules)
     lines.append(
         f"watch: {counts['fetched']} boards fetched, {counts['failed']} failed, "
         f"{counts['left']} left"
@@ -352,15 +365,20 @@ def _utc_now() -> dt.datetime:
 
 
 def _finish_run(
-    conn: sqlite3.Connection, state: _State, run_id: int, counts: Mapping[str, int]
+    conn: sqlite3.Connection,
+    state: _State,
+    run_id: int,
+    counts: Mapping[str, int],
+    config: Mapping[str, Any],
 ) -> None:
     """Finish this run's `watch_runs` row with its counts and the postings still held.
 
     The held counts are read from search.db now, so they are true for a run the budget
     cut short too. A run that never gets here keeps its row unfinished, with no counts.
     """
+    min_fit = off_lane_min_fit(config) if state.lanes_on else None
     with db.transaction(conn):
-        held = search_store.held_counts(conn)
+        held = search_store.held_counts(conn, off_lane_min_fit=min_fit)
         search_store.finish_watch_run(
             conn,
             run_id,
@@ -371,6 +389,22 @@ def _finish_run(
             boards_left=counts["left"],
             held=held,
         )
+
+
+def _fill_lanes(conn: sqlite3.Connection, state: _State, config: Mapping[str, Any]) -> None:
+    """Check every posting not yet checked against the lanes. Safe to run twice."""
+    with db.transaction(conn):
+        filled = sum(
+            search_store.set_posting_lane(conn, posting_id, _lane_name(title, config))
+            for posting_id, title in search_store.unchecked_lane_titles(conn)
+        )
+    if filled:
+        state.lines.append(f"watch: lanes filled in from config for {filled} postings")
+
+
+def _lane_name(title: str, config: Mapping[str, Any]) -> str | None:
+    found = lanes.match(title, config)
+    return None if found is None else found.name
 
 
 def _fill_fits(conn: sqlite3.Connection, state: _State) -> None:
@@ -721,6 +755,8 @@ def _record_jobs(
                     and not search_store.posting_has_skip(conn, posting_id)
                 ):
                     search_store.insert_skip(conn, posting_id, today, verdict.reason)
+                if inserted and state.lanes_on:  # skipped postings get a lane too
+                    search_store.set_posting_lane(conn, posting_id, _lane_name(item.title, config))
         except search_store.IdentityConflict as exc:
             lines.append(
                 _line(name, ats, f"identity conflict on {item.title!r}; continuing: {exc}")

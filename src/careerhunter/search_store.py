@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from careerhunter.enums import FIT_LEVELS
 from careerhunter.models import Application, Dating, Posting
 
 
@@ -266,8 +267,13 @@ class HeldCounts:
     off_lane: int = 0  # scored, off-lane, and below search.off_lane_min_fit
 
 
-def held_counts(conn: sqlite3.Connection) -> HeldCounts:
-    """How many watcher postings with no skip are held, read now."""
+def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None) -> HeldCounts:
+    """How many watcher postings with no skip are held, read now.
+
+    `off_lane_min_fit` is `search.off_lane_min_fit` while lane checking is on: an
+    off-lane posting with a lower fit is held. None means lane checking is off, and no
+    posting is held for its lane.
+    """
     row = conn.execute(
         """
         SELECT
@@ -279,7 +285,35 @@ def held_counts(conn: sqlite3.Connection) -> HeldCounts:
           AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
         """
     ).fetchone()
-    return HeldCounts(unscored=int(row["unscored"]), no_fit=int(row["no_fit"]))
+    off_lane = 0
+    if off_lane_min_fit is not None:
+        off_lane = int(
+            conn.execute(
+                "SELECT count(*) FROM postings p "
+                "WHERE p.source = 'watcher' AND p.llm_output IS NOT NULL "
+                "AND p.alerted_at IS NULL AND p.lane_checked = 1 AND p.lane IS NULL "
+                "AND (CASE p.fit WHEN 'low' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 END) "
+                "< ? "
+                "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)",
+                (FIT_LEVELS.index(off_lane_min_fit),),
+            ).fetchone()[0]
+        )
+    return HeldCounts(unscored=int(row["unscored"]), no_fit=int(row["no_fit"]), off_lane=off_lane)
+
+
+def set_posting_lane(conn: sqlite3.Connection, posting_id: int, lane: str | None) -> bool:
+    """Record the lane a posting matched (None: off-lane), once. False if already set."""
+    cur = conn.execute(
+        "UPDATE postings SET lane = ?, lane_checked = 1 WHERE id = ? AND lane_checked = 0",
+        (lane, posting_id),
+    )
+    return cur.rowcount == 1
+
+
+def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+    """Every posting whose title has not been checked against the lanes, oldest first."""
+    rows = conn.execute("SELECT id, title FROM postings WHERE lane_checked = 0 ORDER BY id")
+    return [(int(row["id"]), str(row["title"])) for row in rows]
 
 
 def start_watch_run(conn: sqlite3.Connection, started_at: str) -> int:

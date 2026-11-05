@@ -433,3 +433,49 @@ def test_new_posting_columns_are_checked(
     p = _posting(search, _company(search))
     with pytest.raises(sqlite3.IntegrityError):
         search.execute(f"UPDATE postings SET {column} = ? WHERE id = ?", (value, p))  # noqa: S608
+
+
+# --- 0010: the lane, set once ---------------------------------------------------------------
+
+
+def _lane(search: sqlite3.Connection, posting: int) -> tuple[object, object]:
+    row = search.execute("SELECT lane, lane_checked FROM postings WHERE id = ?", (posting,))
+    found = row.fetchone()
+    return found["lane"], found["lane_checked"]
+
+
+def test_a_new_posting_is_unchecked_with_no_lane(search: sqlite3.Connection) -> None:
+    assert _lane(search, _posting(search, _company(search))) == (None, 0)
+
+
+@pytest.mark.parametrize(("lane", "other"), [("operations", "support"), (None, "support")])
+def test_a_lane_is_set_once_and_not_changed(
+    search: sqlite3.Connection, lane: str | None, other: str
+) -> None:
+    p = _posting(search, _company(search))
+    search.execute("UPDATE postings SET lane = ?, lane_checked = 1 WHERE id = ?", (lane, p))
+    assert _lane(search, p) == (lane, 1)
+    # Writing the same values again is allowed: the fill-in is safe to repeat.
+    search.execute("UPDATE postings SET lane = ?, lane_checked = 1 WHERE id = ?", (lane, p))
+    for sql, params in (
+        ("UPDATE postings SET lane = ? WHERE id = ?", (other, p)),
+        ("UPDATE postings SET lane_checked = 0, lane = NULL WHERE id = ?", (p,)),
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="set once"):
+            search.execute(sql, params)
+    search.execute("UPDATE postings SET title = 'Renamed' WHERE id = ?", (p,))
+    assert _lane(search, p) == (lane, 1)
+
+
+@pytest.mark.parametrize(
+    ("lane", "checked"),
+    [("operations", 0), ("  ", 1), ("", 1), (None, 2)],
+)
+def test_lane_columns_are_checked(
+    search: sqlite3.Connection, lane: str | None, checked: int
+) -> None:
+    p = _posting(search, _company(search))
+    with pytest.raises(sqlite3.IntegrityError):
+        search.execute(
+            "UPDATE postings SET lane = ?, lane_checked = ? WHERE id = ?", (lane, checked, p)
+        )
