@@ -58,5 +58,5 @@ doctor: ## Check the setup and report what is missing
 embed-eval: ## Rank stored cosines against tiers; the report stays in the data folder
 	uv run careerhunter embed-eval
 
-discover: ## Queue companies from a local SearXNG; pages are not fetched
+discover: ## Run one discovery pass against a local SearXNG by hand
 	uv run careerhunter discover

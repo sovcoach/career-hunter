@@ -1,13 +1,14 @@
-"""Fetch Greenhouse, Lever and Ashby boards, filter the new postings, then score them.
+"""Fetch ATS boards, filter the new postings, then score them.
 
-One `careerhunter watch` run reads the watchlist and fetches those three boards, one
-company after another, through `fetch.py`. It also fetches companies stored with
-`source` discovery and `watchlist` 1 when the ATS type is Greenhouse, Lever, or Ashby
-and the slug is one path segment. A seeded watchlist row with any other source is not
-fetched by that extra path. It writes companies, postings, skip reasons and local
-scores in `search.db`. It does not call Telegram, write applications, EI rows or
-snapshots. The bot sends one alert digest per watch run when it polls.
-`run` returns the log lines; the CLI prints them to stderr.
+One `careerhunter watch` run reads the watchlist and fetches its Greenhouse, Lever,
+Ashby, SmartRecruiters, BambooHR and Workday boards, one company after another,
+through `fetch.py`. It also fetches companies stored with `source` discovery and
+`watchlist` 1 when the ATS type is one of those and the identity is usable. A seeded
+watchlist row with any other source is not fetched by that extra path. It writes
+companies, postings, skip reasons and local scores in `search.db`. It does not call
+Telegram, write applications, EI rows or snapshots. The bot sends one alert digest
+per watch run when it polls. `run` returns the log lines; the CLI prints them to
+stderr.
 
 A posting that is already stored is not inserted again. After the boards, watcher rows
 that still have no skip are filtered again, and rows that are still unscored are
@@ -17,15 +18,23 @@ beside the score. A missing resume, a down embedding server, or a bad dimension 
 `embedding miss posting <id>: <reason>`, and the run still finishes. A cosine does
 not cause a skip.
 
-The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
-one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
-Greenhouse is fetched with `content=true`, so every gate sees its descriptions; the
-HTML is turned into text with the standard library (`htmltext.py`). A Lever posting's
-text adds its lists, closing text and salary description; Ashby is fetched with
-`includeCompensation=true` and adds each job's salary summary. A description is
-held in memory for the filter and the scoring prompt, and never stored. A board body
-over BOARD_MAX_BYTES logs `board over the size cap (...); nothing recorded`, stores
-nothing from that board, and counts as failed. Nothing is cut to fit.
+The requests for a board and the parsing of its replies are in `ats.py`. The list URL
+is built only from `ats_slug`. `careers_url` is ignored. A slug has to be one path
+segment (`A-Za-z0-9_-`). A Workday board is watched per employer: its tenant
+(`ats_slug`), `ats_host` (wdN) and `ats_site`, all three stored on the company and
+part of its board key; its list is a JSON POST (`poster`), so a run without one
+skips it with a line. Every other `ats_type` is not fetched. A description is held in
+memory for the filter and the scoring prompt, and never stored. A board whose replies
+together pass BOARD_MAX_BYTES logs `board over the size cap (...); nothing recorded`,
+stores nothing from that board, and counts as failed. Nothing is cut to fit.
+
+A SmartRecruiters, BambooHR or Workday list has no descriptions, so each posting not
+stored yet gets one detail request, at most `ats.DETAIL_LIMIT` per board per run; the
+rest are logged and left out, to be read as new next run. A detail that answers with
+another status or a bad body leaves out that posting only. A fetch error or HTTP 429
+on a detail stops
+the board's details: what was read before is recorded, the board counts as failed (or
+as left, when the run budget ran out), and a 429 blocks that host for the run.
 
 One company's failure does not stop the run. An exception while handling one board, or
 one row of the recheck or scoring pass, or the embedding refresh, is rolled back and
@@ -90,18 +99,26 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import re
 import sqlite3
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, NoReturn, Self, SupportsIndex
+from typing import Any, Literal, NamedTuple, NoReturn, Self, SupportsIndex
 
-from careerhunter import db, filters, htmltext, lanes, search_store
-from careerhunter.config import off_lane_min_fit, tier_fits
+from careerhunter import ats as ats_boards
+from careerhunter import db, filters, lanes, search_store
+from careerhunter.ats import (
+    BoardHTTPError,
+    BoardParseError,
+    Job,
+    Skip,
+)
+from careerhunter.ats import board_url as board_url  # the tests build list URLs with it
+from careerhunter.config import max_posting_age_days, off_lane_min_fit, tier_fits
 from careerhunter.deadline import Deadline
+from careerhunter.discover import Pass
 from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout, FetchTooLarge
 from careerhunter.filters import PostingText
@@ -111,21 +128,19 @@ from careerhunter.runlog import RunLogError
 from careerhunter.score import Score, ScoreError
 
 Fetcher = Callable[[str], Fetched]
+Poster = ats_boards.Poster
 Scorer = Callable[[PostingText], Score | None]
 # Told about each isolated crash, after the rollback and the log line.
 OnCrash = Callable[[str, Exception], None]
 Tally = Literal["fetched", "failed", "left"]
 
 RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
-# The body cap for one board. Greenhouse boards carry every description (content=true),
-# so this is larger than a job ad's cap. The CLI passes it to the fetcher.
-BOARD_MAX_BYTES = 20 * 1024 * 1024
+# All of one board's replies together (ats.py). The CLI also caps each request with it.
+BOARD_MAX_BYTES = ats_boards.BOARD_MAX_BYTES
 # Inline scoring of new postings stops once less than this is left of the budget.
 SCORE_RESERVE = 240.0
 _LEFT = "run budget reached; left for the next run"
 
-_BOARDS = ("greenhouse", "lever", "ashby")
-_SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 # A board's own company label that carries no information. The watchlist name is used.
 _PLACEHOLDERS = frozenset(
     {
@@ -143,34 +158,11 @@ _PLACEHOLDERS = frozenset(
         "-",
     }
 )
-# The public postings API says "on-site"; the hire API says "onsite".
-_LEVER_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite", "on-site": "onsite"}
-_ASHBY_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite"}
-
-
-class BoardParseError(Exception):
-    """The body is not that board's JSON. Nothing from the board is stored."""
-
-
-@dataclass(frozen=True)
-class _Job:
-    title: str
-    location: str
-    work_model: str | None
-    url: str | None
-    requisition_id: str | None
-    company_field: str | None
-    description: str | None = None
-
-
-@dataclass(frozen=True)
-class _Skip:
-    reason: str
 
 
 @dataclass(frozen=True)
 class _Parsed:
-    jobs: list[_Job | _Skip]
+    read: ats_boards.BoardRead
 
 
 @dataclass(frozen=True)
@@ -202,6 +194,8 @@ class _State:
     fits: Mapping[str, str] = field(default_factory=dict)  # tier name -> fit, from config
     lanes_on: bool = False  # search.lanes is set: titles are checked against the lanes
     run_id: int | None = None  # this run's watch_runs row, stored with each score
+    max_age: int = 7  # search.max_posting_age_days
+    today: str = ""  # the configured date, YYYY-MM-DD
     model_down: bool = False
     budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
@@ -258,17 +252,24 @@ class _Aligned:
     ok: bool
     stored_type: str | None = None
     stored_slug: str | None = None
+    stored_host: str | None = None
+    stored_site: str | None = None
 
 
-def board_url(ats_type: str, slug: str) -> str | None:
-    """The list URL for one board, built only from a single safe path segment."""
-    if ats_type not in _BOARDS or _SLUG.fullmatch(slug) is None:
-        return None
-    if ats_type == "greenhouse":
-        return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
-    if ats_type == "lever":
-        return f"https://api.lever.co/v0/postings/{slug}?mode=json"
-    return f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
+class _Entry(NamedTuple):
+    """One watchlist entry. `host` and `site` are Workday's only."""
+
+    name: str
+    ats: str | None
+    slug: str | None
+    role_filters: Mapping[str, Any] | None
+    host: str | None = None
+    site: str | None = None
+
+    def board(self) -> ats_boards.Board | None:
+        if self.ats is None or not self.slug:
+            return None
+        return ats_boards.Board(self.ats, self.slug, self.host, self.site)
 
 
 def run(
@@ -288,8 +289,15 @@ def run(
     now: Callable[[], dt.datetime] | None = None,
     resume: Resume | None = None,
     resume_problem: str | None = None,
+    poster: Poster | None = None,
+    discovery: Callable[[sqlite3.Connection], Pass] | None = None,
 ) -> list[str]:
     """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`.
+
+    `poster` sends one JSON POST (`fetch.post_json`); Workday boards need it and are
+    skipped with a line without it. `discovery` is the discovery pass (#40): it runs
+    before the boards, isolated like a board, and returns its lines and the posting
+    URLs it found, which are then fetched once each and recorded like a board's (#41).
 
     Each log line is handed to `emit` as it happens; the same lines are returned.
     `budget` bounds the whole run; the caller also gives it to each client it builds.
@@ -307,6 +315,8 @@ def run(
         resume=resume,
         fits=tier_fits(rules),
         lanes_on=lanes.configured(rules) is not None,
+        max_age=max_posting_age_days(rules),
+        today=today,
     )
     lines = state.lines
     with db.transaction(conn):
@@ -317,32 +327,46 @@ def run(
     if state.lanes_on:
         with _isolated(conn, lines, "lane fill-in", state.hook):
             _fill_lanes(conn, state, rules)
+    found: Pass | None = None
+    if discovery is not None:
+        with _isolated(conn, lines, "discovery", state.hook):
+            found = discovery(conn)
+            lines.extend(found.lines)
     if scorer is not None and resume_problem is not None:
         lines.append(f"watch: scoring: resume not usable ({resume_problem}); left for the next run")
         scorer = None
     embedder = Embedder(conn, data_dir, rules, transport=embed_transport)
     blocked: set[str] = set()
+    if found is not None and found.postings:
+        _record_discovered(
+            conn,
+            state,
+            blocked,
+            found.postings,
+            rules,
+            skipped,
+            today,
+            ats_boards.Client(fetcher, poster=poster),
+            scorer,
+            embedder,
+        )
     counts = {"fetched": 0, "failed": 0, "left": 0}
     for item in _by_last_attempt(conn, _with_discovery_boards(conn, watchlist)):
         entry = _entry(item)
         if entry is None:
             lines.append("watch: a watchlist entry has no name; skipped")
             continue
-        name, ats, slug, role_filters = entry
         tally: Tally | None = None
-        with _isolated(conn, lines, name, state.hook) as guard:
+        with _isolated(conn, lines, entry.name, state.hook) as guard:
             tally = _watch_one(
                 conn,
                 state,
                 blocked,
-                name,
-                ats,
-                slug,
-                role_filters,
+                entry,
                 rules,
                 skipped,
                 today,
-                fetcher,
+                ats_boards.Client(fetcher, poster=poster),
                 scorer,
                 embedder,
             )
@@ -430,11 +454,12 @@ def _fill_fits(conn: sqlite3.Connection, state: _State) -> None:
         state.lines.append(f"watch: fit filled in from config for {filled} scored postings")
 
 
-def _board_key(ats: str | None, slug: str | None) -> str | None:
-    """`<ats_type>:<slug>`, case-folded, for a board this command can fetch."""
-    if ats is None or not slug or board_url(ats, slug) is None:
+def _board_key(entry: _Entry) -> str | None:
+    """`ats.Board.key`, for a board this command can fetch."""
+    board = entry.board()
+    if board is None or ats_boards.list_url(board) is None:
         return None
-    return f"{ats}:{slug.casefold()}"
+    return board.key
 
 
 def _by_last_attempt(conn: sqlite3.Connection, items: list[Any]) -> list[Any]:
@@ -448,7 +473,7 @@ def _by_last_attempt(conn: sqlite3.Connection, items: list[Any]) -> list[Any]:
     def order(pair: tuple[int, Any]) -> tuple[int, str, int]:
         index, item = pair
         entry = _entry(item)
-        key = _board_key(entry[1], entry[2]) if entry is not None else None
+        key = _board_key(entry) if entry is not None else None
         if key is None:
             return (0, "", index)
         return (1, stamps.get(key, ""), index)  # "" sorts before every timestamp
@@ -528,84 +553,98 @@ def _crashed(
 def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -> list[Any]:
     """Config entries, then approved discovery boards that are not already listed."""
     items: list[Any] = list(watchlist)
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     for item in watchlist:
         entry = _entry(item)
-        if entry is None:
-            continue
-        _name, ats, slug, _filters = entry
-        if ats and slug:
-            seen.add((ats, slug.casefold()))
+        board = entry.board() if entry is not None else None
+        if board is not None:
+            seen.add(board.key)
     rows = conn.execute(
-        "SELECT name, ats_type, ats_slug FROM companies "
-        "WHERE source = 'discovery' AND watchlist = 1 "
-        "AND ats_type IN ('greenhouse', 'lever', 'ashby') "
+        "SELECT name, ats_type, ats_slug, ats_host, ats_site FROM companies "
+        "WHERE source = 'discovery' AND watchlist = 1 AND ats_type IS NOT NULL "
         "AND ats_slug IS NOT NULL AND length(trim(ats_slug)) > 0 "
         "ORDER BY id"
     )
     for row in rows:
-        ats = str(row["ats_type"])
-        slug = str(row["ats_slug"]).strip()
-        if board_url(ats, slug) is None:
+        host = None if row["ats_host"] is None else str(row["ats_host"])
+        site = None if row["ats_site"] is None else str(row["ats_site"])
+        board = ats_boards.Board(str(row["ats_type"]), str(row["ats_slug"]).strip(), host, site)
+        if ats_boards.list_url(board) is None or board.key in seen:
             continue
-        key = (ats, slug.casefold())
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append({"name": str(row["name"]), "ats_type": ats, "ats_slug": slug})
+        seen.add(board.key)
+        found: dict[str, Any] = {
+            "name": str(row["name"]),
+            "ats_type": board.ats,
+            "ats_slug": board.slug,
+        }
+        if board.ats == "workday":
+            found.update(ats_host=host, ats_site=site)
+        items.append(found)
     return items
 
 
-def _entry(item: object) -> tuple[str, str | None, str | None, Mapping[str, Any] | None] | None:
+def _entry(item: object) -> _Entry | None:
     if not isinstance(item, dict):
         return None
     name = item.get("name")
     if not isinstance(name, str) or not name.strip():
         return None
     ats = item.get("ats_type")
-    slug = item.get("ats_slug")
     role_filters = item.get("role_filters")
-    return (
+    return _Entry(
         name.strip(),
         ats if isinstance(ats, str) else None,
-        slug.strip() if isinstance(slug, str) else None,
+        _stripped(item.get("ats_slug")),
         role_filters if isinstance(role_filters, dict) else None,
+        _stripped(item.get("ats_host")),
+        _stripped(item.get("ats_site")),
     )
+
+
+def _stripped(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) else None
 
 
 def _watch_one(
     conn: sqlite3.Connection,
     state: _State,
     blocked: set[str],
-    name: str,
-    ats: str | None,
-    slug: str | None,
-    role_filters: Mapping[str, Any] | None,
+    entry: _Entry,
     config: Mapping[str, Any],
     exclusions: Mapping[str, Any],
     today: str,
-    fetcher: Fetcher,
+    client: ats_boards.Client,
     scorer: Scorer | None,
     embedder: Embedder,
 ) -> Tally | None:
     """Whether the board was fetched and parsed, failed, left for the next run, or
     (None) never attempted."""
     lines = state.lines
+    name, ats, slug = entry.name, entry.ats, entry.slug
     if ats is None:
         lines.append(_line(name, None, "no ats_type; skipped"))
         return None
-    if ats == "workday":
-        lines.append(_line(name, ats, "not fetched yet; skipped"))
-        return None
-    if ats not in _BOARDS:
+    if ats not in ats_boards.BOARDS:
         lines.append(_line(name, ats, "not a board this command fetches; skipped"))
         return None
     if not slug:
         lines.append(_line(name, ats, "no ats_slug; skipped"))
         return None
-    url = board_url(ats, slug)
+    if ats == "workday" and not (entry.host and entry.site):
+        lines.append(_line(name, ats, "no ats_host or ats_site; skipped"))
+        return None
+    board = ats_boards.Board(ats, slug, entry.host, entry.site)
+    url = ats_boards.list_url(board)
     if url is None:
-        lines.append(_line(name, ats, "ats_slug is not a single path segment; skipped"))
+        why = (
+            "ats_slug, ats_host or ats_site is not usable"
+            if ats == "workday"
+            else "ats_slug is not a single path segment"
+        )
+        lines.append(_line(name, ats, f"{why}; skipped"))
+        return None
+    if ats == "workday" and not client.can_post:
+        lines.append(_line(name, ats, "no POST client; skipped"))
         return None
     host = urllib.parse.urlsplit(url).hostname or ""
     if host in blocked:
@@ -616,9 +655,9 @@ def _watch_one(
     if state.out_of_time():
         lines.append(_line(name, ats, _LEFT))
         return "left"
-    key = f"{ats}:{slug.casefold()}"
+    key = board.key
     previous = _stamp_attempt(conn, key, state.now())
-    outcome = _fetch_jobs(state, blocked, name, ats, slug, url, host, fetcher)
+    outcome = _fetch_jobs(conn, state, blocked, name, board, host, client)
     if isinstance(outcome, _Left):
         _restore_attempt(conn, key, previous)
         return "left"
@@ -627,48 +666,187 @@ def _watch_one(
     # One transaction, after a board parsed and before any posting is recorded: a
     # failed fetch never touches the company, and a disagreement records nothing.
     with db.transaction(conn):
-        aligned = _align(conn, name, ats, slug)
+        aligned = _align(conn, name, board)
     if not aligned.ok:
-        lines.append(
-            _line(
-                name,
-                ats,
-                "stored ats identity disagrees "
-                f"(ats_type={_shown(aligned.stored_type)}, "
-                f"ats_slug={_shown(aligned.stored_slug)}); skipped",
+        shown = f"ats_type={_shown(aligned.stored_type)}, ats_slug={_shown(aligned.stored_slug)}"
+        if ats == "workday":
+            shown += (
+                f", ats_host={_shown(aligned.stored_host)}, ats_site={_shown(aligned.stored_site)}"
             )
-        )
+        lines.append(_line(name, ats, f"stored ats identity disagrees ({shown}); skipped"))
         return "failed"
     _record_jobs(
         conn,
         state,
         name,
         ats,
-        outcome.jobs,
-        role_filters,
+        outcome.read.jobs,
+        entry.role_filters,
         config,
         exclusions,
         today,
         scorer,
         embedder,
     )
-    return "fetched"
+    for note in outcome.read.notes:
+        lines.append(_line(name, ats, note))
+    return _details_tally(conn, state, blocked, name, ats, key, previous, outcome.read.stopped)
 
 
-def _fetch_jobs(
+def _details_tally(
+    conn: sqlite3.Connection,
     state: _State,
     blocked: set[str],
     name: str,
     ats: str,
-    slug: str,
-    url: str,
-    host: str,
-    fetcher: Fetcher,
-) -> _Parsed | _Failed | _Left:
-    """Parse one board. A failure, or a fetch the run budget cut short, stores nothing."""
-    lines = state.lines
+    key: str,
+    previous: str | None,
+    stopped: Exception | None,
+) -> Tally:
+    """A board whose detail requests all ran is fetched. Details stopped by the run
+    budget leave the board for the next run, first in line; any other stop fails it.
+    The postings read before the stop are recorded either way."""
+    if stopped is None:
+        return "fetched"
+    if isinstance(stopped, FetchTimeout) and state.out_of_time():
+        state.left_by_budget(_line(name, ats, _LEFT))
+        _restore_attempt(conn, key, previous)
+        return "left"
+    if isinstance(stopped, BoardHTTPError) and stopped.status == 429:
+        blocked.add(urllib.parse.urlsplit(stopped.url).hostname or "")
+        state.lines.append(
+            _line(
+                name,
+                ats,
+                f"detail HTTP 429, retry-after {_retry(stopped.retry_after)}; "
+                "left for the next run",
+            )
+        )
+    return "failed"
+
+
+DISCOVERED_PER_RUN = 20  # posting URLs from one discovery pass fetched in one run
+
+
+def _record_discovered(
+    conn: sqlite3.Connection,
+    state: _State,
+    blocked: set[str],
+    postings: Sequence[ats_boards.PostingRef],
+    config: Mapping[str, Any],
+    exclusions: Mapping[str, Any],
+    today: str,
+    client: ats_boards.Client,
+    scorer: Scorer | None,
+    embedder: Embedder,
+) -> None:
+    """Fetch each posting a discovery pass found, once, and record it like a board's.
+
+    A posting whose URL is stored already is not fetched. The rest go through the same
+    gates, age gate, lanes and scoring as watched postings, with `source` discovery, and
+    so into the same digest; approval is never needed first (#41). At most
+    DISCOVERED_PER_RUN are fetched; the others are left with a line (a later pass can
+    find them again). A failed fetch is a line and stores nothing; HTTP 429 blocks the
+    host for the rest of the run, boards included.
+    """
+    day = dt.date.fromisoformat(today)
+    # Stored postings are left out before the limit counts, by their identity on the
+    # board as well as their URL, so every pass reaches new postings.
+    fresh = [
+        ref
+        for ref in postings
+        if not search_store.posting_key_known(conn, ats_boards.posting_key(ref))
+        and not search_store.posting_url_known(conn, ats_boards.posting_url(ref) or "")
+    ]
+    # Start at a different place each run, so postings that keep failing at the front
+    # of the same results cannot take the limit every time.
+    if fresh:
+        start = ((state.run_id or 1) - 1) % len(fresh)
+        fresh = fresh[start:] + fresh[:start]
+    for index, ref in enumerate(fresh):
+        name = ref.board.slug
+        if index >= DISCOVERED_PER_RUN:
+            state.lines.append(
+                f"watch: discovery: {len(fresh) - index} postings left (limit {DISCOVERED_PER_RUN})"
+            )
+            return
+        if state.out_of_time():
+            state.left_by_budget(f"watch: discovery: {len(fresh) - index} postings {_LEFT}")
+            return
+        api = urllib.parse.urlsplit(ats_boards.list_url(ref.board) or "").hostname or ""
+        if api in blocked:
+            state.lines.append(
+                _line(name, ref.board.ats, f"posting: {api} already returned HTTP 429 this run")
+            )
+            continue
+        with _isolated(conn, state.lines, name, state.hook):
+            job = _fetch_posting(state, blocked, name, ref, client, day)
+            if job is not None:
+                _record_jobs(
+                    conn,
+                    state,
+                    job.company_field or name,
+                    ref.board.ats,
+                    [job],
+                    None,
+                    config,
+                    exclusions,
+                    today,
+                    scorer,
+                    embedder,
+                    source="discovery",
+                )
+
+
+def _fetch_posting(
+    state: _State,
+    blocked: set[str],
+    name: str,
+    ref: ats_boards.PostingRef,
+    client: ats_boards.Client,
+    day: dt.date,
+) -> Job | None:
+    """One discovered posting, or None with a line saying why it was not recorded."""
+    ats = ref.board.ats
     try:
-        fetched = fetcher(url)
+        return ats_boards.read_posting(ref, client, today=day)
+    except FetchError as exc:
+        state.lines.append(_line(name, ats, f"posting: {type(exc).__name__}; nothing recorded"))
+    except BoardHTTPError as exc:
+        if exc.status == 429:
+            blocked.add(urllib.parse.urlsplit(exc.url).hostname or "")
+        state.lines.append(_line(name, ats, f"posting: HTTP {exc.status}; nothing recorded"))
+    except BoardParseError as exc:
+        state.lines.append(_line(name, ats, f"posting: {exc}; nothing recorded"))
+    return None
+
+
+def _fetch_jobs(
+    conn: sqlite3.Connection,
+    state: _State,
+    blocked: set[str],
+    name: str,
+    board: ats_boards.Board,
+    host: str,
+    client: ats_boards.Client,
+) -> _Parsed | _Failed | _Left:
+    """Read one board. A failed list, or one the run budget cut short, stores nothing.
+
+    A posting whose URL is stored already gets no detail request (`ats.read`).
+    """
+    lines = state.lines
+    ats = board.ats
+
+    def known(url: str) -> bool:
+        return search_store.posting_url_known(conn, url)
+
+    day = dt.date.fromisoformat(state.today)
+
+    def too_old(job: Job) -> bool:
+        return filters.too_old(job.posted, job.posted_min_days, day, state.max_age) is True
+
+    try:
+        return _Parsed(ats_boards.read(board, client, known=known, today=day, too_old=too_old))
     except FetchError as exc:
         if isinstance(exc, FetchTimeout) and state.out_of_time():
             lines.append(_line(name, ats, _LEFT))
@@ -680,22 +858,20 @@ def _fetch_jobs(
         kind = type(exc).__name__
         lines.append(_line(name, ats, f"{kind}; nothing recorded"))
         return _Failed(kind)
-    if fetched.status == 429:
-        # Do not read the body, sleep, or retry. The next watch tries again.
-        blocked.add(host)
-        lines.append(
-            _line(
-                name,
-                ats,
-                f"HTTP 429, retry-after {_retry(fetched.retry_after)}; left for the next run",
+    except BoardHTTPError as exc:
+        if exc.status == 429:
+            # Do not read the body, sleep, or retry. The next watch tries again.
+            blocked.add(urllib.parse.urlsplit(exc.url).hostname or host)
+            lines.append(
+                _line(
+                    name,
+                    ats,
+                    f"HTTP 429, retry-after {_retry(exc.retry_after)}; left for the next run",
+                )
             )
-        )
-        return _Failed("HTTP 429")
-    if fetched.status != 200:
-        lines.append(_line(name, ats, f"HTTP {fetched.status}; nothing recorded"))
-        return _Failed(f"HTTP {fetched.status}")
-    try:
-        return _Parsed(_parse(ats, slug, fetched.body))
+            return _Failed("HTTP 429")
+        lines.append(_line(name, ats, f"HTTP {exc.status}; nothing recorded"))
+        return _Failed(f"HTTP {exc.status}")
     except BoardParseError as exc:
         lines.append(_line(name, ats, f"HTTP 200, {exc}; nothing recorded"))
         return _Failed(str(exc))
@@ -706,13 +882,14 @@ def _record_jobs(
     state: _State,
     name: str,
     ats: str,
-    jobs: list[_Job | _Skip],
+    jobs: list[Job | Skip],
     role_filters: Mapping[str, Any] | None,
     config: Mapping[str, Any],
     exclusions: Mapping[str, Any],
     today: str,
     scorer: Scorer | None,
     embedder: Embedder,
+    source: str = "watcher",
 ) -> None:
     lines = state.lines
     new = 0
@@ -720,7 +897,7 @@ def _record_jobs(
     mismatches: set[str] = set()
     dating = Dating("exact", day=today)
     for item in jobs:
-        if isinstance(item, _Skip):
+        if isinstance(item, Skip):
             lines.append(_line(name, ats, f"{item.reason}; skipped"))
             continue
         if item.url is None and item.requisition_id is None:
@@ -753,27 +930,33 @@ def _record_jobs(
             role_filters=role_filters,
             applied=False,
         )
+        reason = verdict.reason
+        aged = filters.too_old(
+            item.posted, item.posted_min_days, dt.date.fromisoformat(today), state.max_age
+        )
+        if reason is None and aged:
+            reason = "too_old"
         posting = Posting(
             company=company,
             title=item.title,
             first_seen=today,
             location=item.location,
             work_model=item.work_model,
-            schedule=None if verdict.reason else verdict.schedule,
+            schedule=None if reason else verdict.schedule,
             url=item.url,
             requisition_id=item.requisition_id,
-            source="watcher",
+            source=source,
         )
         try:
             with db.transaction(conn):
                 found = search_store.find_or_create_posting(conn, posting, dating)
                 posting_id, inserted = found[1], found[3]
-                if (
-                    inserted
-                    and verdict.reason
-                    and not search_store.posting_has_skip(conn, posting_id)
-                ):
-                    search_store.insert_skip(conn, posting_id, today, verdict.reason)
+                if inserted and reason and not search_store.posting_has_skip(conn, posting_id):
+                    search_store.insert_skip(conn, posting_id, today, reason)
+                if inserted and item.posted is not None:
+                    search_store.set_posted_date(conn, posting_id, item.posted.isoformat())
+                if item.key is not None:  # new or met again: its identity on the board
+                    search_store.set_ats_key(conn, posting_id, item.key)
                 if inserted and state.lanes_on:  # skipped postings get a lane too
                     search_store.set_posting_lane(conn, posting_id, _lane_name(item.title, config))
         except search_store.IdentityConflict as exc:
@@ -796,8 +979,10 @@ def _record_jobs(
             continue
         new += 1
         state.inserted.add(posting_id)
-        if verdict.reason:
-            lines.append(_line(name, ats, f"{item.title!r} skipped ({verdict.reason})"))
+        if aged is None:
+            lines.append(_line(name, ats, f"{item.title!r}: no posted date; first_seen used"))
+        if reason:
+            lines.append(_line(name, ats, f"{item.title!r} skipped ({reason})"))
             continue
         if scorer is None:
             continue
@@ -840,9 +1025,9 @@ def _recheck(
     }
     rows = conn.execute(
         "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, "
-        "p.requisition_id, p.schedule FROM postings p "
+        "p.requisition_id, p.schedule, p.posted_date, p.first_seen FROM postings p "
         "JOIN companies c ON c.id = p.company_id "
-        "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
+        "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
     ).fetchall()
     rows = [row for row in rows if int(row["id"]) not in state.inserted]
@@ -851,7 +1036,7 @@ def _recheck(
             state.left_by_budget(_partly("recheck", len(rows) - index))
             return False
         with _isolated(conn, state.lines, str(row["company"]), state.hook):
-            _recheck_one(conn, row, roles, config, exclusions, today, state.lines)
+            _recheck_one(conn, row, roles, config, exclusions, today, state.lines, state.max_age)
     return True
 
 
@@ -867,6 +1052,7 @@ def _recheck_one(
     exclusions: Mapping[str, Any],
     today: str,
     lines: list[str],
+    max_age: int,
 ) -> None:
     verdict = filters.decide(
         PostingText(
@@ -881,16 +1067,19 @@ def _recheck_one(
         role_filters=roles.get(str(row["company"]).casefold()),
         applied=search_store.posting_has_application(conn, int(row["id"])),
     )
+    reason = verdict.reason
+    # The stored posted date, or first_seen when the board gave none.
+    posted = dt.date.fromisoformat(str(row["posted_date"] or row["first_seen"])[:10])
+    if reason is None and filters.too_old(posted, None, dt.date.fromisoformat(today), max_age):
+        reason = "too_old"
     with db.transaction(conn):
-        if verdict.reason:
+        if reason:
             if not search_store.posting_has_skip(conn, int(row["id"])):
-                search_store.insert_skip(conn, int(row["id"]), today, verdict.reason)
+                search_store.insert_skip(conn, int(row["id"]), today, reason)
         elif verdict.schedule != row["schedule"]:
             search_store.set_posting_schedule(conn, int(row["id"]), verdict.schedule)
-    if verdict.reason:
-        lines.append(
-            _line(str(row["company"]), None, f"{row['title']!r} skipped ({verdict.reason})")
-        )
+    if reason:
+        lines.append(_line(str(row["company"]), None, f"{row['title']!r} skipped ({reason})"))
 
 
 # The three scoring queries, written out in full. Never-scored postings are first come,
@@ -902,14 +1091,14 @@ def _recheck_one(
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
-    "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
+    "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
-    "WHERE p.source = 'watcher' AND p.llm_output IS NOT NULL "
+    "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
@@ -917,7 +1106,7 @@ _RESCORE_SQL = (
 )
 _NEEDS_RESCORE_SQL = (
     "SELECT 1 FROM postings p "
-    "WHERE p.id = ? AND p.source = 'watcher' AND p.llm_output IS NOT NULL "
+    "WHERE p.id = ? AND p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)"
@@ -1069,174 +1258,45 @@ def _iso(moment: dt.datetime) -> str:
     return moment.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _align(conn: sqlite3.Connection, name: str, ats_type: str, ats_slug: str) -> _Aligned:
+def _align(conn: sqlite3.Connection, name: str, board: ats_boards.Board) -> _Aligned:
     """Fill a watchlist company, or refuse when its stored ATS identity disagrees.
 
     A disagreement writes nothing. Source is never changed. The caller runs this only
-    after a board parsed, so a failed fetch leaves the company untouched.
+    after a board parsed, so a failed fetch leaves the company untouched. A Workday
+    company's identity includes its host and site.
     """
+    host = board.host if board.ats == "workday" else None
+    site = board.site if board.ats == "workday" else None
     row = conn.execute(
-        "SELECT id, ats_type, ats_slug FROM companies WHERE name = ?",
+        "SELECT id, ats_type, ats_slug, ats_host, ats_site FROM companies WHERE name = ?",
         (name,),
     ).fetchone()
     if row is None:
         search_store.upsert_company(
-            conn, name, ats_type=ats_type, ats_slug=ats_slug, watchlist=1, source="watcher"
+            conn,
+            name,
+            ats_type=board.ats,
+            ats_slug=board.slug,
+            ats_host=host,
+            ats_site=site,
+            watchlist=1,
+            source="watcher",
         )
         return _Aligned(True)
-    stored_type = row["ats_type"]
-    stored_slug = row["ats_slug"]
-    type_text = stored_type if isinstance(stored_type, str) else None
-    slug_text = stored_slug if isinstance(stored_slug, str) else None
-    if (type_text is not None and type_text != ats_type) or (
-        slug_text is not None and slug_text != ats_slug
-    ):
-        return _Aligned(False, type_text, slug_text)
+    stored = [
+        value if isinstance(value, str) else None
+        for value in (row["ats_type"], row["ats_slug"], row["ats_host"], row["ats_site"])
+    ]
+    wanted = [board.ats, board.slug, host, site]
+    if any(have is not None and have != want for have, want in zip(stored, wanted, strict=True)):
+        return _Aligned(False, *stored)
     conn.execute(
         "UPDATE companies SET ats_type = coalesce(ats_type, ?), ats_slug = coalesce(ats_slug, ?), "
+        "ats_host = coalesce(ats_host, ?), ats_site = coalesce(ats_site, ?), "
         "watchlist = 1 WHERE id = ?",
-        (ats_type, ats_slug, row["id"]),
+        (board.ats, board.slug, host, site, row["id"]),
     )
     return _Aligned(True)
-
-
-def _parse(ats: str, slug: str, body: bytes) -> list[_Job | _Skip]:
-    data = _loads(body)
-    if ats == "lever":
-        if not isinstance(data, list):
-            raise BoardParseError("unexpected JSON shape")
-        return [_lever_job(item, slug) for item in data]
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    if not isinstance(jobs, list):
-        raise BoardParseError("unexpected JSON shape")
-    if ats == "greenhouse":
-        return [_greenhouse_job(item, slug) for item in jobs]
-    return [_ashby_job(item, slug) for item in jobs]
-
-
-def _loads(body: bytes) -> object:
-    try:
-        loaded: object = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise BoardParseError("invalid JSON") from exc
-    return loaded
-
-
-def _greenhouse_job(item: object, slug: str) -> _Job | _Skip:
-    job = _mapping(item)
-    if job is None:
-        return _Skip("a job was not an object")
-    title = _text(job.get("title"))
-    if title is None:
-        return _Skip("a job has no title")
-    # The list payload has no documented company field. Honor company_name when present.
-    return _Job(
-        title=title,
-        location=_nested_text(job.get("location"), "name"),
-        work_model=None,
-        url=_http_url(job.get("absolute_url"))
-        or _built(f"https://boards.greenhouse.io/{slug}/jobs/", job.get("id")),
-        requisition_id=_text(job.get("requisition_id")),
-        company_field=_text(job.get("company_name")),
-        description=_greenhouse_text(job.get("content")),
-    )
-
-
-def _greenhouse_text(content: object) -> str | None:
-    """`content` (with `?content=true`) is entity-escaped HTML; plain text, or None."""
-    text = _text(content)
-    if text is None:
-        return None
-    return htmltext.to_text(text, escaped=True) or None
-
-
-def _lever_job(item: object, slug: str) -> _Job | _Skip:
-    job = _mapping(item)
-    if job is None:
-        return _Skip("a job was not an object")
-    title = _text(job.get("text"))
-    if title is None:
-        return _Skip("a job has no title")
-    return _Job(
-        title=title,
-        location=_nested_text(job.get("categories"), "location"),
-        work_model=_mapped(job.get("workplaceType"), _LEVER_WORK),
-        url=_http_url(job.get("hostedUrl"))
-        or _built(f"https://jobs.lever.co/{slug}/", job.get("id")),
-        requisition_id=_id_text(job.get("id")),
-        company_field=None,
-        description=_lever_text(job),
-    )
-
-
-def _lever_text(job: dict[str, Any]) -> str | None:
-    """The description, the extra lists, the closing text and the salary description.
-
-    Field names from the Lever postings API README (github.com/lever/postings-api):
-    `descriptionPlain`, `lists` (`{text, content}` with HTML content),
-    `additionalPlain` and `salaryDescriptionPlain`. `salaryRange` is not read: the
-    README does not document its `interval` values.
-    """
-    parts = [_text(job.get("descriptionPlain"))]
-    for item in job.get("lists") or []:
-        if isinstance(item, dict):
-            parts.append(_text(item.get("text")))
-            content = _text(item.get("content"))
-            parts.append(htmltext.to_text(content) if content else None)
-    parts.append(_text(job.get("additionalPlain")))
-    parts.append(_text(job.get("salaryDescriptionPlain")))
-    return _joined(parts)
-
-
-def _ashby_text(job: dict[str, Any]) -> str | None:
-    """The description and, with `includeCompensation=true`, the salary summary.
-
-    Field names from Ashby's public job posting API docs
-    (developers.ashbyhq.com/docs/public-job-posting-api): `descriptionPlain` and
-    `compensation.scrapeableCompensationSalarySummary` on each job, such as
-    "$120K - $150K". The summary gets a "Salary:" label so it reads as pay.
-    """
-    compensation = job.get("compensation")
-    summary = (
-        _text(compensation.get("scrapeableCompensationSalarySummary"))
-        if isinstance(compensation, dict)
-        else None
-    )
-    return _joined([_text(job.get("descriptionPlain")), f"Salary: {summary}" if summary else None])
-
-
-def _joined(parts: list[str | None]) -> str | None:
-    """Non-empty parts, one per line (so a sentence never runs into the next); or None."""
-    return "\n".join(part for part in parts if part) or None
-
-
-def _ashby_job(item: object, slug: str) -> _Job | _Skip:
-    job = _mapping(item)
-    if job is None:
-        return _Skip("a job was not an object")
-    title = _text(job.get("title"))
-    if title is None:
-        return _Skip("a job has no title")
-    return _Job(
-        title=title,
-        location=_text(job.get("location")) or "",
-        work_model=_ashby_work(job),
-        url=_http_url(job.get("jobUrl"))
-        or _built(f"https://jobs.ashbyhq.com/{slug}/", job.get("id")),
-        requisition_id=_id_text(job.get("id")),
-        company_field=None,
-        description=_ashby_text(job),
-    )
-
-
-def _ashby_work(job: dict[str, Any]) -> str | None:
-    # Ashby sets isRemote for hybrid as well as remote, so workplaceType wins when
-    # the board sends it. isRemote is only the fallback when that field is absent.
-    if "workplaceType" in job:
-        return _mapped(job.get("workplaceType"), _ASHBY_WORK)
-    if job.get("isRemote") is True:
-        return "remote"
-    return None
 
 
 def _company_name(field: str | None, watchlist_name: str) -> tuple[str, str | None]:
@@ -1250,66 +1310,6 @@ def _company_name(field: str | None, watchlist_name: str) -> tuple[str, str | No
     if field.casefold() == watchlist_name.casefold():
         return watchlist_name, None
     return field, field
-
-
-def _built(prefix: str, ident: object) -> str | None:
-    text = _path_id(ident)
-    if text is None:
-        return None
-    return prefix + text
-
-
-def _path_id(value: object) -> str | None:
-    text = _id_text(value)
-    if text is not None and _SLUG.fullmatch(text):
-        return text
-    return None
-
-
-def _id_text(value: object) -> str | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return str(value)
-    return _text(value)
-
-
-def _http_url(value: object) -> str | None:
-    text = _text(value)
-    if text is None:
-        return None
-    parts = urllib.parse.urlsplit(text)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        return None
-    if parts.username is not None or parts.password is not None:
-        return None
-    return text
-
-
-def _nested_text(value: object, key: str) -> str:
-    if isinstance(value, dict):
-        return _text(value.get(key)) or ""
-    return ""
-
-
-def _mapped(value: object, table: dict[str, str]) -> str | None:
-    text = _text(value)
-    if text is None:
-        return None
-    return table.get(text.casefold())
-
-
-def _mapping(value: object) -> dict[str, Any] | None:
-    if isinstance(value, dict):
-        return value
-    return None
-
-
-def _text(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    stripped = value.strip()
-    return stripped or None
 
 
 def _line(name: str, ats: str | None, message: str) -> str:

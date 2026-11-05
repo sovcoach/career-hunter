@@ -202,7 +202,23 @@ Postings that were already scored, and not yet alerted, get their fit from your 
 
 `hard_gates.min_salary` is yearly pay in CAD. A figure counts only when its sentence mentions pay (salary, pay, compensation, base, wage, range) or a pay unit follows it (per hour, /yr, annually). Bonus, signing, relocation and equity amounts don't count. Hourly figures are converted at 40 hours a week, daily at 260 days a year, weekly at 52 and monthly at 12. A figure marked as another currency (USD, US$, €, £ or any three-letter code but CAD) is ignored, and a plain `$` is read as CAD. A posting is skipped only when the top of its highest range is below your minimum; a posting with no salary passes.
 
-`search.location_rules`: Greenhouse gives no work model, so a location containing the word "remote" is treated as remote and anything else as on-site. Lever and Ashby give one, and it is used as given. With location rules set, a posting with no location text and no work model is skipped as `empty_location`; a Lever or Ashby posting with a work model but no location text is kept.
+`search.location_rules`: Greenhouse, BambooHR and Workday give no work model, so a location containing the word "remote" is treated as remote and anything else as on-site. Lever and Ashby give one, and it is used as given; SmartRecruiters says remote or hybrid when it is, and otherwise nothing. With location rules set, a posting with no location text and no work model is skipped as `empty_location`; a posting with a work model but no location text is kept.
+
+`search.max_posting_age_days` (default 7) skips a posting the board says was posted more than that many days ago, as `too_old`. A board that gives no date uses the day the posting was first seen, and the watch log says so for that posting.
+
+A Workday board needs three values on its watchlist entry, all from its careers page address `https://<tenant>.<wdN>.myworkdayjobs.com/<site>`: `ats_slug` is the tenant, `ats_host` the `wdN` part and `ats_site` the site. A BambooHR board's `ats_slug` is the company's `bamboohr.com` subdomain, and a SmartRecruiters board's is the company identifier after `jobs.smartrecruiters.com/`.
+
+#### Check a new ATS board once by hand
+
+CI only reads fixtures. Before relying on a SmartRecruiters, BambooHR or Workday board, check its endpoint once from this Mac, outside CI, with the board's own values in place of the examples:
+
+```bash
+curl -sS "https://api.smartrecruiters.com/v1/companies/ExampleRobotics/postings?limit=1"
+curl -sS -H "Accept: application/json" "https://examplerobotics.bamboohr.com/careers/list"
+curl -sS -X POST -H "Content-Type: application/json" -d '{"appliedFacets":{},"limit":1,"offset":0,"searchText":""}' "https://examplefreight.wd5.myworkdayjobs.com/wday/cxs/examplefreight/External/jobs"
+```
+
+Each should answer JSON with a list of postings (`content`, `result` or `jobPostings`). An unknown SmartRecruiters company answers an empty list; an unknown BambooHR company is redirected to BambooHR's own site; an unknown Workday site answers 404 and an unknown tenant 422. Then run `careerhunter watch` and read the board's lines in `logs/watch.log`.
 
 `hard_gates.seniority_words`, `title_exceptions` and `never_gated_families` match whole words of the title, ignoring case: "Lead" matches "Team Lead" and "(Lead)", but not "Leader". List a plural on its own if it should count. `hard_gates.seniority_in_description: true` also checks the description for seniority words; it is false by default, so a junior title whose description mentions senior colleagues is kept. A key under `hard_gates` that career-hunter does not know, such as a misspelled option, is refused when the config is loaded.
 
@@ -245,7 +261,7 @@ With the template files, the prompt names Example Staffing Mill, the title keywo
 
 SearXNG runs on this Mac and listens on `127.0.0.1` only. Leave `public_instance` and `image_proxy` off, leave the limiter off, and add `json` to `search.formats`. Leave engines that need an API key disabled. Set `discovery.searxng_url` to that loopback URL, for example `http://127.0.0.1:8888/search`. A null URL leaves discovery off.
 
-`careerhunter discover` sends at most 12 site-restricted queries. It prints each new pending row and stores it in `search.db`. It does not fetch the page. A down server prints `discovery miss: unreachable` and stores nothing. `careerhunter discover list` prints the pending rows again.
+Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`. A pass sends the next `discovery.queries_per_run` site-restricted queries (default 12), `discovery.query_delay_seconds` apart (default 5), and the next pass carries on from there, so over several passes every title, place and host is asked. Titles come from your lanes, places from `search.location_rules`, and hosts are each supported ATS plus `discovery.career_hosts`. A posting URL in the results is fetched once from its ATS and goes through the same gates, scoring and digest as a watched posting, with no approval. A board is queued only after one request to its API confirms it exists; a board that does not exist is never queued again, and a company in `exclusions.companies` is never queued. Career pages are not queued. A down server prints `discovery miss: unreachable` and stores nothing; HTTP 429 or a CAPTCHA reported by SearXNG stops the pass, and either way later passes wait longer each time, up to seven days. `careerhunter discover` runs one pass by hand and prints each new pending row. `careerhunter discover list` prints the pending rows again.
 
 ```bash
 make discover
@@ -253,9 +269,9 @@ careerhunter discover approve 4
 careerhunter discover reject 4
 ```
 
-`approve` marks that pending row approved. A board becomes a company with `watchlist` 1, and a new company has `source` discovery. The next `careerhunter watch` fetches that board. A career page stores `careers_url` and is not fetched. `reject` stores the rejection and inserts no company. Neither command rewrites `config.yaml` or `exclusions.yaml`.
+`approve` marks that pending row approved. A board becomes a company with `watchlist` 1, and a new company has `source` discovery. The next `careerhunter watch` fetches that board. A career page queued by an earlier version stores `careers_url` and is not fetched. `reject` stores the rejection and inserts no company. Neither command rewrites `config.yaml` or `exclusions.yaml`.
 
-The bot does the same thing from the allowlisted chat. Each pending row is one message with the suggested name, the URL, and Approve and Reject. When more than five are waiting, one message lists up to eight, and the rest follow on a later poll. A tap that does not apply answers `Not changed.` and leaves the row pending.
+The bot does the same thing from the allowlisted chat. Each pending board is one message with the suggested name, the URL, and Approve and Reject. When more than five are waiting, one message lists up to eight, each row with its own buttons, and the rest follow on a later poll. A tap that does not apply answers `Not changed.` and leaves the row pending. Nothing is sent while `config.yaml` can't be read.
 
 ### Compare a cosine with the tier
 
@@ -483,20 +499,14 @@ watch: 2 boards fetched, 0 failed, 0 left
 
 A run has 600 seconds. Boards it does not reach are logged `run budget reached; left for the next run`, and the next run fetches them first. To stop them: `uv run careerhunter service uninstall`. Changing an interval means uninstalling the services and installing them again.
 
-A null `discovery.searxng_url` leaves the discovery agent out. `doctor` then shows `discovery agent --  off`. Set the URL and run `service install` again. It adds `org.careerhunter.discover` and leaves the bot and watch agents as they are. The new line looks like:
-
-```text
-installed ~/Library/LaunchAgents/org.careerhunter.discover.plist; careerhunter discover runs now and every 1440 minutes
-```
-
-That agent runs once and exits, then waits for `discovery.interval_minutes`. A finished search writes `logs/discover.success`, and its lines go to `logs/discover.log`:
+Discovery runs inside the watch agent: there is no separate discovery agent. A null `discovery.searxng_url` leaves it off, and `doctor` shows `discovery       --  off`. With the URL set, a watch run starts with a discovery pass when the last one was claimed at least `discovery.interval_minutes` ago; the pass's lines go to `logs/watch.log` with the run's, and a pass that ran writes `logs/discover.success`:
 
 ```text
 discovery miss: unreachable
-discover: 0 queued
+discover: 0 queued, 0 postings found
 ```
 
-List, approve and reject write no log. Approve and reject do not refresh that stamp. `doctor` shows the agent and how old the stamp is. A stamp older than two intervals is a failure. A warning, such as a plist left behind after the URL is set back to null, does not fail `doctor`. `service uninstall` removes the bot, the watch agent, and the discovery agent.
+`doctor` shows how old that stamp is; one older than two discovery intervals, or two watch intervals when those are longer, is a failure. If an earlier version installed `org.careerhunter.discover`, run `service install` again: it removes that agent and prints `removed …; discovery now runs inside the watch agent`, and `doctor` warns until you do. List, approve and reject write no log and do not refresh the stamp. `service uninstall` removes the bot and the watch agent, and an old discovery agent if one is left.
 
 ### 10d. Using it
 
