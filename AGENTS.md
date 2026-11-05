@@ -4,11 +4,22 @@ These rules apply to every AI agent session in this repo, Claude Code or otherwi
 
 ## Approval
 
-- Plan first. Every phase and every non-trivial step starts with a written plan. No code, config writes, commits, or pushes until that plan is explicitly approved. An approval covers only the step that was approved.
+- Plan first. Every phase and every non-trivial step starts with a written plan, as a numbered commit list. No code, config writes, commits, or pushes until that plan is explicitly approved. An approval covers only the plan it was given for.
 - Sessions start from the repo directory so project permission rules load. Merges are done by the operator on GitHub with “Create a merge commit”, as described in "Merging" below. Public commits are authored as Daniel with the GitHub noreply address.
-- Commit, push, tag, publish a release or open a PR only after the operator explicitly approves that step. An approval covers only the step it was given for.
-- Before every commit, show the staged file list and the commit message, then wait.
-- Stop on any hook failure. Report it and fix the cause. Never skip a hook, bypass it, point git at other hooks, or use the push guard's override.
+- Inside an approved plan, getting your own uncommitted code to pass is normal authoring. Fix failures yourself (tests, lint, types, formatting, hook autofixes, a missing environment variable) and keep going. Commit each step of the plan once its full checks pass. List anything notable in the push-review summary.
+- Stop and ask only when:
+  1. The plan's scope or design would change. That includes an extra commit, a different approach, or an acceptance criterion you can't meet as written.
+  2. A fix would touch code outside this batch, or weaken a check: a noqa in `src`, a loosened test, a skipped hook, a coverage drop, a lint rule disabled.
+  3. A dependency is added or changed.
+  4. Anything touches the real data folder, or any push, PR or issue post.
+  5. You're stuck on the same failure after two honest attempts.
+- These hold in every plan:
+  - Format with `uv run ruff format` only, never `make format`, which also runs `ruff check --fix`.
+  - `CAREERHUNTER_DATA_DIR` comes from the bot's LaunchAgent plist (`org.careerhunter.bot.plist`, read with PlistBuddy) and is never printed. Set it on each check command and on each `git commit`.
+  - Run each guarded git command on its own (see "Git commands").
+  - The full checks pass fresh before every commit.
+  - Never skip a hook, bypass it, point git at other hooks, or use the push guard's override.
+- Push, tag, publish a release, open a PR or post to an issue only after the operator explicitly approves that step. An approval covers only the step it was given for. Before asking to push, show the commits since `origin/main`, the check results, and what was done differently from the plan and why.
 - Never push to `main`, and never merge a PR: the operator merges (see "Merging"). Branch from an up-to-date `main` with `--no-track`, and push with `-u` to a branch of the same name.
 
 ## Merging
