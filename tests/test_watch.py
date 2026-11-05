@@ -1125,11 +1125,13 @@ def test_watch_fetches_an_approved_discovery_board_only(
     stored = postings(search)
     assert [row["company"] for row in stored] == ["Example Robotics", "newrobotics"]
     assert {row["source"] for row in stored} == {"watcher"}
-    search.execute("UPDATE postings SET llm_output = 'synthetic' WHERE source = 'watcher'")
+    search.execute(
+        "UPDATE postings SET llm_output = 'synthetic', fit = 'high' WHERE source = 'watcher'"
+    )
     other, _inserted = search_store.upsert_company(search, "Example Org", source="discovery")
     search.execute(
-        "INSERT INTO postings (company_id, title, first_seen, source, llm_output) "
-        "VALUES (?, 'Customer Success Specialist', ?, 'discovery', 'synthetic')",
+        "INSERT INTO postings (company_id, title, first_seen, source, llm_output, fit) "
+        "VALUES (?, 'Customer Success Specialist', ?, 'discovery', 'synthetic', 'high')",
         (other, DAY),
     )
     alerted = search_store.pending_alert_ids(search)

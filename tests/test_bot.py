@@ -374,10 +374,10 @@ def test_an_unknown_action_writes_nothing(env: Env) -> None:
 # --- /log and Applied, with each date choice -----------------------------------------------
 
 
-def test_log_sends_an_alert_with_company_title_and_link_only(env: Env) -> None:
+def test_log_sends_an_alert_with_company_title_link_and_no_fit(env: Env) -> None:
     env.say(f"/log {AD_URL}")
     text = env.api.texts()[-1]
-    assert text == f"Example Robotics — Synthetic Analyst\n{AD_URL}"
+    assert text == f"Example Robotics — Synthetic Analyst\n{AD_URL}\nFit: not scored"
     labels = [b["text"] for b in env.api.last()[1]["reply_markup"]["inline_keyboard"][0]]
     assert labels == ["Applied", "Skipped"]
     s = env.search()
@@ -955,6 +955,7 @@ def _insert(
     scored: bool = True,
     skip: str | None = None,
     schedule: str | None = None,
+    fit: str | None = "high",
 ) -> int:
     conn = db.connect(env.datadir.search_db_path)
     db.migrate(conn, "search")
@@ -973,6 +974,8 @@ def _insert(
     _, posting_id, _, _ = search_store.find_or_create_posting(
         conn, posting, Dating("exact", day="2026-10-28")
     )
+    if scored and fit is not None:
+        conn.execute("UPDATE postings SET fit = ? WHERE id = ?", (fit, posting_id))
     if skip:
         search_store.insert_skip(conn, posting_id, "2026-10-28", skip)
     conn.close()
@@ -1014,9 +1017,11 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
     assert [p["text"] for p in sends] == [
         "Example Robotics — Operations Coordinator\n"
         "https://jobs.example.com/ads/robotics\n"
+        "Fit: High\n"
         "LLM: strong",
         "Example Staffing (agency) — Support Coordinator\n"
         "https://jobs.example.com/ads/staffing\n"
+        "Fit: High\n"
         "LLM: strong",
     ]
     for params in sends:
@@ -1066,10 +1071,12 @@ def test_alert_adds_similarity_only_when_a_cosine_is_stored(env: Env, keep_umask
     assert [p["text"] for p in _sends(env)] == [
         "Example Robotics — Operations Coordinator\n"
         "https://jobs.example.com/ads/robotics\n"
+        "Fit: High\n"
         "LLM: strong\n"
         "similarity: 0.82",
         "Sample Logistics — Support Coordinator\n"
         "https://jobs.example.com/ads/logistics\n"
+        "Fit: High\n"
         "LLM: strong\n"
         "similarity: -1.00",
     ]
@@ -1415,3 +1422,69 @@ def test_an_expired_discovery_button_writes_nothing_and_a_later_poll_sends_again
     assert conn.execute("SELECT status FROM discovery_candidates").fetchone()[0] == "approved"
     assert conn.execute("SELECT name, source FROM companies").fetchone()["source"] == "discovery"
     conn.close()
+
+
+# --- held postings (#38): no fit, no alert -----------------------------------------------------
+
+
+def _watch(env: Env, scorer: Any, config: dict[str, Any]) -> list[str]:
+    from careerhunter import watch as w
+    from tests.test_rescore import board, lever, watched
+
+    conn = db.connect(env.datadir.search_db_path)
+    db.migrate(conn, "search")
+    try:
+        return w.run(
+            conn,
+            watched("examplerobotics"),
+            today="2026-10-28",
+            fetcher=lambda address: {
+                board("examplerobotics"): lever("examplerobotics", ("r1", "Held Coordinator"))
+            }[address],
+            scorer=scorer,
+            config=config,
+        )
+    finally:
+        conn.close()
+
+
+def test_a_held_posting_is_never_alerted_is_retried_and_alerts_once_scored(
+    env: Env, keep_umask: None
+) -> None:
+    from tests.test_fit import FITS
+    from tests.test_rescore import Recorder
+
+    scorer = Recorder()
+    scorer.replies["Held Coordinator"] = None  # the reply does not parse: held
+    _watch(env, scorer, FITS)
+    assert _poll(env) == 0
+    assert _sends(env) == []
+    retry = Recorder()  # the next run tries it again, and this time it scores
+    _watch(env, retry, FITS)
+    assert [text.title for text in retry.calls] == ["Held Coordinator"]
+    assert _poll(env) == 0
+    assert [p["text"].split("\n")[0] for p in _sends(env)] == ["Examplerobotics — Held Coordinator"]
+    assert "Fit: High" in _sends(env)[0]["text"]
+    assert _poll(env) == 0
+    assert len(_sends(env)) == 1
+
+
+def test_a_tier_name_missing_from_config_is_held_until_it_is_back(
+    env: Env, keep_umask: None
+) -> None:
+    from careerhunter.score import Score
+    from tests.test_fit import FITS
+    from tests.test_rescore import Recorder
+
+    scorer = Recorder()
+    scorer.replies["Held Coordinator"] = Score(llm_output="{}", gaps="[]", tier="renamed")
+    _watch(env, scorer, FITS)
+    assert _poll(env) == 0
+    assert _sends(env) == []
+    renamed = json.loads(json.dumps(FITS))
+    renamed["fit_rubric"]["gap_tiers"]["tiers"][1]["name"] = "renamed"
+    lines = _watch(env, Recorder(), renamed)  # already scored: not sent to the model again
+    assert "watch: fit filled in from config for 1 scored postings" in lines
+    assert _poll(env) == 0
+    assert len(_sends(env)) == 1
+    assert "Fit: Medium" in _sends(env)[0]["text"]

@@ -18,10 +18,11 @@ Trust boundary (ADR-016):
   as the CLI does. A discovery approve or reject opens `search.db` only.
 
 Privacy (ADR-015, amended by ADR-019 and ADR-020): messages the bot sends carry
-company, title, link, the LLM tier name, a cosine when one is stored, status
+company, title, link, the fit tier (`Fit: High`, `Medium`, `Low`, or `not scored` for a
+job ad sent to the bot), the LLM tier name, a cosine when one is stored, status
 words and references. A discovery row sends the suggested name and the reduced
 URL only. A watchlist agency with no separate employer stored is labelled
-" (agency)". Never notes, fit ratings, gaps, model text, vectors, snippets,
+" (agency)". Never notes, 0-10 fit ratings, gaps, model text, vectors, snippets,
 queries, EI record details or claim labels.
 
 Dates: after Applied and a method, the bot asks when, with buttons (today, yesterday,
@@ -203,12 +204,25 @@ def _cosine(value: object) -> float | None:
     return number
 
 
+def _fit_label(raw: object) -> str:
+    """`High`, `Medium` or `Low`; anything else, a job ad included, is `not scored`."""
+    if isinstance(raw, str) and raw in enums.FIT_LEVELS:
+        return raw.capitalize()
+    return "not scored"
+
+
 def _alert_text(
-    label: str, title: str, url: str | None, tier: str | None, score: float | None
+    label: str,
+    title: str,
+    url: str | None,
+    fit: object,
+    tier: str | None,
+    score: float | None,
 ) -> str:
     lines = [f"{label} — {title}"]
     if url:
         lines.append(url)
+    lines.append(f"Fit: {_fit_label(fit)}")
     if tier:
         lines.append(f"LLM: {tier}")
     if score is not None:
@@ -395,7 +409,8 @@ class Bot:
 
         The message goes out first. ``alerted_at`` is set only after Telegram accepts
         it. If the process stops between those two steps, the next poll sends it again.
-        A failed send leaves ``alerted_at`` null. Skips and unscored rows are not sent.
+        A failed send leaves ``alerted_at`` null. Skips, unscored rows and rows without
+        a fit are not sent: they are held until the watcher gives them a fit.
         """
         try:
             with self._search() as search:
@@ -566,18 +581,22 @@ class Bot:
             self.alert(search, posting_id)
 
     def alert(self, search: sqlite3.Connection, posting_id: int) -> None:
-        """Company, title, link, the LLM tier, and a similarity line when a cosine is stored."""
+        """Company, title, link, the fit, the LLM tier, and a similarity line with a cosine.
+
+        A posting with no fit, such as a job ad sent to the bot, says `Fit: not scored`.
+        """
         posting = search_store.posting_by_id(search, posting_id)
         if posting is None:
             raise Refusal("That posting isn't in search.db any more.")
         label = self._labelled_company(posting.company)
         row = search.execute(
-            "SELECT scout_metadata, embedding_score FROM postings WHERE id = ?",
+            "SELECT fit, scout_metadata, embedding_score FROM postings WHERE id = ?",
             (posting_id,),
         ).fetchone()
+        fit = row["fit"] if row is not None else None
         tier = _tier_name(row["scout_metadata"]) if row is not None else None
         score = _cosine(row["embedding_score"]) if row is not None else None
-        text = _alert_text(label, posting.title, posting.url, tier, score)
+        text = _alert_text(label, posting.title, posting.url, fit, tier, score)
         payload = {"posting_id": posting_id}
         self._keyboard(
             search, text, [[("Applied", "apply", payload), ("Skipped", "skip", payload)]], ALERT_TTL

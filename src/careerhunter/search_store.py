@@ -319,12 +319,16 @@ def finish_watch_run(
 
 
 def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
-    """Watcher postings with a score, no skip, and no alert yet. Oldest id first."""
+    """Watcher postings with a score and a fit, no skip, and no alert yet. Oldest id first.
+
+    A posting without a fit (unscored, or scored into a tier name not in config) is held.
+    """
     rows = conn.execute(
         """
         SELECT p.id FROM postings p
         WHERE p.source = 'watcher'
           AND p.llm_output IS NOT NULL
+          AND p.fit IS NOT NULL
           AND p.alerted_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
         ORDER BY p.id
