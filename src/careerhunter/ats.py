@@ -25,24 +25,40 @@ import json
 import re
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from careerhunter import htmltext
-from careerhunter.fetch import Fetched, FetchTooLarge
+from careerhunter.fetch import Fetched, FetchError, FetchTooLarge
 
 Fetcher = Callable[[str], Fetched]
+Known = Callable[[str], bool]  # a posting URL already stored: its detail is not fetched
 
 # The body cap for one board, all of its requests together. Greenhouse boards carry
 # every description (content=true), so this is larger than a job ad's cap. The CLI
 # also gives it to the fetcher as the cap for each single request.
 BOARD_MAX_BYTES = 20 * 1024 * 1024
+# A board whose list has no descriptions gets one detail request per new posting, at
+# most this many per board per run. The rest are left for the next run, so one large
+# board cannot take the run budget from the others.
+DETAIL_LIMIT = 40
+# List pages read per board per run, for the boards that page.
+MAX_PAGES = 25
+SMARTRECRUITERS_PAGE = 100
 
-BOARDS = ("greenhouse", "lever", "ashby")
+BOARDS = ("greenhouse", "lever", "ashby", "smartrecruiters")
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 # The public postings API says "on-site"; the hire API says "onsite".
 _LEVER_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite", "on-site": "onsite"}
 _ASHBY_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite"}
+# SmartRecruiters job ad sections, in the order a reader sees them. Each is {title, text}
+# with HTML text (developers.smartrecruiters.com/docs/objects, and a live public board).
+_SMARTRECRUITERS_SECTIONS = (
+    "companyDescription",
+    "jobDescription",
+    "qualifications",
+    "additionalInformation",
+)
 
 
 class BoardParseError(Exception):
@@ -68,6 +84,7 @@ class Job:
     requisition_id: str | None
     company_field: str | None
     description: str | None = None
+    detail_url: str | None = None  # where the description is, when the list has none
 
 
 @dataclass(frozen=True)
@@ -75,12 +92,37 @@ class Skip:
     reason: str
 
 
+@dataclass(frozen=True)
+class Board:
+    """One board's identity. Only Workday has a host and a site."""
+
+    ats: str
+    slug: str
+    host: str | None = None
+    site: str | None = None
+
+
+@dataclass
+class BoardRead:
+    """What one board gave this run.
+
+    `notes` are log lines: postings or pages left for the next run, and details that
+    could not be read. `stopped` is the fetch or HTTP error that stopped the detail
+    requests early; the postings read before it are kept, the others are left out
+    (not stored) so the next run reads them as new.
+    """
+
+    jobs: list[Job | Skip]
+    notes: list[str] = field(default_factory=list)
+    stopped: Exception | None = None
+
+
 class Client:
     """One board's requests, under one byte budget for all of them."""
 
-    def __init__(self, fetcher: Fetcher, *, max_bytes: int = BOARD_MAX_BYTES) -> None:
+    def __init__(self, fetcher: Fetcher, *, max_bytes: int | None = None) -> None:
         self._fetcher = fetcher
-        self._max_bytes = max_bytes
+        self._max_bytes = BOARD_MAX_BYTES if max_bytes is None else max_bytes
         self.used = 0
 
     def get_json(self, url: str) -> object:
@@ -96,22 +138,194 @@ class Client:
 
 
 def board_url(ats_type: str, slug: str) -> str | None:
-    """The list URL for one board, built only from a single safe path segment."""
+    """The (first) list URL for one board, built only from a single safe path segment."""
     if ats_type not in BOARDS or _SLUG.fullmatch(slug) is None:
         return None
     if ats_type == "greenhouse":
         return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
     if ats_type == "lever":
         return f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    if ats_type == "smartrecruiters":
+        return _smartrecruiters_list(slug, 0)
     return f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
 
 
-def read(ats: str, slug: str, client: Client) -> list[Job | Skip]:
-    """Every job on one board. Raises on a fetch error, a non-200 reply or a bad body."""
-    url = board_url(ats, slug)
+def _nothing_known(url: str) -> bool:
+    return False
+
+
+def read(
+    board: Board,
+    client: Client,
+    *,
+    known: Known = _nothing_known,
+    detail_limit: int | None = None,
+) -> BoardRead:
+    """Every job on one board this run.
+
+    A list request that fails raises: a fetch error as it is, a non-200 reply as
+    BoardHTTPError, a bad body as BoardParseError, and the board stores nothing. Detail
+    requests are made only for postings whose URL is not `known`, at most
+    `detail_limit` (DETAIL_LIMIT by default). A detail that answers with a non-200
+    status other than 429, or with a body that does not parse, leaves out that posting
+    only, with a note. A fetch
+    error or HTTP 429 stops the details: see `BoardRead.stopped`. Going over the byte
+    budget always raises, so a board over the cap stores nothing.
+    """
+    url = board_url(board.ats, board.slug)
     if url is None:
         raise BoardParseError("not a board this module reads")
-    return _parse(ats, slug, client.get_json(url))
+    if board.ats == "smartrecruiters":
+        stubs, notes = _smartrecruiters_list_pages(board.slug, client)
+        limit = DETAIL_LIMIT if detail_limit is None else detail_limit
+        found = _with_details(stubs, client, known, limit, _smartrecruiters_detail)
+        found.notes[:0] = notes
+        return found
+    return BoardRead(_parse(board.ats, board.slug, client.get_json(url)))
+
+
+def _with_details(
+    stubs: list[Job | Skip],
+    client: Client,
+    known: Known,
+    limit: int,
+    parse_detail: Callable[[Job, object], Job],
+) -> BoardRead:
+    """Fill in each new posting's description from its detail request."""
+    out = BoardRead([])
+    fetched = 0
+    left = 0
+    for item in stubs:
+        if isinstance(item, Skip) or item.detail_url is None:
+            out.jobs.append(item)
+            continue
+        if item.url is not None and known(item.url):
+            out.jobs.append(item)  # stored already: no detail needed
+            continue
+        if out.stopped is not None or fetched >= limit:
+            left += 1
+            continue
+        fetched += 1
+        try:
+            out.jobs.append(parse_detail(item, client.get_json(item.detail_url)))
+        except FetchTooLarge:
+            raise
+        except BoardHTTPError as exc:
+            if exc.status == 429:
+                out.stopped = exc
+                left += 1
+            else:
+                out.notes.append(f"{item.title!r}: detail HTTP {exc.status}; not recorded")
+        except BoardParseError as exc:
+            out.notes.append(f"{item.title!r}: detail {exc}; not recorded")
+        except FetchError as exc:
+            out.stopped = exc
+            left += 1
+    if left:
+        why = "detail limit" if out.stopped is None else f"details stopped: {_kind(out.stopped)}"
+        out.notes.append(f"{left} postings left for the next run ({why})")
+    return out
+
+
+def _kind(exc: Exception) -> str:
+    if isinstance(exc, BoardHTTPError):
+        return f"HTTP {exc.status}"
+    return type(exc).__name__
+
+
+# --- SmartRecruiters ------------------------------------------------------------------
+# The public Posting API (developers.smartrecruiters.com/docs/endpoints, checked
+# against a live public board): GET /v1/companies/{company}/postings pages with
+# `limit` and `offset` and answers {offset, limit, totalFound, content}; each posting
+# has id, name, refNumber, releasedDate, company {identifier, name} and location
+# {city, region, country, remote, hybrid, fullLocation}. The list has no description:
+# GET /v1/companies/{company}/postings/{id} has it in jobAd.sections. The posting
+# page is https://jobs.smartrecruiters.com/{company}/{id}.
+# An unknown company answers 200 with an empty list, not 404.
+
+
+def _smartrecruiters_list(slug: str, offset: int) -> str:
+    return (
+        f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"
+        f"?limit={SMARTRECRUITERS_PAGE}&offset={offset}"
+    )
+
+
+def _smartrecruiters_list_pages(slug: str, client: Client) -> tuple[list[Job | Skip], list[str]]:
+    """Every page, by offset. The offset moves by the rows each page really gave."""
+    jobs: list[Job | Skip] = []
+    offset = 0
+    for _page in range(MAX_PAGES):
+        data = client.get_json(_smartrecruiters_list(slug, offset))
+        content = data.get("content") if isinstance(data, dict) else None
+        total = data.get("totalFound") if isinstance(data, dict) else None
+        if not isinstance(content, list) or not isinstance(total, int) or not _count(total):
+            raise BoardParseError("unexpected JSON shape")
+        jobs.extend(_smartrecruiters_job(item, slug) for item in content)
+        offset += len(content)
+        if not content or offset >= total:
+            return jobs, []
+    return jobs, [f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"]
+
+
+def _count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _smartrecruiters_job(item: object, slug: str) -> Job | Skip:
+    job = _mapping(item)
+    if job is None:
+        return Skip("a job was not an object")
+    title = _text(job.get("name"))
+    if title is None:
+        return Skip("a job has no title")
+    ident = _path_id(job.get("id"))
+    if ident is None:
+        return Skip(f"{title!r} has no usable id")
+    location = _mapping(job.get("location")) or {}
+    company = _mapping(job.get("company")) or {}
+    return Job(
+        title=title,
+        location=_smartrecruiters_place(location),
+        work_model=_smartrecruiters_work(location),
+        url=f"https://jobs.smartrecruiters.com/{slug}/{ident}",
+        requisition_id=ident,
+        company_field=_text(company.get("name")),
+        detail_url=f"https://api.smartrecruiters.com/v1/companies/{slug}/postings/{ident}",
+    )
+
+
+def _smartrecruiters_place(location: dict[str, Any]) -> str:
+    full = _text(location.get("fullLocation"))
+    if full is not None:
+        return full
+    parts = [_text(location.get(key)) for key in ("city", "region", "country")]
+    return ", ".join(part for part in parts if part)
+
+
+def _smartrecruiters_work(location: dict[str, Any]) -> str | None:
+    """`remote` and `hybrid` are booleans. Neither true says nothing for sure: None."""
+    if location.get("remote") is True:
+        return "remote"
+    if location.get("hybrid") is True:
+        return "hybrid"
+    return None
+
+
+def _smartrecruiters_detail(stub: Job, data: object) -> Job:
+    detail = _mapping(data)
+    ad = _mapping(detail.get("jobAd")) if detail is not None else None
+    sections = _mapping(ad.get("sections")) if ad is not None else None
+    if sections is None:
+        raise BoardParseError("unexpected JSON shape")
+    parts: list[str | None] = []
+    for key in _SMARTRECRUITERS_SECTIONS:
+        section = _mapping(sections.get(key))
+        html = _text(section.get("text")) if section is not None else None
+        parts.append(htmltext.to_text(html) if html else None)
+    # The posting URL stays the one built from the list, so the next run knows it is
+    # stored without asking for its detail again.
+    return replace(stub, description=_joined(parts), detail_url=None)
 
 
 def _parse(ats: str, slug: str, data: object) -> list[Job | Skip]:

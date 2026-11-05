@@ -64,4 +64,4 @@ def test_a_transport_failure_passes_through_unchanged() -> None:
 
 def test_read_refuses_a_board_it_cannot_build_a_url_for() -> None:
     with pytest.raises(ats.BoardParseError):
-        ats.read("greenhouse", "two/segments", ats.Client(Pages()))
+        ats.read(ats.Board("greenhouse", "two/segments"), ats.Client(Pages()))

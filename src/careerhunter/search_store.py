@@ -182,6 +182,11 @@ def add_decision(
     )
 
 
+def posting_url_known(conn: sqlite3.Connection, url: str) -> bool:
+    """Whether a posting with this exact URL is stored, from any source."""
+    return conn.execute("SELECT 1 FROM postings WHERE url = ?", (url,)).fetchone() is not None
+
+
 def posting_has_application(conn: sqlite3.Connection, posting_id: int) -> bool:
     row = conn.execute(
         "SELECT 1 FROM applications WHERE posting_id = ? LIMIT 1", (posting_id,)

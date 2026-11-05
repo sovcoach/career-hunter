@@ -1,12 +1,13 @@
-"""Fetch Greenhouse, Lever and Ashby boards, filter the new postings, then score them.
+"""Fetch ATS boards, filter the new postings, then score them.
 
-One `careerhunter watch` run reads the watchlist and fetches those three boards, one
-company after another, through `fetch.py`. It also fetches companies stored with
-`source` discovery and `watchlist` 1 when the ATS type is Greenhouse, Lever, or Ashby
-and the slug is one path segment. A seeded watchlist row with any other source is not
-fetched by that extra path. It writes companies, postings, skip reasons and local
-scores in `search.db`. It does not call Telegram, write applications, EI rows or
-snapshots. The bot sends one alert digest per watch run when it polls.
+One `careerhunter watch` run reads the watchlist and fetches its Greenhouse, Lever,
+Ashby and SmartRecruiters boards, one company after another, through `fetch.py`. It
+also fetches companies stored with `source` discovery and `watchlist` 1 when the ATS
+type is one of those and the slug is one path segment. A seeded watchlist row with
+any other source is not fetched by that extra path. It writes companies, postings,
+skip reasons and local scores in `search.db`. It does not call Telegram, write
+applications, EI rows or snapshots. The bot sends one alert digest per watch run when
+it polls.
 `run` returns the log lines; the CLI prints them to stderr.
 
 A posting that is already stored is not inserted again. After the boards, watcher rows
@@ -24,6 +25,13 @@ description is held in memory for the filter and the scoring prompt, and never
 stored. A board whose replies together pass BOARD_MAX_BYTES logs `board over the size
 cap (...); nothing recorded`, stores nothing from that board, and counts as failed.
 Nothing is cut to fit.
+
+A SmartRecruiters list has no descriptions, so each posting not stored yet gets one
+detail request, at most `ats.DETAIL_LIMIT` per board per run; the rest are logged and
+left out, to be read as new next run. A detail that answers with another status or a
+bad body leaves out that posting only. A fetch error or HTTP 429 on a detail stops
+the board's details: what was read before is recorded, the board counts as failed (or
+as left, when the run budget ran out), and a 429 blocks that host for the run.
 
 One company's failure does not stop the run. An exception while handling one board, or
 one row of the recheck or scoring pass, or the embedding refresh, is rolled back and
@@ -149,7 +157,7 @@ _PLACEHOLDERS = frozenset(
 
 @dataclass(frozen=True)
 class _Parsed:
-    jobs: list[Job | Skip]
+    read: ats_boards.BoardRead
 
 
 @dataclass(frozen=True)
@@ -506,8 +514,7 @@ def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -
             seen.add((ats, slug.casefold()))
     rows = conn.execute(
         "SELECT name, ats_type, ats_slug FROM companies "
-        "WHERE source = 'discovery' AND watchlist = 1 "
-        "AND ats_type IN ('greenhouse', 'lever', 'ashby') "
+        "WHERE source = 'discovery' AND watchlist = 1 AND ats_type IS NOT NULL "
         "AND ats_slug IS NOT NULL AND length(trim(ats_slug)) > 0 "
         "ORDER BY id"
     )
@@ -586,7 +593,7 @@ def _watch_one(
         return "left"
     key = f"{ats}:{slug.casefold()}"
     previous = _stamp_attempt(conn, key, state.now())
-    outcome = _fetch_jobs(state, blocked, name, ats, slug, url, host, fetcher)
+    outcome = _fetch_jobs(conn, state, blocked, name, ats, slug, host, fetcher)
     if isinstance(outcome, _Left):
         _restore_attempt(conn, key, previous)
         return "left"
@@ -612,7 +619,7 @@ def _watch_one(
         state,
         name,
         ats,
-        outcome.jobs,
+        outcome.read.jobs,
         role_filters,
         config,
         exclusions,
@@ -620,23 +627,65 @@ def _watch_one(
         scorer,
         embedder,
     )
-    return "fetched"
+    for note in outcome.read.notes:
+        lines.append(_line(name, ats, note))
+    return _details_tally(conn, state, blocked, name, ats, key, previous, outcome.read.stopped)
+
+
+def _details_tally(
+    conn: sqlite3.Connection,
+    state: _State,
+    blocked: set[str],
+    name: str,
+    ats: str,
+    key: str,
+    previous: str | None,
+    stopped: Exception | None,
+) -> Tally:
+    """A board whose detail requests all ran is fetched. Details stopped by the run
+    budget leave the board for the next run, first in line; any other stop fails it.
+    The postings read before the stop are recorded either way."""
+    if stopped is None:
+        return "fetched"
+    if isinstance(stopped, FetchTimeout) and state.out_of_time():
+        state.left_by_budget(_line(name, ats, _LEFT))
+        _restore_attempt(conn, key, previous)
+        return "left"
+    if isinstance(stopped, BoardHTTPError) and stopped.status == 429:
+        blocked.add(urllib.parse.urlsplit(stopped.url).hostname or "")
+        state.lines.append(
+            _line(
+                name,
+                ats,
+                f"detail HTTP 429, retry-after {_retry(stopped.retry_after)}; "
+                "left for the next run",
+            )
+        )
+    return "failed"
 
 
 def _fetch_jobs(
+    conn: sqlite3.Connection,
     state: _State,
     blocked: set[str],
     name: str,
     ats: str,
     slug: str,
-    url: str,
     host: str,
     fetcher: Fetcher,
 ) -> _Parsed | _Failed | _Left:
-    """Parse one board. A failure, or a fetch the run budget cut short, stores nothing."""
+    """Read one board. A failed list, or one the run budget cut short, stores nothing.
+
+    A posting whose URL is stored already gets no detail request (`ats.read`).
+    """
     lines = state.lines
+
+    def known(url: str) -> bool:
+        return search_store.posting_url_known(conn, url)
+
     try:
-        return _Parsed(ats_boards.read(ats, slug, ats_boards.Client(fetcher)))
+        board = ats_boards.Board(ats, slug)
+        return _Parsed(ats_boards.read(board, ats_boards.Client(fetcher), known=known))
     except FetchError as exc:
         if isinstance(exc, FetchTimeout) and state.out_of_time():
             lines.append(_line(name, ats, _LEFT))
