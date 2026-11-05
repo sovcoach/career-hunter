@@ -447,3 +447,28 @@ def test_score_stamps_are_utc(search: sqlite3.Connection) -> None:
         now=lambda: moment,
     )
     assert row(search, "One")["score_attempted_at"] == "2026-10-31T22:04:05Z"
+
+
+def test_a_budget_that_runs_out_during_a_call_keeps_the_postings_place(
+    search: sqlite3.Connection,
+) -> None:
+    run(search, {board("examplea"): lever("examplea", ("a1", "One"), ("a2", "Two"))}, ("examplea",))
+    clock = FakeClock()
+
+    def slow_then_cut(text: PostingText) -> Score | None:
+        clock.advance(700.0)  # past the whole budget
+        raise ScoreError("the local model could not be reached")
+
+    lines = w.run(
+        search,
+        [],
+        today=DAY,
+        fetcher=Scripted({}),
+        scorer=slow_then_cut,
+        budget=minutes(clock, 10),
+        now=ticking(),
+    )
+    assert "watch: Examplea: 'One' left for the next run (run budget reached)" in lines
+    assert "model unreachable" not in "\n".join(lines)  # a cut budget is not a down model
+    assert "watch: scoring: run budget reached; 1 postings left for the next run" in lines
+    assert row(search, "One")["score_attempted_at"] is None  # its earlier (empty) stamp is back

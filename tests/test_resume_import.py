@@ -414,3 +414,69 @@ def test_a_refused_file_stores_nothing(
         assert c.execute("SELECT count(*) FROM resume_import").fetchone()[0] == 0
     finally:
         c.close()
+
+
+def test_a_file_where_the_resume_folder_should_be_is_refused(
+    root: Path, conn: sqlite3.Connection
+) -> None:
+    (root / resume.RESUME_DIR).write_text("not a folder")
+    with pytest.raises(resume.ResumeError) as caught:
+        do_import(root, conn)
+    assert caught.value.reason == "folder"
+    assert imports(conn) == []
+
+
+def test_a_leftover_that_cannot_be_removed_stops_the_import(
+    root: Path, conn: sqlite3.Connection
+) -> None:
+    do_import(root, conn)
+    (root / resume.RESUME_DIR / resume.PREVIOUS).mkdir()  # unlink() cannot remove it
+    with pytest.raises(resume.ResumeError) as caught:
+        do_import(root, conn, _OTHER)
+    assert caught.value.reason == "write"
+    assert (root / resume.RESUME_DIR / resume.CURRENT).read_text() == _TEXT
+    assert [s for s, _ in imports(conn)] == [sha(_TEXT)]
+
+
+def test_read_imported_refuses_a_folder_that_is_a_file(
+    root: Path, conn: sqlite3.Connection
+) -> None:
+    do_import(root, conn)
+    folder = root / resume.RESUME_DIR
+    for child in folder.iterdir():
+        child.unlink()
+    folder.rmdir()
+    folder.write_text("a file now")
+    with pytest.raises(resume.ResumeError) as caught:
+        resume.read_imported(root, conn)
+    assert caught.value.reason == "folder"
+
+
+def test_read_imported_refuses_a_current_that_is_a_folder(
+    root: Path, conn: sqlite3.Connection
+) -> None:
+    do_import(root, conn)
+    current = root / resume.RESUME_DIR / resume.CURRENT
+    current.unlink()
+    current.mkdir(mode=0o700)
+    with pytest.raises(resume.ResumeError) as caught:
+        resume.read_imported(root, conn)
+    assert caught.value.reason == "mismatch"
+
+
+def test_read_imported_refuses_bytes_that_match_but_are_not_utf8(
+    root: Path, conn: sqlite3.Connection
+) -> None:
+    do_import(root, conn)
+    raw = b"\xff\xfe not text"
+    current = root / resume.RESUME_DIR / resume.CURRENT
+    current.write_bytes(raw)
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO resume_import (sha256, imported_at) VALUES (?, ?)",
+            (hashlib.sha256(raw).hexdigest(), _STAMP),
+        )
+    with pytest.raises(resume.ResumeError) as caught:
+        resume.read_imported(root, conn)
+    assert caught.value.reason == "mismatch"
+    assert caught.value.__cause__ is None

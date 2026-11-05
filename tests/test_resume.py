@@ -359,3 +359,45 @@ def test_messages_carry_no_content_or_path() -> None:
         assert "Avery" not in message
     with pytest.raises(ValueError, match="unknown resume error reason"):
         resume.ResumeError("made up")
+
+
+def test_a_file_that_grows_after_fstat_is_still_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(resume, "MAX_FILE_BYTES", 1024)
+    path = tmp_path / "growing.pdf"
+    path.write_bytes(b"%PDF-" + b"0" * 2048)
+    real = resume.os.fstat
+
+    def small(fd: int) -> object:
+        info = real(fd)
+
+        class Shrunk:
+            st_mode = info.st_mode
+            st_size = 10
+
+        return Shrunk()
+
+    monkeypatch.setattr(resume.os, "fstat", small)
+    with pytest.raises(resume.ResumeError) as caught:
+        resume.read_file(path)
+    assert caught.value.reason == "too_large"
+
+
+@pytest.mark.parametrize("where", ["pages", "extract"])
+def test_pypdf_failing_after_the_header_is_a_fixed_error(
+    monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    def broken(*_args: object, **_kwargs: object) -> str:
+        raise KeyError("/Contents")
+
+    if where == "pages":
+        monkeypatch.setattr(pypdf.PdfReader, "pages", property(broken))
+    else:
+        monkeypatch.setattr(pypdf.PageObject, "extract_text", broken)
+    _refused(make_pdf([_SAMPLE]), "pdf_unreadable")
+
+
+def test_an_encrypted_docx_entry_is_a_fixed_error() -> None:
+    data = _patched(make_docx(document_xml("<w:p/>")), 8, "<H", 0x1)  # the encrypted flag
+    _refused(data, "docx_zip")
