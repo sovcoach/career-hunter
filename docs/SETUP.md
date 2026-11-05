@@ -169,7 +169,7 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | Target titles, in priority groups | `search.lanes` |
 | Where on-site, hybrid, and remote work is acceptable | `search.location_rules` |
 | How many missing requirements still count | `fit_rubric.gap_tiers` |
-| A resume file inside the data folder, for a similarity line | `search.resume` |
+| Your resume, for scoring and a similarity line (see "Import your resume") | `search.resume: resume/current.txt` |
 | Languages, credentials, shifts, pay, seniority (in the title, or also the description), and a minimum salary | `hard_gates` |
 | A cap on weekend days | `schedule_limits` |
 | Which roles to keep at one company | that company's `role_filters` |
@@ -189,6 +189,27 @@ The templates use placeholder names such as Example Robotics, Example City, and 
 `hard_gates.seniority_words`, `title_exceptions` and `never_gated_families` match whole words of the title, ignoring case: "Lead" matches "Team Lead" and "(Lead)", but not "Leader". List a plural on its own if it should count. `hard_gates.seniority_in_description: true` also checks the description for seniority words; it is false by default, so a junior title whose description mentions senior colleagues is kept. A key under `hard_gates` that career-hunter does not know, such as a misspelled option, is refused when the config is loaded.
 
 One `role_filters` block requires every family, work model, and place it lists. It cannot say "remote, or else Example City." Treating that as an AND would hide roles that should stay. There is no field for that or-rule yet.
+
+### Import your resume
+
+The scorer gives your resume to the local model with each posting, so the gaps it lists are about you, not just about the posting. Import it once, and again whenever it changes:
+
+```bash
+uv run careerhunter resume import path/to/your-resume.pdf
+```
+
+A PDF or a DOCX works. It is read on this Mac, with no network. The text goes to `resume/current.txt` in the data folder (owner-only), and `search.db` keeps only a fingerprint of it (its SHA-256). The command prints the number of characters, never the text. An encrypted PDF, any other kind of file, or a file over 10 MB or 50,000 characters is refused, and nothing is stored.
+
+Then set this in `config.yaml`:
+
+```yaml
+search:
+  resume: resume/current.txt
+```
+
+No other value is accepted. The next watch run re-scores the postings you haven't skipped or applied to. Postings still listed on their board are re-scored with the description the board sends, when it sends one, and the rest from what was stored. That can take a few runs: new postings go first, and each run stops at its time budget. A posting you were already alerted about is re-scored but not sent again.
+
+Don't edit `resume/current.txt` by hand. If it no longer matches what was imported, scoring and embeddings stop using it and `doctor` says so. Run `resume import` again.
 
 ### Refresh the scout prompt
 
@@ -488,9 +509,15 @@ Every date must fall inside your active EI claim, as with `seed`, and future dat
 | `… is before claim 2026-27 started` | A seed date falls outside your claim | Fix the date, or see `--route-out-of-claim-to-search` in Step 8 |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 6, expected 7` | The code was updated and `search.db` hasn't caught up | Stop the services with `uv run careerhunter service uninstall`, run `uv run careerhunter migrate`, then `uv run careerhunter service install` |
+| `search.db BAD schema version 7, expected 8` | The code was updated and `search.db` hasn't caught up | Stop the services with `uv run careerhunter service uninstall`, run `uv run careerhunter migrate`, then `uv run careerhunter service install` |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
+| `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |
+| `resume BAD no resume has been imported` | `search.resume` is set but nothing was imported | Run `uv run careerhunter resume import <file>`, or set `search.resume: null` |
+| `resume BAD search.resume must be resume/current.txt` | `search.resume` names another file | Set it to `resume/current.txt` |
+| `resume WARN left by an interrupted or running import` | An import stopped part-way, or one is running now | Nothing to fix. The next import removes them |
+| `watch: scoring: resume not usable (…)` | The resume can't be used this run, for the reason shown | Run `uv run careerhunter doctor` and fix what it reports. Nothing is scored until then |
+| `watch: scoring: model unreachable; N postings left for the next run` | The local model stopped answering | Start the model server. The next run scores them |
 | `config.yaml BAD … needs an end date` | A claim that isn't active has no `end` | Add its end date, or check `active_claim` for a typo |
 | `WARNING: FileVault is OFF` | The Mac's own disk isn't encrypted | Step 1 |
 | `uv: command not found` | Terminal hasn't picked up uv yet | Close and reopen Terminal, or re-run the Step 3 installer |

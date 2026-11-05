@@ -9,8 +9,9 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+import yaml
 
-from careerhunter import claims, cli, db
+from careerhunter import claims, cli, db, resume
 from careerhunter.claims import Claim
 from tests.conftest import ACTIVE, EARLIER, FIXTURES, FakeProbe, set_claims
 
@@ -38,7 +39,7 @@ def test_a_clean_setup(ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixt
         "config.yaml     OK",
         "exclusions.yaml OK",
         "ei claim        OK  2026-27 active (from 2026-08-05)",
-        "search.db       OK  schema version 7",
+        "search.db       OK  schema version 8",
         "search.db       OK  0600",
         "claim 2026-27   OK  schema version 1",
         "claim 2026-27   OK  active, from 2026-08-05",
@@ -120,7 +121,7 @@ def test_schema_behind_is_reported_not_migrated(
     conn.close()
     code, out = doctor(probe, capsys)
     assert code == cli.EXIT_ERROR
-    assert "search.db       BAD schema version 0, expected 7; run: careerhunter migrate" in out
+    assert "search.db       BAD schema version 0, expected 8; run: careerhunter migrate" in out
     assert "reconcile       --  skipped until the problems above are fixed" in out
     conn = db.connect_read_only(path)
     assert db.schema_version(conn) == 0
@@ -298,3 +299,117 @@ def test_a_missing_timezone_is_a_warning_not_a_failure(
     code, out = doctor(probe, capsys)
     assert code == 0
     assert "timezone        WARN schedule.timezone isn't set, so dates use UTC" in out
+
+
+# --- resume ---------------------------------------------------------------------------------
+
+
+def _import_resume(data: Path, text: str = "Avery Example, coordinator") -> None:
+    conn = db.connect(data / "search.db")
+    try:
+        resume.import_text(data, conn, text, now=lambda: "2026-11-04T12:00:00Z")
+    finally:
+        conn.close()
+
+
+def _set_resume(data: Path, value: str | None) -> None:
+    path = data / "config.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["search"]["resume"] = value
+    path.write_text(yaml.safe_dump(doc))
+
+
+def test_no_resume_is_optional(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "resume          --  not imported (optional: careerhunter resume import)" in out
+
+
+def test_an_imported_resume_in_use_is_ok(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _import_resume(ready)
+    _set_resume(ready, resume.CONFIG_VALUE)
+    code, out = doctor(probe, capsys)
+    assert code == 0, out
+    assert "resume          OK  matches its import" in out
+    assert "Avery" not in out
+
+
+def test_an_imported_resume_not_in_config_is_a_warning(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _import_resume(ready)
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert (
+        f"resume          WARN imported but not used: set search.resume: {resume.CONFIG_VALUE}"
+        in out
+    )
+
+
+def test_search_resume_set_without_an_import_is_bad(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_resume(ready, resume.CONFIG_VALUE)
+    code, out = doctor(probe, capsys)
+    assert code == 1
+    assert "resume          BAD no resume has been imported" in out
+
+
+def test_search_resume_naming_another_file_is_bad(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _import_resume(ready)
+    _set_resume(ready, "resume.txt")
+    code, out = doctor(probe, capsys)
+    assert code == 1
+    assert f"resume          BAD search.resume must be {resume.CONFIG_VALUE}" in out
+
+
+def test_a_file_that_does_not_match_its_import_is_bad(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """For example a COMMIT that failed after the rename, with the restore failing too."""
+    _import_resume(ready)
+    _set_resume(ready, resume.CONFIG_VALUE)
+    current = ready / resume.RESUME_DIR / resume.CURRENT
+    current.write_text("Avery Example, a different text")
+    code, out = doctor(probe, capsys)
+    assert code == 1
+    assert "resume          BAD the resume file does not match its import" in out
+    assert "different text" not in out
+
+
+def test_loose_resume_modes_are_fixed_then_checked(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _import_resume(ready)
+    _set_resume(ready, resume.CONFIG_VALUE)
+    folder = ready / resume.RESUME_DIR
+    os.chmod(folder / resume.CURRENT, 0o644)
+    os.chmod(folder, 0o755)  # noqa: S103 - deliberately too loose
+    code, out = doctor(probe, capsys)
+    assert code == 0, out
+    assert "resume/         FIXED folder -> 0700" in out
+    assert "resume/         FIXED current.txt (0o644) -> owner-only" in out
+    assert "resume          OK  matches its import" in out
+    assert (folder / resume.CURRENT).stat().st_mode & 0o777 == 0o600
+    assert folder.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("name", [resume.PREVIOUS, f"{resume.TMP_PREFIX}abc{resume.TMP_SUFFIX}"])
+def test_import_leftovers_are_a_warning(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    _import_resume(ready)
+    _set_resume(ready, resume.CONFIG_VALUE)
+    leftover = ready / resume.RESUME_DIR / name
+    leftover.write_text("left over")
+    os.chmod(leftover, 0o600)
+    code, out = doctor(probe, capsys)
+    assert code == 0, out
+    assert f"resume          WARN left by an interrupted or running import: {name}" in out
+    assert "resume          OK  matches its import" in out

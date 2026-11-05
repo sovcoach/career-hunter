@@ -297,3 +297,66 @@ def test_scout_metadata_must_be_json(search: sqlite3.Connection) -> None:
             "VALUES (?, 'B', '2026-09-01', 'watcher', 'not json')",
             (c,),
         )
+
+
+# --- 0008: resume_import, scored_resume_sha256, score_attempted_at ------------------------
+
+_HASH = "0123456789abcdef" * 4
+_STAMP = "2026-11-04T12:00:00Z"
+
+
+def test_resume_import_keeps_only_a_hash_and_a_time(search: sqlite3.Connection) -> None:
+    cols = [row["name"] for row in search.execute("PRAGMA table_info(resume_import)")]
+    assert cols == ["id", "sha256", "imported_at"]
+    search.execute("INSERT INTO resume_import (sha256, imported_at) VALUES (?, ?)", (_HASH, _STAMP))
+
+
+@pytest.mark.parametrize(
+    ("sha256", "imported_at"),
+    [
+        (_HASH[:-1], _STAMP),
+        (_HASH.upper(), _STAMP),
+        ("g" + _HASH[1:], _STAMP),
+        (_HASH, "2026-11-04 12:00:00"),
+        (_HASH, "2026-11-04T12:00:00+00:00"),
+        (None, _STAMP),
+        (_HASH, None),
+    ],
+)
+def test_resume_import_checks(
+    search: sqlite3.Connection, sha256: str | None, imported_at: str | None
+) -> None:
+    with pytest.raises(sqlite3.IntegrityError):
+        search.execute(
+            "INSERT INTO resume_import (sha256, imported_at) VALUES (?, ?)",
+            (sha256, imported_at),
+        )
+
+
+def test_new_posting_columns_start_null(search: sqlite3.Connection) -> None:
+    p = _posting(search, _company(search))
+    row = search.execute(
+        "SELECT scored_resume_sha256, score_attempted_at FROM postings WHERE id = ?", (p,)
+    ).fetchone()
+    assert tuple(row) == (None, None)
+    search.execute(
+        "UPDATE postings SET scored_resume_sha256 = ?, score_attempted_at = ? WHERE id = ?",
+        (_HASH, _STAMP, p),
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("scored_resume_sha256", "abc"),
+        ("scored_resume_sha256", _HASH.upper()),
+        ("score_attempted_at", "yesterday"),
+        ("score_attempted_at", "2026-11-04T12:00:00"),
+    ],
+)
+def test_new_posting_columns_are_checked(
+    search: sqlite3.Connection, column: str, value: str
+) -> None:
+    p = _posting(search, _company(search))
+    with pytest.raises(sqlite3.IntegrityError):
+        search.execute(f"UPDATE postings SET {column} = ? WHERE id = ?", (value, p))  # noqa: S608

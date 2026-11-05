@@ -56,7 +56,7 @@ Tests never need a real data folder or Keychain: the storage guard and Keychain 
 | `make check` | Lint, types, tests with coverage, and all pre-commit hooks. CI also runs the supply-chain checks below |
 | `make verify-tree` | Every hook and gitleaks over every file, **untracked ones included**. `make check` uses `pre-commit run --all-files`, which only sees tracked files, and the gitleaks hook only scans staged changes (ADR-013), so run this before committing new files |
 | `make hooks` | Reinstall the git hooks, the pre-push guard and `push.default=current` |
-| `make check-lock-age` | Every version in `uv.lock` was at least 14 days old when it was locked, unless it is a listed security fix (ADR-006) |
+| `make check-lock-age` | Every version in `uv.lock` was at least 14 days old when it was locked, unless it is a listed security fix (ADR-006). The mypy pre-commit hook pins `pypdf==6.21.4` in its own environment; move that pin with `uv.lock` whenever pypdf is upgraded |
 | `make check-history BASE=origin/main` | No local `/Volumes/` or `/Users/` path in the commits since `BASE`, other than the allowed placeholders |
 
 ## Supply-chain checks

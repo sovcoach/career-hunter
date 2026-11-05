@@ -38,8 +38,9 @@ search:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here
     remote: [Canada]                    # fully remote only within these regions
     allow_travel_outside: false         # refuse roles needing office days elsewhere
-  # Optional file inside the data folder. Null skips embeddings. An absolute path,
-  # or any ".." segment, is invalid. The real path stays in your own config.
+  # Optional. After `careerhunter resume import <file>`, set this to
+  # resume/current.txt (no other value is used) so scoring and embeddings read your
+  # resume. Null leaves the resume out of scoring and skips embeddings.
   resume: null
 
 # Hard gates: a posting failing any of these is skipped, with the reason recorded.

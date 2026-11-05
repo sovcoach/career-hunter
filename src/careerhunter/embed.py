@@ -6,7 +6,9 @@ ad and wrong for a model on this Mac. This client allows only `http` to `127.0.0
 the model id are constants, not config fields.
 
 A cosine is stored beside the LLM tier. It does not cause a skip, and
-`fit_rubric.embedding_weight` is not read. A missing resume file, a down server, or a
+`fit_rubric.embedding_weight` is not read. The resume is read only through
+`resume.load`: the imported resume/current.txt, checked against its recorded hash. A
+resume that is not imported, missing, or changed since its import, a down server, or a
 different dimension leaves that posting's cosine null. The watch log records the
 posting id and a reason, and nothing else.
 """
@@ -14,7 +16,6 @@ posting id and a reason, and nothing else.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import http.client
 import json
 import math
@@ -24,7 +25,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from careerhunter import db, loopback, search_store
+from careerhunter import db, loopback, resume, search_store
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
 from careerhunter.score import ScoreError, Transport, require_loopback
@@ -164,11 +165,11 @@ class Embedder:
         if not self._enabled():
             return []
         try:
-            resume = self._resume_vector()
+            own = self._resume_vector()
         except EmbedError as exc:
             self._failed = exc.reason
             return self._clear_stored(exc.reason)
-        return self._recompute(resume)
+        return self._recompute(own)
 
     def attach(self, posting_id: int, posting: PostingText) -> str | None:
         """Store this posting's cosine. Returns a reason when the cosine stays null."""
@@ -177,12 +178,12 @@ class Embedder:
         if self._failed is not None:
             return self._miss(posting_id, self._failed)
         try:
-            resume = self._resume_vector()
+            own = self._resume_vector()
         except EmbedError as exc:
             self._failed = exc.reason
             return self._miss(posting_id, exc.reason)
         try:
-            return self._store(posting_id, posting, resume)
+            return self._store(posting_id, posting, own)
         except EmbedError as exc:
             if exc.down:  # the server, not this reply: nothing more is sent this run
                 self._failed = exc.reason
@@ -193,47 +194,18 @@ class Embedder:
         return self._enabled()
 
     def _enabled(self) -> bool:
-        if self.data_dir is None:
-            return False
-        search = self.config.get("search")
-        if not isinstance(search, Mapping):
-            return False
-        resume = search.get("resume")
-        return isinstance(resume, str) and bool(resume.strip())
-
-    def _resume_file(self) -> Path:
-        if self.data_dir is None:
-            raise EmbedError("no-resume")
-        search = self.config.get("search")
-        raw = search.get("resume") if isinstance(search, Mapping) else None
-        if not isinstance(raw, str) or not raw.strip():
-            raise EmbedError("no-resume")
-        relative = Path(raw.strip())
-        if relative.is_absolute() or ".." in relative.parts:
-            raise EmbedError("no-resume")
-        root = self.data_dir.resolve()
-        full = (root / relative).resolve()
-        if full != root and root not in full.parents:
-            raise EmbedError("no-resume")
-        if not full.is_file():
-            raise EmbedError("no-resume")
-        return full
+        return self.data_dir is not None and resume.configured(self.config)
 
     def _resume_vector(self) -> tuple[str, int, list[float]]:
-        path = self._resume_file()
-        try:
-            raw = path.read_bytes()
-        except OSError:
-            raise EmbedError("no-resume") from None
-        if not raw:
+        if self.data_dir is None:
             raise EmbedError("no-resume")
         try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
+            loaded = resume.load(self.data_dir, self.conn, self.config)
+        except resume.ResumeError:
             raise EmbedError("no-resume") from None
-        if not text.strip():
+        if loaded is None:
             raise EmbedError("no-resume")
-        digest = hashlib.sha256(raw).hexdigest()
+        text, digest = loaded.text, loaded.sha256
         if self._cached is not None and self._cached[0] == digest:
             return self._cached
         stored = search_store.resume_embedding(self.conn)
@@ -259,9 +231,9 @@ class Embedder:
         self,
         posting_id: int,
         posting: PostingText,
-        resume: tuple[str, int, list[float]],
+        own: tuple[str, int, list[float]],
     ) -> str | None:
-        _digest, dim, resume_vec = resume
+        _digest, dim, resume_vec = own
         stored = search_store.posting_embedding(self.conn, posting_id)
         if stored is None:
             values = embed_text(posting_text(posting), url=self.url, transport=self.transport)
@@ -296,8 +268,8 @@ class Embedder:
             search_store.set_embedding_score(self.conn, posting_id, score)
         return None
 
-    def _recompute(self, resume: tuple[str, int, list[float]]) -> list[str]:
-        _digest, dim, resume_vec = resume
+    def _recompute(self, own: tuple[str, int, list[float]]) -> list[str]:
+        _digest, dim, resume_vec = own
         lines: list[str] = []
         updates: list[tuple[int, float | None]] = []
         for posting_id, pdim, blob in search_store.posting_embeddings(self.conn):

@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "PyYAML>=6.0.2",
     "keyring>=25.6",
+    "pypdf>=6.21.4",
     "reportlab>=4.4",
     "truststore>=0.10",
 ]
@@ -28,8 +29,10 @@ dev = [
 # ADR-006: uv lock may only pick releases uploaded before this cutoff. Move it forward
 # deliberately at each re-lock, to at most 14 days before the re-lock commit.
 exclude-newer = "2026-10-17T17:31:54Z"
-# A single version the cutoff would keep that breaks the rule and fixes no advisory.
-exclude-newer-package = { ast-serialize = "2026-10-16T00:00:00Z" }
+# Per-package cutoffs. ast-serialize: a single version the global cutoff would keep that
+# breaks the rule and fixes no advisory. pypdf: moved past the global cutoff to reach
+# 6.21.4, a listed security fix in scripts/lock_age_allowlist.toml.
+exclude-newer-package = { ast-serialize = "2026-10-16T00:00:00Z", pypdf = "2026-10-29T00:00:00Z" }
 
 [build-system]
 requires = ["hatchling>=1.27"]

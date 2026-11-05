@@ -5,12 +5,23 @@ ad and wrong for a model on this Mac. This client allows only `http` to `127.0.0
 `localhost` or `::1`, follows no redirects, and refuses any other host. The URL is a
 constant, not a config field.
 
-The prompt is built from lanes, location rules, hard gates and `gap_tiers`, plus the
-posting fields. The model lists gaps. This module applies `gap_tiers` and stores the
-tier name. `fit_rating` is left null. There is no mapping onto 0-10.
+The prompt is built from lanes, location rules, hard gates and `gap_tiers`, the
+posting fields, and the resume when one is in use. The model lists gaps. This module
+applies `gap_tiers` and stores the tier name. `fit_rating` is left null. There is no
+mapping onto 0-10.
 
-A down server, a redirect, a broken reply, or a reply that does not parse leaves the
-posting unscored.
+Two kinds of failure are told apart. A server that cannot be reached, a timeout, a
+refused URL, or any HTTP status other than 200 (a redirect included) raises
+ScoreError: the model is not answering, and the caller stops asking it for the rest of
+the run. A 200 whose reply does not parse returns None: that posting stays unscored
+and is tried again on a later run.
+
+While a resume is in use (D-A1), the stored model text is canonical JSON of the parsed
+gaps, never the reply itself. A reply is also treated as one that does not parse when
+a gap name or type is longer than 120 characters, or when 40 characters in a row of a
+gap name or type also appear in the resume. Both sides are compared after NFKC, case
+folding, and turning every run of whitespace into one space. A copied run shorter than
+40 characters is not caught.
 """
 
 from __future__ import annotations
@@ -18,6 +29,7 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import unicodedata
 import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -26,6 +38,7 @@ from typing import Any
 from careerhunter import loopback
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
+from careerhunter.resume import Resume
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/chat/completions"
 MODEL_NAME = "local-model"
@@ -35,6 +48,9 @@ TOTAL = 120.0
 TIMEOUT = TOTAL
 MAX_OUTPUT = 20_000
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
+MAX_GAP_TEXT = 120
+COPY_RUN = 40
+_SPACES = re.compile(r"\s+")
 _FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 _GATE_KEYS = (
     "min_salary",
@@ -52,7 +68,10 @@ Transport = Callable[[str, bytes], tuple[int, bytes]]
 
 
 class ScoreError(Exception):
-    """The local model URL is not loopback, or the server could not be reached."""
+    """The model did not answer: a refused URL, no connection, a timeout, or not HTTP 200.
+
+    The message is fixed; it never carries the request or the reply.
+    """
 
 
 @dataclass(frozen=True)
@@ -63,6 +82,7 @@ class Score:
     gaps: str
     tier: str | None
     excluded: bool = False
+    resume_sha256: str | None = None  # the resume this score was made with
 
 
 @dataclass(frozen=True)
@@ -117,39 +137,81 @@ def score_posting(
     *,
     url: str = DEFAULT_URL,
     transport: Transport | None = None,
+    resume: Resume | None = None,
 ) -> Score | None:
-    """The score, or None when the model is down or the reply does not parse.
+    """The score, or None when the reply does not parse.
 
-    None leaves the posting unscored. The caller does not alert it.
+    Raises ScoreError when the model does not answer. None leaves the posting unscored.
+    The caller does not alert it.
     """
     rubric = _rubric(config)
     if rubric is None:
         return None
     send = default_transport if transport is None else transport
+    require_loopback(url)
     try:
-        require_loopback(url)
-        status, body = send(url, _request_body(posting, config))
+        status, body = send(url, _request_body(posting, config, resume))
     except (ScoreError, OSError, http.client.HTTPException):
-        return None
-    content = _content(status, body)
+        raise ScoreError("the local model could not be reached") from None
+    if status != 200:
+        raise ScoreError(f"the local model answered HTTP {int(status)}")
+    content = _content(body)
     if content is None:
         return None
     parsed = _parse_gaps(content)
     if parsed is None:
         return None
+    if resume is not None and _copies_resume(parsed, resume.text):
+        return None
     counted, tier, excluded = _apply_tiers(parsed, rubric)
     if tier is None and not excluded:
         return None
+    # D-A1: with a resume in the prompt, the reply itself is never stored.
+    stored = content[:MAX_OUTPUT] if resume is None else canonical_gaps(parsed)
     return Score(
-        llm_output=content[:MAX_OUTPUT],
+        llm_output=stored,
         gaps=json.dumps([_gap_dict(gap) for gap in counted], separators=(",", ":")),
         tier=tier,
         excluded=excluded,
+        resume_sha256=None if resume is None else resume.sha256,
     )
 
 
-def _request_body(posting: PostingText, config: Mapping[str, Any]) -> bytes:
-    view = {
+def canonical_gaps(gaps: list[_Gap]) -> str:
+    """The parsed gaps as canonical JSON: sorted keys, compact, UTF-8 text kept as is."""
+    return json.dumps(
+        {"gaps": [_gap_dict(gap) for gap in gaps]},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def normalized(text: str) -> str:
+    """NFKC, case-folded, every run of whitespace one space, stripped (D-A1)."""
+    return _SPACES.sub(" ", unicodedata.normalize("NFKC", text).casefold()).strip()
+
+
+def _copies_resume(gaps: list[_Gap], resume_text: str) -> bool:
+    """True when a gap is too long, or repeats COPY_RUN characters of the resume."""
+    haystack = normalized(resume_text)
+    for gap in gaps:
+        for field in (gap.name, gap.type):
+            if field is None:
+                continue
+            if len(field) > MAX_GAP_TEXT:
+                return True
+            needle = normalized(field)
+            for start in range(len(needle) - COPY_RUN + 1):
+                if needle[start : start + COPY_RUN] in haystack:
+                    return True
+    return False
+
+
+def _request_body(
+    posting: PostingText, config: Mapping[str, Any], resume: Resume | None = None
+) -> bytes:
+    view: dict[str, Any] = {
         "lanes": _section(config, "search", "lanes"),
         "location_rules": _section(config, "search", "location_rules"),
         "hard_gates": _gates(config),
@@ -162,6 +224,8 @@ def _request_body(posting: PostingText, config: Mapping[str, Any]) -> bytes:
             "description": posting.description,
         },
     }
+    if resume is not None:
+        view["resume"] = resume.text
     payload = {
         "model": MODEL_NAME,
         "temperature": 0,
@@ -197,9 +261,7 @@ def _rubric(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return None
 
 
-def _content(status: int, body: bytes) -> str | None:
-    if status != 200:
-        return None
+def _content(body: bytes) -> str | None:
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
