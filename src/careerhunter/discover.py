@@ -4,6 +4,13 @@ The client is not `fetch.py`. It allows only plain http to a loopback host, foll
 no redirects, and reads result URLs only. Titles, snippets, and the response body are
 not stored. A down server yields one closed miss line and writes nothing.
 
+Etiquette (#40). Queries of one pass are `discovery.query_delay_seconds` apart. An
+HTTP 429 from SearXNG, or an engine SearXNG reports as unresponsive for a CAPTCHA or
+too many requests, stops the pass at once with a closed line. A stopped pass and a
+miss both write no queue row, leave the cursor where it was, and count as a failed
+pass: the next pass waits `discovery.interval_minutes` times 2 to the number of failed
+passes in a row, at most BACKOFF_CAP, and a pass that succeeds clears the count.
+
 Approve and reject update this queue, and a board approval can fill a company row.
 They do not rewrite config files or open an EI record. The bot may call them.
 Sending the message is separate: `notified_at` is set only after Telegram accepts it.
@@ -11,22 +18,33 @@ Sending the message is separate: `notified_at` is set only after Telegram accept
 
 from __future__ import annotations
 
+import datetime as dt
 import http.client
 import json
 import re
 import sqlite3
+import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from careerhunter import db, loopback, search_store
-from careerhunter.config import discovery_queries_per_run
+from careerhunter.config import (
+    discovery_interval_minutes,
+    discovery_queries_per_run,
+    discovery_query_delay_seconds,
+)
 from careerhunter.deadline import Deadline
 
 MAX_BODY = 1_048_576
 MISS = "discovery miss: unreachable"
 OFF = "discovery off"
+THROTTLED = "discovery stopped: rate limited or asked for a CAPTCHA"
+BACKOFF_CAP = dt.timedelta(days=7)
+# Engine errors in SearXNG's `unresponsive_engines` that mean "slow down". The English
+# texts from searx/webutils.py; a suspended engine's text starts with "Suspended: ".
+_THROTTLE_WORDS = ("captcha", "too many requests")
 _TOTAL = 30.0
 _TIMEOUT = 20.0
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -285,37 +303,56 @@ def reject(conn: sqlite3.Connection, candidate_id: int) -> Queued:
     return _queued(row)
 
 
+def _utc_now() -> dt.datetime:
+    """The wall clock. Looked up at each call, so tests can replace it."""
+    return dt.datetime.now(dt.UTC)
+
+
+def _sleep(seconds: float) -> None:
+    """The pause between queries. Looked up at each call, so tests can replace it."""
+    time.sleep(seconds)
+
+
 def run(
     conn: sqlite3.Connection,
     config: Mapping[str, Any],
     *,
     today: str,
     transport: Transport | None = None,
+    sleep: Callable[[float], None] | None = None,
+    now: Callable[[], dt.datetime] | None = None,
 ) -> Outcome:
-    """Search, then insert new pending rows. A miss writes nothing."""
+    """Search, then insert new pending rows. A miss or a stop writes nothing.
+
+    A pass inside a backoff sends nothing and says until when. `sleep` waits between
+    queries; `now` stamps the backoff. Both default to the module's own, looked up at
+    each call.
+    """
+    clock = now or _utc_now
     base = _configured_url(config)
     if base is None:
         return Outcome(OFF, ())
+    waiting = _backoff_until(conn)
+    if waiting is not None and _stamp(clock()) < waiting:
+        return Outcome(f"discovery backing off until {waiting}", ())
     every = build_queries(config)
     if not every:
         return Outcome(None, ())
     queries, after = take(every, _cursor(conn), discovery_queries_per_run(config))
     talk = transport or default_transport
     career_hosts = _career_hosts(config)
+    delay = discovery_query_delay_seconds(config)
     hits: list[Hit] = []
     seen: set[tuple[str, ...]] = set()
-    for query in queries:
-        try:
-            target = request_url(base, query)
-            status, body = talk(target)
-        except (DiscoverError, OSError, http.client.HTTPException):
-            return Outcome(MISS, ())
-        if status != 200 or len(body) > MAX_BODY:
-            return Outcome(MISS, ())
-        urls = _result_urls(body)
-        if urls is None:
-            return Outcome(MISS, ())
-        for raw in urls:
+    pause = sleep or _sleep
+    for index, query in enumerate(queries):
+        if index:
+            pause(delay)
+        answer = _ask(talk, base, query)
+        if isinstance(answer, str):
+            _record_failure(conn, config, clock())
+            return Outcome(answer, ())
+        for raw in answer:
             hit = classify(raw, career_hosts)
             if hit is None:
                 continue
@@ -327,6 +364,72 @@ def run(
     # The queue rows and the moved cursor go in one transaction: a miss moves neither,
     # so the same queries are asked again next time.
     return Outcome(None, tuple(_store(conn, config, hits, today, career_hosts, cursor=after)))
+
+
+def _ask(talk: Transport, base: str, query: str) -> list[str] | str:
+    """One query's result URLs, or the closed line that ends the pass.
+
+    A transport failure, another status or a reply that is not a result list is a miss;
+    HTTP 429 or an engine throttled is a stop.
+    """
+    try:
+        status, body = talk(request_url(base, query))
+    except (DiscoverError, OSError, http.client.HTTPException):
+        return MISS
+    if status == 429:
+        return THROTTLED
+    if status != 200 or len(body) > MAX_BODY:
+        return MISS
+    if _throttled(body):
+        return THROTTLED
+    urls = _result_urls(body)
+    return MISS if urls is None else urls
+
+
+def _throttled(body: bytes) -> bool:
+    """Whether SearXNG reports an engine that hit a CAPTCHA or too many requests.
+
+    `unresponsive_engines` is a list of [engine, error text] pairs.
+    """
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    engines = payload.get("unresponsive_engines") if isinstance(payload, dict) else None
+    for pair in engines if isinstance(engines, list) else []:
+        if isinstance(pair, list) and len(pair) == 2 and isinstance(pair[1], str):
+            text = pair[1].casefold()
+            if any(word in text for word in _THROTTLE_WORDS):
+                return True
+    return False
+
+
+def _stamp(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _backoff_until(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute("SELECT backoff_until FROM discovery_state WHERE id = 1").fetchone()
+    return None if row is None or row[0] is None else str(row[0])
+
+
+def backoff_for(failures: int, interval_minutes: int) -> dt.timedelta:
+    """The wait after `failures` failed passes in a row: the interval doubled each time."""
+    wait: dt.timedelta = dt.timedelta(minutes=interval_minutes) * (2 ** min(failures, 16))
+    return wait if wait < BACKOFF_CAP else BACKOFF_CAP
+
+
+def _record_failure(
+    conn: sqlite3.Connection, config: Mapping[str, Any], moment: dt.datetime
+) -> None:
+    with db.transaction(conn):
+        row = conn.execute("SELECT failures FROM discovery_state WHERE id = 1").fetchone()
+        failures = (0 if row is None else int(row[0])) + 1
+        until = moment + backoff_for(failures, discovery_interval_minutes(dict(config)))
+        conn.execute(
+            "UPDATE discovery_state SET failures = ?, backoff_until = ? WHERE id = 1",
+            (failures, _stamp(until)),
+        )
 
 
 def _cursor(conn: sqlite3.Connection) -> int:
@@ -569,8 +672,12 @@ def _store(
     }
     stored: list[Queued] = []
     with db.transaction(conn):
-        if cursor is not None:
-            conn.execute("UPDATE discovery_state SET cursor = ? WHERE id = 1", (cursor,))
+        if cursor is not None:  # a pass that succeeded: move on and clear any backoff
+            conn.execute(
+                "UPDATE discovery_state SET cursor = ?, failures = 0, backoff_until = NULL "
+                "WHERE id = 1",
+                (cursor,),
+            )
         for hit in hits:
             if hit.kind == "board":
                 if hit.ats_type is None or hit.ats_slug is None:

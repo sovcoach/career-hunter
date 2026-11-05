@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import http.client
 import inspect
 import json
@@ -153,6 +154,8 @@ def test_a_miss_leaves_the_cursor_where_it_was(tmp_path: Path) -> None:
     ok = _Talk(json.dumps({"results": []}).encode())
     discover.run(conn, config, today="2026-11-02", transport=ok)
     discover.run(conn, config, today="2026-11-02", transport=_Talk(b"", status=0, fail_at=2))
+    assert conn.execute("SELECT cursor FROM discovery_state").fetchone()[0] == 2
+    _clear_backoff(conn)
     again = _Talk(json.dumps({"results": []}).encode())
     discover.run(conn, config, today="2026-11-02", transport=again)
     first = [c for c in ok.calls]
@@ -232,13 +235,16 @@ def test_a_miss_writes_nothing(tmp_path: Path) -> None:
     outcome = discover.run(conn, config, today="2026-11-02", transport=down)
     assert outcome.notice == discover.MISS
     assert outcome.rows == ()
+    _clear_backoff(conn)
     bad = _Talk(b"<html>", status=200)
     outcome = discover.run(conn, config, today="2026-11-02", transport=bad)
     assert outcome.notice == discover.MISS
+    _clear_backoff(conn)
     partial = _Talk(_body(["https://jobs.lever.co/freshlogistics/post-1"]), fail_at=3, status=500)
     outcome = discover.run(conn, config, today="2026-11-02", transport=partial)
     assert outcome.notice == discover.MISS
     assert partial.calls
+    _clear_backoff(conn)
     huge = _Talk(b"x" * (discover.MAX_BODY + 1))
     outcome = discover.run(conn, config, today="2026-11-02", transport=huge)
     assert outcome.notice == discover.MISS
@@ -703,6 +709,10 @@ _SEARCH = {
 _GOOD = "https://job-boards.greenhouse.io/newrobotics/jobs/42"
 
 
+def _clear_backoff(conn: sqlite3.Connection) -> None:
+    conn.execute("UPDATE discovery_state SET failures = 0, backoff_until = NULL")
+
+
 def _rows(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT count(*) FROM discovery_candidates").fetchone()
     assert row is not None
@@ -1143,3 +1153,153 @@ def test_approving_a_board_whose_stored_site_differs_is_refused(tmp_path: Path) 
     with pytest.raises(discover.DiscoverError, match="disagrees"):
         discover.approve(conn, queued.id)
     conn.close()
+
+
+# --- etiquette: spacing, backoff and stop signals (#40) --------------------------------
+
+_ETIQUETTE = {
+    "discovery": {
+        "searxng_url": "http://127.0.0.1:8888/search",
+        "queries_per_run": 3,
+        "query_delay_seconds": 7,
+        "interval_minutes": 60,
+    },
+    "search": {"target_titles": ["One"]},
+}
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.moment = dt.datetime(2026, 11, 2, 9, 0, tzinfo=dt.UTC)
+
+    def __call__(self) -> dt.datetime:
+        return self.moment
+
+    def advance(self, **delta: float) -> None:
+        self.moment += dt.timedelta(**delta)
+
+
+def _empty() -> _Talk:
+    return _Talk(json.dumps({"results": []}).encode())
+
+
+def _state(conn: sqlite3.Connection) -> tuple[object, ...]:
+    row = conn.execute("SELECT cursor, failures, backoff_until FROM discovery_state").fetchone()
+    return tuple(row)
+
+
+def test_queries_are_spaced_by_the_configured_delay(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    pauses: list[float] = []
+    talk = _empty()
+    discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk, sleep=pauses.append)
+    assert len(talk.calls) == 3
+    assert pauses == [7, 7]  # between queries, not before the first or after the last
+    conn.close()
+
+
+def test_failed_passes_back_off_exponentially_and_a_success_clears_it(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    clock = _Clock()
+    down = _Talk(b"", status=0, fail_at=1)
+    run = {"today": "2026-11-02", "now": clock}
+    assert discover.run(conn, _ETIQUETTE, transport=down, **run).notice == discover.MISS
+    assert _state(conn) == (0, 1, "2026-11-02T11:00:00Z")  # 60 minutes times 2
+    clock.advance(minutes=119)
+    waiting = _empty()
+    outcome = discover.run(conn, _ETIQUETTE, transport=waiting, **run)
+    assert outcome == discover.Outcome("discovery backing off until 2026-11-02T11:00:00Z", ())
+    assert waiting.calls == []
+    clock.advance(minutes=1)
+    assert discover.run(conn, _ETIQUETTE, transport=down, **run).notice == discover.MISS
+    assert _state(conn) == (0, 2, "2026-11-02T15:00:00Z")  # 60 times 4, from 11:00
+    clock.advance(hours=4)
+    assert discover.run(conn, _ETIQUETTE, transport=_empty(), **run).notice is None
+    assert _state(conn) == (3, 0, None)
+    conn.close()
+
+
+def test_the_backoff_is_capped_at_seven_days() -> None:
+    assert discover.backoff_for(1, 60) == dt.timedelta(hours=2)
+    assert discover.backoff_for(3, 1440) == dt.timedelta(days=7)
+    assert discover.backoff_for(99, 60) == dt.timedelta(days=7)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param((429, b""), id="http-429"),
+        pytest.param(
+            (
+                200,
+                json.dumps(
+                    {
+                        "results": [{"url": _GOOD}],
+                        "unresponsive_engines": [["example engine", "CAPTCHA"]],
+                    }
+                ).encode(),
+            ),
+            id="captcha",
+        ),
+        pytest.param(
+            (
+                200,
+                json.dumps(
+                    {
+                        "results": [],
+                        "unresponsive_engines": [["example engine", "too many requests"]],
+                    }
+                ).encode(),
+            ),
+            id="too-many-requests",
+        ),
+        pytest.param(
+            (
+                200,
+                json.dumps(
+                    {
+                        "results": [],
+                        "unresponsive_engines": [["example engine", "Suspended: CAPTCHA"]],
+                    }
+                ).encode(),
+            ),
+            id="suspended-captcha",
+        ),
+    ],
+)
+def test_a_429_or_a_captcha_stops_the_pass_and_starts_the_backoff(
+    tmp_path: Path, reply: tuple[int, bytes]
+) -> None:
+    conn = _search_db(tmp_path)
+    calls: list[str] = []
+
+    def talk(url: str) -> tuple[int, bytes]:
+        calls.append(url)
+        return reply
+
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk)
+    assert outcome == discover.Outcome(discover.THROTTLED, ())
+    assert len(calls) == 1  # stopped at once
+    assert _rows(conn) == 0
+    assert _state(conn)[:2] == (0, 1)
+    conn.close()
+
+
+def test_another_engine_error_is_not_a_stop(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    body = json.dumps(
+        {"results": [{"url": _GOOD}], "unresponsive_engines": [["example engine", "timeout"]]}
+    ).encode()
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=_Talk(body))
+    assert outcome.notice is None
+    assert _rows(conn) == 1
+    conn.close()
+
+
+@pytest.mark.parametrize("value", [1, 31, "5", True])
+def test_the_query_delay_is_checked(value: object) -> None:
+    from careerhunter.config import discovery_query_delay_seconds, validate_config
+
+    doc = {"discovery": {"query_delay_seconds": value}}
+    assert any("discovery.query_delay_seconds" in p for p in validate_config(doc))
+    assert discovery_query_delay_seconds(doc) == 5

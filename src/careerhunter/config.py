@@ -69,6 +69,9 @@ MIN_DISCOVERY_INTERVAL_MINUTES = 60
 # discovery.queries_per_run: how many queries one pass sends (#40).
 DEFAULT_QUERIES_PER_RUN = 12
 QUERIES_PER_RUN_LIMITS = (1, 40)
+# discovery.query_delay_seconds: the pause between two queries of one pass.
+DEFAULT_QUERY_DELAY_SECONDS = 5
+QUERY_DELAY_LIMITS = (2, 30)
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 DEFAULT_OFF_LANE_MIN_FIT = "high"
 DEFAULT_MAX_POSTING_AGE_DAYS = 7
@@ -199,6 +202,7 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
         "career_hosts",
         "interval_minutes",
         "queries_per_run",
+        "query_delay_seconds",
     }
     if extra:
         problems.append(f"discovery has unknown keys: {sorted(extra)}")
@@ -215,6 +219,14 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
         problems.append(
             f"discovery.queries_per_run must be an integer from {low} to {high} "
             f"(default {DEFAULT_QUERIES_PER_RUN})"
+        )
+    low, high = QUERY_DELAY_LIMITS
+    if not _int(value := section.get("query_delay_seconds", DEFAULT_QUERY_DELAY_SECONDS)) or not (
+        low <= value <= high
+    ):
+        problems.append(
+            f"discovery.query_delay_seconds must be an integer from {low} to {high} "
+            f"(default {DEFAULT_QUERY_DELAY_SECONDS})"
         )
 
 
@@ -627,6 +639,14 @@ def discovery_queries_per_run(doc: Mapping[str, Any] | None) -> int:
     value = section.get("queries_per_run") if isinstance(section, Mapping) else None
     low, high = QUERIES_PER_RUN_LIMITS
     return value if _int(value) and low <= value <= high else DEFAULT_QUERIES_PER_RUN
+
+
+def discovery_query_delay_seconds(doc: Mapping[str, Any] | None) -> int:
+    """Seconds between two discovery queries. 5 when it is not set."""
+    section = doc.get("discovery") if isinstance(doc, Mapping) else None
+    value = section.get("query_delay_seconds") if isinstance(section, Mapping) else None
+    low, high = QUERY_DELAY_LIMITS
+    return value if _int(value) and low <= value <= high else DEFAULT_QUERY_DELAY_SECONDS
 
 
 def max_posting_age_days(doc: Mapping[str, Any] | None) -> int:

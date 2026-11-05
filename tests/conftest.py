@@ -294,3 +294,15 @@ def loopback_watchdog(monkeypatch: pytest.MonkeyPatch) -> Any:
     watchdog = ManualWatchdog()
     monkeypatch.setattr(loopback, "_timer", watchdog)
     return watchdog
+
+
+@pytest.fixture(autouse=True)
+def no_discovery_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """No test waits between discovery queries; the pauses are recorded instead."""
+    from careerhunter import discover
+
+    pauses: list[float] = []
+    monkeypatch.setattr(discover, "_sleep", pauses.append)
+    # A fixed wall clock for the discovery backoff, so no test depends on today.
+    monkeypatch.setattr(discover, "_utc_now", lambda: dt.datetime(2026, 11, 2, 9, tzinfo=dt.UTC))
+    return pauses
