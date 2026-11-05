@@ -22,6 +22,8 @@ ATS_TYPES = (
     "other",
 )
 WORK_MODELS = ("onsite", "hybrid", "remote")
+# A gap tier's fit, best last. Sorting by FIT_LEVELS.index puts high above low.
+FIT_LEVELS = ("low", "medium", "high")
 DATE_PRECISIONS = ("exact", "week", "unknown")
 METHODS = (
     "company_site",
