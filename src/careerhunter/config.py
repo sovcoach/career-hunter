@@ -24,7 +24,9 @@ LaunchAgent runs, default 60 and at least 15.
   with title exceptions;
 - schedule_limits: a cap on weekend work, flagged rather than excluded;
 - watchlist role filters and an agency flag;
-- exclusions: role-level exclusions and "exclude roles already applied to".
+- exclusions: role-level exclusions and "exclude roles already applied to";
+- alerts.max_per_poll: the per-poll cap on watcher alerts, an integer from 1 to 50,
+  default 10.
 
 With lanes present, search.target_titles becomes optional; with gap_tiers present, the
 fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
@@ -66,6 +68,8 @@ DEFAULT_DISCOVERY_INTERVAL_MINUTES = 1440
 MIN_DISCOVERY_INTERVAL_MINUTES = 60
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 DEFAULT_OFF_LANE_MIN_FIT = "high"
+DEFAULT_MAX_PER_POLL = 10
+MAX_PER_POLL_LIMIT = 50
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _CAREER_HOST = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -372,6 +376,23 @@ def _validate_watchlist_item(item: dict[str, Any], where: str, problems: list[st
             _work_models(filters["work_models"], f"{where}.role_filters.work_models", problems)
 
 
+def _validate_alerts(section: Any, problems: list[str]) -> None:
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        problems.append("alerts must be a mapping")
+        return
+    extra = set(section) - {"max_per_poll"}
+    if extra:
+        problems.append(f"alerts has unknown keys: {sorted(extra)}")
+    value = section.get("max_per_poll")
+    if value is not None and (not _int(value) or not 1 <= value <= MAX_PER_POLL_LIMIT):
+        problems.append(
+            f"alerts.max_per_poll must be an integer from 1 to {MAX_PER_POLL_LIMIT} "
+            f"(default {DEFAULT_MAX_PER_POLL})"
+        )
+
+
 def _validate_telegram(section: Any, problems: list[str]) -> None:
     if section is None:
         return
@@ -482,6 +503,7 @@ def validate_config(doc: Any) -> list[str]:
             _validate_watchlist_item(item, where, problems)
 
     _validate_telegram(doc.get("telegram"), problems)
+    _validate_alerts(doc.get("alerts"), problems)
     _validate_discovery(doc.get("discovery"), problems)
     problems.extend(validate_section(doc.get("ei")))
     return problems
@@ -540,6 +562,15 @@ def telegram_chat_id(doc: dict[str, Any]) -> int | None:
     section = doc.get("telegram") or {}
     value = section.get("chat_id")
     return int(value) if value is not None else None
+
+
+def alerts_max_per_poll(doc: Mapping[str, Any] | None) -> int:
+    """The per-poll cap on watcher alerts from an already validated config; 10 if unset."""
+    section = doc.get("alerts") if isinstance(doc, Mapping) else None
+    value = section.get("max_per_poll") if isinstance(section, Mapping) else None
+    if _int(value) and 1 <= value <= MAX_PER_POLL_LIMIT:
+        return value
+    return DEFAULT_MAX_PER_POLL
 
 
 def off_lane_min_fit(doc: Mapping[str, Any] | None) -> str:
