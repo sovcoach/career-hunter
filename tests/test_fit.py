@@ -250,3 +250,47 @@ def test_a_retry_that_fails_again_waits_behind_what_arrived_before_it(
     scorer = Recorder()
     w.run(search, [], today=DAY, fetcher=Scripted({}), scorer=scorer, config=FITS)
     assert titles(scorer) == ["Retry", "Arrived at eleven"]  # its 10:00 stamp is older
+
+
+# --- key requirements and the scoring run (search migration 0011) ---------------------------
+
+
+def _row(conn: sqlite3.Connection, posting_id: int) -> tuple[object, object]:
+    found = conn.execute(
+        "SELECT key_requirements, score_run_id FROM postings WHERE id = ?", (posting_id,)
+    ).fetchone()
+    return found["key_requirements"], found["score_run_id"]
+
+
+def test_a_score_stores_its_requirements_and_run_and_replaces_them(
+    search: sqlite3.Connection,
+) -> None:
+    posting = _scored_without_fit(search, "Coordinator", None)
+    run_id = search_store.start_watch_run(search, "2026-11-01T09:00:00Z")
+    search_store.set_posting_score(
+        search,
+        posting,
+        gaps="[]",
+        llm_output="{}",
+        scout_metadata=None,
+        fit=None,
+        key_requirements=["Forklift licence", "Café shifts"],
+        run_id=run_id,
+    )
+    assert _row(search, posting) == ('["Forklift licence", "Café shifts"]', run_id)
+    # A later score with none, outside a run, clears both.
+    search_store.set_posting_score(
+        search, posting, gaps="[]", llm_output="{}", scout_metadata=None, fit=None
+    )
+    assert _row(search, posting) == (None, None)
+
+
+def test_the_fill_in_records_the_run_that_made_a_posting_alertable(
+    search: sqlite3.Connection,
+) -> None:
+    filled = _scored_without_fit(search, "Waiting strong", "strong")
+    held = _scored_without_fit(search, "Waiting renamed", "renamed")
+    run_id = search_store.start_watch_run(search, "2026-11-01T09:00:00Z")
+    assert search_store.fill_missing_fits(search, {"strong": "high"}, run_id) == 1
+    assert _row(search, filled) == (None, run_id)
+    assert _row(search, held) == (None, None)

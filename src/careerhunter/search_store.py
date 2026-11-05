@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from careerhunter.enums import FIT_LEVELS
@@ -206,27 +207,38 @@ def set_posting_score(
     scout_metadata: str | None,
     fit: str | None,
     resume_sha256: str | None = None,
+    key_requirements: Sequence[str] = (),
+    run_id: int | None = None,
 ) -> None:
-    """Store parsed gaps, model text, the tier, its fit and the resume's hash.
+    """Store parsed gaps, model text, the tier, its fit, the resume's hash and the rest.
 
     `fit` is the tier's fit from config, or None when there is no tier or its name is
     not in config. `fit_rating` is not touched. `resume_sha256` is the resume the score
-    was made with, or None without one. Every value replaces the stored one in a single
-    UPDATE, so the score, its fit and its hash always change together.
+    was made with, or None without one. `key_requirements` (at most three, already
+    checked by the scorer) are stored as a JSON array, or null when there are none.
+    `run_id` is the watch run that made the score, or None outside one. Every value
+    replaces the stored one in a single UPDATE, so they always change together.
     """
+    requirements = (
+        json.dumps(list(key_requirements), ensure_ascii=False) if key_requirements else None
+    )
     conn.execute(
         "UPDATE postings SET gaps = ?, llm_output = ?, scout_metadata = ?, fit = ?, "
-        "scored_resume_sha256 = ? WHERE id = ?",
-        (gaps, llm_output, scout_metadata, fit, resume_sha256, posting_id),
+        "scored_resume_sha256 = ?, key_requirements = ?, score_run_id = ? WHERE id = ?",
+        (gaps, llm_output, scout_metadata, fit, resume_sha256, requirements, run_id, posting_id),
     )
 
 
-def fill_missing_fits(conn: sqlite3.Connection, fits: Mapping[str, str]) -> int:
+def fill_missing_fits(
+    conn: sqlite3.Connection, fits: Mapping[str, str], run_id: int | None = None
+) -> int:
     """Give a fit to scored, unalerted watcher postings that have a tier name but no fit.
 
     The fit is looked up by the stored tier name in `fits` (from the current config).
     A name that is not there is left alone: that posting stays without a fit and is not
-    alerted. Returns how many postings got a fit. The caller holds the transaction.
+    alerted. A posting that gets a fit also gets `run_id` as its scoring run, since it
+    becomes alertable in that run. Returns how many postings got a fit. The caller
+    holds the transaction.
     """
     rows = conn.execute(
         "SELECT p.id, json_extract(p.scout_metadata, '$.tier') AS tier FROM postings p "
@@ -241,7 +253,10 @@ def fill_missing_fits(conn: sqlite3.Connection, fits: Mapping[str, str]) -> int:
         fit = fits.get(tier) if isinstance(tier, str) else None
         if fit is None:
             continue
-        conn.execute("UPDATE postings SET fit = ? WHERE id = ? AND fit IS NULL", (fit, row["id"]))
+        conn.execute(
+            "UPDATE postings SET fit = ?, score_run_id = ? WHERE id = ? AND fit IS NULL",
+            (fit, run_id, row["id"]),
+        )
         filled += 1
     return filled
 
