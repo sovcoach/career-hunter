@@ -43,11 +43,19 @@ stops once less than SCORE_RESERVE seconds of the budget are left, so the passes
 the boards always get time. A stored posting on a fetched board whose score was made
 with another resume (or none) is queued for re-scoring with its description, which
 stays in memory only. After the boards, under the budget, come never-scored postings,
-then the queued re-scores, then re-scores from the stored fields. Within each pass the
-order is the last score attempt (never-tried first), then the oldest posting, so a
-posting that keeps failing goes behind the others. A posting with a skip or an
-application keeps its score and is not re-scored. An alerted posting is re-scored and
-not alerted again. A failed re-score keeps the old score and hash.
+then the queued re-scores, then re-scores from the stored fields. Never-scored postings
+go first come, first served: by the last score attempt, or by when the posting was
+stored (`created_at`) if it was never tried, then by id. A posting that keeps failing
+goes behind what was stored before its last attempt, and new arrivals can't push it
+back forever. Within each re-score pass the order is the last score attempt
+(never-tried first), then the oldest posting. A posting with a skip or an application
+keeps its score and is not re-scored. An alerted posting is re-scored and not alerted
+again. A failed re-score keeps the old score, fit and hash.
+
+The fit. A score stores the fit of its tier, from that tier's `fit` key in config
+(`config.tier_fits`), in the same UPDATE as the score. A tier name that is not in
+config gets no fit, so that posting is held. Every run first fills in the fit of
+scored, unalerted postings stored without one, by their stored tier name.
 
 A model that does not answer (ScoreError) stops all scoring for the rest of the run;
 the posting it happened on keeps its place, and one line counts what is left. A reply
@@ -68,6 +76,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, Self, SupportsIndex
 
 from careerhunter import db, filters, search_store
+from careerhunter.config import tier_fits
 from careerhunter.deadline import Deadline
 from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout
@@ -163,6 +172,7 @@ class _State:
     inserted: set[int] = field(default_factory=set)
     attempted: set[int] = field(default_factory=set)  # sent to the scorer this run
     resume: Resume | None = None
+    fits: Mapping[str, str] = field(default_factory=dict)  # tier name -> fit, from config
     model_down: bool = False
     # In memory only: re-scores queued from fetched boards, and new postings the
     # reserve left for the passes after the boards. Never written anywhere.
@@ -260,8 +270,11 @@ def run(
         budget=budget,
         now=now or _utc_now,
         resume=resume,
+        fits=tier_fits(rules),
     )
     lines = state.lines
+    with _isolated(conn, lines, "fit fill-in", state.hook):
+        _fill_fits(conn, state)
     if scorer is not None and resume_problem is not None:
         lines.append(f"watch: scoring: resume not usable ({resume_problem}); left for the next run")
         scorer = None
@@ -321,6 +334,14 @@ def run(
 
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+def _fill_fits(conn: sqlite3.Connection, state: _State) -> None:
+    """Give scored, unalerted postings stored without a fit the fit of their tier name."""
+    with db.transaction(conn):
+        filled = search_store.fill_missing_fits(conn, state.fits)
+    if filled:
+        state.lines.append(f"watch: fit filled in from config for {filled} scored postings")
 
 
 def _board_key(ats: str | None, slug: str | None) -> str | None:
@@ -780,14 +801,18 @@ def _recheck_one(
         )
 
 
-# The three scoring queries, written out in full. Within a pass: never-tried first, then
-# the oldest attempt, then the oldest posting.
+# The three scoring queries, written out in full. Never-scored postings are first come,
+# first served: each one waits from its last attempt, or from when it was stored if it
+# was never tried, so a retry stamped at T goes ahead of every posting stored after T
+# and new arrivals can't push it back forever. Both stamps are UTC to the second. The
+# re-score passes keep never-tried first, then the oldest attempt, then the oldest
+# posting.
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
-    "ORDER BY p.score_attempted_at IS NOT NULL, p.score_attempted_at, p.first_seen, p.id"
+    "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
@@ -917,6 +942,7 @@ def _attempt(
         lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
     else:
         metadata = None if result.tier is None else json.dumps({"tier": result.tier})
+        fit = None if result.tier is None else state.fits.get(result.tier)
         with db.transaction(conn):
             search_store.set_posting_score(
                 conn,
@@ -924,6 +950,7 @@ def _attempt(
                 gaps=result.gaps,
                 llm_output=result.llm_output,
                 scout_metadata=metadata,
+                fit=fit,
                 resume_sha256=state.resume_sha256,
             )
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):

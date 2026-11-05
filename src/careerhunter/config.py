@@ -49,6 +49,7 @@ import datetime as dt
 import re
 import urllib.parse
 import zoneinfo
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypeGuard
 
@@ -533,13 +534,13 @@ def telegram_chat_id(doc: dict[str, Any]) -> int | None:
     return int(value) if value is not None else None
 
 
-def tier_fits(doc: dict[str, Any] | None) -> dict[str, str]:
+def tier_fits(doc: Mapping[str, Any] | None) -> dict[str, str]:
     """Each gap tier's name and its fit, from an already validated config.
 
     A tier without a valid fit is left out, so a name missing here has no fit. With no
     gap tiers the mapping is empty.
     """
-    if not isinstance(doc, dict):
+    if not isinstance(doc, Mapping):
         return {}
     rubric = doc.get("fit_rubric")
     gap_tiers = rubric.get("gap_tiers") if isinstance(rubric, dict) else None

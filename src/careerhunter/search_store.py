@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 
 from careerhunter.models import Application, Dating, Posting
 
@@ -201,18 +202,46 @@ def set_posting_score(
     gaps: str,
     llm_output: str,
     scout_metadata: str | None,
+    fit: str | None,
     resume_sha256: str | None = None,
 ) -> None:
-    """Store parsed gaps, model text, the tier and the resume's hash. Not fit_rating.
+    """Store parsed gaps, model text, the tier, its fit and the resume's hash.
 
-    `resume_sha256` is the resume the score was made with, or None without one. It
-    replaces the stored value, so a later resume change is seen as a difference.
+    `fit` is the tier's fit from config, or None when there is no tier or its name is
+    not in config. `fit_rating` is not touched. `resume_sha256` is the resume the score
+    was made with, or None without one. Every value replaces the stored one in a single
+    UPDATE, so the score, its fit and its hash always change together.
     """
     conn.execute(
-        "UPDATE postings SET gaps = ?, llm_output = ?, scout_metadata = ?, "
+        "UPDATE postings SET gaps = ?, llm_output = ?, scout_metadata = ?, fit = ?, "
         "scored_resume_sha256 = ? WHERE id = ?",
-        (gaps, llm_output, scout_metadata, resume_sha256, posting_id),
+        (gaps, llm_output, scout_metadata, fit, resume_sha256, posting_id),
     )
+
+
+def fill_missing_fits(conn: sqlite3.Connection, fits: Mapping[str, str]) -> int:
+    """Give a fit to scored, unalerted watcher postings that have a tier name but no fit.
+
+    The fit is looked up by the stored tier name in `fits` (from the current config).
+    A name that is not there is left alone: that posting stays without a fit and is not
+    alerted. Returns how many postings got a fit. The caller holds the transaction.
+    """
+    rows = conn.execute(
+        "SELECT p.id, json_extract(p.scout_metadata, '$.tier') AS tier FROM postings p "
+        "WHERE p.source = 'watcher' AND p.llm_output IS NOT NULL AND p.fit IS NULL "
+        "AND p.alerted_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+        "ORDER BY p.id"
+    ).fetchall()
+    filled = 0
+    for row in rows:
+        tier = row["tier"]
+        fit = fits.get(tier) if isinstance(tier, str) else None
+        if fit is None:
+            continue
+        conn.execute("UPDATE postings SET fit = ? WHERE id = ? AND fit IS NULL", (fit, row["id"]))
+        filled += 1
+    return filled
 
 
 def score_attempted_at(conn: sqlite3.Connection, posting_id: int) -> str | None:

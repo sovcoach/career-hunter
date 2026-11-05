@@ -382,6 +382,8 @@ def test_a_posting_that_keeps_failing_goes_behind_the_others(search: sqlite3.Con
         {board("examplea"): lever("examplea", ("a1", "Poison"), ("a2", "Healthy"))},
         ("examplea",),
     )
+    # Stored before the first attempt on the same clock as the attempt stamps.
+    search.execute("UPDATE postings SET created_at = '2026-11-01T07:00:00Z'")
     seen: list[str] = []
     for _ in range(2):
         clock = FakeClock()
