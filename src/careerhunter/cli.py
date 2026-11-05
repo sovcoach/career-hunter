@@ -34,7 +34,9 @@ from careerhunter import (
     discover,
     embed,
     embed_eval,
+    lanes,
     resume,
+    search_store,
     secrets_store,
     service,
     storage_guard,
@@ -48,6 +50,7 @@ from careerhunter.config import (
     discovery_interval_minutes,
     load_config,
     load_exclusions,
+    off_lane_min_fit,
     telegram_chat_id,
     timezone_name,
     watch_interval_minutes,
@@ -1025,6 +1028,79 @@ def _record_discover_success(datadir: DataDir) -> None:
     _record_success(datadir, "discover.success")
 
 
+# A watch run still unfinished this long after it started did not finish: it crashed,
+# was killed, or stopped on an error. The budget plus five minutes for the slowest call.
+_RUN_GRACE = dt.timedelta(seconds=watch.RUN_BUDGET + 300)
+
+
+def _doctor_lanes(report: _Report, config_doc: dict[str, Any] | None) -> None:
+    """Whether lane checking is on, so it is never off without saying so."""
+    if config_doc is None:
+        return
+    configured = lanes.configured(config_doc)
+    if configured is None:
+        report.line(
+            "lanes", "--", "not configured: lane checking is off, alerts go by fit then oldest"
+        )
+        return
+    count = plural(len(configured), "lane", "lanes")
+    minimum = off_lane_min_fit(config_doc)
+    report.line("lanes", "OK", f"{count}; off-lane postings alert at {minimum} fit or better")
+
+
+def _doctor_watch_runs(report: _Report, search: sqlite3.Connection) -> None:
+    """The last watch run: unfinished for too long is BAD; held counts from the last finish."""
+    latest = search.execute("SELECT * FROM watch_runs ORDER BY id DESC LIMIT 1").fetchone()
+    if latest is None:
+        report.line("watch run", "--", "none recorded yet")
+        return
+    if latest["finished_at"] is None:
+        started = dt.datetime.fromisoformat(str(latest["started_at"]))
+        age = dt.datetime.now(dt.UTC) - started
+        minutes = max(0, int(age.total_seconds() // 60))
+        if age > _RUN_GRACE:
+            report.line(
+                "watch run",
+                "BAD",
+                f"the last run started {minutes} min ago and did not finish; see logs/watch.log",
+            )
+        else:
+            report.line("watch run", "OK", f"a run started {minutes} min ago is in progress")
+    finished = search.execute(
+        "SELECT * FROM watch_runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if finished is None:
+        report.line("watch held", "--", "no finished run yet, so nothing is counted")
+        return
+    detail = (
+        f"{finished['held_unscored']} unscored, {finished['held_no_fit']} with no fit, "
+        f"{finished['held_off_lane']} off-lane below the threshold"
+    )
+    if finished["budget_reached"]:
+        detail += "; that run's budget left work for the next one"
+    if finished["held_no_fit"]:
+        report.line(
+            "watch held",
+            "WARN",
+            f"{detail}. A tier name isn't in fit_rubric.gap_tiers; those wait until it is",
+        )
+    else:
+        report.line("watch held", "OK", detail)
+
+
+def _doctor_alert_hold(report: _Report, search: sqlite3.Connection) -> None:
+    """Whether the bot is holding watcher alerts because it couldn't read config.yaml."""
+    since = search_store.alerts_held_since(search)
+    if since is None:
+        report.line("bot alerts", "OK", "not held")
+    else:
+        report.line(
+            "bot alerts",
+            "BAD",
+            f"held since {since}: the bot couldn't read config.yaml at its last poll",
+        )
+
+
 def _doctor_resume(
     report: _Report,
     datadir: DataDir,
@@ -1148,6 +1224,10 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
     else:
         report.line("search.db", "--", "not created yet (run: careerhunter init)")
     _doctor_resume(report, datadir, config_doc, search)
+    _doctor_lanes(report, config_doc)
+    if search is not None:
+        _doctor_watch_runs(report, search)
+        _doctor_alert_hold(report, search)
 
     records: dict[str, sqlite3.Connection] = {}
     unreadable = search is None and datadir.search_db_path.exists()

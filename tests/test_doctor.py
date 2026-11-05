@@ -417,3 +417,120 @@ def test_import_leftovers_are_a_warning(
     assert code == 0, out
     assert f"resume          WARN left by an interrupted or running import: {name}" in out
     assert "resume          OK  matches its import" in out
+
+
+# --- lanes, watch runs and the bot's alert hold (#38, #33) ------------------------------------
+
+
+def _write(path: Path, sql: str, *params: object) -> None:
+    conn = db.connect(path)
+    try:
+        conn.execute(sql, params)
+    finally:
+        conn.close()
+
+
+def _stamp(delta: dt.timedelta) -> str:
+    return (dt.datetime.now(dt.UTC) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_lanes_and_watch_runs_on_a_fresh_setup(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _code, out = doctor(probe, capsys)
+    assert "lanes           OK  2 lanes; off-lane postings alert at high fit or better" in out
+    assert "watch run       --  none recorded yet" in out
+    assert "bot alerts      OK  not held" in out
+
+
+def test_lanes_off_is_reported_not_silent(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = ready / "config.yaml"
+    doc = yaml.safe_load(path.read_text())
+    del doc["search"]["lanes"]
+    doc["search"]["target_titles"] = ["Example Role"]
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert (
+        "lanes           --  not configured: lane checking is off, alerts go by fit then oldest"
+        in out
+    )
+
+
+def test_a_finished_run_reports_what_is_held(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write(
+        ready / "search.db",
+        "INSERT INTO watch_runs (started_at, finished_at, budget_reached, boards_fetched, "
+        "boards_failed, boards_left, held_unscored, held_no_fit, held_off_lane) "
+        "VALUES (?, ?, 1, 3, 0, 1, 4, 0, 2)",
+        _stamp(dt.timedelta(minutes=20)),
+        _stamp(dt.timedelta(minutes=12)),
+    )
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert (
+        "watch held      OK  4 unscored, 0 with no fit, 2 off-lane below the threshold; "
+        "that run's budget left work for the next one"
+    ) in out
+
+
+def test_postings_with_no_fit_are_a_warning(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write(
+        ready / "search.db",
+        "INSERT INTO watch_runs (started_at, finished_at, boards_fetched, boards_failed, "
+        "boards_left, held_unscored, held_no_fit, held_off_lane) VALUES (?, ?, 1, 0, 0, 0, 3, 0)",
+        _stamp(dt.timedelta(minutes=20)),
+        _stamp(dt.timedelta(minutes=12)),
+    )
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "watch held      WARN 0 unscored, 3 with no fit" in out
+    assert "A tier name isn't in fit_rubric.gap_tiers" in out
+
+
+def test_a_run_that_never_finished_is_bad_and_its_counts_are_not_used(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write(
+        ready / "search.db",
+        "INSERT INTO watch_runs (started_at) VALUES (?)",
+        _stamp(dt.timedelta(minutes=45)),
+    )
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert "watch run       BAD the last run started 45 min ago and did not finish" in out
+    assert "watch held      --  no finished run yet, so nothing is counted" in out
+
+
+def test_a_run_in_progress_is_ok(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write(
+        ready / "search.db",
+        "INSERT INTO watch_runs (started_at) VALUES (?)",
+        _stamp(dt.timedelta(minutes=2)),
+    )
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert "watch run       OK  a run started 2 min ago is in progress" in out
+
+
+def test_alerts_held_by_the_bot_are_bad(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write(
+        ready / "search.db",
+        "INSERT INTO bot_state (key, value) VALUES ('alerts_held_since', '2026-10-28T16:00:00Z')",
+    )
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert (
+        "bot alerts      BAD held since 2026-10-28T16:00:00Z: the bot couldn't read config.yaml "
+        "at its last poll"
+    ) in out
