@@ -152,7 +152,7 @@ def test_board_url_is_built_only_from_a_safe_slug() -> None:
     )
     assert (
         w.board_url("ashby", "exampleorg")
-        == "https://api.ashbyhq.com/posting-api/job-board/exampleorg"
+        == "https://api.ashbyhq.com/posting-api/job-board/exampleorg?includeCompensation=true"
     )
     assert (
         w.board_url("greenhouse", "example-robotics_1")

@@ -20,7 +20,9 @@ not cause a skip.
 The list URL is built only from `ats_slug`. `careers_url` is ignored. A slug has to be
 one path segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched.
 Greenhouse is fetched with `content=true`, so every gate sees its descriptions; the
-HTML is turned into text with the standard library (`htmltext.py`). A description is
+HTML is turned into text with the standard library (`htmltext.py`). A Lever posting's
+text adds its lists, closing text and salary description; Ashby is fetched with
+`includeCompensation=true` and adds each job's salary summary. A description is
 held in memory for the filter and the scoring prompt, and never stored. A board body
 over BOARD_MAX_BYTES logs `board over the size cap (...); nothing recorded`, stores
 nothing from that board, and counts as failed. Nothing is cut to fit.
@@ -262,7 +264,7 @@ def board_url(ats_type: str, slug: str) -> str | None:
         return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
     if ats_type == "lever":
         return f"https://api.lever.co/v0/postings/{slug}?mode=json"
-    return f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
+    return f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
 
 
 def run(
@@ -1156,8 +1158,49 @@ def _lever_job(item: object, slug: str) -> _Job | _Skip:
         or _built(f"https://jobs.lever.co/{slug}/", job.get("id")),
         requisition_id=_id_text(job.get("id")),
         company_field=None,
-        description=_text(job.get("descriptionPlain")),
+        description=_lever_text(job),
     )
+
+
+def _lever_text(job: dict[str, Any]) -> str | None:
+    """The description, the extra lists, the closing text and the salary description.
+
+    Field names from the Lever postings API README (github.com/lever/postings-api):
+    `descriptionPlain`, `lists` (`{text, content}` with HTML content),
+    `additionalPlain` and `salaryDescriptionPlain`. `salaryRange` is not read: the
+    README does not document its `interval` values.
+    """
+    parts = [_text(job.get("descriptionPlain"))]
+    for item in job.get("lists") or []:
+        if isinstance(item, dict):
+            parts.append(_text(item.get("text")))
+            content = _text(item.get("content"))
+            parts.append(htmltext.to_text(content) if content else None)
+    parts.append(_text(job.get("additionalPlain")))
+    parts.append(_text(job.get("salaryDescriptionPlain")))
+    return _joined(parts)
+
+
+def _ashby_text(job: dict[str, Any]) -> str | None:
+    """The description and, with `includeCompensation=true`, the salary summary.
+
+    Field names from Ashby's public job posting API docs
+    (developers.ashbyhq.com/docs/public-job-posting-api): `descriptionPlain` and
+    `compensation.scrapeableCompensationSalarySummary` on each job, such as
+    "$120K - $150K". The summary gets a "Salary:" label so it reads as pay.
+    """
+    compensation = job.get("compensation")
+    summary = (
+        _text(compensation.get("scrapeableCompensationSalarySummary"))
+        if isinstance(compensation, dict)
+        else None
+    )
+    return _joined([_text(job.get("descriptionPlain")), f"Salary: {summary}" if summary else None])
+
+
+def _joined(parts: list[str | None]) -> str | None:
+    """Non-empty parts, one per line (so a sentence never runs into the next); or None."""
+    return "\n".join(part for part in parts if part) or None
 
 
 def _ashby_job(item: object, slug: str) -> _Job | _Skip:
@@ -1175,7 +1218,7 @@ def _ashby_job(item: object, slug: str) -> _Job | _Skip:
         or _built(f"https://jobs.ashbyhq.com/{slug}/", job.get("id")),
         requisition_id=_id_text(job.get("id")),
         company_field=None,
-        description=_text(job.get("descriptionPlain")),
+        description=_ashby_text(job),
     )
 
 
