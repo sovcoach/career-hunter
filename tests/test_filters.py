@@ -236,9 +236,9 @@ def test_location_rules_and_role_filters() -> None:
         verdict("Coordinator", location="Other City", work_model="hybrid", config=config).reason
         == "location_rule"
     )
-    # No work model: the location lists do not apply. Travel outside them does.
+    # No work model and no "remote" in the location: treated as on-site.
     unset = verdict("Coordinator", location="Other City", work_model=None, config=config)
-    assert unset.reason is None
+    assert unset.reason == "location_rule"
     assert (
         verdict(
             "Coordinator",
@@ -284,6 +284,97 @@ def test_location_rules_and_role_filters() -> None:
             role_filters=filters,
             config={},
         ).reason
+        is None
+    )
+
+
+RULES = {
+    "search": {"location_rules": {"onsite_hybrid": ["Example City"], "remote": ["Example Region"]}}
+}
+
+
+@pytest.mark.parametrize(
+    ("location", "reason"),
+    [
+        ("Example City", None),  # treated as on-site, and on the on-site list
+        ("Other City", "location_rule"),
+        ("Example Region", "location_rule"),  # on-site default: the remote list does not apply
+        ("Remote - Example Region", None),  # inferred remote, on the remote list
+        ("Remote, Other Region", "location_rule"),
+        ("Example City or Remote", None),  # inferred remote may match either list
+        ("Remote-first, Example City", None),
+        ("Remotely located team, Other City", "location_rule"),  # not the whole word
+    ],
+)
+def test_without_a_work_model_remote_is_inferred_and_otherwise_on_site(
+    location: str, reason: str | None
+) -> None:
+    assert verdict("Coordinator", location=location, work_model=None, config=RULES).reason == (
+        reason
+    )
+
+
+def test_a_given_work_model_is_strict() -> None:
+    assert (
+        verdict("Coordinator", location="Example City", work_model="remote", config=RULES).reason
+        == "location_rule"
+    )
+    assert (
+        verdict(
+            "Coordinator", location="Remote - Example Region", work_model="hybrid", config=RULES
+        ).reason
+        == "location_rule"
+    )
+
+
+def test_an_empty_location_is_skipped_only_with_location_rules_and_no_work_model() -> None:
+    for blank in ("", "   "):
+        assert verdict("Coordinator", location=blank, work_model=None, config=RULES).reason == (
+            "empty_location"
+        )
+        # No location rules: an empty location is not a reason.
+        assert verdict("Coordinator", location=blank, work_model=None, config={}).reason is None
+        # A work model from the board stands in for the location (a remote Lever or Ashby row).
+        for model in ("remote", "onsite", "hybrid"):
+            assert (
+                verdict("Coordinator", location=blank, work_model=model, config=RULES).reason
+                is None
+            )
+
+
+def test_an_empty_location_comes_before_the_role_filters() -> None:
+    picky = {"locations": ["Example City"]}
+    assert (
+        verdict(
+            "Coordinator", location="", work_model=None, config=RULES, role_filters=picky
+        ).reason
+        == "empty_location"
+    )
+
+
+def test_role_filter_work_models_use_only_a_positive_inference() -> None:
+    remote_only = {"work_models": ["remote"]}
+    onsite_only = {"work_models": ["onsite"]}
+    # No "remote" in the location: the work model is unknown, and unknown passes.
+    assert (
+        verdict(
+            "Coordinator", location="Example City", work_model=None, role_filters=remote_only
+        ).reason
+        is None
+    )
+    assert (
+        verdict(
+            "Coordinator", location="Example City", work_model=None, role_filters=onsite_only
+        ).reason
+        is None
+    )
+    # "Remote" found: the inferred model is checked.
+    assert (
+        verdict("Coordinator", location="Remote", work_model=None, role_filters=onsite_only).reason
+        == "role_filter"
+    )
+    assert (
+        verdict("Coordinator", location="Remote", work_model=None, role_filters=remote_only).reason
         is None
     )
 
@@ -600,3 +691,34 @@ def test_a_short_exception_no_longer_exempts_a_title_that_merely_contains_it() -
         == "seniority"
     )
     assert verdict("Port Coordinator", description="Senior team", config=described).reason is None
+
+
+def test_an_empty_location_from_a_board_is_skipped_and_logged(search: sqlite3.Connection) -> None:
+    board = url("greenhouse", "examplerobotics")
+    payload = one_greenhouse("examplerobotics", title="Operations Coordinator")
+    payload["jobs"][0]["location"] = {"name": "  "}  # type: ignore[index]
+    lines = watch.run(
+        search,
+        [company("Example Robotics", "greenhouse", "examplerobotics")],
+        today=DAY,
+        fetcher=Scripted({board: fetched(payload)}),
+        config=RULES,
+    )
+    assert any("'Operations Coordinator' skipped (empty_location)" in line for line in lines)
+    assert [r["reason"] for r in search.execute("SELECT reason FROM skips")] == ["empty_location"]
+
+
+def test_a_recheck_skips_a_stored_empty_location_once_rules_are_set(
+    search: sqlite3.Connection,
+) -> None:
+    board = url("greenhouse", "examplerobotics")
+    item = company("Example Robotics", "greenhouse", "examplerobotics")
+    payload = one_greenhouse("examplerobotics", title="Operations Coordinator")
+    payload["jobs"][0]["location"] = {}  # type: ignore[index]
+    watch.run(search, [item], today=DAY, fetcher=Scripted({board: fetched(payload)}), config={})
+    assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 0
+    lines = watch.run(
+        search, [item], today=DAY, fetcher=Scripted({board: fetched(payload)}), config=RULES
+    )
+    assert any("skipped (empty_location)" in line for line in lines)
+    assert [r["reason"] for r in search.execute("SELECT reason FROM skips")] == ["empty_location"]

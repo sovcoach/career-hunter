@@ -5,11 +5,26 @@ The checks run in one order. The first skip wins, and it is the reason stored on
 
 1. exclusions: company, title keyword, description keyword, one role, already applied
 2. hard gates: language, credential, shift, pay, seniority, then minimum salary
-3. location rules, then the watchlist entry's role filters
+3. location: an empty location, then the location rules; then the watchlist
+   entry's role filters
 4. schedule limits
 
-A description keyword can match only when the list payload included a description.
-Greenhouse list rows have none. The description is not stored.
+A description keyword can match only when the board sent a description. The
+description is held in memory for the decision and is not stored, so a recheck of a
+stored posting runs the description checks without it.
+
+The work model. A board that gives one (Lever, Ashby) is used as given. With none
+(Greenhouse), a location that has the whole word "remote" is inferred remote;
+otherwise the location rules treat the posting as on-site. On-site and hybrid must
+match `search.location_rules.onsite_hybrid`, remote must match `remote`. An inferred
+remote posting may match either list, because "Example City or Remote" can be
+either. A list that is unset or empty does not constrain its work models.
+
+With `search.location_rules` set, a posting with blank location text and no work
+model from the board is skipped as `empty_location`. A work model from the board
+stands in for the location: such a posting is not skipped as empty, and with no text
+there is nothing to match against the lists, so they do not skip it either. Without
+location rules an empty location is not a reason to skip.
 
 Seniority words match whole words of the title, ignoring case. The description is
 checked too only when `seniority_in_description` is true. `title_exceptions` and
@@ -17,8 +32,9 @@ checked too only when `seniority_in_description` is true. `title_exceptions` and
 family is gated only when the title itself has a seniority word.
 
 One `role_filters` block is a set of AND constraints. It cannot say "this work model,
-or else that place." A missing work model does not fail `work_models`, because a
-Greenhouse list row has no work model.
+or else that place." `work_models` checks the board's work model, or remote when it is
+inferred from the location. Otherwise the work model is unknown, and an unknown work
+model does not fail `work_models`: the on-site default is for the location rules only.
 
 `min_salary` applies only when it is a number, and only to figures in a pay context,
 converted to yearly CAD (`_yearly_amounts` has the rules). A posting is skipped only
@@ -358,21 +374,41 @@ def _not_pay_before(before: str) -> bool:
 def _location(posting: PostingText, rules: Mapping[str, Any]) -> str | None:
     if not rules:
         return None
-    places = _places_for(posting.work_model, rules)
-    if places and not _any(posting.location, places):
+    blank = not posting.location.strip()
+    if blank and posting.work_model is None:
+        return "empty_location"
+    if not blank and not _place_allowed(posting, rules):
         return "location_rule"
     if rules.get("allow_travel_outside") is False and _outside_travel(posting, rules):
         return "location_rule"
     return None
 
 
-def _places_for(work_model: str | None, rules: Mapping[str, Any]) -> list[str] | None:
-    """Places the work model has to match, or None when this model is not constrained."""
-    if work_model in ("onsite", "hybrid"):
-        return _strings(rules.get("onsite_hybrid"))
-    if work_model == "remote":
-        return _strings(rules.get("remote"))
-    return None
+def _place_allowed(posting: PostingText, rules: Mapping[str, Any]) -> bool:
+    """Whether the location matches the list for its work model. An empty list allows all."""
+    onsite = _strings(rules.get("onsite_hybrid"))
+    remote = _strings(rules.get("remote"))
+    if posting.work_model in ("onsite", "hybrid"):
+        return not onsite or _any(posting.location, onsite)
+    if posting.work_model == "remote":
+        return not remote or _any(posting.location, remote)
+    if posting.work_model is None and inferred_remote(posting.location):
+        # Inferred, not given: "Example City or Remote" may be either kind of job.
+        return not remote or _any(posting.location, remote) or _any(posting.location, onsite)
+    # No work model from the board and no "remote": treated as on-site.
+    return not onsite or _any(posting.location, onsite)
+
+
+def inferred_remote(location: str) -> bool:
+    """True when the location text has the whole word "remote", ignoring case."""
+    return has_phrase(location, "remote")
+
+
+def _role_work_model(posting: PostingText) -> str | None:
+    """The board's work model, or remote when inferred; None when unknown."""
+    if posting.work_model is not None:
+        return posting.work_model
+    return "remote" if inferred_remote(posting.location) else None
 
 
 def _outside_travel(posting: PostingText, rules: Mapping[str, Any]) -> bool:
@@ -389,7 +425,8 @@ def _role(posting: PostingText, filters: Mapping[str, Any] | None) -> str | None
     if families and not _any(posting.title, families):
         return "role_filter"
     models = _strings(filters.get("work_models"))
-    if models and posting.work_model is not None and posting.work_model not in models:
+    work_model = _role_work_model(posting)
+    if models and work_model is not None and work_model not in models:
         return "role_filter"
     places = _strings(filters.get("locations"))
     if places and not _any(posting.location, places):
