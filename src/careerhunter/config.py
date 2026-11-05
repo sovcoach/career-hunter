@@ -37,9 +37,11 @@ skips, alerts, or stored scores. embed-eval may rank a blend with it.
 discovery.searxng_url and discovery.career_hosts are optional. A null URL leaves
 discovery off. The URL is plain http to a loopback host, with no userinfo. A career
 host is a hostname only. discovery.interval_minutes is optional. Missing or null
-means 1440 minutes, and a set value is an integer of at least 60. When the URL is
-set, service install uses that interval for the discovery LaunchAgent. Every
-problem is reported in one pass.
+means 1440 minutes, and a set value is an integer of at least 60. Discovery runs
+inside the watch agent, and the interval is the least time between two passes.
+discovery.queries_per_run (1 to 40, default 12) and discovery.query_delay_seconds (2
+to 30, default 5) are optional; together the pauses of one pass are at most 120
+seconds. Every problem is reported in one pass.
 
 schedule.timezone is the only place a time zone is set. It takes an IANA name
 (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); a fixed offset doesn't
@@ -72,6 +74,7 @@ QUERIES_PER_RUN_LIMITS = (1, 40)
 # discovery.query_delay_seconds: the pause between two queries of one pass.
 DEFAULT_QUERY_DELAY_SECONDS = 5
 QUERY_DELAY_LIMITS = (2, 30)
+MAX_PASS_PAUSES = 120
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 DEFAULT_OFF_LANE_MIN_FIT = "high"
 DEFAULT_MAX_POSTING_AGE_DAYS = 7
@@ -227,6 +230,13 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
         problems.append(
             f"discovery.query_delay_seconds must be an integer from {low} to {high} "
             f"(default {DEFAULT_QUERY_DELAY_SECONDS})"
+        )
+    elif discovery_queries_per_run({"discovery": section}) * value > MAX_PASS_PAUSES:
+        # The pauses of one pass must leave time for the queries inside its share of
+        # the watch run (discover.PASS_SECONDS).
+        problems.append(
+            "discovery.queries_per_run times discovery.query_delay_seconds must be at most "
+            f"{MAX_PASS_PAUSES} seconds"
         )
 
 

@@ -289,11 +289,13 @@ def run(
     resume: Resume | None = None,
     resume_problem: str | None = None,
     poster: Poster | None = None,
+    discovery: Callable[[sqlite3.Connection], list[str]] | None = None,
 ) -> list[str]:
     """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`.
 
     `poster` sends one JSON POST (`fetch.post_json`); Workday boards need it and are
-    skipped with a line without it.
+    skipped with a line without it. `discovery` is the discovery pass (#40): it runs
+    before the boards, isolated like a board, and returns its lines.
 
     Each log line is handed to `emit` as it happens; the same lines are returned.
     `budget` bounds the whole run; the caller also gives it to each client it builds.
@@ -323,6 +325,9 @@ def run(
     if state.lanes_on:
         with _isolated(conn, lines, "lane fill-in", state.hook):
             _fill_lanes(conn, state, rules)
+    if discovery is not None:
+        with _isolated(conn, lines, "discovery", state.hook):
+            lines.extend(discovery(conn))
     if scorer is not None and resume_problem is not None:
         lines.append(f"watch: scoring: resume not usable ({resume_problem}); left for the next run")
         scorer = None

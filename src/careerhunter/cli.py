@@ -317,20 +317,18 @@ def cmd_service(datadir: DataDir, args: argparse.Namespace) -> int:
     if args.service_action == "install":
         doc = _service_config(datadir)
         minutes = watch_interval_minutes(doc)
-        discover_minutes = discovery_interval_minutes(doc) if discovery_enabled(doc) else None
-        installed = service.install(
-            datadir.root,
-            watch_interval_minutes=minutes,
-            discovery_interval_minutes=discover_minutes,
-        )
+        retired = service.retire_discovery_agent()
+        if retired is not None:
+            print(f"removed {retired}; discovery now runs inside the watch agent")
+        try:
+            installed = service.install(datadir.root, watch_interval_minutes=minutes)
+        except service.ServiceError:
+            if retired is None:
+                raise
+            installed = []  # the bot and watch agents were already there: migrated
         for path in installed:
             if path.name == f"{service.WATCH_LABEL}.plist":
                 print(f"installed {path}; careerhunter watch runs now and every {minutes} minutes")
-            elif path.name == f"{service.DISCOVER_LABEL}.plist" and discover_minutes is not None:
-                print(
-                    f"installed {path}; careerhunter discover runs now and every "
-                    f"{discover_minutes} minutes"
-                )
             else:
                 print(f"installed {path}; the bot starts now and at every login")
     elif args.service_action == "uninstall":
@@ -340,11 +338,14 @@ def cmd_service(datadir: DataDir, args: argparse.Namespace) -> int:
         doc = _service_config(datadir)
         _print_service("bot", service.status(), stay_running=True)
         _print_service("watch", service.status(label=service.WATCH_LABEL), stay_running=False)
-        current = service.status(label=service.DISCOVER_LABEL)
-        if not discovery_enabled(doc) and not current.installed:
-            print("discovery: off")
+        if service.discover_plist_path().exists():
+            print(
+                "discovery: the old separate agent is installed (run: careerhunter service install)"
+            )
+        elif discovery_enabled(doc):
+            print("discovery: runs inside the watch agent")
         else:
-            _print_service("discovery", current, stay_running=False)
+            print("discovery: off")
     return EXIT_OK
 
 
@@ -544,37 +545,28 @@ def _doctor_watch_success(
 
 
 def _doctor_discover(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
-    """The discovery agent. A null URL is off. A warning does not fail doctor."""
-    current = service.status(label=service.DISCOVER_LABEL)
-    if not discovery_enabled(config_doc):
-        if current.installed:
-            report.line("discovery agent", "WARN", "installed while discovery is off; reinstall")
-        else:
-            report.line("discovery agent", "--", "off")
-        return
-    if not current.installed:
-        report.line("discovery agent", "--", "not installed (run: careerhunter service install)")
-    elif not current.loaded:
-        report.line("discovery agent", "BAD", "installed but not loaded")
-    elif current.running and current.pid is not None:
-        report.line("discovery agent", "OK", f"running (pid {current.pid})")
-    else:
-        report.line("discovery agent", "OK", "loaded")
-    if current.installed:
-        _doctor_interval(
-            report,
-            config_doc,
-            name="discovery interval",
-            path=service.discover_plist_path(),
-            expected=discovery_interval_minutes(config_doc) * 60,
-            noun="discovery",
+    """Discovery runs inside the watch agent (#40). A null URL is off.
+
+    The separate agent of earlier versions left installed is a warning, which does not
+    fail doctor. The success stamp is checked against two discovery intervals, or two
+    watch intervals when those are longer, since a pass can only start in a watch run.
+    """
+    if service.discover_plist_path().exists():
+        report.line(
+            "discovery agent",
+            "WARN",
+            "the old separate agent is installed (run: careerhunter service install)",
         )
+    if not discovery_enabled(config_doc):
+        report.line("discovery", "--", "off")
+        return
+    every = max(discovery_interval_minutes(config_doc), watch_interval_minutes(config_doc))
     _doctor_stamp(
         report,
         datadir,
         name="discovery",
         filename="discover.success",
-        limit=dt.timedelta(minutes=2 * discovery_interval_minutes(config_doc)),
+        limit=dt.timedelta(minutes=2 * every),
     )
 
 
@@ -784,6 +776,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             budget=budget,
             resume=loaded,
             resume_problem=problem,
+            discovery=partial(_discovery_pass, datadir, doc, budget),
         )
     except (sqlite3.Error, db.MigrationError) as exc:
         _rollback(conn)
@@ -793,6 +786,36 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
         conn.close()
     _record_watch_success(datadir)
     return EXIT_OK
+
+
+BUSY = "discover: another pass started less than 150 seconds ago; skipped"
+
+
+def _discovery_pass(
+    datadir: DataDir, doc: dict[str, Any], budget: Deadline, conn: sqlite3.Connection
+) -> list[str]:
+    """One discovery pass inside the watch run, when it is on and due (#40).
+
+    Due means no pass was claimed in the last `discovery.interval_minutes`; the claim is
+    atomic (`discover.claim_pass`). The pass gets at most `discover.PASS_SECONDS` of the
+    run budget, and writes `logs/discover.success` once it has run, a miss included.
+    """
+    if not discovery_enabled(doc):
+        return []
+    gap = dt.timedelta(minutes=discovery_interval_minutes(doc))
+    if not discover.claim_pass(conn, discover._utc_now(), gap):
+        return []
+    share = Deadline(discover.PASS_SECONDS).sooner(budget)
+    outcome = discover.run(
+        conn,
+        doc,
+        today=config_today(doc).isoformat(),
+        transport=partial(discover.default_transport, budget=share),
+    )
+    lines = [outcome.notice] if outcome.notice else []
+    lines.append(f"discover: {len(outcome.rows)} queued")
+    _record_discover_success(datadir)
+    return lines
 
 
 def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
@@ -843,6 +866,11 @@ def _discover_run(datadir: DataDir, log: RunLog) -> int:
         return _db_abort(log, "discover", exc)
     try:
         db.migrate(conn, "search")
+        # A pass the watch agent started moments ago may still be running.
+        recent = dt.timedelta(seconds=discover.PASS_SECONDS)
+        if discovery_enabled(doc) and not discover.claim_pass(conn, discover._utc_now(), recent):
+            log.append(BUSY)
+            return EXIT_OK
         outcome = discover.run(conn, doc, today=config_today(doc).isoformat())
     except (sqlite3.Error, db.MigrationError) as exc:
         _rollback(conn)

@@ -300,6 +300,8 @@ def test_the_command_queues_reduced_urls_and_drops_the_snippet(
     assert postings is not None and postings[0] == 0
     assert list(inited.glob("ei_record_*.db")) == []
     assert not (inited / "logs" / "watch.success").exists()
+    later = dt.datetime(2026, 11, 2, 10, tzinfo=dt.UTC)  # past the last pass's claim
+    monkeypatch.setattr(discover, "_utc_now", lambda: later)
     assert cli.main(["discover"], probe=probe) == 0
     again = capsys.readouterr()
     assert again.out == ""
@@ -1303,3 +1305,41 @@ def test_the_query_delay_is_checked(value: object) -> None:
     doc = {"discovery": {"query_delay_seconds": value}}
     assert any("discovery.query_delay_seconds" in p for p in validate_config(doc))
     assert discovery_query_delay_seconds(doc) == 5
+
+
+def test_a_manual_run_right_after_another_pass_is_skipped(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited)
+    talk = _Talk(json.dumps({"results": []}).encode())
+    monkeypatch.setattr(discover, "default_transport", talk)
+    assert cli.main(["discover"], probe=probe) == 0
+    sent = len(talk.calls)
+    capsys.readouterr()
+    assert cli.main(["discover"], probe=probe) == 0  # the clock has not moved
+    assert capsys.readouterr().err == f"{cli.BUSY}\n"
+    assert len(talk.calls) == sent
+
+
+def test_two_claims_inside_the_gap_cannot_both_win(tmp_path: Path) -> None:
+    first = _search_db(tmp_path)
+    second = db.connect(tmp_path / "search.db")
+    moment = dt.datetime(2026, 11, 2, 9, tzinfo=dt.UTC)
+    gap = dt.timedelta(minutes=60)
+    assert discover.claim_pass(first, moment, gap) is True
+    assert discover.claim_pass(second, moment + dt.timedelta(minutes=59), gap) is False
+    assert discover.claim_pass(second, moment + dt.timedelta(minutes=60), gap) is True
+    first.close()
+    second.close()
+
+
+def test_the_pauses_of_a_pass_must_fit_its_share_of_the_watch_run() -> None:
+    from careerhunter.config import validate_config
+
+    doc = {"discovery": {"queries_per_run": 40, "query_delay_seconds": 5}}
+    assert any("must be at most 120 seconds" in p for p in validate_config(doc))
+    doc = {"discovery": {"queries_per_run": 24, "query_delay_seconds": 5}}
+    assert not any("discovery" in p for p in validate_config(doc))

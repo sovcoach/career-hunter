@@ -42,6 +42,9 @@ MISS = "discovery miss: unreachable"
 OFF = "discovery off"
 THROTTLED = "discovery stopped: rate limited or asked for a CAPTCHA"
 BACKOFF_CAP = dt.timedelta(days=7)
+# The share of the watch run's budget one discovery pass may use, in seconds. Config
+# keeps queries_per_run times query_delay_seconds well inside it (config.py).
+PASS_SECONDS = 150.0
 # Engine errors in SearXNG's `unresponsive_engines` that mean "slow down". The English
 # texts from searx/webutils.py; a suspended engine's text starts with "Suspended: ".
 _THROTTLE_WORDS = ("captcha", "too many requests")
@@ -430,6 +433,21 @@ def _record_failure(
             "UPDATE discovery_state SET failures = ?, backoff_until = ? WHERE id = 1",
             (failures, _stamp(until)),
         )
+
+
+def claim_pass(conn: sqlite3.Connection, moment: dt.datetime, gap: dt.timedelta) -> bool:
+    """Claim a discovery pass, unless one was claimed less than `gap` before `moment`.
+
+    One conditional UPDATE inside BEGIN IMMEDIATE, so two processes can never both
+    claim: the second one sees the first one's stamp. Returns whether this one did.
+    """
+    with db.transaction(conn):
+        cur = conn.execute(
+            "UPDATE discovery_state SET last_pass_at = ? "
+            "WHERE id = 1 AND (last_pass_at IS NULL OR last_pass_at <= ?)",
+            (_stamp(moment), _stamp(moment - gap)),
+        )
+    return cur.rowcount == 1
 
 
 def _cursor(conn: sqlite3.Connection) -> int:
