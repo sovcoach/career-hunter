@@ -889,7 +889,7 @@ def test_unfetched_entries_make_no_request(search: sqlite3.Connection, datadir: 
     assert fetcher.calls == []
     assert companies(search) == []
     assert lines == [
-        "watch: Workday Example (workday): not fetched yet; skipped",
+        "watch: Workday Example (workday): no ats_host or ats_site; skipped",
         "watch: Icims Example (icims): not a board this command fetches; skipped",
         "watch: No Type: no ats_type; skipped",
         "watch: Numeric Type: no ats_type; skipped",

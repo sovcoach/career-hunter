@@ -32,6 +32,7 @@ from careerhunter import htmltext
 from careerhunter.fetch import Fetched, FetchError, FetchTooLarge
 
 Fetcher = Callable[[str], Fetched]
+Poster = Callable[[str, object], Fetched]  # one POST of a JSON payload (fetch.post_json)
 Known = Callable[[str], bool]  # a posting URL already stored: its detail is not fetched
 
 # The body cap for one board, all of its requests together. Greenhouse boards carry
@@ -45,11 +46,16 @@ DETAIL_LIMIT = 40
 # List pages read per board per run, for the boards that page.
 MAX_PAGES = 25
 SMARTRECRUITERS_PAGE = 100
+# Workday answers HTTP 400 to a page larger than 20 (checked on a live public board).
+WORKDAY_PAGE = 20
 
-BOARDS = ("greenhouse", "lever", "ashby", "smartrecruiters", "bamboohr")
+BOARDS = ("greenhouse", "lever", "ashby", "smartrecruiters", "bamboohr", "workday")
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
-# A BambooHR slug is the company's subdomain: one DNS label.
+# A BambooHR slug and a Workday tenant are subdomains: one DNS label each.
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_WORKDAY_HOST = re.compile(r"^wd[0-9]{1,3}$")
+# A Workday posting path: /job/<location>/<title>_<id>, URL-safe segments only.
+_WORKDAY_PATH = re.compile(r"^/job(?:/[A-Za-z0-9._~%+-]+)+$")
 # The public postings API says "on-site"; the hire API says "onsite".
 _LEVER_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite", "on-site": "onsite"}
 _ASHBY_WORK = {"remote": "remote", "hybrid": "hybrid", "onsite": "onsite"}
@@ -103,6 +109,14 @@ class Board:
     host: str | None = None
     site: str | None = None
 
+    @property
+    def key(self) -> str:
+        """`<ats_type>:<slug>`, or `workday:<tenant>:<host>:<site>`, case-folded."""
+        parts = [self.ats, self.slug] + (
+            [self.host or "", self.site or ""] if self.ats == "workday" else []
+        )
+        return ":".join(parts).casefold()
+
 
 @dataclass
 class BoardRead:
@@ -122,13 +136,25 @@ class BoardRead:
 class Client:
     """One board's requests, under one byte budget for all of them."""
 
-    def __init__(self, fetcher: Fetcher, *, max_bytes: int | None = None) -> None:
+    def __init__(
+        self, fetcher: Fetcher, *, poster: Poster | None = None, max_bytes: int | None = None
+    ) -> None:
         self._fetcher = fetcher
+        self._poster = poster
         self._max_bytes = BOARD_MAX_BYTES if max_bytes is None else max_bytes
         self.used = 0
 
+    @property
+    def can_post(self) -> bool:
+        return self._poster is not None
+
     def get_json(self, url: str) -> object:
         return _loads(self._checked(url, self._fetcher(url)))
+
+    def post_json(self, url: str, payload: object) -> object:
+        if self._poster is None:
+            raise BoardParseError("no POST client")
+        return _loads(self._checked(url, self._poster(url, payload)))
 
     def _checked(self, url: str, fetched: Fetched) -> bytes:
         if fetched.status != 200:
@@ -139,9 +165,27 @@ class Client:
         return fetched.body
 
 
+def list_url(board: Board) -> str | None:
+    """The (first) list URL for a board, or None when its identity is not safe to use."""
+    if board.ats != "workday":
+        return board_url(board.ats, board.slug)
+    if (
+        _HOST_LABEL.fullmatch(board.slug) is None
+        or board.host is None
+        or _WORKDAY_HOST.fullmatch(board.host) is None
+        or board.site is None
+        or _SLUG.fullmatch(board.site) is None
+    ):
+        return None
+    return f"{_workday_base(board)}/jobs"
+
+
 def board_url(ats_type: str, slug: str) -> str | None:
-    """The (first) list URL for one board, built only from a single safe path segment."""
-    if ats_type not in BOARDS or _SLUG.fullmatch(slug) is None:
+    """The (first) list URL for one board, built only from a single safe path segment.
+
+    Workday needs its host and site too: see `list_url`.
+    """
+    if ats_type not in BOARDS or ats_type == "workday" or _SLUG.fullmatch(slug) is None:
         return None
     if ats_type == "bamboohr":
         if _HOST_LABEL.fullmatch(slug) is None:
@@ -178,7 +222,7 @@ def read(
     error or HTTP 429 stops the details: see `BoardRead.stopped`. Going over the byte
     budget always raises, so a board over the cap stores nothing.
     """
-    url = board_url(board.ats, board.slug)
+    url = list_url(board)
     if url is None:
         raise BoardParseError("not a board this module reads")
     limit = DETAIL_LIMIT if detail_limit is None else detail_limit
@@ -190,6 +234,11 @@ def read(
     if board.ats == "bamboohr":
         stubs = _bamboohr_list(board.slug, client.get_json(url))
         return _with_details(stubs, client, known, limit, _bamboohr_detail)
+    if board.ats == "workday":
+        stubs, notes = _workday_list_pages(board, url, client)
+        found = _with_details(stubs, client, known, limit, _workday_detail)
+        found.notes[:0] = notes
+        return found
     return BoardRead(_parse(board.ats, board.slug, client.get_json(url)))
 
 
@@ -398,6 +447,82 @@ def _bamboohr_detail(stub: Job, data: object) -> Job:
         raise BoardParseError("unexpected JSON shape")
     html = _text(opening.get("description"))
     return replace(stub, description=htmltext.to_text(html) if html else None, detail_url=None)
+
+
+# --- Workday ----------------------------------------------------------------------------
+# The candidate-experience JSON behind each Workday careers site, checked against a live
+# public board (Workday documents no public jobs API). A board is a tenant on a wdN host
+# with a site: https://{tenant}.{wdN}.myworkdayjobs.com/{site}.
+# POST /wday/cxs/{tenant}/{site}/jobs with {"appliedFacets": {}, "limit": 20, "offset":
+# N, "searchText": ""} answers {total, jobPostings, facets}; `total` is only filled in on
+# the first page, so paging stops at a short page. Each posting has title,
+# externalPath, locationsText, postedOn ("Posted Today", "Posted 3 Days Ago",
+# "Posted 30+ Days Ago") and bulletFields. GET /wday/cxs/{tenant}/{site}{externalPath}
+# answers {jobPostingInfo, hiringOrganization}; jobPostingInfo has title, jobDescription
+# (HTML), location, postedOn, startDate and externalUrl. The posting page is
+# https://{tenant}.{wdN}.myworkdayjobs.com/{site}{externalPath}. No remote-work field
+# was present, so no work model is read. An unknown site answers 404, an unknown tenant
+# 422. hiringOrganization.name is a legal entity, not the employer's name, so it is not
+# used.
+
+
+def _workday_base(board: Board) -> str:
+    return f"https://{board.slug}.{board.host}.myworkdayjobs.com/wday/cxs/{board.slug}/{board.site}"
+
+
+def _workday_list_pages(
+    board: Board, url: str, client: Client
+) -> tuple[list[Job | Skip], list[str]]:
+    jobs: list[Job | Skip] = []
+    offset = 0
+    for _page in range(MAX_PAGES):
+        payload = {"appliedFacets": {}, "limit": WORKDAY_PAGE, "offset": offset, "searchText": ""}
+        data = client.post_json(url, payload)
+        rows = data.get("jobPostings") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            raise BoardParseError("unexpected JSON shape")
+        jobs.extend(_workday_job(item, board) for item in rows)
+        offset += len(rows)
+        if len(rows) < WORKDAY_PAGE:
+            return jobs, []
+    return jobs, [f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"]
+
+
+def _workday_job(item: object, board: Board) -> Job | Skip:
+    job = _mapping(item)
+    if job is None:
+        return Skip("a job was not an object")
+    title = _text(job.get("title"))
+    if title is None:
+        return Skip("a job has no title")
+    path = _text(job.get("externalPath"))
+    if path is None or _WORKDAY_PATH.fullmatch(path) is None or "/../" in f"{path}/":
+        return Skip(f"{title!r} has no usable path")
+    return Job(
+        title=title,
+        location=_text(job.get("locationsText")) or "",
+        work_model=None,
+        url=f"https://{board.slug}.{board.host}.myworkdayjobs.com/{board.site}{path}",
+        requisition_id=None,  # the URL is the identity; bulletFields are not documented
+        company_field=None,
+        detail_url=f"{_workday_base(board)}{path}",
+    )
+
+
+def _workday_detail(stub: Job, data: object) -> Job:
+    info = _mapping(data.get("jobPostingInfo")) if isinstance(data, dict) else None
+    if info is None:
+        raise BoardParseError("unexpected JSON shape")
+    html = _text(info.get("jobDescription"))
+    # The list's locationsText can be a count ("6 Locations"); the detail names the
+    # primary location.
+    location = _text(info.get("location")) or stub.location
+    return replace(
+        stub,
+        location=location,
+        description=htmltext.to_text(html) if html else None,
+        detail_url=None,
+    )
 
 
 def _parse(ats: str, slug: str, data: object) -> list[Job | Skip]:

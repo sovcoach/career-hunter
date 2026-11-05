@@ -359,10 +359,15 @@ def _validate_seniority(gates: dict[str, Any], problems: list[str]) -> None:
         problems.append("hard_gates.seniority_in_description must be true or false")
 
 
+_WORKDAY_HOST = re.compile(r"wd[0-9]{1,3}")
+_WORKDAY_SITE = re.compile(r"[A-Za-z0-9_-]+")
+
+
 def _validate_watchlist_item(item: dict[str, Any], where: str, problems: list[str]) -> None:
     ats = item.get("ats_type")
     if ats is not None and ats not in ATS_TYPES:
         problems.append(f"{where}.ats_type must be one of {list(ATS_TYPES)}")
+    _validate_workday_identity(item, where, problems)
     if not isinstance(item.get("agency", False), bool):
         problems.append(f"{where}.agency must be true or false")
     filters = _optional_mapping(item, "role_filters", where, problems)
@@ -374,6 +379,25 @@ def _validate_watchlist_item(item: dict[str, Any], where: str, problems: list[st
         _optional_str_list(filters, "locations", f"{where}.role_filters", problems)
         if "work_models" in filters:
             _work_models(filters["work_models"], f"{where}.role_filters.work_models", problems)
+
+
+def _validate_workday_identity(item: dict[str, Any], where: str, problems: list[str]) -> None:
+    """A Workday board is a tenant (ats_slug) on a wdN host with a site (#35).
+
+    `ats_host` and `ats_site` belong to Workday entries only. A Workday entry without
+    them is valid; the watcher logs and skips it.
+    """
+    for key in ("ats_host", "ats_site"):
+        if key not in item:
+            continue
+        if item.get("ats_type") != "workday":
+            problems.append(f"{where}.{key} is for ats_type workday only")
+            continue
+        value = item[key]
+        pattern = _WORKDAY_HOST if key == "ats_host" else _WORKDAY_SITE
+        if not isinstance(value, str) or pattern.fullmatch(value) is None:
+            shape = "wd and up to three digits" if key == "ats_host" else "one path segment"
+            problems.append(f"{where}.{key} must be {shape}")
 
 
 def _validate_alerts(section: Any, problems: list[str]) -> None:

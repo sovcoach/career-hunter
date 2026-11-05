@@ -59,6 +59,7 @@ from careerhunter.config import today as config_today
 from careerhunter.deadline import Deadline
 from careerhunter.export import export, plural
 from careerhunter.fetch import fetch as fetch_url
+from careerhunter.fetch import post_json
 from careerhunter.filters import PostingText
 from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.platform_checks import SystemProbe
@@ -772,6 +773,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             entries,
             today=config_today(doc).isoformat(),
             fetcher=partial(fetch_url, budget=budget, max_bytes=watch.BOARD_MAX_BYTES),
+            poster=partial(post_json, budget=budget, max_bytes=watch.BOARD_MAX_BYTES),
             config=doc,
             exclusions=exclusions,
             scorer=scorer,

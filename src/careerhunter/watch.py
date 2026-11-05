@@ -1,14 +1,14 @@
 """Fetch ATS boards, filter the new postings, then score them.
 
 One `careerhunter watch` run reads the watchlist and fetches its Greenhouse, Lever,
-Ashby, SmartRecruiters and BambooHR boards, one company after another, through `fetch.py`. It
-also fetches companies stored with `source` discovery and `watchlist` 1 when the ATS
-type is one of those and the slug is one path segment. A seeded watchlist row with
-any other source is not fetched by that extra path. It writes companies, postings,
-skip reasons and local scores in `search.db`. It does not call Telegram, write
-applications, EI rows or snapshots. The bot sends one alert digest per watch run when
-it polls.
-`run` returns the log lines; the CLI prints them to stderr.
+Ashby, SmartRecruiters, BambooHR and Workday boards, one company after another,
+through `fetch.py`. It also fetches companies stored with `source` discovery and
+`watchlist` 1 when the ATS type is one of those and the identity is usable. A seeded
+watchlist row with any other source is not fetched by that extra path. It writes
+companies, postings, skip reasons and local scores in `search.db`. It does not call
+Telegram, write applications, EI rows or snapshots. The bot sends one alert digest
+per watch run when it polls. `run` returns the log lines; the CLI prints them to
+stderr.
 
 A posting that is already stored is not inserted again. After the boards, watcher rows
 that still have no skip are filtered again, and rows that are still unscored are
@@ -20,16 +20,19 @@ not cause a skip.
 
 The requests for a board and the parsing of its replies are in `ats.py`. The list URL
 is built only from `ats_slug`. `careers_url` is ignored. A slug has to be one path
-segment (`A-Za-z0-9_-`). Workday and every other `ats_type` are not fetched. A
-description is held in memory for the filter and the scoring prompt, and never
-stored. A board whose replies together pass BOARD_MAX_BYTES logs `board over the size
-cap (...); nothing recorded`, stores nothing from that board, and counts as failed.
-Nothing is cut to fit.
+segment (`A-Za-z0-9_-`). A Workday board is watched per employer: its tenant
+(`ats_slug`), `ats_host` (wdN) and `ats_site`, all three stored on the company and
+part of its board key; its list is a JSON POST (`poster`), so a run without one
+skips it with a line. Every other `ats_type` is not fetched. A description is held in
+memory for the filter and the scoring prompt, and never stored. A board whose replies
+together pass BOARD_MAX_BYTES logs `board over the size cap (...); nothing recorded`,
+stores nothing from that board, and counts as failed. Nothing is cut to fit.
 
-A SmartRecruiters or BambooHR list has no descriptions, so each posting not stored yet gets one
-detail request, at most `ats.DETAIL_LIMIT` per board per run; the rest are logged and
-left out, to be read as new next run. A detail that answers with another status or a
-bad body leaves out that posting only. A fetch error or HTTP 429 on a detail stops
+A SmartRecruiters, BambooHR or Workday list has no descriptions, so each posting not
+stored yet gets one detail request, at most `ats.DETAIL_LIMIT` per board per run; the
+rest are logged and left out, to be read as new next run. A detail that answers with
+another status or a bad body leaves out that posting only. A fetch error or HTTP 429
+on a detail stops
 the board's details: what was read before is recorded, the board counts as failed (or
 as left, when the run budget ran out), and a 429 blocks that host for the run.
 
@@ -102,7 +105,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, NoReturn, Self, SupportsIndex
+from typing import Any, Literal, NamedTuple, NoReturn, Self, SupportsIndex
 
 from careerhunter import ats as ats_boards
 from careerhunter import db, filters, lanes, search_store
@@ -111,8 +114,8 @@ from careerhunter.ats import (
     BoardParseError,
     Job,
     Skip,
-    board_url,
 )
+from careerhunter.ats import board_url as board_url  # the tests build list URLs with it
 from careerhunter.config import off_lane_min_fit, tier_fits
 from careerhunter.deadline import Deadline
 from careerhunter.embed import Embedder, miss_line
@@ -124,6 +127,7 @@ from careerhunter.runlog import RunLogError
 from careerhunter.score import Score, ScoreError
 
 Fetcher = Callable[[str], Fetched]
+Poster = ats_boards.Poster
 Scorer = Callable[[PostingText], Score | None]
 # Told about each isolated crash, after the rollback and the log line.
 OnCrash = Callable[[str, Exception], None]
@@ -245,6 +249,24 @@ class _Aligned:
     ok: bool
     stored_type: str | None = None
     stored_slug: str | None = None
+    stored_host: str | None = None
+    stored_site: str | None = None
+
+
+class _Entry(NamedTuple):
+    """One watchlist entry. `host` and `site` are Workday's only."""
+
+    name: str
+    ats: str | None
+    slug: str | None
+    role_filters: Mapping[str, Any] | None
+    host: str | None = None
+    site: str | None = None
+
+    def board(self) -> ats_boards.Board | None:
+        if self.ats is None or not self.slug:
+            return None
+        return ats_boards.Board(self.ats, self.slug, self.host, self.site)
 
 
 def run(
@@ -264,8 +286,12 @@ def run(
     now: Callable[[], dt.datetime] | None = None,
     resume: Resume | None = None,
     resume_problem: str | None = None,
+    poster: Poster | None = None,
 ) -> list[str]:
     """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`.
+
+    `poster` sends one JSON POST (`fetch.post_json`); Workday boards need it and are
+    skipped with a line without it.
 
     Each log line is handed to `emit` as it happens; the same lines are returned.
     `budget` bounds the whole run; the caller also gives it to each client it builds.
@@ -304,21 +330,17 @@ def run(
         if entry is None:
             lines.append("watch: a watchlist entry has no name; skipped")
             continue
-        name, ats, slug, role_filters = entry
         tally: Tally | None = None
-        with _isolated(conn, lines, name, state.hook) as guard:
+        with _isolated(conn, lines, entry.name, state.hook) as guard:
             tally = _watch_one(
                 conn,
                 state,
                 blocked,
-                name,
-                ats,
-                slug,
-                role_filters,
+                entry,
                 rules,
                 skipped,
                 today,
-                fetcher,
+                ats_boards.Client(fetcher, poster=poster),
                 scorer,
                 embedder,
             )
@@ -406,11 +428,12 @@ def _fill_fits(conn: sqlite3.Connection, state: _State) -> None:
         state.lines.append(f"watch: fit filled in from config for {filled} scored postings")
 
 
-def _board_key(ats: str | None, slug: str | None) -> str | None:
-    """`<ats_type>:<slug>`, case-folded, for a board this command can fetch."""
-    if ats is None or not slug or board_url(ats, slug) is None:
+def _board_key(entry: _Entry) -> str | None:
+    """`ats.Board.key`, for a board this command can fetch."""
+    board = entry.board()
+    if board is None or ats_boards.list_url(board) is None:
         return None
-    return f"{ats}:{slug.casefold()}"
+    return board.key
 
 
 def _by_last_attempt(conn: sqlite3.Connection, items: list[Any]) -> list[Any]:
@@ -424,7 +447,7 @@ def _by_last_attempt(conn: sqlite3.Connection, items: list[Any]) -> list[Any]:
     def order(pair: tuple[int, Any]) -> tuple[int, str, int]:
         index, item = pair
         entry = _entry(item)
-        key = _board_key(entry[1], entry[2]) if entry is not None else None
+        key = _board_key(entry) if entry is not None else None
         if key is None:
             return (0, "", index)
         return (1, stamps.get(key, ""), index)  # "" sorts before every timestamp
@@ -504,73 +527,76 @@ def _crashed(
 def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -> list[Any]:
     """Config entries, then approved discovery boards that are not already listed."""
     items: list[Any] = list(watchlist)
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     for item in watchlist:
         entry = _entry(item)
-        if entry is None:
-            continue
-        _name, ats, slug, _filters = entry
-        if ats and slug:
-            seen.add((ats, slug.casefold()))
+        board = entry.board() if entry is not None else None
+        if board is not None:
+            seen.add(board.key)
     rows = conn.execute(
-        "SELECT name, ats_type, ats_slug FROM companies "
+        "SELECT name, ats_type, ats_slug, ats_host, ats_site FROM companies "
         "WHERE source = 'discovery' AND watchlist = 1 AND ats_type IS NOT NULL "
         "AND ats_slug IS NOT NULL AND length(trim(ats_slug)) > 0 "
         "ORDER BY id"
     )
     for row in rows:
-        ats = str(row["ats_type"])
-        slug = str(row["ats_slug"]).strip()
-        if board_url(ats, slug) is None:
+        host = None if row["ats_host"] is None else str(row["ats_host"])
+        site = None if row["ats_site"] is None else str(row["ats_site"])
+        board = ats_boards.Board(str(row["ats_type"]), str(row["ats_slug"]).strip(), host, site)
+        if ats_boards.list_url(board) is None or board.key in seen:
             continue
-        key = (ats, slug.casefold())
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append({"name": str(row["name"]), "ats_type": ats, "ats_slug": slug})
+        seen.add(board.key)
+        found: dict[str, Any] = {
+            "name": str(row["name"]),
+            "ats_type": board.ats,
+            "ats_slug": board.slug,
+        }
+        if board.ats == "workday":
+            found.update(ats_host=host, ats_site=site)
+        items.append(found)
     return items
 
 
-def _entry(item: object) -> tuple[str, str | None, str | None, Mapping[str, Any] | None] | None:
+def _entry(item: object) -> _Entry | None:
     if not isinstance(item, dict):
         return None
     name = item.get("name")
     if not isinstance(name, str) or not name.strip():
         return None
     ats = item.get("ats_type")
-    slug = item.get("ats_slug")
     role_filters = item.get("role_filters")
-    return (
+    return _Entry(
         name.strip(),
         ats if isinstance(ats, str) else None,
-        slug.strip() if isinstance(slug, str) else None,
+        _stripped(item.get("ats_slug")),
         role_filters if isinstance(role_filters, dict) else None,
+        _stripped(item.get("ats_host")),
+        _stripped(item.get("ats_site")),
     )
+
+
+def _stripped(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) else None
 
 
 def _watch_one(
     conn: sqlite3.Connection,
     state: _State,
     blocked: set[str],
-    name: str,
-    ats: str | None,
-    slug: str | None,
-    role_filters: Mapping[str, Any] | None,
+    entry: _Entry,
     config: Mapping[str, Any],
     exclusions: Mapping[str, Any],
     today: str,
-    fetcher: Fetcher,
+    client: ats_boards.Client,
     scorer: Scorer | None,
     embedder: Embedder,
 ) -> Tally | None:
     """Whether the board was fetched and parsed, failed, left for the next run, or
     (None) never attempted."""
     lines = state.lines
+    name, ats, slug = entry.name, entry.ats, entry.slug
     if ats is None:
         lines.append(_line(name, None, "no ats_type; skipped"))
-        return None
-    if ats == "workday":
-        lines.append(_line(name, ats, "not fetched yet; skipped"))
         return None
     if ats not in ats_boards.BOARDS:
         lines.append(_line(name, ats, "not a board this command fetches; skipped"))
@@ -578,9 +604,21 @@ def _watch_one(
     if not slug:
         lines.append(_line(name, ats, "no ats_slug; skipped"))
         return None
-    url = board_url(ats, slug)
+    if ats == "workday" and not (entry.host and entry.site):
+        lines.append(_line(name, ats, "no ats_host or ats_site; skipped"))
+        return None
+    board = ats_boards.Board(ats, slug, entry.host, entry.site)
+    url = ats_boards.list_url(board)
     if url is None:
-        lines.append(_line(name, ats, "ats_slug is not a single path segment; skipped"))
+        why = (
+            "ats_slug, ats_host or ats_site is not usable"
+            if ats == "workday"
+            else "ats_slug is not a single path segment"
+        )
+        lines.append(_line(name, ats, f"{why}; skipped"))
+        return None
+    if ats == "workday" and not client.can_post:
+        lines.append(_line(name, ats, "no POST client; skipped"))
         return None
     host = urllib.parse.urlsplit(url).hostname or ""
     if host in blocked:
@@ -591,9 +629,9 @@ def _watch_one(
     if state.out_of_time():
         lines.append(_line(name, ats, _LEFT))
         return "left"
-    key = f"{ats}:{slug.casefold()}"
+    key = board.key
     previous = _stamp_attempt(conn, key, state.now())
-    outcome = _fetch_jobs(conn, state, blocked, name, ats, slug, host, fetcher)
+    outcome = _fetch_jobs(conn, state, blocked, name, board, host, client)
     if isinstance(outcome, _Left):
         _restore_attempt(conn, key, previous)
         return "left"
@@ -602,17 +640,14 @@ def _watch_one(
     # One transaction, after a board parsed and before any posting is recorded: a
     # failed fetch never touches the company, and a disagreement records nothing.
     with db.transaction(conn):
-        aligned = _align(conn, name, ats, slug)
+        aligned = _align(conn, name, board)
     if not aligned.ok:
-        lines.append(
-            _line(
-                name,
-                ats,
-                "stored ats identity disagrees "
-                f"(ats_type={_shown(aligned.stored_type)}, "
-                f"ats_slug={_shown(aligned.stored_slug)}); skipped",
+        shown = f"ats_type={_shown(aligned.stored_type)}, ats_slug={_shown(aligned.stored_slug)}"
+        if ats == "workday":
+            shown += (
+                f", ats_host={_shown(aligned.stored_host)}, ats_site={_shown(aligned.stored_site)}"
             )
-        )
+        lines.append(_line(name, ats, f"stored ats identity disagrees ({shown}); skipped"))
         return "failed"
     _record_jobs(
         conn,
@@ -620,7 +655,7 @@ def _watch_one(
         name,
         ats,
         outcome.read.jobs,
-        role_filters,
+        entry.role_filters,
         config,
         exclusions,
         today,
@@ -669,23 +704,22 @@ def _fetch_jobs(
     state: _State,
     blocked: set[str],
     name: str,
-    ats: str,
-    slug: str,
+    board: ats_boards.Board,
     host: str,
-    fetcher: Fetcher,
+    client: ats_boards.Client,
 ) -> _Parsed | _Failed | _Left:
     """Read one board. A failed list, or one the run budget cut short, stores nothing.
 
     A posting whose URL is stored already gets no detail request (`ats.read`).
     """
     lines = state.lines
+    ats = board.ats
 
     def known(url: str) -> bool:
         return search_store.posting_url_known(conn, url)
 
     try:
-        board = ats_boards.Board(ats, slug)
-        return _Parsed(ats_boards.read(board, ats_boards.Client(fetcher), known=known))
+        return _Parsed(ats_boards.read(board, client, known=known))
     except FetchError as exc:
         if isinstance(exc, FetchTimeout) and state.out_of_time():
             lines.append(_line(name, ats, _LEFT))
@@ -1084,33 +1118,43 @@ def _iso(moment: dt.datetime) -> str:
     return moment.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _align(conn: sqlite3.Connection, name: str, ats_type: str, ats_slug: str) -> _Aligned:
+def _align(conn: sqlite3.Connection, name: str, board: ats_boards.Board) -> _Aligned:
     """Fill a watchlist company, or refuse when its stored ATS identity disagrees.
 
     A disagreement writes nothing. Source is never changed. The caller runs this only
-    after a board parsed, so a failed fetch leaves the company untouched.
+    after a board parsed, so a failed fetch leaves the company untouched. A Workday
+    company's identity includes its host and site.
     """
+    host = board.host if board.ats == "workday" else None
+    site = board.site if board.ats == "workday" else None
     row = conn.execute(
-        "SELECT id, ats_type, ats_slug FROM companies WHERE name = ?",
+        "SELECT id, ats_type, ats_slug, ats_host, ats_site FROM companies WHERE name = ?",
         (name,),
     ).fetchone()
     if row is None:
         search_store.upsert_company(
-            conn, name, ats_type=ats_type, ats_slug=ats_slug, watchlist=1, source="watcher"
+            conn,
+            name,
+            ats_type=board.ats,
+            ats_slug=board.slug,
+            ats_host=host,
+            ats_site=site,
+            watchlist=1,
+            source="watcher",
         )
         return _Aligned(True)
-    stored_type = row["ats_type"]
-    stored_slug = row["ats_slug"]
-    type_text = stored_type if isinstance(stored_type, str) else None
-    slug_text = stored_slug if isinstance(stored_slug, str) else None
-    if (type_text is not None and type_text != ats_type) or (
-        slug_text is not None and slug_text != ats_slug
-    ):
-        return _Aligned(False, type_text, slug_text)
+    stored = [
+        value if isinstance(value, str) else None
+        for value in (row["ats_type"], row["ats_slug"], row["ats_host"], row["ats_site"])
+    ]
+    wanted = [board.ats, board.slug, host, site]
+    if any(have is not None and have != want for have, want in zip(stored, wanted, strict=True)):
+        return _Aligned(False, *stored)
     conn.execute(
         "UPDATE companies SET ats_type = coalesce(ats_type, ?), ats_slug = coalesce(ats_slug, ?), "
+        "ats_host = coalesce(ats_host, ?), ats_site = coalesce(ats_site, ?), "
         "watchlist = 1 WHERE id = ?",
-        (ats_type, ats_slug, row["id"]),
+        (board.ats, board.slug, host, site, row["id"]),
     )
     return _Aligned(True)
 

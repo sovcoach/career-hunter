@@ -102,9 +102,12 @@ schedule_limits:
   weekend_days_per_month: 2
   over_limit: flag
 
-# Companies to watch directly. `careerhunter watch` fetches greenhouse, lever and
-# ashby from ats_slug (one path segment) and ignores careers_url. Other ats_type
-# values are kept here and not fetched yet. ats_type is one of:
+# Companies to watch directly. `careerhunter watch` fetches greenhouse, lever,
+# ashby, smartrecruiters and bamboohr from ats_slug (one path segment; for bamboohr,
+# the company's subdomain) and ignores careers_url. A workday board also needs its
+# host and site: ats_slug is the tenant, ats_host the wdN host and ats_site the site,
+# as in https://<tenant>.<wdN>.myworkdayjobs.com/<site>. Other ats_type values are
+# kept here and not fetched. ats_type is one of:
 # greenhouse, lever, ashby, workday, successfactors, icims, taleo, smartrecruiters,
 # jobvite, bamboohr, other
 watchlist:
@@ -119,6 +122,12 @@ watchlist:
     role_filters:              # optional: only these roles at this company
       role_families: [support, operations]
       work_models: [remote, hybrid]
+  # A Workday board, for example:
+  # - name: Example Freight
+  #   ats_type: workday
+  #   ats_slug: examplefreight   # the tenant
+  #   ats_host: wd5
+  #   ats_site: External
   - name: Example Staffing
     agency: true               # optional: a staffing agency, labelled as such
 

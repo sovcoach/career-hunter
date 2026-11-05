@@ -535,3 +535,335 @@ def test_a_bamboohr_board_over_the_cap_as_a_whole_stores_nothing(
     lines = w.run(search, [BH], today=DAY, fetcher=Scripted(board))
     assert any("board over the size cap" in line for line in lines)
     assert stored(search) == []
+
+
+# --- Workday ---------------------------------------------------------------------------
+
+WD = company("Example Robotics", "workday", "examplerobotics", ats_host="wd5", ats_site="External")
+WD_BASE = "https://examplerobotics.wd5.myworkdayjobs.com/wday/cxs/examplerobotics/External"
+WD_LIST = f"{WD_BASE}/jobs"
+
+
+class Posted(Scripted):
+    """Scripted GETs, plus POSTs answered by the request's offset."""
+
+    def __init__(
+        self,
+        mapping: dict[str, Fetched | Exception],
+        pages: dict[int, Fetched | Exception] | None = None,
+    ) -> None:
+        super().__init__(mapping)
+        self.pages = pages or {}
+        self.posts: list[tuple[str, object]] = []
+
+    def post(self, address: str, payload: object) -> Fetched:
+        self.posts.append((address, payload))
+        assert address == WD_LIST
+        assert isinstance(payload, dict)
+        found = self.pages[payload["offset"]]
+        if isinstance(found, Exception):
+            raise found
+        return found
+
+
+def wd_path(n: int) -> str:
+    return f"/job/Example-City/Operations-Coordinator_JR{n:05d}"
+
+
+def wd_row(
+    n: int,
+    *,
+    title: str = "Operations Coordinator",
+    where: str = "Example City",
+    posted: str = "Posted Today",
+) -> dict[str, object]:
+    """One list row, in the Workday jobs list's own fields."""
+    return {
+        "title": title,
+        "externalPath": wd_path(n),
+        "locationsText": where,
+        "postedOn": posted,
+        "bulletFields": [f"JR{n:05d}"],
+    }
+
+
+def wd_page(rows: list[dict[str, object]], total: int = 0) -> dict[str, object]:
+    return {"total": total, "jobPostings": rows, "facets": [], "userAuthenticated": False}
+
+
+def wd_info(
+    description: str,
+    *,
+    location: str = "Example City",
+    pay: str | None = None,
+    posted: str = "Posted Today",
+) -> dict[str, object]:
+    html = f"<p>{description}</p>" + (f"<p>{pay}</p>" if pay else "")
+    return {
+        "jobPostingInfo": {
+            "id": "abc",
+            "title": "Operations Coordinator",
+            "jobDescription": html,
+            "location": location,
+            "postedOn": posted,
+            "startDate": "2026-10-30",
+            "timeType": "Full time",
+            "jobReqId": "JR00001",
+            "externalUrl": "https://examplerobotics.wd5.myworkdayjobs.com/External/job/x",
+        },
+        "hiringOrganization": {"name": "Example Robotics Holdings Ltd", "url": ""},
+        "userAuthenticated": False,
+    }
+
+
+def workday_board(
+    slug: str,
+    *,
+    title: str = "Operations Coordinator",
+    location: str = "Example City",
+    model: str = "onsite",
+    description: str = "A friendly team.",
+    pay: str | None = None,
+) -> Posted:
+    """A one-posting board as a fetcher. Workday gives no work model."""
+    return Posted(
+        routes({f"{WD_BASE}{wd_path(1)}": wd_info(description, location=location, pay=pay)}),
+        {0: fetched(wd_page([wd_row(1, title=title, where=location)], total=1))},
+    )
+
+
+def wd_run(
+    conn: sqlite3.Connection, fetcher: Posted, items: list[object] | None = None, **kwargs: Any
+) -> list[str]:
+    return w.run(conn, items or [WD], today=DAY, fetcher=fetcher, poster=fetcher.post, **kwargs)
+
+
+def test_workday_pages_then_details_are_parsed(
+    search: sqlite3.Connection, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(ats, "WORKDAY_PAGE", 2)
+    fetcher = Posted(
+        routes(
+            {
+                f"{WD_BASE}{wd_path(n)}": wd_info("A friendly team.", location=f"Place {n}")
+                for n in (1, 2, 3)
+            }
+        ),
+        {
+            0: fetched(wd_page([wd_row(1), wd_row(2, where="2 Locations")], total=3)),
+            2: fetched(wd_page([wd_row(3)])),  # total is 0 after the first page
+        },
+    )
+    lines = wd_run(search, fetcher)
+    assert [payload for _, payload in fetcher.posts] == [
+        {"appliedFacets": {}, "limit": 2, "offset": 0, "searchText": ""},
+        {"appliedFacets": {}, "limit": 2, "offset": 2, "searchText": ""},
+    ]
+    assert fetcher.calls == [f"{WD_BASE}{wd_path(n)}" for n in (1, 2, 3)]
+    site = "https://examplerobotics.wd5.myworkdayjobs.com/External"
+    assert stored(search) == [
+        ("Operations Coordinator", f"Place {n}", None, f"{site}{wd_path(n)}", None)
+        for n in (1, 2, 3)
+    ]
+    assert lines[-1] == "watch: 1 boards fetched, 0 failed, 0 left"
+    row = search.execute("SELECT ats_type, ats_slug, ats_host, ats_site FROM companies").fetchone()
+    assert tuple(row) == ("workday", "examplerobotics", "wd5", "External")
+    keys = [r[0] for r in search.execute("SELECT board_key FROM watch_board_attempts")]
+    assert keys == ["workday:examplerobotics:wd5:external"]
+
+
+def test_workday_stored_postings_get_no_detail_request(search: sqlite3.Connection) -> None:
+    wd_run(search, workday_board("examplerobotics"))
+    again = Posted({}, {0: fetched(wd_page([wd_row(1)], total=1))})
+    lines = wd_run(search, again)
+    assert again.calls == []
+    assert "watch: Example Robotics (workday): 0 new, 1 already recorded" in lines
+
+
+def test_workday_pages_stop_at_the_page_limit(search: sqlite3.Connection, monkeypatch: Any) -> None:
+    monkeypatch.setattr(ats, "WORKDAY_PAGE", 1)
+    monkeypatch.setattr(ats, "MAX_PAGES", 2)
+    fetcher = Posted(
+        routes({f"{WD_BASE}{wd_path(n)}": wd_info("x") for n in (1, 2)}),
+        {0: fetched(wd_page([wd_row(1)], total=5)), 1: fetched(wd_page([wd_row(2)]))},
+    )
+    lines = wd_run(search, fetcher)
+    assert len(stored(search)) == 2
+    assert (
+        "watch: Example Robotics (workday): page limit reached (2 pages); later postings "
+        "left for the next run"
+    ) in lines
+
+
+def test_an_unknown_workday_site_or_tenant_fails_and_stores_nothing(
+    search: sqlite3.Connection,
+) -> None:
+    for status in (404, 422):
+        fetcher = Posted({}, {0: fetched(status=status, body=b"{}")})
+        lines = wd_run(search, fetcher)
+        assert f"watch: Example Robotics (workday): HTTP {status}; nothing recorded" in lines
+        assert lines[-1] == "watch: 0 boards fetched, 1 failed, 0 left"
+    assert search.execute("SELECT count(*) FROM companies").fetchone()[0] == 0
+
+
+def test_a_workday_post_that_fails_in_transit_stores_nothing(search: sqlite3.Connection) -> None:
+    fetcher = Posted({}, {0: FetchFailed("a POST was redirected; not followed")})
+    lines = wd_run(search, fetcher)
+    assert "watch: Example Robotics (workday): FetchFailed; nothing recorded" in lines
+    assert stored(search) == []
+
+
+def test_bad_workday_payloads_log_and_store_nothing(search: sqlite3.Connection) -> None:
+    for body in ({"total": 1}, {"jobPostings": {}}, [1]):
+        lines = wd_run(search, Posted({}, {0: fetched(body)}))
+        assert (
+            "watch: Example Robotics (workday): HTTP 200, unexpected JSON shape; nothing recorded"
+        ) in lines
+    fetcher = Posted(
+        routes({f"{WD_BASE}{wd_path(1)}": {"nope": 1}}), {0: fetched(wd_page([wd_row(1)]))}
+    )
+    lines = wd_run(search, fetcher)
+    assert (
+        "watch: Example Robotics (workday): 'Operations Coordinator': detail unexpected JSON "
+        "shape; not recorded"
+    ) in lines
+    assert stored(search) == []
+
+
+def test_bad_workday_rows_are_skip_lines(search: sqlite3.Connection) -> None:
+    rows: list[object] = [
+        "x",
+        {"externalPath": wd_path(1)},
+        {"title": "No Path"},
+        {"title": "Dot Path", "externalPath": "/job/../../wday/x"},
+        {"title": "Query Path", "externalPath": "/job/a?b=c"},
+        {"title": "Other Path", "externalPath": "/admin/x"},
+    ]
+    lines = wd_run(search, Posted({}, {0: fetched({"jobPostings": rows})}))
+    who = "watch: Example Robotics (workday): "
+    assert f"{who}a job was not an object; skipped" in lines
+    assert f"{who}a job has no title; skipped" in lines
+    for title in ("No Path", "Dot Path", "Query Path", "Other Path"):
+        assert f"{who}{title!r} has no usable path; skipped" in lines
+
+
+def test_workday_entries_need_a_usable_identity_and_a_post_client(
+    search: sqlite3.Connection,
+) -> None:
+    items: list[object] = [
+        company("No Site", "workday", "examplerobotics", ats_host="wd5"),
+        company("Bad Host", "workday", "examplerobotics", ats_host="wdx", ats_site="External"),
+        company("Bad Site", "workday", "examplerobotics", ats_host="wd5", ats_site="a/b"),
+        company("Bad Tenant", "workday", "example_robotics", ats_host="wd5", ats_site="External"),
+    ]
+    fetcher = Posted({}, {})
+    lines = wd_run(search, fetcher, items)
+    assert lines[:4] == [
+        "watch: No Site (workday): no ats_host or ats_site; skipped",
+        "watch: Bad Host (workday): ats_slug, ats_host or ats_site is not usable; skipped",
+        "watch: Bad Site (workday): ats_slug, ats_host or ats_site is not usable; skipped",
+        "watch: Bad Tenant (workday): ats_slug, ats_host or ats_site is not usable; skipped",
+    ]
+    assert fetcher.posts == []
+    lines = w.run(search, [WD], today=DAY, fetcher=Scripted({}))
+    assert "watch: Example Robotics (workday): no POST client; skipped" in lines
+
+
+def test_a_workday_company_whose_stored_site_differs_is_refused(
+    search: sqlite3.Connection,
+) -> None:
+    wd_run(search, workday_board("examplerobotics"))
+    moved = company(
+        "Example Robotics", "workday", "examplerobotics", ats_host="wd5", ats_site="Careers"
+    )
+    fetcher = Posted({}, {0: fetched(wd_page([]))})
+    lines = w.run(search, [moved], today=DAY, fetcher=fetcher, poster=_any_post(fetcher))
+    assert (
+        "watch: Example Robotics (workday): stored ats identity disagrees (ats_type=workday, "
+        "ats_slug=examplerobotics, ats_host=wd5, ats_site=External); skipped"
+    ) in lines
+
+
+def _any_post(fetcher: Posted) -> Any:
+    def post(address: str, payload: object) -> Fetched:
+        found = fetcher.pages[0]
+        assert isinstance(found, Fetched)
+        return found
+
+    return post
+
+
+def test_an_approved_discovery_workday_board_is_watched(search: sqlite3.Connection) -> None:
+    from careerhunter import db, search_store
+
+    with db.transaction(search):
+        search_store.upsert_company(
+            search,
+            "examplerobotics",
+            ats_type="workday",
+            ats_slug="examplerobotics",
+            ats_host="wd5",
+            ats_site="External",
+            watchlist=1,
+            source="discovery",
+        )
+    fetcher = workday_board("examplerobotics")
+    lines = wd_run(search, fetcher, [{"name": "Unrelated", "ats_type": "icims"}])
+    assert fetcher.posts and fetcher.posts[0][0] == WD_LIST
+    assert "watch: examplerobotics (workday): 1 new, 0 already recorded" in lines
+
+
+def test_a_workday_board_over_the_cap_as_a_whole_stores_nothing(
+    search: sqlite3.Connection, monkeypatch: Any
+) -> None:
+    fetcher = workday_board("examplerobotics")
+    sizes = [
+        len(r.body)
+        for r in (*fetcher.pages.values(), *fetcher.mapping.values())
+        if isinstance(r, Fetched)
+    ]
+    monkeypatch.setattr(ats, "BOARD_MAX_BYTES", sum(sizes) - 1)
+    lines = wd_run(search, fetcher)
+    assert any("board over the size cap" in line for line in lines)
+    assert stored(search) == []
+
+
+def test_a_client_without_a_poster_refuses_a_post() -> None:
+    import pytest
+
+    with pytest.raises(ats.BoardParseError, match="no POST client"):
+        ats.Client(Scripted({})).post_json(WD_LIST, {})
+
+
+def test_the_watch_command_posts_workday_lists_under_the_board_cap(
+    data_env: Any, probe: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    import yaml
+
+    from careerhunter import cli
+
+    assert cli.main(["init"], probe=probe) == 0
+    path = data_env / "config.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["watchlist"] = [WD]
+    path.write_text(yaml.safe_dump(doc))
+    board = workday_board("examplerobotics")
+    caps: list[object] = []
+
+    def fake_get(address: str, **kw: object) -> Fetched:
+        caps.append(kw.get("max_bytes"))
+        return board(address)
+
+    def fake_post(address: str, payload: object, **kw: object) -> Fetched:
+        caps.append(kw.get("max_bytes"))
+        assert kw.get("budget") is not None
+        return board.post(address, payload)
+
+    monkeypatch.setattr(cli, "fetch_url", fake_get)
+    monkeypatch.setattr(cli, "post_json", fake_post)
+    monkeypatch.setattr(cli, "score_posting", lambda *a, **k: None)
+    assert cli.main(["watch"], probe=probe) == 0
+    assert "watch: Example Robotics (workday): 1 new, 0 already recorded" in (
+        capsys.readouterr().err
+    )
+    assert caps == [w.BOARD_MAX_BYTES, w.BOARD_MAX_BYTES]

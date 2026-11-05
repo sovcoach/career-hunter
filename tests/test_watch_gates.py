@@ -9,7 +9,7 @@ import pytest
 from careerhunter import watch as w
 from careerhunter.fetch import FetchTooLarge
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, url
-from tests.test_watch_ats import bamboohr_board, smartrecruiters_board
+from tests.test_watch_ats import Posted, bamboohr_board, smartrecruiters_board, workday_board
 
 GREENHOUSE = company("Example Robotics", "greenhouse", "examplerobotics")
 
@@ -93,7 +93,7 @@ def _board(
     """One job on a board of `ats`, in that board's own fields, and every URL the board
     is read from with its payload. `pay` goes where that board keeps pay: Greenhouse
     content, a Lever list, the Ashby salary summary, a SmartRecruiters ad section, the
-    BambooHR description."""
+    BambooHR or Workday description. A Workday board is a `Posted` fetcher under ""."""
     slug = "examplerobotics"
     item = company("Example Robotics", ats, slug)
     if ats == "greenhouse":
@@ -119,6 +119,11 @@ def _board(
         if pay:
             job["lists"] = [{"text": "Compensation", "content": f"<li>{pay}</li>"}]
         return item, {url(ats, slug): [job]}
+    if ats == "workday":
+        board = workday_board(
+            slug, title=title, location=location, model=model, description=description, pay=pay
+        )
+        return {**item, "ats_host": "wd5", "ats_site": "External"}, {"": board}
     if ats == "bamboohr":
         return item, bamboohr_board(
             slug, title=title, location=location, model=model, description=description, pay=pay
@@ -142,11 +147,18 @@ def _board(
 
 def _reason(conn: sqlite3.Connection, ats: str, config: object = None, **job: str) -> str | None:
     item, routes = _board(ats, **job)
+    posted = routes.get("")
+    fetcher = (
+        posted
+        if isinstance(posted, Posted)
+        else Scripted({address: fetched(body) for address, body in routes.items()})
+    )
     w.run(
         conn,
         [item],
         today=DAY,
-        fetcher=Scripted({address: fetched(body) for address, body in routes.items()}),
+        fetcher=fetcher,
+        poster=posted.post if isinstance(posted, Posted) else None,
         config=config or MATRIX_CONFIG,  # type: ignore[arg-type]
         exclusions=MATRIX_EXCLUSIONS,
     )
@@ -155,7 +167,7 @@ def _reason(conn: sqlite3.Connection, ats: str, config: object = None, **job: st
     return reasons[0] if reasons else None
 
 
-ATS = ("greenhouse", "lever", "ashby", "smartrecruiters", "bamboohr")
+ATS = ("greenhouse", "lever", "ashby", "smartrecruiters", "bamboohr", "workday")
 GATE_CASES: dict[str, tuple[dict[str, str], str | None]] = {
     "kept": ({}, None),
     "description_keyword": ({"description": "An unpaid trial week."}, "excluded_description"),
@@ -205,6 +217,8 @@ def test_seniority_in_the_description_runs_on_every_ats(
         ("greenhouse", {"location": "Remote - Example Region"}, None),
         ("bamboohr", {"location": "Remote - Other Region"}, "location_rule"),
         ("bamboohr", {"location": "Remote - Example Region"}, None),
+        ("workday", {"location": "Remote - Other Region"}, "location_rule"),
+        ("workday", {"location": "Remote - Example Region"}, None),
         ("lever", {"location": "Example Region", "model": "remote"}, None),
         ("ashby", {"location": "Example Region", "model": "remote"}, None),
         ("smartrecruiters", {"location": "Other Region", "model": "remote"}, "location_rule"),
@@ -214,10 +228,11 @@ def test_seniority_in_the_description_runs_on_every_ats(
         # Hybrid is checked like on-site.
         ("lever", {"location": "Other City", "model": "hybrid"}, "location_rule"),
         ("ashby", {"location": "Other City", "model": "hybrid"}, "location_rule"),
-        # Blank location: Greenhouse and BambooHR give no work model, so it is empty; the
+        # Blank location: Greenhouse, BambooHR and Workday give no work model, so it is empty; the
         # others give one.
         ("greenhouse", {"location": ""}, "empty_location"),
         ("bamboohr", {"location": ""}, "empty_location"),
+        ("workday", {"location": ""}, "empty_location"),
         ("lever", {"location": "", "model": "remote"}, None),
         ("ashby", {"location": "", "model": "remote"}, None),
     ],

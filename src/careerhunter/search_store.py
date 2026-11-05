@@ -24,12 +24,17 @@ def upsert_company(
     careers_url: str | None = None,
     watchlist: int = 0,
     source: str = "manual",
+    ats_host: str | None = None,
+    ats_site: str | None = None,
 ) -> tuple[int, bool]:
-    """The company's id, inserting it if new. Returns (id, inserted)."""
+    """The company's id, inserting it if new. Returns (id, inserted).
+
+    `ats_host` and `ats_site` are Workday's wdN host and site (search migration 0012).
+    """
     cur = conn.execute(
-        "INSERT INTO companies (name, ats_type, ats_slug, careers_url, watchlist, source) "
-        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-        (name, ats_type, ats_slug, careers_url, watchlist, source),
+        "INSERT INTO companies (name, ats_type, ats_slug, ats_host, ats_site, careers_url, "
+        "watchlist, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        (name, ats_type, ats_slug, ats_host, ats_site, careers_url, watchlist, source),
     )
     found = conn.execute("SELECT id FROM companies WHERE name = ?", (name,)).fetchone()
     return int(found["id"]), cur.rowcount == 1
