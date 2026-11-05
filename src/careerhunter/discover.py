@@ -31,7 +31,16 @@ _TOTAL = 30.0
 _TIMEOUT = 20.0
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
+_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _GREENHOUSE = frozenset({"boards.greenhouse.io", "job-boards.greenhouse.io"})
+_SMARTRECRUITERS = frozenset({"jobs.smartrecruiters.com", "careers.smartrecruiters.com"})
+_SMARTRECRUITERS_POSTING = re.compile(r"^[0-9]+(?:-.*)?$")
+# BambooHR subdomains that are BambooHR's own, not a company's careers site.
+_BAMBOOHR_OWN = frozenset({"www", "api", "app", "help", "partners", "marketplace"})
+_WORKDAY_HOST = re.compile(
+    r"^([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.(wd[0-9]{1,3})\.myworkdayjobs\.com$"
+)
+_LOCALE = re.compile(r"^[a-z]{2}-[A-Z]{2}$")
 _QUERY_HOSTS = (
     "boards.greenhouse.io",
     "job-boards.greenhouse.io",
@@ -42,6 +51,9 @@ _BOARD_URL = {
     "greenhouse": "https://boards.greenhouse.io/{slug}",
     "lever": "https://jobs.lever.co/{slug}",
     "ashby": "https://jobs.ashbyhq.com/{slug}",
+    "smartrecruiters": "https://jobs.smartrecruiters.com/{slug}",
+    "bamboohr": "https://{slug}.bamboohr.com/careers",
+    "workday": "https://{slug}.{host}.myworkdayjobs.com/{site}",
 }
 
 Transport = Callable[[str], tuple[int, bytes]]
@@ -53,13 +65,18 @@ class DiscoverError(Exception):
 
 @dataclass(frozen=True)
 class Hit:
-    """One reduced company. `url` is the board root or the career-page URL."""
+    """One reduced company. `url` is the board root or the career-page URL.
+
+    A Workday board also has its wdN host and its site.
+    """
 
     kind: str
     url: str
     ats_type: str | None
     ats_slug: str | None
     suggested_name: str
+    ats_host: str | None = None
+    ats_site: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,8 +201,9 @@ def classify(url: str, career_hosts: Sequence[str]) -> Hit | None:
         return None
     board = _board(host, segments, parts.query)
     if board is not None:
-        ats, slug = board
-        return Hit("board", _BOARD_URL[ats].format(slug=slug), ats, slug, slug)
+        ats, slug, wd_host, site = board
+        url = _BOARD_URL[ats].format(slug=slug, host=wd_host, site=site)
+        return Hit("board", url, ats, slug, slug, wd_host, site)
     allowed = {item.casefold() for item in career_hosts if isinstance(item, str)}
     if host not in allowed:
         return None
@@ -365,20 +383,64 @@ def _segments(path: str) -> list[str] | None:
     return segments
 
 
-def _board(host: str, segments: list[str], query: str) -> tuple[str, str] | None:
+_Board = tuple[str, str, str | None, str | None]  # ats_type, slug, Workday host, site
+
+
+def _board(host: str, segments: list[str], query: str) -> _Board | None:
     if host in _GREENHOUSE:
         if segments == ["embed", "job_board"]:
             slug = _query_slug(query)
-            return ("greenhouse", slug) if slug else None
+            return ("greenhouse", slug, None, None) if slug else None
         slug = _greenhouse_slug(segments)
-        return ("greenhouse", slug) if slug else None
+        return ("greenhouse", slug, None, None) if slug else None
     if host == "jobs.lever.co":
         slug = _one_or_two(segments)
-        return ("lever", slug) if slug else None
+        return ("lever", slug, None, None) if slug else None
     if host == "jobs.ashbyhq.com":
         slug = _one_or_two(segments)
-        return ("ashby", slug) if slug else None
+        return ("ashby", slug, None, None) if slug else None
+    if host in _SMARTRECRUITERS:
+        slug = _smartrecruiters_slug(segments)
+        return ("smartrecruiters", slug, None, None) if slug else None
+    if host.endswith(".bamboohr.com"):
+        slug = _bamboohr_slug(host.removesuffix(".bamboohr.com"), segments)
+        return ("bamboohr", slug, None, None) if slug else None
+    if host.endswith(".myworkdayjobs.com"):
+        return _workday(host, segments)
     return None
+
+
+def _smartrecruiters_slug(segments: list[str]) -> str | None:
+    """`/<company>` or `/<company>/<id>-<title>`."""
+    if not segments or len(segments) > 2 or _slug(segments[0]) is None:
+        return None
+    if len(segments) == 2 and _SMARTRECRUITERS_POSTING.fullmatch(segments[1]) is None:
+        return None
+    return segments[0]
+
+
+def _bamboohr_slug(sub: str, segments: list[str]) -> str | None:
+    """`<company>.bamboohr.com/careers` or `/careers/<id>`."""
+    if _LABEL.fullmatch(sub) is None or sub.casefold() in _BAMBOOHR_OWN:
+        return None
+    if not segments or segments[0] != "careers" or len(segments) > 2:
+        return None
+    if len(segments) == 2 and not segments[1].isdigit():
+        return None
+    return sub.casefold()
+
+
+def _workday(host: str, segments: list[str]) -> _Board | None:
+    """`<tenant>.<wdN>.myworkdayjobs.com/[<locale>/]<site>[/job/...]`."""
+    match = _WORKDAY_HOST.fullmatch(host)
+    if match is None:
+        return None
+    rest = segments[1:] if segments and _LOCALE.fullmatch(segments[0]) else segments
+    if not rest or _slug(rest[0]) is None or rest[0] in ("wday", "job"):
+        return None
+    if len(rest) > 1 and (rest[1] != "job" or len(rest) < 3):
+        return None
+    return ("workday", match.group(1).casefold(), match.group(2), rest[0])
 
 
 def _greenhouse_slug(segments: list[str]) -> str | None:
@@ -440,8 +502,15 @@ def _result_urls(body: bytes) -> list[str] | None:
 
 def _hit_key(hit: Hit) -> tuple[str, ...]:
     if hit.kind == "board" and hit.ats_type and hit.ats_slug:
-        return ("board", hit.ats_type, hit.ats_slug.casefold())
+        return ("board", *_board_key(hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site))
     return ("career", hit.url)
+
+
+def _board_key(ats: str, slug: str, host: str | None, site: str | None) -> tuple[str, ...]:
+    """Case-folded; Workday's host and site are part of it."""
+    if ats == "workday":
+        return (ats, slug.casefold(), (host or "").casefold(), (site or "").casefold())
+    return (ats, slug.casefold())
 
 
 def _store(
@@ -454,9 +523,10 @@ def _store(
     watched_boards = _watched_boards(config)
     watched_careers = _watched_careers(config, career_hosts)
     known_boards = {
-        (str(row["ats_type"]), str(row["ats_slug"]).casefold())
+        _board_key(str(row["ats_type"]), str(row["ats_slug"]), row["ats_host"], row["ats_site"])
         for row in conn.execute(
-            "SELECT ats_type, ats_slug FROM discovery_candidates WHERE kind = 'board'"
+            "SELECT ats_type, ats_slug, ats_host, ats_site FROM discovery_candidates "
+            "WHERE kind = 'board'"
         )
     }
     known_careers = {
@@ -469,7 +539,7 @@ def _store(
             if hit.kind == "board":
                 if hit.ats_type is None or hit.ats_slug is None:
                     continue
-                key = (hit.ats_type, hit.ats_slug.casefold())
+                key = _board_key(hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site)
                 if key in watched_boards or key in known_boards:
                     continue
                 known_boards.add(key)
@@ -478,10 +548,19 @@ def _store(
                     continue
                 known_careers.add(hit.url)
             cur = conn.execute(
-                "INSERT INTO discovery_candidates "
-                "(kind, url, ats_type, ats_slug, suggested_name, status, first_seen) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-                (hit.kind, hit.url, hit.ats_type, hit.ats_slug, hit.suggested_name, today),
+                "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, ats_host, "
+                "ats_site, suggested_name, status, first_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                (
+                    hit.kind,
+                    hit.url,
+                    hit.ats_type,
+                    hit.ats_slug,
+                    hit.ats_host,
+                    hit.ats_site,
+                    hit.suggested_name,
+                    today,
+                ),
             )
             stored.append(
                 Queued(
@@ -496,13 +575,22 @@ def _store(
     return stored
 
 
-def _watched_boards(config: Mapping[str, Any]) -> set[tuple[str, str]]:
-    found: set[tuple[str, str]] = set()
+def _watched_boards(config: Mapping[str, Any]) -> set[tuple[str, ...]]:
+    found: set[tuple[str, ...]] = set()
     for item in _watch_items(config):
         ats = item.get("ats_type")
         slug = item.get("ats_slug")
+        host = item.get("ats_host")
+        site = item.get("ats_site")
         if isinstance(ats, str) and isinstance(slug, str) and slug.strip():
-            found.add((ats, slug.strip().casefold()))
+            found.add(
+                _board_key(
+                    ats,
+                    slug.strip(),
+                    host if isinstance(host, str) else None,
+                    site if isinstance(site, str) else None,
+                )
+            )
     return found
 
 
@@ -527,7 +615,7 @@ def _watch_items(config: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 def _pending_row(conn: sqlite3.Connection, candidate_id: int) -> sqlite3.Row:
     row: sqlite3.Row | None = conn.execute(
-        "SELECT id, kind, url, ats_type, ats_slug, suggested_name, status "
+        "SELECT id, kind, url, ats_type, ats_slug, ats_host, ats_site, suggested_name, status "
         "FROM discovery_candidates WHERE id = ?",
         (candidate_id,),
     ).fetchone()
@@ -553,24 +641,40 @@ def _approve_board(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     slug = row["ats_slug"]
     if not isinstance(ats, str) or not isinstance(slug, str):
         raise DiscoverError(f"discovery candidate {int(row['id'])} was not found")
+    host = row["ats_host"]
+    site = row["ats_site"]
     name = str(row["suggested_name"])
     existing = conn.execute(
-        "SELECT id, ats_type, ats_slug FROM companies WHERE name = ?",
+        "SELECT id, ats_type, ats_slug, ats_host, ats_site FROM companies WHERE name = ?",
         (name,),
     ).fetchone()
     if existing is None:
         search_store.upsert_company(
-            conn, name, ats_type=ats, ats_slug=slug, watchlist=1, source="discovery"
+            conn,
+            name,
+            ats_type=ats,
+            ats_slug=slug,
+            ats_host=host,
+            ats_site=site,
+            watchlist=1,
+            source="discovery",
         )
         return
-    if _ats_disagrees(existing["ats_type"], existing["ats_slug"], ats, slug):
+    stored = (
+        existing["ats_type"],
+        existing["ats_slug"],
+        existing["ats_host"],
+        existing["ats_site"],
+    )
+    if _ats_disagrees(stored, (ats, slug, host, site)):
         raise DiscoverError(
             f"discovery candidate {int(row['id'])} disagrees with the stored company"
         )
     conn.execute(
         "UPDATE companies SET ats_type = coalesce(ats_type, ?), ats_slug = coalesce(ats_slug, ?), "
+        "ats_host = coalesce(ats_host, ?), ats_site = coalesce(ats_site, ?), "
         "watchlist = 1 WHERE id = ?",
-        (ats, slug, existing["id"]),
+        (ats, slug, host, site, existing["id"]),
     )
 
 
@@ -596,11 +700,10 @@ def _approve_career(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
         )
 
 
-def _ats_disagrees(stored_type: object, stored_slug: object, ats: str, slug: str) -> bool:
-    type_text = stored_type if isinstance(stored_type, str) else None
-    slug_text = stored_slug if isinstance(stored_slug, str) else None
-    return (type_text is not None and type_text != ats) or (
-        slug_text is not None and slug_text != slug
+def _ats_disagrees(stored: tuple[object, ...], wanted: tuple[object, ...]) -> bool:
+    """A stored value that is set and differs. A null stored value is filled in."""
+    return any(
+        isinstance(have, str) and have != want for have, want in zip(stored, wanted, strict=True)
     )
 
 

@@ -912,3 +912,172 @@ def test_list_without_its_files_exits_1_and_writes_no_log(
     assert cli.main(["discover", "list"], probe=probe) == cli.EXIT_ERROR
     assert capsys.readouterr().err == err
     assert not (inited / "logs" / "discover.log").exists()
+
+
+@pytest.mark.parametrize(
+    ("address", "ats", "slug", "board_url"),
+    [
+        (
+            "https://jobs.smartrecruiters.com/ExampleRobotics/744000000000001-operations-lead",
+            "smartrecruiters",
+            "ExampleRobotics",
+            "https://jobs.smartrecruiters.com/ExampleRobotics",
+        ),
+        (
+            "https://careers.smartrecruiters.com/ExampleRobotics",
+            "smartrecruiters",
+            "ExampleRobotics",
+            "https://jobs.smartrecruiters.com/ExampleRobotics",
+        ),
+        (
+            "https://examplerobotics.bamboohr.com/careers/41",
+            "bamboohr",
+            "examplerobotics",
+            "https://examplerobotics.bamboohr.com/careers",
+        ),
+        (
+            "https://ExampleRobotics.bamboohr.com/careers",
+            "bamboohr",
+            "examplerobotics",
+            "https://examplerobotics.bamboohr.com/careers",
+        ),
+    ],
+)
+def test_smartrecruiters_and_bamboohr_urls_reduce_to_a_board(
+    address: str, ats: str, slug: str, board_url: str
+) -> None:
+    hit = discover.classify(address, [])
+    assert hit is not None
+    assert (hit.kind, hit.ats_type, hit.ats_slug, hit.url) == ("board", ats, slug, board_url)
+    assert hit.ats_host is None and hit.ats_site is None
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "https://examplefreight.wd5.myworkdayjobs.com/External",
+        "https://examplefreight.wd5.myworkdayjobs.com/en-US/External",
+        "https://examplefreight.wd5.myworkdayjobs.com/External/job/Example-City/Clerk_JR00042",
+        "https://ExampleFreight.wd5.myworkdayjobs.com/en-US/External/job/Example-City/Clerk_JR1",
+    ],
+)
+def test_workday_urls_reduce_to_tenant_host_and_site(address: str) -> None:
+    hit = discover.classify(address, [])
+    assert hit is not None
+    assert (hit.kind, hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site) == (
+        "board",
+        "workday",
+        "examplefreight",
+        "wd5",
+        "External",
+    )
+    assert hit.url == "https://examplefreight.wd5.myworkdayjobs.com/External"
+    assert hit.suggested_name == "examplefreight"
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "https://jobs.smartrecruiters.com/",
+        "https://jobs.smartrecruiters.com/ExampleRobotics/not-a-posting",
+        "https://jobs.smartrecruiters.com/ExampleRobotics/1/extra",
+        "https://www.bamboohr.com/careers",
+        "https://www.bamboohr.com/careers/41",
+        "https://examplerobotics.bamboohr.com/",
+        "https://examplerobotics.bamboohr.com/careers/abc",
+        "https://examplerobotics.bamboohr.com/login.php",
+        "https://a.b.bamboohr.com/careers",
+        "https://www.myworkdayjobs.com/External",
+        "https://examplefreight.myworkdayjobs.com/External",
+        "https://examplefreight.wdx.myworkdayjobs.com/External",
+        "https://examplefreight.wd5.myworkdayjobs.com/",
+        "https://examplefreight.wd5.myworkdayjobs.com/en-US",
+        "https://examplefreight.wd5.myworkdayjobs.com/wday/cxs/examplefreight/External/jobs",
+        "https://examplefreight.wd5.myworkdayjobs.com/External/details/Clerk_1",
+        "https://examplefreight.wd5.myworkdayjobs.com/External/job",
+        "http://examplefreight.wd5.myworkdayjobs.com/External",
+    ],
+)
+def test_other_urls_on_the_new_ats_hosts_are_dropped(address: str) -> None:
+    assert discover.classify(address, []) is None
+
+
+def test_new_ats_boards_are_queued_once_and_watched_ones_are_not(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    config = {
+        "watchlist": [
+            {
+                "name": "Example Freight",
+                "ats_type": "workday",
+                "ats_slug": "ExampleFreight",
+                "ats_host": "wd5",
+                "ats_site": "External",
+            }
+        ]
+    }
+    hits = [
+        discover.classify(address, [])
+        for address in (
+            "https://examplefreight.wd5.myworkdayjobs.com/External/job/Example-City/Clerk_JR1",
+            "https://examplefreight.wd5.myworkdayjobs.com/Careers",
+            "https://examplefreight.wd5.myworkdayjobs.com/en-US/Careers",
+            "https://examplerobotics.bamboohr.com/careers/41",
+            "https://jobs.smartrecruiters.com/ExampleRobotics/744000000000001",
+        )
+    ]
+    found = discover._store(conn, config, [h for h in hits if h is not None], "2026-11-01", [])
+    assert [(row.ats_type, row.ref) for row in found] == [
+        ("workday", "examplefreight"),
+        ("bamboohr", "examplerobotics"),
+        ("smartrecruiters", "ExampleRobotics"),
+    ]
+    row = conn.execute(
+        "SELECT ats_host, ats_site FROM discovery_candidates WHERE ats_type = 'workday'"
+    ).fetchone()
+    assert tuple(row) == ("wd5", "Careers")
+    conn.close()
+
+
+def test_approving_a_workday_board_stores_its_identity(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    hit = discover.classify("https://examplefreight.wd5.myworkdayjobs.com/External", [])
+    assert hit is not None
+    (queued,) = discover._store(conn, {}, [hit], "2026-11-01", [])
+    discover.approve(conn, queued.id)
+    row = conn.execute(
+        "SELECT name, ats_type, ats_slug, ats_host, ats_site, watchlist, source FROM companies"
+    ).fetchone()
+    assert tuple(row) == (
+        "examplefreight",
+        "workday",
+        "examplefreight",
+        "wd5",
+        "External",
+        1,
+        "discovery",
+    )
+    conn.close()
+
+
+def test_approving_a_board_whose_stored_site_differs_is_refused(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    from careerhunter import search_store
+
+    with db.transaction(conn):
+        search_store.upsert_company(
+            conn,
+            "examplefreight",
+            ats_type="workday",
+            ats_slug="examplefreight",
+            ats_host="wd5",
+            ats_site="Careers",
+        )
+    hit = discover.classify("https://examplefreight.wd5.myworkdayjobs.com/External", [])
+    assert hit is not None
+    (queued,) = discover._store(conn, {}, [hit], "2026-11-01", [])
+    with pytest.raises(discover.DiscoverError, match="disagrees"):
+        discover.approve(conn, queued.id)
+    conn.close()
