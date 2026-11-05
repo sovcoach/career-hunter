@@ -1653,3 +1653,64 @@ def test_a_job_ad_with_config_unreadable_from_the_start_is_refused_and_writes_no
     assert reply == botmod.CONFIG_UNREADABLE
     assert str(env.datadir.root) not in reply and "unclosed" not in reply
     assert not env.datadir.search_db_path.exists() or env.counts()["search.postings"] == 0
+
+
+# --- the client tells failure kinds apart --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("code", "kind"),
+    [
+        (400, telegram.TelegramRejected),
+        (403, telegram.TelegramRejected),
+        (429, telegram.TelegramRateLimited),
+        (500, telegram.TelegramUnreachable),
+        (502, telegram.TelegramUnreachable),
+    ],
+)
+def test_an_http_status_maps_to_its_failure_kind(
+    monkeypatch: pytest.MonkeyPatch, code: int, kind: type[Exception]
+) -> None:
+    import io
+
+    def urlopen(request: Any, timeout: float, context: Any) -> Any:
+        raise urllib.error.HTTPError(request.full_url, code, "x", {}, io.BytesIO(b"{}"))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+    with pytest.raises(kind) as exc:
+        telegram.HttpTelegram(TOKEN).call("sendMessage", {"chat_id": CHAT, "text": "x"})
+    assert TOKEN not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "kind"),
+    [
+        (b"not json", telegram.TelegramBadReply),
+        (b"[1, 2]", telegram.TelegramBadReply),
+        (
+            b'{"ok": false, "description": "Bad Request: message is too long"}',
+            telegram.TelegramRejected,
+        ),
+        (
+            b'{"ok": false, "error_code": 429, "description": "Too Many Requests"}',
+            telegram.TelegramRateLimited,
+        ),
+    ],
+)
+def test_a_reply_body_maps_to_its_failure_kind(
+    monkeypatch: pytest.MonkeyPatch, body: bytes, kind: type[Exception]
+) -> None:
+    monkeypatch.setattr(
+        telegram.urllib.request, "urlopen", lambda request, timeout, context: FakeReply(body)
+    )
+    with pytest.raises(kind):
+        telegram.HttpTelegram(TOKEN).call("sendMessage", {"chat_id": CHAT, "text": "x"})
+
+
+def test_a_network_failure_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def urlopen(request: Any, timeout: float, context: Any) -> Any:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+    with pytest.raises(telegram.TelegramUnreachable):
+        telegram.HttpTelegram(TOKEN).call("getUpdates")
