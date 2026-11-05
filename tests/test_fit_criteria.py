@@ -13,6 +13,7 @@ import yaml
 from careerhunter.config import (
     discovery_enabled,
     discovery_interval_minutes,
+    off_lane_min_fit,
     telegram_chat_id,
     tier_fits,
     timezone,
@@ -290,6 +291,30 @@ def test_tier_fits_leaves_out_what_has_no_fit() -> None:
     assert tier_fits({"fit_rubric": {"weights": {"a": 1}}}) == {}
     assert tier_fits({"fit_rubric": {"gap_tiers": {"tiers": "x"}}}) == {}
     assert tier_fits({"fit_rubric": {"gap_tiers": {"tiers": ["x", {"fit": "low"}]}}}) == {}
+
+
+def test_off_lane_min_fit_defaults_to_high() -> None:
+    d = doc()
+    assert d["search"]["off_lane_min_fit"] == "high"
+    assert off_lane_min_fit(d) == "high"
+    del d["search"]["off_lane_min_fit"]
+    assert validate_config(d) == []
+    assert off_lane_min_fit(d) == "high"
+    assert off_lane_min_fit(None) == "high"
+    assert off_lane_min_fit({"search": "x"}) == "high"
+    for level in ("low", "medium", "high"):
+        d["search"]["off_lane_min_fit"] = level
+        assert validate_config(d) == []
+        assert off_lane_min_fit(d) == level
+
+
+@pytest.mark.parametrize("value", ["High", "great", "", None, 2, True])
+def test_a_bad_off_lane_min_fit_is_reported(value: object) -> None:
+    d = doc()
+    d["search"]["off_lane_min_fit"] = value
+    assert validate_config(d) == [
+        "search.off_lane_min_fit must be one of low | medium | high (default high)"
+    ]
 
 
 def test_every_problem_is_reported_in_one_pass() -> None:

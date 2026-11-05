@@ -33,6 +33,9 @@ search:
       fallback: true
       titles:
         - Customer Success Specialist
+  # Optional: the lowest fit (low, medium or high) at which a posting whose title
+  # matches no lane still alerts, labelled Off-lane and sent last. Default high.
+  off_lane_min_fit: high
   # Optional: where each work model is acceptable.
   location_rules:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here

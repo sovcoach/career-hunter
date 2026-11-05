@@ -14,6 +14,8 @@ implemented. `schedule.watcher_interval_minutes` is how often the watch
 LaunchAgent runs, default 60 and at least 15.
 
 - search.lanes: named groups of target titles, by priority, optionally a fallback;
+- search.off_lane_min_fit: the lowest fit (low, medium or high, default high) at which
+  a posting whose title matches no lane still alerts;
 - search.location_rules: places for on-site and hybrid work, regions for remote;
 - fit_rubric.gap_tiers: a rating from the number of missing requirements. Every tier
   names its fit (low, medium or high), and a boundary outcome takes the fit of the
@@ -63,6 +65,7 @@ MIN_WATCH_INTERVAL_MINUTES = 15
 DEFAULT_DISCOVERY_INTERVAL_MINUTES = 1440
 MIN_DISCOVERY_INTERVAL_MINUTES = 60
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
+DEFAULT_OFF_LANE_MIN_FIT = "high"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _CAREER_HOST = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -404,6 +407,11 @@ def validate_config(doc: Any) -> list[str]:
             _validate_location_rules(rules, problems)
         if "resume" in search:
             _resume_path(search["resume"], problems)
+        if search.get("off_lane_min_fit", DEFAULT_OFF_LANE_MIN_FIT) not in FIT_LEVELS:
+            problems.append(
+                f"search.off_lane_min_fit must be one of {' | '.join(FIT_LEVELS)} "
+                f"(default {DEFAULT_OFF_LANE_MIN_FIT})"
+            )
 
     gates = _section(doc, "hard_gates", problems)
     extra = set(gates) - _HARD_GATES
@@ -532,6 +540,13 @@ def telegram_chat_id(doc: dict[str, Any]) -> int | None:
     section = doc.get("telegram") or {}
     value = section.get("chat_id")
     return int(value) if value is not None else None
+
+
+def off_lane_min_fit(doc: Mapping[str, Any] | None) -> str:
+    """The lowest fit an off-lane posting needs to alert. `high` when it is not set."""
+    search = doc.get("search") if isinstance(doc, Mapping) else None
+    value = search.get("off_lane_min_fit") if isinstance(search, Mapping) else None
+    return value if isinstance(value, str) and value in FIT_LEVELS else DEFAULT_OFF_LANE_MIN_FIT
 
 
 def tier_fits(doc: Mapping[str, Any] | None) -> dict[str, str]:
