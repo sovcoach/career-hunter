@@ -21,9 +21,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from careerhunter import db, loopback, search_store
+from careerhunter.config import discovery_queries_per_run
 from careerhunter.deadline import Deadline
 
-MAX_QUERIES = 12
 MAX_BODY = 1_048_576
 MISS = "discovery miss: unreachable"
 OFF = "discovery off"
@@ -41,11 +41,14 @@ _WORKDAY_HOST = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.(wd[0-9]{1,3})\.myworkdayjobs\.com$"
 )
 _LOCALE = re.compile(r"^[a-z]{2}-[A-Z]{2}$")
+# One query per host. `greenhouse.io` covers both board hosts in one query.
 _QUERY_HOSTS = (
-    "boards.greenhouse.io",
-    "job-boards.greenhouse.io",
+    "greenhouse.io",
     "jobs.lever.co",
     "jobs.ashbyhq.com",
+    "jobs.smartrecruiters.com",
+    "bamboohr.com",
+    "myworkdayjobs.com",
 )
 _BOARD_URL = {
     "greenhouse": "https://boards.greenhouse.io/{slug}",
@@ -165,20 +168,35 @@ def default_transport(url: str, *, budget: Deadline | None = None) -> tuple[int,
 
 
 def build_queries(config: Mapping[str, Any]) -> list[str]:
-    """At most 12 `site:` queries. Titles, then locations, then hosts."""
-    titles = _titles(config)
-    locations = _locations(config) or [""]
+    """Every `site:` query, in rotation order (#40).
+
+    The full product of titles (lanes in priority order, every variant), places (from
+    `search.location_rules`: on-site and hybrid places, then remote regions) and hosts
+    (each ATS once, then `discovery.career_hosts`). Each run takes the next slice of it
+    (`take`). No titles means no queries; no places means queries without one.
+    """
+    places = _places(config) or [""]
     found: list[str] = []
-    for title in titles:
-        for location in locations:
+    for title in _titles(config):
+        for place in places:
             for host in _hosts(config):
                 text = f"site:{host} {title}"
-                if location:
-                    text = f"{text} {location}"
-                found.append(text)
-                if len(found) == MAX_QUERIES:
-                    return found
+                found.append(f"{text} {place}" if place else text)
     return found
+
+
+def take(queries: Sequence[str], cursor: int, count: int) -> tuple[list[str], int]:
+    """The next `count` queries from `cursor`, wrapping around, and the cursor after them.
+
+    Never more than the whole list, so one run asks no query twice. A cursor past the
+    end (the list got shorter) wraps first.
+    """
+    if not queries:
+        return [], 0
+    start = cursor % len(queries)
+    size = min(count, len(queries))
+    chosen = [queries[(start + offset) % len(queries)] for offset in range(size)]
+    return chosen, (start + size) % len(queries)
 
 
 def classify(url: str, career_hosts: Sequence[str]) -> Hit | None:
@@ -278,9 +296,10 @@ def run(
     base = _configured_url(config)
     if base is None:
         return Outcome(OFF, ())
-    queries = build_queries(config)
-    if not queries:
+    every = build_queries(config)
+    if not every:
         return Outcome(None, ())
+    queries, after = take(every, _cursor(conn), discovery_queries_per_run(config))
     talk = transport or default_transport
     career_hosts = _career_hosts(config)
     hits: list[Hit] = []
@@ -305,7 +324,14 @@ def run(
                 continue
             seen.add(key)
             hits.append(hit)
-    return Outcome(None, tuple(_store(conn, config, hits, today, career_hosts)))
+    # The queue rows and the moved cursor go in one transaction: a miss moves neither,
+    # so the same queries are asked again next time.
+    return Outcome(None, tuple(_store(conn, config, hits, today, career_hosts, cursor=after)))
+
+
+def _cursor(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT cursor FROM discovery_state WHERE id = 1").fetchone()
+    return 0 if row is None else int(row[0])
 
 
 def _configured_url(config: Mapping[str, Any]) -> str | None:
@@ -329,47 +355,53 @@ def _career_hosts(config: Mapping[str, Any]) -> list[str]:
 
 
 def _titles(config: Mapping[str, Any]) -> list[str]:
+    """Lanes by priority, best first, every variant; else `search.target_titles`.
+
+    A title already listed (ignoring case) is not listed again.
+    """
     search = config.get("search")
     if not isinstance(search, Mapping):
         return []
     lanes = search.get("lanes")
+    raw: list[object] = []
     if isinstance(lanes, list) and lanes:
-        titles: list[str] = []
-        for lane in lanes:
-            if not isinstance(lane, Mapping):
-                continue
-            raw = lane.get("titles")
-            if not isinstance(raw, list):
-                continue
-            for item in raw:
-                title = _one_title(item)
-                if title:
-                    titles.append(title)
-        return titles
-    raw_titles = search.get("target_titles")
-    if not isinstance(raw_titles, list):
-        return []
-    return [item.strip() for item in raw_titles if isinstance(item, str) and item.strip()]
+        ranked = sorted((lane for lane in lanes if isinstance(lane, Mapping)), key=_lane_priority)
+        for lane in ranked:
+            entries = lane.get("titles")
+            for entry in entries if isinstance(entries, list) else []:
+                raw.extend(entry if isinstance(entry, list) else [entry])
+    else:
+        targets = search.get("target_titles")
+        raw = list(targets) if isinstance(targets, list) else []
+    return _unique(raw)
 
 
-def _one_title(item: object) -> str | None:
-    if isinstance(item, str) and item.strip():
-        return item.strip()
-    if isinstance(item, list):
-        for variant in item:
-            if isinstance(variant, str) and variant.strip():
-                return variant.strip()
-    return None
+def _lane_priority(lane: Mapping[str, Any]) -> int:
+    priority = lane.get("priority")
+    return priority if isinstance(priority, int) else 0
 
 
-def _locations(config: Mapping[str, Any]) -> list[str]:
+def _places(config: Mapping[str, Any]) -> list[str]:
+    """On-site and hybrid places, then remote regions, from `search.location_rules`."""
     search = config.get("search")
-    if not isinstance(search, Mapping):
+    rules = search.get("location_rules") if isinstance(search, Mapping) else None
+    if not isinstance(rules, Mapping):
         return []
-    raw = search.get("locations")
-    if not isinstance(raw, list):
-        return []
-    return [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+    raw: list[object] = []
+    for key in ("onsite_hybrid", "remote"):
+        values = rules.get(key)
+        raw.extend(values if isinstance(values, list) else [])
+    return _unique(raw)
+
+
+def _unique(values: Sequence[object]) -> list[str]:
+    seen: set[str] = set()
+    found: list[str] = []
+    for value in values:
+        if isinstance(value, str) and value.strip() and value.strip().casefold() not in seen:
+            seen.add(value.strip().casefold())
+            found.append(value.strip())
+    return found
 
 
 def _hosts(config: Mapping[str, Any]) -> list[str]:
@@ -519,6 +551,8 @@ def _store(
     hits: Sequence[Hit],
     today: str,
     career_hosts: Sequence[str],
+    *,
+    cursor: int | None = None,
 ) -> list[Queued]:
     watched_boards = _watched_boards(config)
     watched_careers = _watched_careers(config, career_hosts)
@@ -535,6 +569,8 @@ def _store(
     }
     stored: list[Queued] = []
     with db.transaction(conn):
+        if cursor is not None:
+            conn.execute("UPDATE discovery_state SET cursor = ? WHERE id = 1", (cursor,))
         for hit in hits:
             if hit.kind == "board":
                 if hit.ats_type is None or hit.ats_slug is None:

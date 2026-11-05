@@ -148,3 +148,20 @@ def test_workday_identity_accepted(item: dict[str, object]) -> None:
     doc = example()
     doc["watchlist"] = [item]
     assert validate_config(doc) == []
+
+
+@pytest.mark.parametrize("value", [0, 41, "12", True, 1.5, None])
+def test_discovery_queries_per_run_is_checked(value: object) -> None:
+    from careerhunter.config import discovery_queries_per_run
+
+    doc = example()
+    doc["discovery"]["queries_per_run"] = value  # type: ignore[index]
+    assert any("discovery.queries_per_run" in p for p in validate_config(doc))
+    assert discovery_queries_per_run(doc) == 12
+
+
+def test_discovery_queries_per_run_is_read() -> None:
+    from careerhunter.config import discovery_queries_per_run
+
+    assert discovery_queries_per_run({"discovery": {"queries_per_run": 40}}) == 40
+    assert discovery_queries_per_run({}) == 12

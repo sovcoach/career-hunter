@@ -66,6 +66,9 @@ DEFAULT_WATCH_INTERVAL_MINUTES = 60
 MIN_WATCH_INTERVAL_MINUTES = 15
 DEFAULT_DISCOVERY_INTERVAL_MINUTES = 1440
 MIN_DISCOVERY_INTERVAL_MINUTES = 60
+# discovery.queries_per_run: how many queries one pass sends (#40).
+DEFAULT_QUERIES_PER_RUN = 12
+QUERIES_PER_RUN_LIMITS = (1, 40)
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 DEFAULT_OFF_LANE_MIN_FIT = "high"
 DEFAULT_MAX_POSTING_AGE_DAYS = 7
@@ -191,7 +194,12 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
     if not isinstance(section, dict):
         problems.append("discovery must be a mapping")
         return
-    extra = set(section) - {"searxng_url", "career_hosts", "interval_minutes"}
+    extra = set(section) - {
+        "searxng_url",
+        "career_hosts",
+        "interval_minutes",
+        "queries_per_run",
+    }
     if extra:
         problems.append(f"discovery has unknown keys: {sorted(extra)}")
     if "searxng_url" in section:
@@ -200,6 +208,14 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
         _career_hosts(section["career_hosts"], problems)
     if "interval_minutes" in section:
         _discovery_interval(section["interval_minutes"], problems)
+    low, high = QUERIES_PER_RUN_LIMITS
+    if not _int(value := section.get("queries_per_run", DEFAULT_QUERIES_PER_RUN)) or not (
+        low <= value <= high
+    ):
+        problems.append(
+            f"discovery.queries_per_run must be an integer from {low} to {high} "
+            f"(default {DEFAULT_QUERIES_PER_RUN})"
+        )
 
 
 def _discovery_interval(value: Any, problems: list[str]) -> None:
@@ -603,6 +619,14 @@ def alerts_max_per_poll(doc: Mapping[str, Any] | None) -> int:
     if _int(value) and 1 <= value <= MAX_PER_POLL_LIMIT:
         return value
     return DEFAULT_MAX_PER_POLL
+
+
+def discovery_queries_per_run(doc: Mapping[str, Any] | None) -> int:
+    """How many queries one discovery pass sends. 12 when it is not set."""
+    section = doc.get("discovery") if isinstance(doc, Mapping) else None
+    value = section.get("queries_per_run") if isinstance(section, Mapping) else None
+    low, high = QUERIES_PER_RUN_LIMITS
+    return value if _int(value) and low <= value <= high else DEFAULT_QUERIES_PER_RUN
 
 
 def max_posting_age_days(doc: Mapping[str, Any] | None) -> int:

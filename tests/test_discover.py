@@ -80,23 +80,85 @@ def inited(data_env: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str
     return data_env
 
 
-def test_queries_stop_at_twelve_and_use_the_first_title_variant() -> None:
+HOSTS = (
+    "greenhouse.io",
+    "jobs.lever.co",
+    "jobs.ashbyhq.com",
+    "jobs.smartrecruiters.com",
+    "bamboohr.com",
+    "myworkdayjobs.com",
+)
+
+
+def test_queries_walk_every_title_variant_place_and_host_in_order() -> None:
     config = {
         "search": {
-            "lanes": [{"titles": ["One", ["Alpha", "Beta"], "Three", "Four"]}],
-            "locations": ["Example City", "Sample Town"],
+            "lanes": [
+                {"name": "B", "priority": 2, "titles": ["Three"]},
+                {"name": "A", "priority": 1, "titles": ["One", ["Alpha", "Beta"], "one"]},
+            ],
+            "location_rules": {"onsite_hybrid": ["Example City"], "remote": ["Example Region"]},
+            "locations": ["Unused Town"],
         },
         "discovery": {"career_hosts": ["jobs.example.com"]},
     }
     queries = discover.build_queries(config)
-    assert len(queries) == 12
-    assert queries[0] == "site:boards.greenhouse.io One Example City"
-    assert any("Alpha" in query for query in queries)
-    assert "Beta" not in "\n".join(queries)
+    hosts = [*HOSTS, "jobs.example.com"]
+    expected = [
+        f"site:{host} {title} {place}"
+        for title in ("One", "Alpha", "Beta", "Three")  # lane priority, every variant, once
+        for place in ("Example City", "Example Region")
+        for host in hosts
+    ]
+    assert queries == expected
+    assert not any("Unused Town" in query for query in queries)
     assert discover.build_queries({"search": {}}) == []
     bare = discover.build_queries({"search": {"target_titles": ["One"]}})
-    assert bare[0] == "site:boards.greenhouse.io One"
-    assert len(bare) == 4
+    assert bare == [f"site:{host} One" for host in HOSTS]
+
+
+def test_the_cursor_takes_the_next_slice_and_wraps() -> None:
+    queries = [f"q{n}" for n in range(5)]
+    assert discover.take(queries, 0, 2) == (["q0", "q1"], 2)
+    assert discover.take(queries, 4, 2) == (["q4", "q0"], 1)
+    assert discover.take(queries, 3, 12) == (["q3", "q4", "q0", "q1", "q2"], 3)  # once each
+    assert discover.take(queries, 17, 1) == (["q2"], 3)  # the list got shorter: wrap first
+    assert discover.take([], 3, 2) == ([], 0)
+
+
+def test_the_cursor_covers_every_query_across_runs_and_wraps(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    config = {
+        "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "queries_per_run": 4},
+        "search": {
+            "target_titles": ["One", "Two"],
+            "location_rules": {"onsite_hybrid": ["Example City"]},
+        },
+    }
+    every = discover.build_queries(config)
+    assert len(every) == 12
+    asked: list[str] = []
+    for _run in range(4):
+        talk = _Talk(json.dumps({"results": []}).encode())
+        assert discover.run(conn, config, today="2026-11-02", transport=talk).notice is None
+        asked += [urllib.parse.parse_qs(urllib.parse.urlsplit(c).query)["q"][0] for c in talk.calls]
+    assert asked[:12] == every  # three runs cover every combination once
+    assert asked[12:] == every[:4]  # then it wraps
+    conn.close()
+
+
+def test_a_miss_leaves_the_cursor_where_it_was(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    config = {**_SEARCH, "discovery": {**_SEARCH["discovery"], "queries_per_run": 2}}
+    ok = _Talk(json.dumps({"results": []}).encode())
+    discover.run(conn, config, today="2026-11-02", transport=ok)
+    discover.run(conn, config, today="2026-11-02", transport=_Talk(b"", status=0, fail_at=2))
+    again = _Talk(json.dumps({"results": []}).encode())
+    discover.run(conn, config, today="2026-11-02", transport=again)
+    first = [c for c in ok.calls]
+    assert again.calls[0] != first[0]  # it moved on after the first run
+    assert conn.execute("SELECT cursor FROM discovery_state").fetchone()[0] == 4
+    conn.close()
 
 
 def test_no_titles_makes_no_request(tmp_path: Path) -> None:
@@ -707,7 +769,7 @@ def test_an_empty_result_list_is_a_normal_reply(tmp_path: Path) -> None:
     talk = _Talk(json.dumps({"results": []}).encode())
     outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=talk)
     assert outcome == discover.Outcome(None, ())
-    assert len(talk.calls) == 4  # every query was sent; none was a miss
+    assert len(talk.calls) == 6  # every query was sent; none was a miss
     conn.close()
 
 

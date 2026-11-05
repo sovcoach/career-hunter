@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 14)), "ei_record": [1]}[track]
+    expected = {"search": list(range(1, 15)), "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -771,5 +771,24 @@ def test_0013_leaves_existing_postings_without_a_posted_date(tmp_path: Path) -> 
         for bad in ("2026-10-30T10:00:00Z", "2026-13-01", "yesterday"):
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute("UPDATE postings SET posted_date = ?", (bad,))
+    finally:
+        conn.close()
+
+
+def test_0014_starts_discovery_at_the_first_query_with_no_backoff(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:14])
+        row = conn.execute("SELECT * FROM discovery_state").fetchall()
+        assert [tuple(r) for r in row] == [(1, 0, None, 0, None)]
+        for sql in (
+            "INSERT INTO discovery_state (id) VALUES (2)",
+            "UPDATE discovery_state SET cursor = -1",
+            "UPDATE discovery_state SET failures = 1",  # a failure needs its backoff time
+            "UPDATE discovery_state SET backoff_until = '2026-11-01T00:00:00Z'",
+            "UPDATE discovery_state SET last_pass_at = '2026-11-01'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(sql)
     finally:
         conn.close()
