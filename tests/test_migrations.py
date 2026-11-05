@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": [1, 2, 3, 4, 5, 6, 7, 8], "ei_record": [1]}[track]
+    expected = {"search": [1, 2, 3, 4, 5, 6, 7, 8, 9], "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -502,11 +502,33 @@ def test_0008_keeps_existing_postings_and_leaves_them_unstamped(tmp_path: Path) 
             "VALUES (?, 'Coordinator', '2026-10-01', 'watcher', '[]', 'text')",
             (company,),
         )
-        assert db.migrate(conn, "search") == [8]
+        assert db.migrate(conn, "search", db.load_migrations("search")[:8]) == [8]
         row = conn.execute(
             "SELECT title, llm_output, scored_resume_sha256, score_attempted_at FROM postings"
         ).fetchone()
         assert tuple(row) == ("Coordinator", "text", None, None)
         assert conn.execute("SELECT count(*) FROM resume_import").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_0009_keeps_scored_postings_and_leaves_their_fit_null(tmp_path: Path) -> None:
+    """A schema-8 file with a scored posting moves to 9 with no fit and no runs."""
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        assert db.migrate(conn, "search", db.load_migrations("search")[:8]) == list(range(1, 9))
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source, gaps, llm_output, "
+            "scout_metadata) VALUES (?, 'Coordinator', '2026-10-01', 'watcher', '[]', 'text', "
+            '\'{"tier": "strong"}\')',
+            (company,),
+        )
+        assert db.migrate(conn, "search") == [9]
+        row = conn.execute("SELECT title, scout_metadata, fit FROM postings").fetchone()
+        assert tuple(row) == ("Coordinator", '{"tier": "strong"}', None)
+        assert conn.execute("SELECT count(*) FROM watch_runs").fetchone()[0] == 0
     finally:
         conn.close()
