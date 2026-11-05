@@ -568,6 +568,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 > **Amended for the run record (#38).** Search migration 0009 adds `watch_runs`. A run inserts its row first, in its own transaction, and finishes it just before the last line with the board counts, `budget_reached`, and the postings still held: unscored, scored with no fit, and off-lane below the threshold, read from `search.db` at that moment. A run the budget cut short still finishes, with `budget_reached` 1, as this ADR counts it a success. A run that crashes, is killed or stops on a database error never finishes its row, so its counts stay null and are never read as zero. A CHECK keeps an unfinished row free of counts. `doctor` reports a run unfinished for more than the budget plus five minutes as BAD, and the held counts from the last finished run. The table is never pruned: one small row per run.
 
+> **Amended for gates on every ATS (#32).** Greenhouse is fetched with `content=true` and Ashby with `includeCompensation=true`, so the description and pay gates see text on every supported board. The text is held in memory only, as before. A board fetch has its own 20 MB body cap, larger than the 5 MB cap for a job ad (ADR-016), because a Greenhouse board now carries every description. A board over the cap logs `board over the size cap (...); nothing recorded`, stores nothing from that board, keeps its attempt stamp, and counts as failed, never as fetched or as zero postings. Nothing is truncated.
+
 **Context.**
 - One unexpected exception in one company ended the whole watch run, and the boards after it were never fetched.
 - Log lines were written only when the run finished. launchd discards stderr, so a crash left no trace at all.

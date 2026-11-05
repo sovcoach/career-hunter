@@ -36,7 +36,8 @@ search:
   # Optional: the lowest fit (low, medium or high) at which a posting whose title
   # matches no lane still alerts, labelled Off-lane and sent last. Default high.
   off_lane_min_fit: high
-  # Optional: where each work model is acceptable.
+  # Optional: where each work model is acceptable. With no work model from the board,
+  # a location saying "remote" counts as remote and anything else as on-site.
   location_rules:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here
     remote: [Canada]                    # fully remote only within these regions
@@ -48,7 +49,7 @@ search:
 
 # Hard gates: a posting failing any of these is skipped, with the reason recorded.
 hard_gates:
-  min_salary: null             # yearly pay below this is skipped; null turns the gate off
+  min_salary: null             # yearly CAD; skipped when the top of the stated range is below it; null turns it off
   max_commute_km: 40
   exclude_work_models: []      # e.g. [onsite]
   # Optional gates; a posting that trips one is skipped with that reason (Phase 3).
