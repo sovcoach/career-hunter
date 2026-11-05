@@ -793,7 +793,7 @@ BUSY = "discover: another pass started less than 150 seconds ago; skipped"
 
 def _discovery_pass(
     datadir: DataDir, doc: dict[str, Any], budget: Deadline, conn: sqlite3.Connection
-) -> list[str]:
+) -> discover.Pass:
     """One discovery pass inside the watch run, when it is on and due (#40).
 
     Due means no pass was claimed in the last `discovery.interval_minutes`; the claim is
@@ -801,10 +801,10 @@ def _discovery_pass(
     run budget, and writes `logs/discover.success` once it has run, a miss included.
     """
     if not discovery_enabled(doc):
-        return []
+        return discover.Pass([])
     gap = dt.timedelta(minutes=discovery_interval_minutes(doc))
     if not discover.claim_pass(conn, discover._utc_now(), gap):
-        return []
+        return discover.Pass([])
     share = Deadline(discover.PASS_SECONDS).sooner(budget)
     outcome = discover.run(
         conn,
@@ -813,9 +813,9 @@ def _discovery_pass(
         transport=partial(discover.default_transport, budget=share),
     )
     lines = [outcome.notice] if outcome.notice else []
-    lines.append(f"discover: {len(outcome.rows)} queued")
+    lines.append(f"discover: {len(outcome.rows)} queued, {len(outcome.postings)} postings found")
     _record_discover_success(datadir)
-    return lines
+    return discover.Pass(lines, outcome.postings)
 
 
 def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:

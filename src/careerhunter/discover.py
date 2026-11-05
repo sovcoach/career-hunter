@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from careerhunter import db, loopback, search_store
+from careerhunter.ats import Board, PostingRef, posting_url
 from careerhunter.config import (
     discovery_interval_minutes,
     discovery_queries_per_run,
@@ -117,10 +118,22 @@ class Queued:
 
 @dataclass(frozen=True)
 class Outcome:
-    """`notice` is a closed stderr line. `rows` are the rows inserted on this run."""
+    """`notice` is a closed stderr line. `rows` are the rows inserted on this run.
+
+    `postings` are the posting URLs among the hits, for the watch run to fetch (#41).
+    """
 
     notice: str | None
     rows: tuple[Queued, ...]
+    postings: tuple[PostingRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class Pass:
+    """What a discovery pass inside the watch run hands back: its lines and postings."""
+
+    lines: list[str]
+    postings: tuple[PostingRef, ...] = ()
 
 
 def request_url(base: str, query: str) -> str:
@@ -347,6 +360,7 @@ def run(
     delay = discovery_query_delay_seconds(config)
     hits: list[Hit] = []
     seen: set[tuple[str, ...]] = set()
+    postings: dict[str, PostingRef] = {}  # by the posting's URL, first one kept
     pause = sleep or _sleep
     for index, query in enumerate(queries):
         if index:
@@ -356,6 +370,9 @@ def run(
             _record_failure(conn, config, clock())
             return Outcome(answer, ())
         for raw in answer:
+            ref = posting(raw)
+            if ref is not None:
+                postings.setdefault(posting_url(ref) or raw, ref)
             hit = classify(raw, career_hosts)
             if hit is None:
                 continue
@@ -366,7 +383,40 @@ def run(
             hits.append(hit)
     # The queue rows and the moved cursor go in one transaction: a miss moves neither,
     # so the same queries are asked again next time.
-    return Outcome(None, tuple(_store(conn, config, hits, today, career_hosts, cursor=after)))
+    stored = _store(conn, config, hits, today, career_hosts, cursor=after)
+    return Outcome(None, tuple(stored), tuple(postings.values()))
+
+
+def posting(url: str) -> PostingRef | None:
+    """The posting a result URL names on a supported ATS, or None (#41).
+
+    Greenhouse `/<board>/jobs/<id>`, Lever and Ashby `/<board>/<id>`, SmartRecruiters
+    `/<company>/<id>-<title>`, BambooHR `/careers/<id>` and Workday
+    `[/<locale>]/<site>/job/...`. The posting's board is the one `classify` reduces
+    the same URL to.
+    """
+    hit = classify(url, [])
+    if hit is None or hit.kind != "board" or hit.ats_type is None or hit.ats_slug is None:
+        return None
+    parts = urllib.parse.urlsplit(url.strip())
+    segments = _segments(parts.path) or []
+    ref: str | None = None
+    if hit.ats_type == "greenhouse" and len(segments) == 3 and segments[1] == "jobs":
+        ref = segments[2]
+    elif hit.ats_type in ("lever", "ashby") and len(segments) == 2:
+        ref = segments[1]
+    elif hit.ats_type == "smartrecruiters" and len(segments) == 2:
+        ref = segments[1].split("-", 1)[0]
+    elif hit.ats_type == "bamboohr" and len(segments) == 2:
+        ref = segments[1]
+    elif hit.ats_type == "workday" and "job" in segments:
+        at = segments.index("job")
+        ref = "/" + "/".join(urllib.parse.quote(part, safe="") for part in segments[at:])
+    if ref is None:
+        return None
+    board = Board(hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site)
+    found = PostingRef(board, ref)
+    return found if posting_url(found) is not None else None
 
 
 def _ask(talk: Transport, base: str, query: str) -> list[str] | str:

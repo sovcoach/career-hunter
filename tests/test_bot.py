@@ -1269,7 +1269,7 @@ def test_a_discovery_message_is_the_name_and_url_only(env: Env, keep_umask: None
         source="discovery",
     )
     conn = env.search()
-    assert search_store.pending_alert_ids(conn) == [watcher]
+    assert search_store.pending_alert_ids(conn) == [watcher, found]  # discovery alerts (#41)
     assert found != watcher
     conn.close()
     assert noticed == {board: "2026-10-28T16:00:00Z", career: "2026-10-28T16:00:00Z"}

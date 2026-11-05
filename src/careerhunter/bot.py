@@ -17,8 +17,9 @@ Trust boundary (ADR-016):
   Before every EI-bearing write the bot re-reads config and re-checks the claims,
   as the CLI does. A discovery approve or reject opens `search.db` only.
 
-Privacy (ADR-015, amended by ADR-019, ADR-020 and #39): watcher postings go out as
-one digest per watch run. A digest row carries the company, title, location, lane,
+Privacy (ADR-015, amended by ADR-019, ADR-020, #39 and #41): watcher and discovery
+postings go out as one digest per watch run. A digest row carries the company, title,
+location, lane,
 fit word (`Fit: High`, `Medium` or `Low`), the number of gaps, the schedule flag in
 words, up to three key requirements the model took from the posting, and the link.
 A job ad sent with /log gets its own alert: company, title, link, `Fit: not scored`,
@@ -520,7 +521,7 @@ class Bot:
             return company
 
     def send_pending_alerts(self) -> None:
-        """Send pending watcher postings as one digest per watch run, within the cap.
+        """Send pending watcher and discovery postings as one digest per watch run.
 
         Config is read once per poll, for the lanes, the off-lane threshold, the cap and
         the agency labels. If it can't be read, no watcher alert is sent this poll: the
@@ -528,8 +529,8 @@ class Bot:
         and when it ends, and the next poll tries again. Job ads sent to the bot are
         not held by this.
 
-        Which postings: scored watcher postings with a fit, no skip and no alert, in
-        ``lanes.alert_order`` (off-lane below ``search.off_lane_min_fit`` and postings
+        Which postings: scored watcher and discovery postings with a fit, no skip and no
+        alert, in ``lanes.alert_order`` (off-lane below ``search.off_lane_min_fit`` and postings
         not yet lane-checked stay pending). A run's postings wait until that run has
         finished, or started more than STALE_RUN ago (killed or crashed), so a run is
         never sent half-scored and a dead one never blocks its postings. Postings with

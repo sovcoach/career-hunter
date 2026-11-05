@@ -118,6 +118,7 @@ from careerhunter.ats import (
 from careerhunter.ats import board_url as board_url  # the tests build list URLs with it
 from careerhunter.config import max_posting_age_days, off_lane_min_fit, tier_fits
 from careerhunter.deadline import Deadline
+from careerhunter.discover import Pass
 from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout, FetchTooLarge
 from careerhunter.filters import PostingText
@@ -289,13 +290,14 @@ def run(
     resume: Resume | None = None,
     resume_problem: str | None = None,
     poster: Poster | None = None,
-    discovery: Callable[[sqlite3.Connection], list[str]] | None = None,
+    discovery: Callable[[sqlite3.Connection], Pass] | None = None,
 ) -> list[str]:
     """Fetch each watched board once. `today` is the configured date, `YYYY-MM-DD`.
 
     `poster` sends one JSON POST (`fetch.post_json`); Workday boards need it and are
     skipped with a line without it. `discovery` is the discovery pass (#40): it runs
-    before the boards, isolated like a board, and returns its lines.
+    before the boards, isolated like a board, and returns its lines and the posting
+    URLs it found, which are then fetched once each and recorded like a board's (#41).
 
     Each log line is handed to `emit` as it happens; the same lines are returned.
     `budget` bounds the whole run; the caller also gives it to each client it builds.
@@ -325,14 +327,29 @@ def run(
     if state.lanes_on:
         with _isolated(conn, lines, "lane fill-in", state.hook):
             _fill_lanes(conn, state, rules)
+    found: Pass | None = None
     if discovery is not None:
         with _isolated(conn, lines, "discovery", state.hook):
-            lines.extend(discovery(conn))
+            found = discovery(conn)
+            lines.extend(found.lines)
     if scorer is not None and resume_problem is not None:
         lines.append(f"watch: scoring: resume not usable ({resume_problem}); left for the next run")
         scorer = None
     embedder = Embedder(conn, data_dir, rules, transport=embed_transport)
     blocked: set[str] = set()
+    if found is not None and found.postings:
+        _record_discovered(
+            conn,
+            state,
+            blocked,
+            found.postings,
+            rules,
+            skipped,
+            today,
+            ats_boards.Client(fetcher, poster=poster),
+            scorer,
+            embedder,
+        )
     counts = {"fetched": 0, "failed": 0, "left": 0}
     for item in _by_last_attempt(conn, _with_discovery_boards(conn, watchlist)):
         entry = _entry(item)
@@ -708,6 +725,94 @@ def _details_tally(
     return "failed"
 
 
+DISCOVERED_PER_RUN = 20  # posting URLs from one discovery pass fetched in one run
+
+
+def _record_discovered(
+    conn: sqlite3.Connection,
+    state: _State,
+    blocked: set[str],
+    postings: Sequence[ats_boards.PostingRef],
+    config: Mapping[str, Any],
+    exclusions: Mapping[str, Any],
+    today: str,
+    client: ats_boards.Client,
+    scorer: Scorer | None,
+    embedder: Embedder,
+) -> None:
+    """Fetch each posting a discovery pass found, once, and record it like a board's.
+
+    A posting whose URL is stored already is not fetched. The rest go through the same
+    gates, age gate, lanes and scoring as watched postings, with `source` discovery, and
+    so into the same digest; approval is never needed first (#41). At most
+    DISCOVERED_PER_RUN are fetched; the others are left with a line (a later pass can
+    find them again). A failed fetch is a line and stores nothing; HTTP 429 blocks the
+    host for the rest of the run, boards included.
+    """
+    day = dt.date.fromisoformat(today)
+    fresh = [
+        ref
+        for ref in postings
+        if not search_store.posting_url_known(conn, ats_boards.posting_url(ref) or "")
+    ]
+    for index, ref in enumerate(fresh):
+        name = ref.board.slug
+        if index >= DISCOVERED_PER_RUN:
+            state.lines.append(
+                f"watch: discovery: {len(fresh) - index} postings left (limit {DISCOVERED_PER_RUN})"
+            )
+            return
+        if state.out_of_time():
+            state.left_by_budget(f"watch: discovery: {len(fresh) - index} postings {_LEFT}")
+            return
+        api = urllib.parse.urlsplit(ats_boards.list_url(ref.board) or "").hostname or ""
+        if api in blocked:
+            state.lines.append(
+                _line(name, ref.board.ats, f"posting: {api} already returned HTTP 429 this run")
+            )
+            continue
+        with _isolated(conn, state.lines, name, state.hook):
+            job = _fetch_posting(state, blocked, name, ref, client, day)
+            if job is not None:
+                _record_jobs(
+                    conn,
+                    state,
+                    job.company_field or name,
+                    ref.board.ats,
+                    [job],
+                    None,
+                    config,
+                    exclusions,
+                    today,
+                    scorer,
+                    embedder,
+                    source="discovery",
+                )
+
+
+def _fetch_posting(
+    state: _State,
+    blocked: set[str],
+    name: str,
+    ref: ats_boards.PostingRef,
+    client: ats_boards.Client,
+    day: dt.date,
+) -> Job | None:
+    """One discovered posting, or None with a line saying why it was not recorded."""
+    ats = ref.board.ats
+    try:
+        return ats_boards.read_posting(ref, client, today=day)
+    except FetchError as exc:
+        state.lines.append(_line(name, ats, f"posting: {type(exc).__name__}; nothing recorded"))
+    except BoardHTTPError as exc:
+        if exc.status == 429:
+            blocked.add(urllib.parse.urlsplit(exc.url).hostname or "")
+        state.lines.append(_line(name, ats, f"posting: HTTP {exc.status}; nothing recorded"))
+    except BoardParseError as exc:
+        state.lines.append(_line(name, ats, f"posting: {exc}; nothing recorded"))
+    return None
+
+
 def _fetch_jobs(
     conn: sqlite3.Connection,
     state: _State,
@@ -776,6 +881,7 @@ def _record_jobs(
     today: str,
     scorer: Scorer | None,
     embedder: Embedder,
+    source: str = "watcher",
 ) -> None:
     lines = state.lines
     new = 0
@@ -831,7 +937,7 @@ def _record_jobs(
             schedule=None if reason else verdict.schedule,
             url=item.url,
             requisition_id=item.requisition_id,
-            source="watcher",
+            source=source,
         )
         try:
             with db.transaction(conn):
@@ -911,7 +1017,7 @@ def _recheck(
         "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, "
         "p.requisition_id, p.schedule, p.posted_date, p.first_seen FROM postings p "
         "JOIN companies c ON c.id = p.company_id "
-        "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
+        "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
     ).fetchall()
     rows = [row for row in rows if int(row["id"]) not in state.inserted]
@@ -975,14 +1081,14 @@ def _recheck_one(
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
-    "WHERE p.source = 'watcher' AND p.llm_output IS NULL "
+    "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
-    "WHERE p.source = 'watcher' AND p.llm_output IS NOT NULL "
+    "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
@@ -990,7 +1096,7 @@ _RESCORE_SQL = (
 )
 _NEEDS_RESCORE_SQL = (
     "SELECT 1 FROM postings p "
-    "WHERE p.id = ? AND p.source = 'watcher' AND p.llm_output IS NOT NULL "
+    "WHERE p.id = ? AND p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)"

@@ -662,10 +662,12 @@ def test_approve_and_reject_leave_config_and_the_ei_file_alone(
     assert pending is not None and pending[0] == 1
 
 
-def test_the_alert_query_stays_on_watcher_postings(search: sqlite3.Connection) -> None:
+def test_the_alert_query_takes_watcher_and_discovery_postings_only(
+    search: sqlite3.Connection,
+) -> None:
+    """Discovery postings alert directly (#41); a posting logged by hand never does."""
     text = inspect.getsource(search_store.pending_alerts)
-    assert "p.source = 'watcher'" in text
-    assert "discovery" not in text
+    assert "p.source IN ('watcher', 'discovery')" in text
     watcher, _inserted = search_store.upsert_company(search, "Example Robotics", source="watcher")
     other, _also = search_store.upsert_company(search, "Example Org", source="discovery")
     search.execute(
@@ -680,7 +682,13 @@ def test_the_alert_query_stays_on_watcher_postings(search: sqlite3.Connection) -
         "'high')",
         (other,),
     )
-    assert search_store.pending_alert_ids(search) == [watcher_id]
+    found_id = int(search.execute("SELECT last_insert_rowid()").fetchone()[0])
+    search.execute(
+        "INSERT INTO postings (company_id, title, first_seen, source, llm_output, fit) "
+        "VALUES (?, 'Logged By Hand', '2026-11-02', 'manual', 'synthetic', 'high')",
+        (other,),
+    )
+    assert search_store.pending_alert_ids(search) == [watcher_id, found_id]
 
 
 def test_the_queue_has_no_snippet_column(tmp_path: Path) -> None:

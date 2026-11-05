@@ -58,9 +58,9 @@ def test_a_due_pass_runs_first_in_the_watch_run(
     err = _watch(probe, capsys)
     assert len(talk.calls) == 2
     assert no_discovery_sleep == [5]
-    assert err.splitlines()[0] == "discover: 0 queued"
+    assert err.splitlines()[0] == "discover: 0 queued, 0 postings found"
     assert (home / "logs" / "discover.success").is_file()
-    assert "discover: 0 queued" in (home / "logs" / "watch.log").read_text()
+    assert "discover: 0 queued, 0 postings found" in (home / "logs" / "watch.log").read_text()
 
 
 def test_a_pass_is_not_due_again_inside_the_interval(
@@ -135,7 +135,7 @@ def test_a_miss_inside_the_watch_run_still_counts_as_a_pass(
 
     monkeypatch.setattr(discover, "default_transport", down)
     err = _watch(probe, capsys)
-    assert err.splitlines()[:2] == [discover.MISS, "discover: 0 queued"]
+    assert err.splitlines()[:2] == [discover.MISS, "discover: 0 queued, 0 postings found"]
     assert (home / "logs" / "discover.success").is_file()
     conn = db.connect(home / "search.db")
     failures = conn.execute("SELECT failures FROM discovery_state").fetchone()[0]

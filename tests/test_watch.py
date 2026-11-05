@@ -1152,9 +1152,8 @@ def test_watch_fetches_an_approved_discovery_board_only(
         int(row["id"])
         for row in search.execute("SELECT id FROM postings WHERE source = 'discovery'")
     ]
-    assert alerted == watcher_ids
     assert discovery_ids
-    assert not set(discovery_ids) & set(alerted)
+    assert alerted == watcher_ids + discovery_ids  # discovery postings alert too (#41)
     career_row = search.execute(
         "SELECT watchlist, source, careers_url FROM companies WHERE name = ?",
         ("jobs.example.com",),

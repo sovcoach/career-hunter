@@ -247,7 +247,7 @@ def set_posting_score(
 def fill_missing_fits(
     conn: sqlite3.Connection, fits: Mapping[str, str], run_id: int | None = None
 ) -> int:
-    """Give a fit to scored, unalerted watcher postings that have a tier name but no fit.
+    """Give a fit to scored, unalerted watched or discovered postings with a tier but no fit.
 
     The fit is looked up by the stored tier name in `fits` (from the current config).
     A name that is not there is left alone: that posting stays without a fit and is not
@@ -257,7 +257,7 @@ def fill_missing_fits(
     """
     rows = conn.execute(
         "SELECT p.id, json_extract(p.scout_metadata, '$.tier') AS tier FROM postings p "
-        "WHERE p.source = 'watcher' AND p.llm_output IS NOT NULL AND p.fit IS NULL "
+        "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL AND p.fit IS NULL "
         "AND p.alerted_at IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
         "ORDER BY p.id"
@@ -290,7 +290,7 @@ def set_score_attempted_at(conn: sqlite3.Connection, posting_id: int, stamp: str
 
 @dataclass(frozen=True)
 class HeldCounts:
-    """Watcher postings with no skip that are held back from alerts, by why."""
+    """Watcher and discovery postings with no skip held back from alerts, by why."""
 
     unscored: int  # no score yet: waiting to be scored or retried
     no_fit: int  # scored and not alerted, but its tier name has no fit in config
@@ -298,7 +298,7 @@ class HeldCounts:
 
 
 def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None) -> HeldCounts:
-    """How many watcher postings with no skip are held, read now.
+    """How many watcher and discovery postings with no skip are held, read now.
 
     `off_lane_min_fit` is `search.off_lane_min_fit` while lane checking is on: an
     off-lane posting with a lower fit is held. None means lane checking is off, and no
@@ -311,7 +311,7 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
           coalesce(sum(p.llm_output IS NOT NULL AND p.fit IS NULL AND p.alerted_at IS NULL), 0)
             AS no_fit
         FROM postings p
-        WHERE p.source = 'watcher'
+        WHERE p.source IN ('watcher', 'discovery')
           AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
         """
     ).fetchone()
@@ -320,7 +320,7 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
         off_lane = int(
             conn.execute(
                 "SELECT count(*) FROM postings p "
-                "WHERE p.source = 'watcher' AND p.llm_output IS NOT NULL "
+                "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
                 "AND p.alerted_at IS NULL AND p.lane_checked = 1 AND p.lane IS NULL "
                 "AND (CASE p.fit WHEN 'low' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 END) "
                 "< ? "
@@ -384,7 +384,8 @@ def finish_watch_run(
 
 @dataclass(frozen=True)
 class PendingAlert:
-    """A watcher posting the bot may alert: scored, with a fit, no skip, not alerted."""
+    """A watcher or discovery posting the bot may alert: scored, with a fit, no skip, not
+    alerted. Discovery postings alert directly, with no approval (#41)."""
 
     posting_id: int
     fit: str
@@ -397,7 +398,8 @@ class PendingAlert:
 
 
 def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
-    """Watcher postings with a score and a fit, no skip, and no alert yet. Oldest id first.
+    """Watcher and discovery postings with a score and a fit, no skip, and no alert yet.
+    Oldest id first.
 
     A posting without a fit (unscored, or scored into a tier name not in config) is held.
     The bot orders these, and holds some for their lane (`lanes.alert_order`).
@@ -407,7 +409,7 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
         SELECT p.id, p.fit, p.lane, p.lane_checked, p.first_seen, p.score_run_id,
                r.finished_at, r.started_at
         FROM postings p LEFT JOIN watch_runs r ON r.id = p.score_run_id
-        WHERE p.source = 'watcher'
+        WHERE p.source IN ('watcher', 'discovery')
           AND p.llm_output IS NOT NULL
           AND p.fit IS NOT NULL
           AND p.alerted_at IS NULL

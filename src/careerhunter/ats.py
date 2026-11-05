@@ -127,6 +127,17 @@ class Board:
         return ":".join(parts).casefold()
 
 
+@dataclass(frozen=True)
+class PostingRef:
+    """One posting on a board, as a discovery hit names it (#41).
+
+    `ref` is the posting's id on its board, or Workday's `/job/...` path.
+    """
+
+    board: Board
+    ref: str
+
+
 @dataclass
 class BoardRead:
     """What one board gave this run.
@@ -207,6 +218,117 @@ def board_url(ats_type: str, slug: str) -> str | None:
     if ats_type == "smartrecruiters":
         return _smartrecruiters_list(slug, 0)
     return f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
+
+
+def posting_url(posting: PostingRef) -> str | None:
+    """The URL the watcher stores for this posting when it reads it from its board, so a
+    posting found by discovery and later on its board is one posting. None when the
+    reference is not safe to use. Greenhouse's own `absolute_url` can be on the
+    company's domain; the board URL here is then only the first check."""
+    board, ref = posting.board, posting.ref
+    if list_url(board) is None:
+        return None
+    if board.ats == "workday":
+        if _WORKDAY_PATH.fullmatch(ref) is None or "/../" in f"{ref}/":
+            return None
+        return f"https://{board.slug}.{board.host}.myworkdayjobs.com/{board.site}{ref}"
+    if _SLUG.fullmatch(ref) is None:
+        return None
+    if board.ats in ("greenhouse", "smartrecruiters", "bamboohr") and not ref.isdigit():
+        return None
+    return {
+        "greenhouse": f"https://boards.greenhouse.io/{board.slug}/jobs/{ref}",
+        "lever": f"https://jobs.lever.co/{board.slug}/{ref}",
+        "ashby": f"https://jobs.ashbyhq.com/{board.slug}/{ref}",
+        "smartrecruiters": f"https://jobs.smartrecruiters.com/{board.slug}/{ref}",
+        "bamboohr": f"https://{board.slug}.bamboohr.com/careers/{ref}",
+    }[board.ats]
+
+
+def read_posting(posting: PostingRef, client: Client, *, today: dt.date | None = None) -> Job:
+    """One posting, fetched once through its ATS's API (#41).
+
+    Greenhouse, Lever, SmartRecruiters, BambooHR and Workday each have a single-posting
+    endpoint (checked on live public boards); Ashby's public API has none, so its board
+    is read and the job picked by id. Raises like `read`: a fetch error as it is, a
+    non-200 reply as BoardHTTPError, and a body that is not that posting (or a posting
+    that is not on its board) as BoardParseError.
+    """
+    board, ref = posting.board, posting.ref
+    if posting_url(posting) is None:
+        raise BoardParseError("not a posting this module reads")
+    found: Job | Skip
+    if board.ats == "greenhouse":
+        data = client.get_json(
+            f"https://boards-api.greenhouse.io/v1/boards/{board.slug}/jobs/{ref}"
+        )
+        found = _greenhouse_job(data, board.slug)
+    elif board.ats == "lever":
+        data = client.get_json(f"https://api.lever.co/v0/postings/{board.slug}/{ref}?mode=json")
+        found = _lever_job(data, board.slug)
+    elif board.ats == "ashby":
+        jobs = read(board, client).jobs
+        matches = [job for job in jobs if isinstance(job, Job) and job.requisition_id == ref]
+        if not matches:
+            raise BoardParseError("the posting is not on its board")
+        found = matches[0]
+    elif board.ats == "smartrecruiters":
+        data = client.get_json(
+            f"https://api.smartrecruiters.com/v1/companies/{board.slug}/postings/{ref}"
+        )
+        found = _smartrecruiters_job(data, board.slug)  # the detail has the list's fields
+        if isinstance(found, Job):
+            found = _smartrecruiters_detail(found, data)
+    elif board.ats == "bamboohr":
+        data = client.get_json(f"https://{board.slug}.bamboohr.com/careers/{ref}/detail")
+        found = _bamboohr_posting(data, board.slug, ref)
+    else:
+        found = _workday_posting(client.get_json(f"{_workday_base(board)}{ref}"), board, ref, today)
+    if isinstance(found, Skip):
+        raise BoardParseError(found.reason)
+    return found
+
+
+def _bamboohr_posting(data: object, slug: str, ref: str) -> Job | Skip:
+    """A posting from its detail alone: result.jobOpening has the title and location."""
+    result = _mapping(data.get("result")) if isinstance(data, dict) else None
+    opening = _mapping(result.get("jobOpening")) if result is not None else None
+    if opening is None:
+        raise BoardParseError("unexpected JSON shape")
+    title = _text(opening.get("jobOpeningName"))
+    if title is None:
+        return Skip("a job has no title")
+    stub = Job(
+        title=title,
+        location=_bamboohr_place(opening),
+        work_model=None,
+        url=f"https://{slug}.bamboohr.com/careers/{ref}",
+        requisition_id=ref,
+        company_field=None,
+    )
+    return _bamboohr_detail(stub, data)
+
+
+def _workday_posting(data: object, board: Board, ref: str, today: dt.date | None) -> Job | Skip:
+    """A posting from its detail alone: jobPostingInfo has the title, location and date."""
+    info = _mapping(data.get("jobPostingInfo")) if isinstance(data, dict) else None
+    if info is None:
+        raise BoardParseError("unexpected JSON shape")
+    title = _text(info.get("title"))
+    if title is None:
+        return Skip("a job has no title")
+    posted, at_least = _workday_posted(info.get("postedOn"), today)
+    stub = Job(
+        title=title,
+        location="",
+        work_model=None,
+        url=f"https://{board.slug}.{board.host}.myworkdayjobs.com/{board.site}{ref}",
+        requisition_id=None,
+        company_field=None,
+        posted=posted,
+        posted_min_days=at_least,
+    )
+    return _workday_detail(stub, data)
 
 
 def _nothing_known(url: str) -> bool:
