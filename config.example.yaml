@@ -136,13 +136,18 @@ watchlist:
 
 # Optional discovery settings (ADR-020). A null URL leaves discovery off.
 # A set URL is plain http to 127.0.0.1, localhost, or ::1, with no userinfo.
-# career_hosts lists extra career-page hostnames: no scheme, path, wildcard, or "..".
-# interval_minutes is optional. Missing or null means 1440, and the minimum is 60.
-# When the URL is set, service install runs careerhunter discover on this interval.
+# career_hosts lists extra hostnames to search with site:, no scheme, path,
+# wildcard, or "..". Career pages are not queued.
+# Discovery runs inside the watch agent, at most once per interval_minutes
+# (missing or null means 1440; the minimum is 60). Each pass sends the next
+# queries_per_run queries (1 to 40), query_delay_seconds apart (2 to 30); the
+# two multiplied are at most 120 seconds.
 discovery:
   searxng_url: null
   career_hosts: []
   interval_minutes: 1440
+  queries_per_run: 12
+  query_delay_seconds: 5
 
 # EI claims. career-hunter keeps one EI job-search record file per claim,
 # ei_record_<label>.db. Set the active claim here: it is never worked out for you.

@@ -411,12 +411,21 @@ class Bot:
         text: str,
         rows: list[list[tuple[str, str, dict[str, Any]]]],
         ttl: dt.timedelta,
+        *,
+        per_row: bool = False,
     ) -> int:
+        """Send `text` with buttons. One keyboard id for all of them, so any tap spends
+        them all; with `per_row`, each row has a keyboard id of its own, so a tap spends
+        only its own row and the others stay live."""
         keyboard_id = secrets.token_urlsafe(9)
+        keyboards = [keyboard_id]
         expires = self._later(ttl)
         markup = []
         with db.transaction(search):
-            for row in rows:
+            for index, row in enumerate(rows):
+                if per_row and index:
+                    keyboard_id = secrets.token_urlsafe(9)
+                    keyboards.append(keyboard_id)
                 buttons = []
                 for label, action, payload in row:
                     token = secrets.token_urlsafe(16)
@@ -428,9 +437,10 @@ class Bot:
                     buttons.append({"text": label, "callback_data": token})
                 markup.append(buttons)
         message_id = self.send(text, markup)
-        search.execute(
-            "UPDATE bot_tokens SET message_id = ? WHERE keyboard = ?", (message_id, keyboard_id)
-        )
+        for keyboard in keyboards:
+            search.execute(
+                "UPDATE bot_tokens SET message_id = ? WHERE keyboard = ?", (message_id, keyboard)
+            )
         return message_id
 
     def _prompt(
@@ -703,8 +713,12 @@ class Bot:
 
         Five or fewer are one message each. More than five are one digest of at
         most eight, and the rest wait for a later poll. ``notified_at`` is set
-        only after Telegram accepts the message.
+        only after Telegram accepts the message. Each row of a digest has its own
+        Approve and Reject tokens, so one tap leaves the other rows' buttons live (#41).
+        Nothing is sent while config.yaml can't be read, like the watcher alerts.
         """
+        if self._alert_config() is None:
+            return
         cutoff = _utc(self.clock() - ALERT_TTL)
         try:
             with self._search() as search:
@@ -734,7 +748,7 @@ class Bot:
             ]
             for row in rows
         ]
-        self._keyboard(search, text, buttons, ALERT_TTL)
+        self._keyboard(search, text, buttons, ALERT_TTL, per_row=True)
         discovery.mark_notified(search, [row.id for row in rows], self._now())
 
     # --- entry point -------------------------------------------------------------------

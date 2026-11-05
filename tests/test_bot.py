@@ -1377,6 +1377,70 @@ def test_six_pending_rows_are_one_digest(env: Env, keep_umask: None) -> None:
     assert len(_sends(env)) == before
 
 
+def test_one_rows_tap_in_a_discovery_digest_leaves_the_others_valid(
+    env: Env, keep_umask: None
+) -> None:
+    ids = [
+        _candidate(env, f"board0{i}", f"https://boards.greenhouse.io/board0{i}")
+        for i in range(1, 7)
+    ]
+    assert _poll(env) == 0
+    ((message_id, params),) = [
+        (mid, sent) for mid, sent in env.api.sent() if "reply_markup" in sent
+    ]
+    rows = params["reply_markup"]["inline_keyboard"]
+    tokens = [[button["callback_data"] for button in row] for row in rows]
+    assert len({token for row in tokens for token in row}) == 12  # a token per button
+
+    def tap(token: str) -> str:
+        update = env.callback(token, message_id)
+        # Telegram echoes the message's keyboard as it is now: the first, then each edit.
+        edited = [p for name, p in env.api.calls if name == "editMessageReplyMarkup"]
+        update["callback_query"]["message"]["reply_markup"] = (
+            edited[-1]["reply_markup"] if edited else params["reply_markup"]
+        )
+        return env.bot.handle_safely(update)
+
+    assert tap(tokens[0][0]) == "callback:discover_approve"  # row 1: Approve
+    assert tap(tokens[0][1]) == "callback:rejected"  # row 1's other button is spent
+    assert tap(tokens[1][1]) == "callback:discover_reject"  # row 2 is still live
+    assert tap(tokens[5][0]) == "callback:discover_approve"  # and so is row 6
+    edits = [p for name, p in env.api.calls if name == "editMessageReplyMarkup"]
+    assert len(edits[0]["reply_markup"]["inline_keyboard"]) == 5  # row 1 taken off
+    assert len(edits[-1]["reply_markup"]["inline_keyboard"]) == 3  # rows 3, 4 and 5 left
+    conn = env.search()
+    statuses = {
+        int(row["id"]): row["status"]
+        for row in conn.execute("SELECT id, status FROM discovery_candidates")
+    }
+    conn.close()
+    assert [statuses[i] for i in ids] == [
+        "approved",
+        "rejected",
+        "pending",
+        "pending",
+        "pending",
+        "approved",
+    ]
+
+
+def test_discovery_rows_are_not_sent_while_config_is_unreadable(env: Env, keep_umask: None) -> None:
+    good = env.datadir.config_path.read_bytes()
+    _candidate(env, "board01", "https://boards.greenhouse.io/board01")
+    env.datadir.config_path.write_text("search: [unclosed\n")
+    env.bot.send_pending_discovery()
+    assert _sends(env) == []
+    conn = env.search()
+    assert conn.execute("SELECT notified_at FROM discovery_candidates").fetchone()[0] is None
+    assert search_store.alerts_held_since(conn) is not None
+    conn.close()
+    env.datadir.config_path.write_bytes(good)
+    env.bot.send_pending_discovery()
+    assert [item["text"] for item in _sends(env)] == [
+        "board01\nhttps://boards.greenhouse.io/board01"
+    ]
+
+
 def test_rows_past_the_digest_wait_for_the_next_poll(env: Env, keep_umask: None) -> None:
     for i in range(1, 10):
         _candidate(env, f"board0{i}", f"https://boards.greenhouse.io/board0{i}")

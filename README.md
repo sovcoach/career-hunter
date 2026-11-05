@@ -4,7 +4,7 @@
 
 Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever and Ashby boards, filters them, and scores the ones it keeps with a local model. The bot sends one alert digest per watch run.
+> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards, filters them, and scores the ones it keeps with a local model. The bot sends one alert digest per watch run.
 
 ---
 
@@ -23,12 +23,12 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
 | `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
-| `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits. A set discovery URL also installs a discovery LaunchAgent |
+| `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits. Discovery runs inside the watch agent; install removes the separate discovery agent of earlier versions |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
-| `careerhunter watch` | Fetches Greenhouse, Lever and Ashby boards named on the watchlist, and approved discovery boards, once. It records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert digest per watch run |
+| `careerhunter watch` | Fetches the Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards named on the watchlist, and approved discovery boards, once, after a discovery pass when one is due. It records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert digest per watch run |
 | `careerhunter scout-prompt` | Prints a scout prompt from exclusions and the hard gates the watcher skips on. Writes nothing |
 | `careerhunter embed-eval` | Ranks stored cosines against LLM tiers. Writes a private report under `evals/` and prints only that relative path |
-| `careerhunter discover` | Queues companies from a local SearXNG into `search.db`. `approve` and `reject` update that queue only and do not fetch pages. The bot can approve or reject a pending row from the allowlisted chat. That message is the suggested name and the URL. An approved board is fetched on the next `careerhunter watch`. When the URL is set, `service install` runs this search once per `discovery.interval_minutes` and exits |
+| `careerhunter discover` | Runs one discovery pass against a local SearXNG by hand; the watch agent runs one each `discovery.interval_minutes`. A posting URL it finds is alerted through the watch run's digest; a board is queued in `search.db` once one board-API request confirms it. `approve` and `reject` update that queue only. The bot can approve or reject a pending row from the allowlisted chat. That message is the suggested name and the URL. An approved board is fetched on the next `careerhunter watch` |
 
 ## What it does *not* do (yet)
 
