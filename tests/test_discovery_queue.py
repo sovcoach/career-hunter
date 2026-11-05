@@ -193,10 +193,18 @@ def test_the_watch_runs_pass_logs_its_queue_notes(
     path.write_text(yaml.safe_dump(doc))
     (data_env / "exclusions.yaml").write_text("companies:\n  - newrobotics\n")
     monkeypatch.setattr(discover, "default_transport", lambda url, **kw: answer(NEW)(url))
+    fetched_urls: list[str] = []
+
+    def no_posting(address: str, **kw: object) -> Fetched:
+        fetched_urls.append(address)
+        return fetched(status=404, body=b"{}")
+
+    monkeypatch.setattr(cli, "fetch_url", no_posting)  # the posting the hit names
     capsys.readouterr()
     assert cli.main(["watch"], probe=probe) == 0
     err = capsys.readouterr().err
     assert "discover: newrobotics (greenhouse): excluded; not queued" in err
+    assert fetched_urls == ["https://boards-api.greenhouse.io/v1/boards/newrobotics/jobs/42"]
 
 
 # --- one board-API request per board ---------------------------------------------------

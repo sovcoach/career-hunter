@@ -64,8 +64,11 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra --strict-markers"
 filterwarnings = ["error"]
+markers = [
+    "allow_network: let this test make real DNS lookups and connections (no test needs it)",
+]
 
 [tool.coverage.run]
 source = ["careerhunter"]
