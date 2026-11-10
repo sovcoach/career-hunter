@@ -210,7 +210,7 @@ def parse_date(text: str, today: dt.date) -> Dating:
 
 
 def _fit_label(raw: object) -> str:
-    """`High`, `Medium` or `Low`; anything else, a job ad included, is `not scored`."""
+    """`High`, `Medium` or `Low`; anything else is `not scored`."""
     if isinstance(raw, str) and raw in enums.FIT_LEVELS:
         return raw.capitalize()
     return "not scored"

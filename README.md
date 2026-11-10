@@ -34,7 +34,7 @@ Your information never leaves your machine and is never stored in this code repo
 
 ## What it does *not* do (yet)
 
-- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends one digest per watch run when it polls, at most `alerts.max_per_poll` postings per poll, in lane order. Each row has company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link, with its own Applied and Skipped buttons. Gap names never leave the Mac. Postings without a fit, and off-lane ones below `search.off_lane_min_fit`, are held. Scoring and embeddings stay on this Mac, at a loopback address.
+- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends one digest per watch run when it polls, at most `alerts.max_per_poll` postings per poll, in lane order. It also sends one message when the local model, SearXNG or every board has failed `health.failure_runs` runs in a row, and one when it works again, and, with `alerts.weekly_digest` set, a weekly message of counts by lane. Each row has company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link, with its own Applied and Skipped buttons. Gap names never leave the Mac. Postings without a fit, and off-lane ones below `search.off_lane_min_fit`, are held. Scoring and embeddings stay on this Mac, at a loopback address.
 - No automatic deletes, ever. Records are kept for at least the 6 years EI requires.
 - No cloud sync and no accounts. It is a local tool.
 
