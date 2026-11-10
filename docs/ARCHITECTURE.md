@@ -290,13 +290,15 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 
 ## Phase roadmap
 
+Only what is on `main` is listed. The latest release is v0.3.0; Phases 3 to 5 are on `main` and not yet tagged.
+
 | Phase | Scope | Status |
 |---|---|---|
-| 1, Foundation (v0.1.0) | Storage guards, Keychain helper, schema and migrations, seed import, EI export, CI, docs | done |
-| 1.5, Data layer split (v0.2.0) | `search.db` and one EI record file per claim, a correlation ID, write order and reconciliation, claim config and sealing | done |
-| 2, Telegram bot (v0.3.0) | The bot (alerts with Applied/Skipped, `/log`, `/status`, `/activity`, `/recent`), job-ad snapshots, the launchd service, the fit-criteria schema (validation only), and repo hygiene | **this release** |
-| 3, Watcher | Fetch watchlisted companies' ATS boards; job-ad snapshots for the EI record; fit rating against the config rubric; skips with reasons | planned |
-| 4, Discovery | Find new companies and postings beyond the watchlist | planned |
-| 5, Release | License, polish | planned |
+| 1, Foundation (v0.1.0) | Storage guards, Keychain helper, schema and migrations, seed import, EI export, CI, docs | released |
+| 1.5, Data layer split (v0.2.0) | `search.db` and one EI record file per claim, a correlation ID, write order and reconciliation, claim config and sealing | released |
+| 2, Telegram bot (v0.3.0) | The bot (alerts with Applied/Skipped, `/log`, `/status`, `/activity`, `/recent`), job-ad snapshots, the launchd service, the fit-criteria schema (validation only), and repo hygiene | released |
+| 3, Watcher | `careerhunter watch` on Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards; exclusions, hard gates, location rules and the posting age; lanes; gap-tier scoring with a fit on a local model, grounded in an imported resume; local embedding cosines and `embed-eval`; one alert digest per run; run records, health and the weekly digest; `careerhunter log` and `report` | on `main` |
+| 4, Discovery | Discovery passes against a local SearXNG inside the watch agent, posting URLs fetched once through their ATS, and a board queue approved from the CLI or the bot | on `main` |
+| 5, Release | The MIT license (ADR-021), `careerhunter demo`, the model-id settings, the inert template watchlist, and SETUP for a release checkout and upgrades | on `main` |
 
-Each phase lands as a pull request against `main` with its own milestone, and gets a semver tag when merged. The repo goes public once Phase 1 is verified, and `main` is protected straight after (ADR-012).
+Work lands as pull requests against `main`, and the operator tags a release with semver when it is cut. The repo went public once Phase 1 was verified, and `main` was protected straight after (ADR-012).

@@ -4,7 +4,7 @@
 
 Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards, filters them, and scores the ones it keeps with a local model. The bot sends one alert digest per watch run.
+> **Status:** the latest release is 0.3.0 (Phase 2, the Telegram bot); Phases 3 to 5 are on `main` for the next release. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards, filters them, and scores the ones it keeps with a local model in LM Studio. The bot sends one alert digest per watch run. `careerhunter demo` shows all of that on made-up data without a data folder.
 
 ---
 
@@ -27,6 +27,7 @@ Your information never leaves your machine and is never stored in this code repo
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
 | `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits. Discovery runs inside the watch agent; install removes the separate discovery agent of earlier versions |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
+| `careerhunter demo` | Runs a watch, prints the digest the bot would send and records one application, all on made-up data in memory, with fake job boards and a fake model. Needs no data folder, writes nothing and connects to nothing |
 | `careerhunter watch` | Fetches the Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards named on the watchlist, and approved discovery boards, once, after a discovery pass when one is due. It records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert digest per watch run |
 | `careerhunter scout-prompt` | Prints a scout prompt from exclusions and the hard gates the watcher skips on. Writes nothing |
 | `careerhunter embed-eval` | Ranks stored cosines against LLM tiers. Writes a private report under `evals/` and prints only that relative path |
@@ -86,6 +87,6 @@ Secrets go in the **macOS Keychain** through the Python `keyring` library. They 
 
 ## Tech
 
-Python 3.12+ managed with [uv](https://docs.astral.sh/uv/), SQLite, PyYAML, keyring and ReportLab. Quality checks: ruff, mypy (strict), pytest with coverage, gitleaks, pre-commit, and GitHub Actions.
+Python 3.12+ managed with [uv](https://docs.astral.sh/uv/), SQLite, PyYAML, keyring, ReportLab, pypdf and truststore. Scoring and embeddings run on [LM Studio](https://lmstudio.ai) on the same Mac, and discovery on an optional local SearXNG. Quality checks: ruff, mypy (strict), pytest with coverage, gitleaks, pre-commit, and GitHub Actions.
 
 The code is released under the MIT License. See [LICENSE](LICENSE).
