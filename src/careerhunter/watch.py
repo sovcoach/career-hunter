@@ -886,13 +886,20 @@ def _fetch_jobs(
     def known(url: str) -> bool:
         return search_store.posting_url_known(conn, url)
 
+    def known_key(key: str) -> bool:
+        return search_store.posting_key_known(conn, key)
+
     day = dt.date.fromisoformat(state.today)
 
     def too_old(job: Job) -> bool:
         return filters.too_old(job.posted, job.posted_min_days, day, state.max_age) is True
 
     try:
-        return _Parsed(ats_boards.read(board, client, known=known, today=day, too_old=too_old))
+        return _Parsed(
+            ats_boards.read(
+                board, client, known=known, known_key=known_key, today=day, too_old=too_old
+            )
+        )
     except FetchError as exc:
         if isinstance(exc, FetchTimeout) and state.out_of_time():
             lines.append(_line(name, ats, _LEFT))
@@ -995,7 +1002,7 @@ def _record_jobs(
         )
         try:
             with db.transaction(conn):
-                found = search_store.find_or_create_posting(conn, posting, dating)
+                found = search_store.find_or_create_posting(conn, posting, dating, ats_key=item.key)
                 posting_id, inserted = found[1], found[3]
                 if inserted and search_store.is_handled_repost(conn, found[0], item.title):
                     reason = ALREADY_HANDLED  # a role already logged or skipped (#34)

@@ -4,7 +4,10 @@ posting. Synthetic boards and companies only; no sockets, no sleeps."""
 from __future__ import annotations
 
 import sqlite3
+from functools import partial
 from typing import Any
+
+import pytest
 
 from careerhunter import ats
 from careerhunter import watch as w
@@ -488,6 +491,39 @@ def test_an_unknown_bamboohr_company_is_a_bad_reply_and_stores_nothing(
     assert search.execute("SELECT count(*) FROM companies").fetchone()[0] == 0
 
 
+def test_the_watch_command_asks_bamboohr_for_json_and_an_html_200_still_fails(
+    data_env: Any, probe: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    """The Accept header is a hint; the JSON parse is the gate (#35)."""
+    import yaml
+
+    from careerhunter import cli
+
+    assert cli.main(["init"], probe=probe) == 0
+    path = data_env / "config.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["watchlist"] = [BH]
+    path.write_text(yaml.safe_dump(doc))
+    asked: list[tuple[str, object]] = []
+
+    def fake_get(address: str, **kw: object) -> Fetched:
+        asked.append((address, kw.get("accept")))
+        return Fetched(address, 200, "text/html", b"<html>synthetic careers page</html>")
+
+    monkeypatch.setattr(cli, "fetch_url", fake_get)
+    monkeypatch.setattr(cli, "score_posting", lambda *a, **k: None)
+    assert cli.main(["watch"], probe=probe) == 0
+    err = capsys.readouterr().err
+    assert asked == [(BH_LIST, "application/json")]
+    assert "watch: Example Robotics (bamboohr): HTTP 200, invalid JSON; nothing recorded" in err
+    assert "watch: 0 boards fetched, 1 failed, 0 left" in err
+    conn = sqlite3.connect(data_env / "search.db")
+    try:
+        assert conn.execute("SELECT count(*) FROM postings").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_bad_bamboohr_payloads_log_and_store_nothing(search: sqlite3.Connection) -> None:
     for body in ({"meta": {}}, {"result": {"id": "41"}}, [1]):
         lines = w.run(search, [BH], today=DAY, fetcher=Scripted(routes({BH_LIST: body})))
@@ -695,6 +731,117 @@ def test_workday_pages_stop_at_the_page_limit(search: sqlite3.Connection, monkey
     ) in lines
 
 
+def _wd_custom(path: str, title: str, where: str) -> dict[str, object]:
+    return {
+        "title": title,
+        "externalPath": path,
+        "locationsText": where,
+        "postedOn": "Posted Today",
+    }
+
+
+def test_a_retitled_and_moved_workday_posting_with_the_same_id_is_the_stored_one(
+    search: sqlite3.Connection,
+) -> None:
+    """The key is the trailing `_<id>`; the title and location slugs are not (#35)."""
+    wd_run(search, workday_board("examplerobotics"))
+    moved = "/job/Example-Town/Senior-Operations-Coordinator_JR00001"
+    again = Posted(
+        routes({f"{WD_BASE}{moved}": wd_info("x", location="Example Town")}),
+        {0: fetched(wd_page([_wd_custom(moved, "Senior Operations Coordinator", "Example Town")]))},
+    )
+    lines = wd_run(search, again)
+    assert again.calls == []  # known by its key: no detail request
+    assert "watch: Example Robotics (workday): 0 new, 1 already recorded" in lines
+    site = "https://examplerobotics.wd5.myworkdayjobs.com/External"
+    assert stored(search) == [
+        ("Operations Coordinator", "Example City", None, f"{site}{wd_path(1)}", None)
+    ]
+    keys = [r[0] for r in search.execute("SELECT ats_key FROM postings")]
+    assert keys == ["workday:examplerobotics:wd5:external:JR00001"]
+
+
+def test_workday_postings_of_one_requisition_with_different_suffixes_stay_apart(
+    search: sqlite3.Connection,
+) -> None:
+    """A -N suffix is kept: JREQ00009-1 and JREQ00009-2 are two postings (#35)."""
+    paths = [f"/job/Example-City/Operations-Coordinator_JREQ00009-{n}" for n in (1, 2)]
+    fetcher = Posted(
+        routes({f"{WD_BASE}{p}": wd_info("x") for p in paths}),  # one jobReqId in both details
+        {
+            0: fetched(
+                wd_page([_wd_custom(p, "Operations Coordinator", "Example City") for p in paths])
+            )
+        },
+    )
+    lines = wd_run(search, fetcher)
+    assert "watch: Example Robotics (workday): 2 new, 0 already recorded" in lines
+    keys = [r[0] for r in search.execute("SELECT ats_key FROM postings ORDER BY id")]
+    assert keys == [
+        "workday:examplerobotics:wd5:external:JREQ00009-1",
+        "workday:examplerobotics:wd5:external:JREQ00009-2",
+    ]
+
+
+def test_a_board_key_held_by_another_company_is_an_identity_conflict(
+    search: sqlite3.Connection,
+) -> None:
+    import pytest
+
+    from careerhunter import search_store
+    from careerhunter.models import Dating, Posting
+
+    wd_run(search, workday_board("examplerobotics"))
+    other, _ = search_store.upsert_company(search, "Sample Logistics", source="watcher")
+    posting = Posting(
+        company="Sample Logistics", title="Clerk", first_seen=DAY, location="", source="watcher"
+    )
+    with pytest.raises(search_store.IdentityConflict, match="board identity"):
+        search_store.find_posting(
+            search,
+            other,
+            posting,
+            Dating(precision="day", day=DAY),
+            ats_key="workday:examplerobotics:wd5:external:JR00001",
+        )
+
+
+def test_a_workday_posting_key_is_the_same_from_discovery_and_from_the_board() -> None:
+    board = ats.Board("workday", "ExampleRobotics", "wd5", "External")
+    ref = "/job/Example-City/Operations-Coordinator_JREQ00009-7"
+    assert ats.posting_key(ats.PostingRef(board, ref)) == (
+        "workday:examplerobotics:wd5:external:JREQ00009-7"
+    )
+    job = ats._workday_job(_wd_custom(ref, "Operations Coordinator", "Example City"), board, None)
+    assert isinstance(job, ats.Job) and job.key == ats.posting_key(ats.PostingRef(board, ref))
+    for path in ("/job/Example-City/Operations-Coordinator", "/job/Example-City/Clerk_JR%2001"):
+        # no usable trailing id: the whole path is the id, as before
+        assert ats.posting_key(ats.PostingRef(board, path)) == (
+            f"workday:examplerobotics:wd5:external:{path}"
+        )
+
+
+def test_workday_paging_stops_at_a_repeated_page(
+    search: sqlite3.Connection, monkeypatch: Any
+) -> None:
+    """A board that ignores the offset serves the same full page again (#35)."""
+    monkeypatch.setattr(ats, "WORKDAY_PAGE", 2)
+    same = wd_page([wd_row(1), wd_row(2)], total=9)
+    fetcher = Posted(
+        routes({f"{WD_BASE}{wd_path(n)}": wd_info("x") for n in (1, 2)}),
+        {0: fetched(same), 2: fetched(same), 4: fetched(wd_page([wd_row(3)]))},
+    )
+    lines = wd_run(search, fetcher)
+    assert [payload["offset"] for _, payload in fetcher.posts] == [0, 2]  # type: ignore[index]
+    assert fetcher.calls == [f"{WD_BASE}{wd_path(n)}" for n in (1, 2)]
+    assert [row[3].rsplit("_", 1)[1] for row in stored(search)] == ["JR00001", "JR00002"]
+    assert (
+        "watch: Example Robotics (workday): repeated page at offset 2 (the same postings as "
+        "the page before); later postings left for the next run"
+    ) in lines
+    assert lines[-1] == "watch: 1 boards fetched, 0 failed, 0 left"
+
+
 def test_an_unknown_workday_site_or_tenant_fails_and_stores_nothing(
     search: sqlite3.Connection,
 ) -> None:
@@ -835,6 +982,54 @@ def test_a_client_without_a_poster_refuses_a_post() -> None:
         ats.Client(Scripted({})).post_json(WD_LIST, {})
 
 
+@pytest.mark.parametrize(
+    "address",
+    [
+        "https://jobs.example.com/wday/cxs/examplerobotics/External/jobs",
+        "https://myworkdayjobs.com/wday/cxs/examplerobotics/External/jobs",
+        "https://examplerobotics.wd5.myworkdayjobs.com.example.net/jobs",
+        "https://examplerobotics.wd5.notmyworkdayjobs.com/jobs",
+        "https://.myworkdayjobs.com/jobs",
+        "http://examplerobotics.wd5.myworkdayjobs.com/jobs",
+        "https://10.0.0.5/jobs",
+    ],
+)
+def test_a_post_to_any_host_but_a_myworkdayjobs_subdomain_is_refused_before_a_lookup(
+    address: str,
+) -> None:
+    from careerhunter import fetch as f
+
+    looked_up: list[str] = []
+
+    def resolve(host: str, port: int, timeout: float) -> list[str]:
+        looked_up.append(host)
+        return ["93.184.216.34"]
+
+    poster = partial(f.post_json, resolver=resolve)
+    with pytest.raises(f.FetchRefused, match=r"only to a myworkdayjobs\.com board"):
+        ats.Client(Scripted({}), poster=poster).post_json(address, {})
+    assert looked_up == []
+
+
+def test_a_post_to_a_myworkdayjobs_subdomain_is_sent() -> None:
+    from careerhunter import fetch as f
+    from tests.test_fetch import FakeResponse, FakeWeb, ManualWatchdog
+
+    web = FakeWeb({WD_LIST: FakeResponse(body=b'{"jobPostings": []}')})
+    looked_up: list[str] = []
+
+    def resolve(host: str, port: int, timeout: float) -> list[str]:
+        looked_up.append(host)
+        return ["93.184.216.34"]
+
+    poster = partial(
+        f.post_json, resolver=resolve, connector=web.connector, watchdog=ManualWatchdog()
+    )
+    assert ats.Client(Scripted({}), poster=poster).post_json(WD_LIST, {}) == {"jobPostings": []}
+    assert looked_up == ["examplerobotics.wd5.myworkdayjobs.com"]
+    assert web.sent[0][0] == "POST"
+
+
 def test_the_watch_command_posts_workday_lists_under_the_board_cap(
     data_env: Any, probe: Any, capsys: Any, monkeypatch: Any
 ) -> None:
@@ -852,6 +1047,7 @@ def test_the_watch_command_posts_workday_lists_under_the_board_cap(
 
     def fake_get(address: str, **kw: object) -> Fetched:
         caps.append(kw.get("max_bytes"))
+        assert kw.get("accept") == "application/json"
         return board(address)
 
     def fake_post(address: str, payload: object, **kw: object) -> Fetched:

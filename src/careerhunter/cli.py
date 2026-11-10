@@ -64,7 +64,7 @@ from careerhunter.config import (
 from careerhunter.config import today as config_today
 from careerhunter.deadline import Deadline
 from careerhunter.export import export, plural
-from careerhunter.fetch import Fetched, post_json
+from careerhunter.fetch import JSON, Fetched, post_json
 from careerhunter.fetch import fetch as fetch_url
 from careerhunter.filters import PostingText
 from careerhunter.ledger import PartialWriteError, reconcile
@@ -864,7 +864,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             conn,
             entries,
             today=config_today(doc).isoformat(),
-            fetcher=partial(fetch_url, budget=budget, max_bytes=watch.BOARD_MAX_BYTES),
+            fetcher=partial(fetch_url, budget=budget, max_bytes=watch.BOARD_MAX_BYTES, accept=JSON),
             poster=partial(post_json, budget=budget, max_bytes=watch.BOARD_MAX_BYTES),
             config=doc,
             exclusions=exclusions,
@@ -896,7 +896,7 @@ def _confirmer(share: Deadline) -> discover.Confirm:
 
     def confirm(board: ats.Board) -> ats.Confirmed:
         client = ats.Client(
-            partial(fetch_url, budget=share, max_bytes=ats.BOARD_MAX_BYTES),
+            partial(fetch_url, budget=share, max_bytes=ats.BOARD_MAX_BYTES, accept=JSON),
             poster=partial(post_json, budget=share, max_bytes=ats.BOARD_MAX_BYTES),
         )
         return ats.confirm_board(board, client)

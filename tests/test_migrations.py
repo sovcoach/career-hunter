@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 19)), "ei_record": [1]}[track]
+    expected = {"search": list(range(1, 20)), "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -925,5 +925,30 @@ def test_0018_adds_health_and_leaves_earlier_runs_unknown(tmp_path: Path) -> Non
         ):
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute(sql)
+    finally:
+        conn.close()
+
+
+def test_0019_clears_only_workday_keys_in_the_old_path_form(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:18])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        keys = {
+            "Old": "workday:examplewidgets:wd5:external:/job/Example-City/Clerk_JR00001",
+            "New": "workday:examplewidgets:wd5:external:JR00002",
+            "Other": "greenhouse:examplewidgets:1",
+        }
+        for title, key in keys.items():
+            conn.execute(
+                "INSERT INTO postings (company_id, title, first_seen, source, ats_key) "
+                "VALUES (?, ?, '2026-10-30', 'watcher', ?)",
+                (company, title, key),
+            )
+        assert db.migrate(conn, "search", db.load_migrations("search")[:19]) == [19]
+        rows = dict(conn.execute("SELECT title, ats_key FROM postings").fetchall())
+        assert rows == {"Old": None, "New": keys["New"], "Other": keys["Other"]}
     finally:
         conn.close()

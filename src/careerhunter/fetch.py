@@ -64,6 +64,9 @@ TIMEOUT = 20.0  # one step: the lookup, the connect, the headers, or one chunk o
 DEADLINE = 60.0  # the whole call: every redirect hop and the body
 LOOKUP_SLOTS = 4  # lookups still running after their caller stopped waiting
 USER_AGENT = "career-hunter (job-ad snapshot; self-hosted)"
+# What a board-API request asks for. Asking is only a hint to the server: the reply is
+# still parsed as JSON by the caller, and a body that is not JSON is refused there.
+JSON = "application/json"
 
 
 class FetchError(Exception):
@@ -267,10 +270,13 @@ def fetch(
     clock: Clock = time.monotonic,
     watchdog: Watchdog | None = None,
     json_body: bytes | None = None,
+    accept: str = "*/*",
 ) -> Fetched:
     """One GET, within `deadline` seconds, or within `budget` when that ends sooner.
 
-    With `json_body`, one POST of that JSON instead (see `post_json`).
+    `accept` is the GET's Accept header: a board-API GET asks for JSON. With
+    `json_body`, one POST of that JSON instead (see `post_json`), which always asks for
+    JSON.
     """
     if json_body is not None and len(json_body) > MAX_POST_BYTES:
         raise FetchRefused("the request body is too large")
@@ -284,7 +290,7 @@ def fetch(
         try:
             path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
             if json_body is None:
-                conn.request("GET", path, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+                conn.request("GET", path, headers={"User-Agent": USER_AGENT, "Accept": accept})
             else:
                 conn.request(
                     "POST",
@@ -292,8 +298,8 @@ def fetch(
                     json_body,
                     headers={
                         "User-Agent": USER_AGENT,
-                        "Accept": "application/json",
-                        "Content-Type": "application/json",
+                        "Accept": JSON,
+                        "Content-Type": JSON,
                         "Content-Length": str(len(json_body)),
                     },
                 )

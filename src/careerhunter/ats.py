@@ -30,7 +30,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from careerhunter import htmltext
-from careerhunter.fetch import Fetched, FetchError, FetchTooLarge
+from careerhunter.fetch import Fetched, FetchError, FetchRefused, FetchTooLarge
 
 Fetcher = Callable[[str], Fetched]
 Poster = Callable[[str, object], Fetched]  # one POST of a JSON payload (fetch.post_json)
@@ -55,6 +55,7 @@ _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 # A BambooHR slug and a Workday tenant are subdomains: one DNS label each.
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _WORKDAY_HOST = re.compile(r"^wd[0-9]{1,3}$")
+_POST_DOMAIN = ".myworkdayjobs.com"  # Client.post_json sends only to its subdomains
 # A Workday posting path: /job/<location>/<title>_<id>, URL-safe segments only.
 _WORKDAY_PATH = re.compile(r"^/job(?:/[A-Za-z0-9._~%+-]+)+$")
 _WORKDAY_DAYS_AGO = re.compile(r"Posted ([0-9]{1,3}) Days Ago")
@@ -100,7 +101,7 @@ class Job:
     posted: dt.date | None = None
     posted_min_days: int | None = None
     # `<ats_type>:<board>:<posting id>`: the posting's identity on its board, however
-    # its URL reads (search migration 0015).
+    # its URL reads (search migrations 0015 and 0019).
     key: str | None = None
 
 
@@ -181,8 +182,19 @@ class Client:
         return fetched
 
     def post_json(self, url: str, payload: object) -> object:
+        """One POST, to a subdomain of myworkdayjobs.com only (the one board that posts).
+
+        Any other host is refused before the poster is called, so before any lookup:
+        defense in depth on top of the fetcher's address pinning.
+        """
         if self._poster is None:
             raise BoardParseError("no POST client")
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        sub = host.removesuffix(_POST_DOMAIN)
+        labels = sub.split(".") if sub and sub != host else []
+        if parts.scheme != "https" or not labels or not all(map(_HOST_LABEL.fullmatch, labels)):
+            raise FetchRefused("a POST goes only to a myworkdayjobs.com board")
         return _loads(self._checked(url, self._poster(url, payload)))
 
     def _checked(self, url: str, fetched: Fetched) -> bytes:
@@ -231,7 +243,23 @@ def board_url(ats_type: str, slug: str) -> str | None:
 
 def posting_key(posting: PostingRef) -> str:
     """The posting's identity on its board, the same as `Job.key` for that posting."""
+    if posting.board.ats == "workday":
+        return _workday_key(posting.board, posting.ref)
     return f"{posting.board.key}:{posting.ref}"
+
+
+def _workday_key(board: Board, path: str) -> str:
+    """`workday:<tenant>:<host>:<site>:<id>`, where `<id>` is the trailing `_<id>` of the
+    path's last segment, as it is (`JREQ205219-7` stays as it is: a -N suffix is not
+    stripped). On a live public board that tail is the tail of jobPostingInfo.jobPostingId
+    and begins with jobReqId; the title and location slugs before it are left out, so a
+    retitled or moved posting keeps its key. A path without a usable tail keys on the
+    whole path."""
+    last = path.rsplit("/", 1)[-1]
+    ident = last.rsplit("_", 1)[1] if "_" in last else ""
+    if not ident or _SLUG.fullmatch(ident) is None:
+        ident = path
+    return f"{board.key}:{ident}"
 
 
 def _key(ats: str, slug: str, ident: str | None) -> str | None:
@@ -346,7 +374,7 @@ def _workday_posting(data: object, board: Board, ref: str, today: dt.date | None
         company_field=None,
         posted=posted,
         posted_min_days=at_least,
-        key=f"{board.key}:{ref}",
+        key=_workday_key(board, ref),
     )
     return _workday_detail(stub, data)
 
@@ -446,12 +474,14 @@ def read(
     detail_limit: int | None = None,
     today: dt.date | None = None,
     too_old: TooOld = _never_too_old,
+    known_key: Known = _nothing_known,
 ) -> BoardRead:
     """Every job on one board this run.
 
     A list request that fails raises: a fetch error as it is, a non-200 reply as
     BoardHTTPError, a bad body as BoardParseError, and the board stores nothing. Detail
-    requests are made only for postings whose URL is not `known`, at most
+    requests are made only for postings whose URL is not `known` and whose key is not
+    `known_key` (a Workday posting retitled since it was stored has a new URL), at most
     `detail_limit` (DETAIL_LIMIT by default). A detail that answers with a non-200
     status other than 429, or with a body that does not parse, leaves out that posting
     only, with a note. A fetch
@@ -468,15 +498,17 @@ def read(
     limit = DETAIL_LIMIT if detail_limit is None else detail_limit
     if board.ats == "smartrecruiters":
         stubs, notes = _smartrecruiters_list_pages(board.slug, client)
-        found = _with_details(stubs, client, known, too_old, limit, _smartrecruiters_detail)
+        found = _with_details(
+            stubs, client, (known, known_key), too_old, limit, _smartrecruiters_detail
+        )
         found.notes[:0] = notes
         return found
     if board.ats == "bamboohr":
         stubs = _bamboohr_list(board.slug, client.get_json(url))
-        return _with_details(stubs, client, known, too_old, limit, _bamboohr_detail)
+        return _with_details(stubs, client, (known, known_key), too_old, limit, _bamboohr_detail)
     if board.ats == "workday":
         stubs, notes = _workday_list_pages(board, url, client, today)
-        found = _with_details(stubs, client, known, too_old, limit, _workday_detail)
+        found = _with_details(stubs, client, (known, known_key), too_old, limit, _workday_detail)
         found.notes[:0] = notes
         return found
     return BoardRead(_parse(board.ats, board.slug, client.get_json(url)))
@@ -485,12 +517,13 @@ def read(
 def _with_details(
     stubs: list[Job | Skip],
     client: Client,
-    known: Known,
+    knowns: tuple[Known, Known],
     too_old: TooOld,
     limit: int,
     parse_detail: Callable[[Job, object], Job],
 ) -> BoardRead:
     """Fill in each new posting's description from its detail request."""
+    known, known_key = knowns
     out = BoardRead([])
     fetched = 0
     left = 0
@@ -498,7 +531,10 @@ def _with_details(
         if isinstance(item, Skip) or item.detail_url is None:
             out.jobs.append(item)
             continue
-        if (item.url is not None and known(item.url)) or too_old(item):
+        stored = (item.url is not None and known(item.url)) or (
+            item.key is not None and known_key(item.key)
+        )
+        if stored or too_old(item):
             out.jobs.append(item)  # stored already, or skipped for its age: no detail
             continue
         if out.stopped is not None or fetched >= limit:
@@ -722,14 +758,28 @@ def _workday_base(board: Board) -> str:
 def _workday_list_pages(
     board: Board, url: str, client: Client, today: dt.date | None
 ) -> tuple[list[Job | Skip], list[str]]:
+    """Every page, by offset, until a short page, a repeated page or the page limit.
+
+    A page whose externalPaths are the previous page's, in order, means the board is
+    ignoring the offset: paging stops there, what was read is kept, and a note says so,
+    the same as the page limit.
+    """
     jobs: list[Job | Skip] = []
     offset = 0
+    previous: list[object] | None = None
     for _page in range(MAX_PAGES):
         payload = {"appliedFacets": {}, "limit": WORKDAY_PAGE, "offset": offset, "searchText": ""}
         data = client.post_json(url, payload)
         rows = data.get("jobPostings") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             raise BoardParseError("unexpected JSON shape")
+        paths = [row.get("externalPath") if isinstance(row, dict) else None for row in rows]
+        if rows and paths == previous:
+            return jobs, [
+                f"repeated page at offset {offset} (the same postings as the page before); "
+                "later postings left for the next run"
+            ]
+        previous = paths
         jobs.extend(_workday_job(item, board, today) for item in rows)
         offset += len(rows)
         if len(rows) < WORKDAY_PAGE:
@@ -758,7 +808,7 @@ def _workday_job(item: object, board: Board, today: dt.date | None) -> Job | Ski
         detail_url=f"{_workday_base(board)}{path}",
         posted=posted,
         posted_min_days=at_least,
-        key=f"{board.key}:{path}",
+        key=_workday_key(board, path),
     )
 
 
