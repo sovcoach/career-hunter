@@ -74,6 +74,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A test keeps the ruff and mypy pre-commit hook revisions equal to their locked versions (#29).
 
 ### Changed
+- The template watchlist is empty: `careerhunter init` copies `watchlist: []`, so `careerhunter watch` makes no network call until the operator adds boards to their own `config.yaml`. The Greenhouse, Lever, Workday and agency examples stay in the template as a commented block (#44).
 - Discovery reports a reply that arrived but can't be used as `discovery miss: bad-reply`, and embedding as the reason `bad-reply`; `unreachable` now means only a transport failure or a reply over the cap (#42, ADR-019, ADR-020).
 - `doctor` measures every age against one injected clock, and its tests use a fixed one (#42).
 - Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`, with up to 150 seconds of the run. `service install` removes the separate discovery LaunchAgent from earlier versions, `service status` says where discovery runs, and `doctor` warns about a leftover plist and checks the discovery stamp against two discovery or watch intervals, whichever is longer (#40, ADR-020).

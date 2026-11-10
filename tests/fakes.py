@@ -7,7 +7,10 @@ import http.client
 import io
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 
 class FakeClock:
@@ -177,3 +180,33 @@ class WireResponse:
 def wire(headers: str, body: bytes) -> bytes:
     """An HTTP/1.1 200 reply with these header lines and this body, exactly as sent."""
     return b"HTTP/1.1 200 OK\r\n" + headers.encode() + b"\r\n\r\n" + body
+
+
+TEMPLATE_CONFIG = Path(__file__).parents[1] / "config.example.yaml"
+
+
+def template_watchlist() -> list[dict[str, Any]]:
+    """The commented example block in the template, as the operator would uncomment it."""
+    lines = TEMPLATE_CONFIG.read_text(encoding="utf-8").splitlines()
+    start = lines.index("# watchlist:")
+    block: list[str] = []
+    for line in lines[start:]:
+        if not line.startswith("#"):
+            break
+        block.append(line[2:] if line.startswith("# ") else line[1:])
+    doc = yaml.safe_load("\n".join(block))
+    assert isinstance(doc, dict)
+    entries = doc["watchlist"]
+    assert isinstance(entries, list)
+    return entries
+
+
+def use_example_watchlist(config_path: Path) -> None:
+    """Put the template's commented examples into a copied config.yaml.
+
+    The template's own watchlist is empty (#44); tests that watch the example boards
+    edit their copy, as an operator would.
+    """
+    doc = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    doc["watchlist"] = template_watchlist()
+    config_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")

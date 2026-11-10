@@ -121,26 +121,31 @@ schedule_limits:
 # kept here and not fetched. ats_type is one of:
 # greenhouse, lever, ashby, workday, successfactors, icims, taleo, smartrecruiters,
 # jobvite, bamboohr, other
-watchlist:
-  - name: Example Robotics
-    ats_type: greenhouse
-    ats_slug: examplerobotics
-    careers_url: https://example.com/careers
-  - name: Sample Logistics
-    ats_type: lever
-    ats_slug: samplelogistics
-    careers_url: https://example.org/jobs
-    role_filters:              # optional: only these roles at this company
-      role_families: [support, operations]
-      work_models: [remote, hybrid]
-  # A Workday board, for example:
-  # - name: Example Freight
-  #   ats_type: workday
-  #   ats_slug: examplefreight   # the tenant
-  #   ats_host: wd5
-  #   ats_site: External
-  - name: Example Staffing
-    agency: true               # optional: a staffing agency, labelled as such
+#
+# The list starts empty, so `careerhunter watch` fetches nothing until you add your
+# own boards. To start from the examples, replace `watchlist: []` with the block
+# below, remove the leading "# " from each of its lines, and put in real companies.
+watchlist: []
+# watchlist:
+#   - name: Example Robotics
+#     ats_type: greenhouse
+#     ats_slug: examplerobotics
+#     careers_url: https://example.com/careers
+#   - name: Sample Logistics
+#     ats_type: lever
+#     ats_slug: samplelogistics
+#     careers_url: https://example.org/jobs
+#     role_filters:              # optional: only these roles at this company
+#       role_families: [support, operations]
+#       work_models: [remote, hybrid]
+#   # A Workday board, for example:
+#   # - name: Example Freight
+#   #   ats_type: workday
+#   #   ats_slug: examplefreight   # the tenant
+#   #   ats_host: wd5
+#   #   ats_site: External
+#   - name: Example Staffing
+#     agency: true               # optional: a staffing agency, labelled as such
 
 # Optional discovery settings (ADR-020). A null URL leaves discovery off.
 # A set URL is plain http to 127.0.0.1, localhost, or ::1, with no userinfo.

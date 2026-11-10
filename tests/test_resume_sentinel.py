@@ -27,6 +27,7 @@ from careerhunter.platform_checks import SystemProbe
 from careerhunter.score import ScoreError, score_posting
 from careerhunter.storage_guard import DataDir
 from tests.conftest import ACTIVE, set_claims
+from tests.fakes import use_example_watchlist
 from tests.test_bot import CHAT, TOKEN, Clock, FakeTelegram
 from tests.test_resume import document_xml, make_docx, make_pdf
 from tests.test_watch import fetched, one_greenhouse, url
@@ -51,6 +52,7 @@ def assert_absent(where: str, haystack: str) -> None:
 @pytest.fixture
 def inited(data_env: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]) -> Path:
     assert cli.main(["init"], probe=probe) == 0
+    use_example_watchlist(data_env / "config.yaml")
     set_claims(data_env, ACTIVE.label, ACTIVE)
     path = data_env / "config.yaml"
     doc = yaml.safe_load(path.read_text())
