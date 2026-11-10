@@ -238,11 +238,11 @@ def test_a_miss_writes_nothing(tmp_path: Path) -> None:
     _clear_backoff(conn)
     bad = _Talk(b"<html>", status=200)
     outcome = discover.run(conn, config, today="2026-11-02", transport=bad)
-    assert outcome.notice == discover.MISS
+    assert outcome.notice == discover.BAD_REPLY  # it answered, with no result list (#42)
     _clear_backoff(conn)
     partial = _Talk(_body(["https://jobs.lever.co/freshlogistics/post-1"]), fail_at=3, status=500)
     outcome = discover.run(conn, config, today="2026-11-02", transport=partial)
-    assert outcome.notice == discover.MISS
+    assert outcome.notice == discover.BAD_REPLY  # HTTP 500 is an answer too
     assert partial.calls
     _clear_backoff(conn)
     huge = _Talk(b"x" * (discover.MAX_BODY + 1))
@@ -772,7 +772,7 @@ def test_a_reply_of_the_wrong_shape_is_a_miss_that_stores_nothing(
 ) -> None:
     conn = _search_db(tmp_path)
     outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=_Talk(body))
-    assert outcome == discover.Outcome(discover.MISS, ())
+    assert outcome == discover.Outcome(discover.BAD_REPLY, ())
     assert _rows(conn) == 0
     conn.close()
 
@@ -822,7 +822,7 @@ def test_a_reply_that_is_not_utf8_does_not_stop_the_command(
     assert cli.main(["discover"], probe=probe) == 0
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == f"{discover.MISS}\n"
+    assert captured.err == f"{discover.BAD_REPLY}\n"
     assert _count(inited) == 0
     assert (inited / "logs" / "discover.success").is_file()
 

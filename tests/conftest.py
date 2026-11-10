@@ -28,6 +28,8 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # Synthetic claims. The active one starts on a Wednesday, so a week can straddle it.
 ACTIVE = Claim("2026-27", dt.date(2026, 8, 5))
 EARLIER = Claim("2025-26", dt.date(2025, 6, 4), dt.date(2026, 6, 2))
+# The one moment doctor measures every age against in tests (never the real clock).
+DOCTOR_NOW = dt.datetime(2026, 11, 10, 12, 0, tzinfo=dt.UTC)
 ACTIVE_ONLY = ClaimSettings(active=ACTIVE, claims=(ACTIVE,))
 
 

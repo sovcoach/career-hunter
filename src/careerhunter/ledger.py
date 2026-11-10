@@ -165,12 +165,16 @@ def record_discovery_decision(
 
 
 def record_skip(search: sqlite3.Connection, posting: Posting, date: str, reason: str) -> int:
-    """A skip is search-only: the EI record never hears about it."""
+    """The operator's skip. Search-only: the EI record never hears about it.
+
+    It is marked as the operator's (search migration 0016), so a repost of the same role
+    is not alerted again (`already_handled`).
+    """
     with transaction(search):
         _, posting_id, _, _ = search_store.find_or_create_posting(
             search, posting, Dating("exact", date)
         )
-        return search_store.insert_skip(search, posting_id, date, reason)
+        return search_store.insert_skip(search, posting_id, date, reason, by_operator=True)
 
 
 def record_activity(active: ActiveClaim | None, activity: Activity) -> bool:
@@ -218,8 +222,13 @@ def attach_snapshot(
 
 @dataclass(frozen=True)
 class Gap:
+    """One way the two layers disagree. `kind` is `orphan` when the application exists
+    on one side only (or links to a claim with no file), `mismatch` when both sides have
+    it but disagree. `doctor` reports both and fixes neither."""
+
     correlation_id: str
     problem: str
+    kind: str = "mismatch"
 
 
 def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]) -> list[Gap]:
@@ -238,7 +247,7 @@ def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]
         statuses = ei_store.status_sequences(conn)
         for corr in sorted(statuses):
             if corr not in links:
-                gaps.append(Gap(corr, f"in {where} but missing from search.db"))
+                gaps.append(Gap(corr, f"in {where} but missing from search.db", "orphan"))
                 continue
             if links[corr] != label:
                 other = links[corr] or "no claim"
@@ -253,10 +262,14 @@ def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]
                 )
         for corr, claim_label in sorted(links.items()):
             if claim_label == label and corr not in statuses:
-                gaps.append(Gap(corr, f"in search.db but missing from {where}"))
+                gaps.append(Gap(corr, f"in search.db but missing from {where}", "orphan"))
     for corr, linked in sorted(links.items()):
         if linked is not None and linked not in records:
             gaps.append(
-                Gap(corr, f"search.db links it to claim {linked}, which has no record file")
+                Gap(
+                    corr,
+                    f"search.db links it to claim {linked}, which has no record file",
+                    "orphan",
+                )
             )
     return gaps

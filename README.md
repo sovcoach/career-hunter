@@ -20,7 +20,9 @@ Your information never leaves your machine and is never stored in this code repo
 |---|---|
 | `careerhunter init` | Creates your private data folder on the encrypted drive, copies in starter config files, and creates the databases |
 | `careerhunter seed` | Imports your existing applications and activities from a simple YAML file, each into the right place. Re-running is safe: nothing is duplicated |
+| `careerhunter log <link> --method … --date …` | Records a job you found and applied to yourself in one step: the posting and the application go into both files under one ID, with a copy of the ad when the page gives one. `--company` and `--title` fill in what the page doesn't show |
 | `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
+| `careerhunter report --claim …` | Joins one claim's EI record to `search.db`, both read-only, into a private report under `reports/`: each application's EI facts beside its lane, fit and source, with counts by lane. Prints only the report's relative path |
 | `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
 | `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits. Discovery runs inside the watch agent; install removes the separate discovery agent of earlier versions |
@@ -32,7 +34,7 @@ Your information never leaves your machine and is never stored in this code repo
 
 ## What it does *not* do (yet)
 
-- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends one digest per watch run when it polls, at most `alerts.max_per_poll` postings per poll, in lane order. Each row has company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link, with its own Applied and Skipped buttons. Gap names never leave the Mac. Postings without a fit, and off-lane ones below `search.off_lane_min_fit`, are held. Scoring and embeddings stay on this Mac, at a loopback address.
+- Quiet hours are not built. `careerhunter watch` does not call Telegram. The bot sends one digest per watch run when it polls, at most `alerts.max_per_poll` postings per poll, in lane order. It also sends one message when the local model, SearXNG or every board has failed `health.failure_runs` runs in a row, and one when it works again, and, with `alerts.weekly_digest` set, a weekly message of counts by lane. Each row has company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link, with its own Applied and Skipped buttons. Gap names never leave the Mac. Postings without a fit, and off-lane ones below `search.off_lane_min_fit`, are held. Scoring and embeddings stay on this Mac, at a loopback address.
 - No automatic deletes, ever. Records are kept for at least the 6 years EI requires.
 - No cloud sync and no accounts. It is a local tool.
 

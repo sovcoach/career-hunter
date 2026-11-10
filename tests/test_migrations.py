@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 16)), "ei_record": [1]}[track]
+    expected = {"search": list(range(1, 19)), "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -819,5 +819,111 @@ def test_0015_keeps_one_posting_per_ats_key(tmp_path: Path) -> None:
             )
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("UPDATE postings SET ats_key = '' WHERE title = 'Two'")
+    finally:
+        conn.close()
+
+
+def test_0016_leaves_every_existing_skip_to_the_watcher(tmp_path: Path) -> None:
+    """No fill: a skip stored before 0016 is never taken for the operator's."""
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:15])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source, alerted_at) "
+            "VALUES (?, 'Coordinator', '2026-10-30', 'watcher', '2026-10-30T09:00:00Z')",
+            (company,),
+        )
+        for reason in ("not a fit", "seniority", "too_old"):
+            conn.execute(
+                "INSERT INTO skips (posting_id, date, reason) VALUES (1, '2026-10-30', ?)",
+                (reason,),
+            )
+        assert db.migrate(conn, "search", db.load_migrations("search")[:16]) == [16]
+        assert [r[0] for r in conn.execute("SELECT by_operator FROM skips")] == [0, 0, 0]
+        conn.execute(
+            "INSERT INTO skips (posting_id, date, reason, by_operator) "
+            "VALUES (1, '2026-10-31', 'any free text at all', 1)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE skips SET by_operator = 2")
+    finally:
+        conn.close()
+
+
+def test_0017_counts_refusals_per_posting(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:17])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (?, 'Coordinator', '2026-10-30', 'watcher')",
+            (company,),
+        )
+        conn.execute(
+            "INSERT INTO alert_refusals (posting_id, refusals, last_refused_at) "
+            "VALUES (1, 1, '2026-10-30T09:00:00Z')"
+        )
+        for sql in (
+            "INSERT INTO alert_refusals (posting_id, refusals, last_refused_at) "
+            "VALUES (1, 1, '2026-10-30T09:00:00Z')",  # one row per posting
+            "INSERT INTO alert_refusals (posting_id, refusals, last_refused_at) "
+            "VALUES (999, 1, '2026-10-30T09:00:00Z')",  # a posting that exists
+            "UPDATE alert_refusals SET refusals = 0",
+            "UPDATE alert_refusals SET last_refused_at = '2026-10-30'",
+            "UPDATE alert_refusals SET given_up_at = 'soon'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(sql)
+    finally:
+        conn.close()
+
+
+def test_0018_adds_health_and_leaves_earlier_runs_unknown(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:17])
+        conn.execute(
+            "INSERT INTO watch_runs (started_at, finished_at, boards_fetched, boards_failed, "
+            "boards_left, held_unscored, held_no_fit, held_off_lane) "
+            "VALUES ('2026-11-01T10:00:00Z', '2026-11-01T10:05:00Z', 1, 0, 0, 0, 0, 0)"
+        )
+        conn.execute("INSERT INTO watch_runs (started_at) VALUES ('2026-11-01T11:00:00Z')")
+        assert db.migrate(conn, "search", db.load_migrations("search")[:18]) == [18]
+        assert [r[0] for r in conn.execute("SELECT useful FROM watch_runs")] == [None, None]
+        assert tuple(
+            conn.execute("SELECT useful_at, unproductive FROM discovery_state").fetchone()
+        ) == (
+            None,
+            0,
+        )
+        rows = conn.execute(
+            "SELECT component, failures, last_failure, alerted_failures, recovery_due "
+            "FROM component_health ORDER BY component"
+        )
+        assert [tuple(r) for r in rows] == [
+            ("boards", 0, None, None, 0),
+            ("lm_studio", 0, None, None, 0),
+            ("searxng", 0, None, None, 0),
+        ]
+        conn.execute("UPDATE watch_runs SET useful = 1 WHERE id = 1")
+        for sql in (
+            "UPDATE watch_runs SET useful = 1 WHERE id = 2",  # an unfinished run has none
+            "UPDATE watch_runs SET useful = 2 WHERE id = 1",
+            "UPDATE discovery_state SET unproductive = -1",
+            "INSERT INTO component_health (component) VALUES ('embedding')",
+            "UPDATE component_health SET failures = 1",  # a failure names its kind
+            "UPDATE component_health SET last_failure = 'unreachable'",  # and needs a count
+            "UPDATE component_health SET failures = 1, last_failure = 'gone'",
+            "UPDATE component_health SET alerted_failures = 0",
+            "UPDATE component_health SET recovery_due = 2",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(sql)
     finally:
         conn.close()

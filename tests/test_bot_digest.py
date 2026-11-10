@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from careerhunter import bot as botmod
-from careerhunter import claims, db, ledger, search_store, telegram
+from careerhunter import claims, cli, db, ledger, search_store, telegram
 from careerhunter.claims import ClaimSettings
 from careerhunter.models import Application, Dating, Posting
 from tests import test_bot
@@ -419,7 +419,7 @@ def test_a_refused_digest_is_sent_row_by_row_and_the_bad_row_goes_last(
     _post(env, "Waiting Row", fit="medium")
     refused = telegram.TelegramRejected("sendMessage: Bad Request")
     _Failing(env, refused, refused, None)  # the digest, then the bad row alone, then the good
-    env.bot.send_pending_alerts()  # one bot, polling twice: what it refused, it remembers
+    env.bot.send_pending_alerts()  # what it refused is counted in search.db
     alerted = _alerted(env)
     assert alerted["Bad Row"] is None and alerted["Good Row"] is not None
     assert alerted["Waiting Row"] is None
@@ -430,6 +430,98 @@ def test_a_refused_digest_is_sent_row_by_row_and_the_bad_row_goes_last(
     env.bot.send_pending_alerts()
     assert _heads(env)[-2:] == ["Example Org — Waiting Row", "Example Org — Bad Row"]
     assert set(_alerted(env).values()) != {None}
+
+
+def _refusals(env: Env) -> list[tuple[str, int, bool]]:
+    conn = env.search()
+    try:
+        rows = conn.execute(
+            "SELECT p.title, r.refusals, r.given_up_at IS NOT NULL AS given_up "
+            "FROM alert_refusals r JOIN postings p ON p.id = r.posting_id ORDER BY p.id"
+        )
+        return [(str(r["title"]), int(r["refusals"]), bool(r["given_up"])) for r in rows]
+    finally:
+        conn.close()
+
+
+def _restarted(env: Env) -> None:
+    """A new Bot on the same data folder: nothing carried over in memory."""
+    env.bot = botmod.Bot(env.datadir, env.api, CHAT, clock=env.clock, fetcher=env.web)
+
+
+def test_a_refusal_is_remembered_after_a_restart(env: Env, keep_umask: None) -> None:
+    _config(env, max_per_poll=1)
+    _post(env, "Bad Row")
+    _post(env, "Waiting Row", fit="medium")
+    refused = telegram.TelegramRejected("sendMessage: Bad Request")
+    _Failing(env, refused, refused)  # the digest, then the row alone
+    env.bot.send_pending_alerts()
+    assert _refusals(env) == [("Bad Row", 1, False)]
+    _restarted(env)
+    env.bot.send_pending_alerts()  # the refused row still goes behind the waiting one
+    assert _heads(env)[-1] == "Example Org — Waiting Row"
+    env.bot.send_pending_alerts()
+    assert _heads(env)[-1] == "Example Org — Bad Row"  # accepted now
+    assert _refusals(env) == []  # an accepted posting's refusals are forgotten
+
+
+def test_three_refusals_give_a_posting_up_and_doctor_counts_it(
+    env: Env,
+    keep_umask: None,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="careerhunter.bot")
+    _post(env, "Bad Row")
+    refused = telegram.TelegramRejected("sendMessage: Bad Request")
+    for count in (1, 2, 3):
+        _Failing(env, refused, refused)
+        _restarted(env)
+        env.bot.send_pending_alerts()
+        assert _refusals(env) == [("Bad Row", count, count == 3)]
+    assert "an alert was refused 3 times (TelegramRejected); given up, see doctor" in [
+        r.getMessage() for r in caplog.records
+    ]
+    before = len(env.api.sent())
+    env.bot.send_pending_alerts()
+    assert len(env.api.sent()) == before  # never sent again
+    assert _alerted(env) == {"Bad Row": None}  # held: never counted as sent
+    conn = env.search()
+    try:
+        assert search_store.pending_alert_ids(conn) == []
+        assert search_store.given_up_count(conn) == 1
+    finally:
+        conn.close()
+    report = cli._Report()
+    conn = env.search()
+    try:
+        capsys.readouterr()
+        cli._doctor_refusals(report, conn)
+    finally:
+        conn.close()
+    assert capsys.readouterr().out.strip() == (
+        "bot refusals    WARN 1 posting refused by Telegram 3 times; given up and never sent "
+        "(see logs/bot.log)"
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        telegram.TelegramUnreachable("sendMessage: TimeoutError"),
+        telegram.TelegramBadReply("sendMessage: the reply was not JSON"),
+        telegram.TelegramRateLimited("sendMessage: HTTP 429"),
+    ],
+)
+def test_a_failure_that_is_not_a_refusal_is_not_counted(
+    env: Env, keep_umask: None, error: Exception
+) -> None:
+    _post(env, "Coordinator")
+    _Failing(env, error)
+    env.bot.send_pending_alerts()
+    assert _refusals(env) == []
+    assert _alerted(env) == {"Coordinator": None}
 
 
 def test_config_unreadable_sends_no_digest(env: Env, keep_umask: None) -> None:
@@ -462,16 +554,23 @@ def test_chat_id_is_the_only_recipient(env: Env, keep_umask: None) -> None:
 # --- the job-ad alert and the edges of a row -------------------------------------------------
 
 
-def test_a_job_ad_that_is_a_scored_watcher_posting_shows_its_tier_and_cosine(
+def test_a_job_ad_that_is_a_scored_watcher_posting_is_logged_against_it(
     env: Env, keep_umask: None
 ) -> None:
+    """/log of a link the watcher already stored records the application on that posting,
+    and sends neither its tier nor its cosine (#34)."""
     posting = _insert(env, "Example Robotics", "Synthetic Analyst", test_bot.AD_URL)
-    _set(env, posting, embedding_score=0.82, alerted_at="2026-10-28T09:00:00Z")
-    env.say(f"/log {test_bot.AD_URL}")
-    assert env.api.texts()[-1] == (
-        f"Example Robotics — Synthetic Analyst\n{test_bot.AD_URL}\n"
-        "Fit: High\nLLM: strong\nsimilarity: 0.82"
-    )
+    _set(env, posting, embedding_score=0.82)
+    env.say(f"/log {test_bot.AD_URL} | email | 2026-10-21")
+    assert env.api.texts()[-1].startswith("Recorded: Example Robotics — Synthetic Analyst")
+    sent = env.api.everything_sent()
+    assert "strong" not in sent and "0.82" not in sent
+    s = env.search()
+    assert s.execute("SELECT count(*) FROM postings").fetchone()[0] == 1
+    assert s.execute("SELECT posting_id FROM applications").fetchone()[0] == posting
+    s.close()
+    assert _poll(env) == 0
+    assert _digests(env) == []  # it has an application, so it is never alerted
 
 
 def test_a_row_leaves_out_what_it_cannot_show(env: Env, keep_umask: None) -> None:

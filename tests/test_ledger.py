@@ -266,7 +266,8 @@ def test_a_skip_writes_nothing_to_the_ei_file(
     )
     assert snapshot(active.conn) == before
     assert active.conn.total_changes == changes
-    assert search.execute("SELECT reason FROM skips").fetchone()[0] == "too far"
+    row = search.execute("SELECT reason, by_operator FROM skips").fetchone()
+    assert tuple(row) == ("too far", 1)  # the operator's skip, so its reposts are held
 
 
 def test_without_an_active_claim_only_search_is_written(
@@ -299,7 +300,7 @@ def test_failure_after_the_ei_commit_leaves_the_ei_record_and_is_reported(
     (corr,) = ei_ids(active.conn)
     assert search_ids(flaky_search) == set()
     assert reconcile(flaky_search, {"2026-27": active.conn}) == [
-        ledger.Gap(corr, "in the EI record for claim 2026-27 but missing from search.db")
+        ledger.Gap(corr, "in the EI record for claim 2026-27 but missing from search.db", "orphan")
     ]
 
 
@@ -355,7 +356,7 @@ def test_the_reverse_gap_is_reported(
         backup.close()
     assert ei_ids(active.conn) == set()
     assert reconcile(search, {"2026-27": active.conn}) == [
-        ledger.Gap(corr, "in search.db but missing from the EI record for claim 2026-27")
+        ledger.Gap(corr, "in search.db but missing from the EI record for claim 2026-27", "orphan")
     ]
 
 
@@ -364,7 +365,7 @@ def test_links_to_a_missing_claim_or_the_wrong_claim_are_reported(
 ) -> None:
     corr = record_application(search, active, application()).correlation_id
     assert reconcile(search, {}) == [
-        ledger.Gap(corr, "search.db links it to claim 2026-27, which has no record file")
+        ledger.Gap(corr, "search.db links it to claim 2026-27, which has no record file", "orphan")
     ]
     other = record_application(search, None, application("2026-09-20")).correlation_id
     ei_store.insert_application(active.conn, ledger.sanitize(application("2026-09-20"), other))

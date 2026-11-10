@@ -426,12 +426,12 @@ def test_a_non_text_resume_is_a_miss(search: sqlite3.Connection, datadir: DataDi
     assert transport.calls == []
 
 
-def test_a_zero_vector_is_unreachable(search: sqlite3.Connection, datadir: DataDir) -> None:
+def test_a_zero_vector_is_a_bad_reply(search: sqlite3.Connection, datadir: DataDir) -> None:
     _write_resume(datadir, search)
     transport = EmbedScript({RESUME: [0.0, 0.0]})
     lines = _run(search, datadir, transport)
     posting_id = int(search.execute("SELECT id FROM postings").fetchone()["id"])
-    assert f"embedding miss posting {posting_id}: unreachable" in lines
+    assert f"embedding miss posting {posting_id}: bad-reply" in lines
     assert search.execute("SELECT count(*) AS n FROM resume_embedding").fetchone()["n"] == 0
     assert RESUME not in "\n".join(lines)
 
@@ -447,14 +447,14 @@ def test_embed_text_refuses_anything_but_loopback() -> None:
     assert RESUME not in str(exc.value)
 
 
-def test_a_redirect_and_a_bad_body_are_unreachable() -> None:
+def test_a_redirect_and_a_bad_body_are_bad_replies() -> None:
     with pytest.raises(EmbedError) as redirect:
         embed_text(RESUME, transport=lambda url, payload: (302, b"go away"))
-    assert str(redirect.value) == "unreachable"
+    assert str(redirect.value) == "bad-reply"
     assert RESUME not in str(redirect.value)
     with pytest.raises(EmbedError) as bad:
         embed_text(RESUME, transport=lambda url, payload: (200, b"not-json"))
-    assert str(bad.value) == "unreachable"
+    assert str(bad.value) == "bad-reply"
     assert RESUME not in str(bad.value)
 
 
@@ -465,7 +465,7 @@ def test_the_default_transport_posts_once_and_does_not_follow_a_redirect(
     monkeypatch.setattr(loopback, "LoopbackConnection", server)
     with pytest.raises(EmbedError) as exc:
         embed_text(RESUME)
-    assert str(exc.value) == "unreachable"
+    assert str(exc.value) == "bad-reply"  # it answered, with a redirect
     assert [(host, address, port) for host, address, port, _t in server.opened] == [
         ("127.0.0.1", "127.0.0.1", 1234)
     ]
@@ -567,10 +567,10 @@ def _vector(value: object) -> bytes:
         pytest.param(b'{"data": [{"embedding": [1e400, 1.0]}]}', id="infinite"),
     ],
 )
-def test_a_reply_of_the_wrong_shape_is_unreachable(body: bytes) -> None:
+def test_a_reply_of_the_wrong_shape_is_a_bad_reply(body: bytes) -> None:
     with pytest.raises(EmbedError) as exc:
         embed_text(RESUME, transport=lambda url, payload: (200, body))
-    assert str(exc.value) == "unreachable"
+    assert str(exc.value) == "bad-reply"
     assert RESUME not in str(exc.value)
 
 
@@ -684,7 +684,7 @@ def test_a_wrong_shape_reply_is_one_postings_miss_and_the_next_is_embedded(
     assert scores["Operations Coordinator"] is None
     assert scores["Support Specialist"] == pytest.approx(1.0)  # refresh did not clear it
     assert len(_misses(lines)) == 1
-    assert _misses(lines)[0].endswith(": unreachable")  # the log text is unchanged
+    assert _misses(lines)[0].endswith(": bad-reply")  # not "unreachable": it answered (#42)
 
 
 def test_a_refused_connection_stops_embedding_for_the_rest_of_the_run(

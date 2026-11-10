@@ -48,6 +48,8 @@ from careerhunter.fetch import FetchError
 
 MAX_BODY = 1_048_576
 MISS = "discovery miss: unreachable"
+# The server answered, with another status or a body that is not a usable result list.
+BAD_REPLY = "discovery miss: bad-reply"
 OFF = "discovery off"
 THROTTLED = "discovery stopped: rate limited or asked for a CAPTCHA"
 BACKOFF_CAP = dt.timedelta(days=7)
@@ -390,7 +392,7 @@ def run(
             pause(delay)
         answer = _ask(talk, base, query)
         if isinstance(answer, str):
-            _record_failure(conn, config, clock())
+            _record_failure(conn, config, clock(), answer)
             return Outcome(answer, ())
         for raw in answer:
             ref = posting(raw)
@@ -410,7 +412,9 @@ def run(
     accepted, gone, notes = _confirmed(
         conn, config, boards, confirm, exclusions or {}, start=_cursor(conn)
     )
-    stored = _store(conn, config, accepted, today, career_hosts, cursor=after, gone=gone)
+    stored = _store(
+        conn, config, accepted, today, career_hosts, cursor=after, gone=gone, stamp=_stamp(clock())
+    )
     return Outcome(None, tuple(stored), tuple(postings.values()), tuple(notes))
 
 
@@ -539,8 +543,9 @@ def posting(url: str) -> PostingRef | None:
 def _ask(talk: Transport, base: str, query: str) -> list[str] | str:
     """One query's result URLs, or the closed line that ends the pass.
 
-    A transport failure, another status or a reply that is not a result list is a miss;
-    HTTP 429 or an engine throttled is a stop.
+    A transport failure or a reply over the cap is `unreachable`; another status or a
+    reply that is not a usable result list is `bad-reply` (#42). Both are a miss. HTTP
+    429 or an engine throttled is a stop.
     """
     try:
         status, body = talk(request_url(base, query))
@@ -548,12 +553,14 @@ def _ask(talk: Transport, base: str, query: str) -> list[str] | str:
         return MISS
     if status == 429:
         return THROTTLED
-    if status != 200 or len(body) > MAX_BODY:
+    if len(body) > MAX_BODY:
         return MISS
+    if status != 200:
+        return BAD_REPLY
     if _throttled(body):
         return THROTTLED
     urls = _result_urls(body)
-    return MISS if urls is None else urls
+    return BAD_REPLY if urls is None else urls
 
 
 def _throttled(body: bytes) -> bool:
@@ -589,16 +596,26 @@ def backoff_for(failures: int, interval_minutes: int) -> dt.timedelta:
     return wait if wait < BACKOFF_CAP else BACKOFF_CAP
 
 
+# The component failure kind for each line that ends a pass (#42).
+_FAILURE_KINDS = {MISS: "unreachable", BAD_REPLY: "bad-reply", THROTTLED: "throttled"}
+
+
 def _record_failure(
-    conn: sqlite3.Connection, config: Mapping[str, Any], moment: dt.datetime
+    conn: sqlite3.Connection, config: Mapping[str, Any], moment: dt.datetime, line: str
 ) -> None:
+    """A pass that ran and failed: the backoff, one more unproductive pass, and one
+    more failed run of SearXNG with its kind, in one transaction."""
     with db.transaction(conn):
         row = conn.execute("SELECT failures FROM discovery_state WHERE id = 1").fetchone()
         failures = (0 if row is None else int(row[0])) + 1
         until = moment + backoff_for(failures, discovery_interval_minutes(dict(config)))
         conn.execute(
-            "UPDATE discovery_state SET failures = ?, backoff_until = ? WHERE id = 1",
+            "UPDATE discovery_state SET failures = ?, backoff_until = ?, "
+            "unproductive = unproductive + 1 WHERE id = 1",
             (failures, _stamp(until)),
+        )
+        search_store.record_component(
+            conn, "searxng", failed=_FAILURE_KINDS.get(line, "failed"), stamp=_stamp(moment)
         )
 
 
@@ -842,8 +859,14 @@ def _store(
     *,
     cursor: int | None = None,
     gone: Sequence[Hit] = (),
+    stamp: str | None = None,
 ) -> list[Queued]:
-    """Insert new pending rows, and `gone` rows for boards that do not exist."""
+    """Insert new pending rows, and `gone` rows for boards that do not exist.
+
+    With `cursor` the pass succeeded: in the same transaction the cursor moves, any
+    backoff is cleared, and with `stamp` the pass is recorded as useful (search
+    migration 0018) and SearXNG as working.
+    """
     watched_boards = _watched_boards(config)
     watched_careers = _watched_careers(config, career_hosts)
     known_boards = _known_boards(conn)
@@ -859,6 +882,12 @@ def _store(
                 "WHERE id = 1",
                 (cursor,),
             )
+            if stamp is not None:
+                conn.execute(
+                    "UPDATE discovery_state SET useful_at = ?, unproductive = 0 WHERE id = 1",
+                    (stamp,),
+                )
+                search_store.record_component(conn, "searxng", failed=None, stamp=stamp)
         for hit in gone:
             conn.execute(
                 "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, ats_host, "

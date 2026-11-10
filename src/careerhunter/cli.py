@@ -39,16 +39,21 @@ from careerhunter import (
     resume,
     search_store,
     secrets_store,
+    selfsourced,
     service,
     storage_guard,
     watch,
 )
+from careerhunter import report as claim_report
 from careerhunter.bot import BotStartupError
 from careerhunter.claims import ActiveClaim, ClaimError, ClaimSettings, settings_from_config
 from careerhunter.config import (
     ConfigError,
     discovery_enabled,
     discovery_interval_minutes,
+    health_failure_runs,
+    health_unproductive_runs,
+    learning_labelled_examples,
     load_config,
     load_exclusions,
     off_lane_min_fit,
@@ -59,8 +64,8 @@ from careerhunter.config import (
 from careerhunter.config import today as config_today
 from careerhunter.deadline import Deadline
 from careerhunter.export import export, plural
+from careerhunter.fetch import Fetched, post_json
 from careerhunter.fetch import fetch as fetch_url
-from careerhunter.fetch import post_json
 from careerhunter.filters import PostingText
 from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.platform_checks import SystemProbe
@@ -252,6 +257,80 @@ def cmd_export(datadir: DataDir, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
+    """A self-sourced application in one step (#34): the posting and the application go
+    to both layers under one correlation id, in one ledger call.
+
+    Fails closed like the bot's `/log`: without a readable config.yaml there is no date
+    and no claim check, so nothing is fetched or written.
+    """
+    if not datadir.config_path.is_file():
+        _err("error: config.yaml is missing, so nothing was recorded")
+        return EXIT_ERROR
+    if (args.company is None) != (args.title is None):
+        _err("error: give --company and --title together, or neither")
+        return EXIT_ERROR
+    doc = load_config(datadir.config_path)
+    today = config_today(doc)
+    try:
+        method = selfsourced.parse_method(args.method)
+        dating = selfsourced.parse_day(args.date, today)
+        posting = selfsourced.describe(
+            args.url, fetch_page, today, company=args.company, title=args.title
+        )
+        with _writable(datadir) as w:
+            logged = selfsourced.record(
+                datadir.root, w.search, w.active, posting, method, dating, today, fetch_page
+            )
+    except selfsourced.NamesMissing as exc:
+        _err(f"error: {exc} Add --company and --title.")
+        return EXIT_ERROR
+    except selfsourced.LogError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    where = f"EI claim {logged.ei_claim}" if logged.ei_claim else "search.db only, no active claim"
+    print(f"Recorded: {logged.company} — {logged.title} ({where}).")
+    print("Job ad saved." if logged.snapshot_saved else "No copy of the job ad was saved.")
+    if logged.earlier:
+        print(logged.earlier)
+    return EXIT_OK
+
+
+def fetch_page(url: str) -> Fetched:
+    """The safe fetch (ADR-016) for `careerhunter log`. Tests replace it."""
+    return fetch_url(url)
+
+
+def cmd_report(datadir: DataDir, args: argparse.Namespace) -> int:
+    """Join one claim's EI record to search.db, both read-only, into a private report.
+
+    The only command that attaches one database to another (ADR-014 as amended). It
+    writes reports/report-<claim>-<utc>.txt (0600) and prints only that relative path.
+    """
+    bad = claims.label_problem(args.claim)
+    if bad:
+        raise ValueError(bad)
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    try:
+        conn = claim_report.connect(datadir.search_db_path, datadir.ei_record_path(args.claim))
+    except claim_report.ReportError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    except sqlite3.DatabaseError:
+        _err(f"error: the record for claim {args.claim} can't be read as a claim record")
+        return EXIT_ERROR
+    try:
+        built = claim_report.build(conn, args.claim)
+    finally:
+        conn.close()
+    now = _utc_now()
+    path = claim_report.write(datadir.root, args.claim, claim_report.render(built, now), now)
+    print(path.relative_to(datadir.root).as_posix())
+    return EXIT_OK
+
+
 def cmd_claim(datadir: DataDir, args: argparse.Namespace) -> int:
     doc = _config_doc(datadir)
     settings = settings_from_config(doc) if doc else ClaimSettings()
@@ -424,8 +503,16 @@ def repo_push_checks(repo: Path) -> list[tuple[str, str]]:
 
 HEARTBEAT_STALE = dt.timedelta(minutes=5)
 
+Clock = Callable[[], dt.datetime]
 
-def _doctor_bot(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
+
+def _utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
+
+
+def _doctor_bot(
+    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
+) -> None:
     """The Telegram chat setting, and whether the bot service is up and polling."""
     if config_doc is not None:
         if telegram_chat_id(config_doc) is None:
@@ -449,7 +536,7 @@ def _doctor_bot(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | 
     except (OSError, ValueError):
         report.line("bot heartbeat", "BAD", "none yet; the bot hasn't completed a poll")
         return
-    age = dt.datetime.now(dt.UTC) - beat
+    age = now - beat
     if age > HEARTBEAT_STALE:
         minutes = int(age.total_seconds() // 60)
         report.line("bot heartbeat", "BAD", f"last poll {minutes} min ago; see logs/bot.log")
@@ -457,7 +544,9 @@ def _doctor_bot(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | 
         report.line("bot heartbeat", "OK", "polled within the last 5 minutes")
 
 
-def _doctor_watch(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
+def _doctor_watch(
+    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
+) -> None:
     """Whether the watch agent is loaded, and how old the last finished run is."""
     current = service.status(label=service.WATCH_LABEL)
     if not current.installed:
@@ -470,7 +559,7 @@ def _doctor_watch(report: _Report, datadir: DataDir, config_doc: dict[str, Any] 
         report.line("watch service", "OK", "loaded")
     if current.installed:
         _doctor_watch_interval(report, config_doc)
-    _doctor_watch_success(report, datadir, config_doc)
+    _doctor_watch_success(report, datadir, config_doc, now)
 
 
 def _doctor_interval(
@@ -515,6 +604,7 @@ def _doctor_stamp(
     name: str,
     filename: str,
     limit: dt.timedelta,
+    now: dt.datetime,
 ) -> None:
     path = datadir.logs / filename
     try:
@@ -527,14 +617,14 @@ def _doctor_stamp(
         return
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=dt.UTC)
-    age = dt.datetime.now(dt.UTC) - stamp.astimezone(dt.UTC)
+    age = now - stamp.astimezone(dt.UTC)
     minutes = max(0, int(age.total_seconds() // 60))
     detail = f"last success {minutes} min ago"
     report.line(name, "BAD" if age > limit else "OK", detail)
 
 
 def _doctor_watch_success(
-    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None
+    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
 ) -> None:
     _doctor_stamp(
         report,
@@ -542,10 +632,13 @@ def _doctor_watch_success(
         name="watch",
         filename="watch.success",
         limit=dt.timedelta(minutes=2 * watch_interval_minutes(config_doc)),
+        now=now,
     )
 
 
-def _doctor_discover(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
+def _doctor_discover(
+    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
+) -> None:
     """Discovery runs inside the watch agent (#40). A null URL is off.
 
     The separate agent of earlier versions left installed is a warning, which does not
@@ -568,6 +661,7 @@ def _doctor_discover(report: _Report, datadir: DataDir, config_doc: dict[str, An
         name="discovery",
         filename="discover.success",
         limit=dt.timedelta(minutes=2 * every),
+        now=now,
     )
 
 
@@ -753,12 +847,17 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
         except resume.ResumeError as exc:
             problem = str(exc)
 
+        # The operator's labelled postings, read once per run (#43). They reach the
+        # local model's request only.
+        examples = search_store.labelled_examples(conn, learning_labelled_examples(doc))
+
         def scorer(posting: PostingText) -> Score | None:
             return score_posting(
                 posting,
                 doc,
                 transport=partial(score_transport, budget=budget),
                 resume=loaded,
+                examples=examples,
             )
 
         watch.run(
@@ -1110,7 +1209,7 @@ def _doctor_lanes(report: _Report, config_doc: dict[str, Any] | None) -> None:
     report.line("lanes", "OK", f"{count}; off-lane postings alert at {minimum} fit or better")
 
 
-def _doctor_watch_runs(report: _Report, search: sqlite3.Connection) -> None:
+def _doctor_watch_runs(report: _Report, search: sqlite3.Connection, now: dt.datetime) -> None:
     """The last watch run: unfinished for too long is BAD; held counts from the last finish."""
     latest = search.execute("SELECT * FROM watch_runs ORDER BY id DESC LIMIT 1").fetchone()
     if latest is None:
@@ -1118,7 +1217,7 @@ def _doctor_watch_runs(report: _Report, search: sqlite3.Connection) -> None:
         return
     if latest["finished_at"] is None:
         started = dt.datetime.fromisoformat(str(latest["started_at"]))
-        age = dt.datetime.now(dt.UTC) - started
+        age = now - started
         minutes = max(0, int(age.total_seconds() // 60))
         if age > _RUN_GRACE:
             report.line(
@@ -1150,6 +1249,95 @@ def _doctor_watch_runs(report: _Report, search: sqlite3.Connection) -> None:
         report.line("watch held", "OK", detail)
 
 
+COMPONENT_NAMES = {"lm_studio": "LM Studio", "searxng": "SearXNG", "boards": "every board"}
+
+
+def _ago(now: dt.datetime, stamp: str) -> str:
+    minutes = max(0, int((now - dt.datetime.fromisoformat(stamp)).total_seconds() // 60))
+    return f"{minutes} min ago"
+
+
+def _unproductive_watch_runs(search: sqlite3.Connection, now: dt.datetime) -> int:
+    """Watch runs in a row, newest first, that did no useful work (#42).
+
+    A finished run with `useful` 0 counts, and so does a run unfinished past its grace:
+    it crashed or was killed, so it did nothing useful. A run still in progress is not
+    counted either way. The count stops at a useful run, and at a run finished before
+    search migration 0018, whose usefulness is unknown.
+    """
+    count = 0
+    for row in search.execute(
+        "SELECT started_at, finished_at, useful FROM watch_runs ORDER BY id DESC"
+    ):
+        if row["finished_at"] is None:
+            if now - dt.datetime.fromisoformat(str(row["started_at"])) > _RUN_GRACE:
+                count += 1
+            continue
+        if row["useful"] != 0:
+            break
+        count += 1
+    return count
+
+
+def _doctor_usefulness(
+    report: _Report,
+    search: sqlite3.Connection,
+    config_doc: dict[str, Any] | None,
+    now: dt.datetime,
+) -> None:
+    """Did useful work, beside the ran stamps: a warning after N unproductive in a row."""
+    limit = health_unproductive_runs(config_doc)
+    last = search.execute("SELECT max(finished_at) FROM watch_runs WHERE useful = 1").fetchone()[0]
+    when = f"last useful run {_ago(now, str(last))}" if last else "no useful run recorded yet"
+    streak = _unproductive_watch_runs(search, now)
+    if streak >= limit:
+        report.line(
+            "watch useful",
+            "WARN",
+            f"the last {streak} watch runs did no useful work; {when}. See logs/watch.log",
+        )
+    elif last:
+        report.line("watch useful", "OK", when)
+    else:
+        report.line("watch useful", "--", when)
+    if not discovery_enabled(config_doc):
+        return
+    row = search.execute("SELECT useful_at, unproductive FROM discovery_state").fetchone()
+    useful_at, unproductive = (None, 0) if row is None else (row[0], int(row[1]))
+    when = f"last useful pass {_ago(now, str(useful_at))}" if useful_at else "no useful pass yet"
+    if unproductive >= limit:
+        report.line(
+            "discovery useful",
+            "WARN",
+            f"the last {unproductive} discovery passes got no usable reply; {when}",
+        )
+    elif useful_at:
+        report.line("discovery useful", "OK", when)
+    else:
+        report.line("discovery useful", "--", when)
+
+
+def _doctor_components(
+    report: _Report, search: sqlite3.Connection, config_doc: dict[str, Any] | None
+) -> None:
+    """A component failing now: a warning at health.failure_runs runs in a row."""
+    limit = health_failure_runs(config_doc)
+    for health in search_store.component_health(search):
+        if not health.failures:
+            continue
+        held = (
+            ""
+            if health.held is None
+            else f"; {plural(health.held, 'posting', 'postings')} held for scoring"
+        )
+        report.line(
+            "health",
+            "WARN" if health.failures >= limit else "OK",
+            f"{COMPONENT_NAMES[health.component]} failed the last "
+            f"{plural(health.failures, 'run', 'runs')} ({health.last_failure}){held}",
+        )
+
+
 def _doctor_alert_hold(report: _Report, search: sqlite3.Connection) -> None:
     """Whether the bot is holding watcher alerts because it couldn't read config.yaml."""
     since = search_store.alerts_held_since(search)
@@ -1161,6 +1349,20 @@ def _doctor_alert_hold(report: _Report, search: sqlite3.Connection) -> None:
             "BAD",
             f"held since {since}: the bot couldn't read config.yaml at its last poll",
         )
+
+
+def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
+    """Postings the bot gave up on after Telegram refused them too often (#42)."""
+    given_up = search_store.given_up_count(search)
+    if given_up:
+        report.line(
+            "bot refusals",
+            "WARN",
+            f"{plural(given_up, 'posting', 'postings')} refused by Telegram "
+            f"{bot.REFUSALS_TO_GIVE_UP} times; given up and never sent (see logs/bot.log)",
+        )
+    else:
+        report.line("bot refusals", "OK", "no posting given up")
 
 
 def _doctor_resume(
@@ -1220,8 +1422,12 @@ def _doctor_resume(
     report.line("resume", "OK", "matches its import")
 
 
-def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
-    """Check everything and report. Reads only, apart from tightening file modes."""
+def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | None = None) -> int:
+    """Check everything and report. Reads only, apart from tightening file modes.
+
+    Every age is measured against one reading of `clock` (UTC), so a test can fix it.
+    """
+    now = (clock or _utc_now)().astimezone(dt.UTC)
     report = _Report()
     report.line("data dir", "OK", f"{datadir.root} (volume {datadir.mount_point}, encrypted)")
 
@@ -1257,7 +1463,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
         report.line("ei claim", "OK", f"{settings.active.label} active ({settings.active.period})")
     else:
         report.line("ei claim", "--", "none active (set ei.active_claim in config.yaml)")
-    for warning in claims.warnings(settings, config_today(config_doc)):
+    for warning in claims.warnings(settings, config_today(config_doc, now)):
         report.line("ei claim", "WARN", warning)
     if config_doc is not None:
         zone = timezone_name(config_doc)
@@ -1288,8 +1494,11 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
     _doctor_resume(report, datadir, config_doc, search)
     _doctor_lanes(report, config_doc)
     if search is not None:
-        _doctor_watch_runs(report, search)
+        _doctor_watch_runs(report, search, now)
+        _doctor_usefulness(report, search, config_doc, now)
+        _doctor_components(report, search, config_doc)
         _doctor_alert_hold(report, search)
+        _doctor_refusals(report, search)
 
     records: dict[str, sqlite3.Connection] = {}
     unreadable = search is None and datadir.search_db_path.exists()
@@ -1310,8 +1519,13 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
         elif search is not None:
             gaps = reconcile(search, records)
             for gap in gaps:
-                report.line("reconcile", "BAD", f"{gap.correlation_id}: {gap.problem}")
-            if not gaps:
+                name = "orphan" if gap.kind == "orphan" else "reconcile"
+                report.line(name, "BAD", f"{gap.correlation_id}: {gap.problem}")
+            if gaps:
+                # Reported only: doctor never repairs either layer (#34). Re-running
+                # seed repairs seed rows; anything else is the operator's to decide.
+                report.line("reconcile", "--", "left as they are; doctor never fixes either file")
+            else:
                 report.line(
                     "reconcile",
                     "OK",
@@ -1324,11 +1538,13 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
             search.close()
 
     _doctor_private_folder(report, "exports/", datadir.exports)
+    if (datadir.root / "reports").exists():
+        _doctor_private_folder(report, "reports/", datadir.root / "reports")
     _doctor_private_folder(report, "snapshots/", datadir.snapshots)
     _doctor_private_folder(report, "logs/", datadir.logs)
-    _doctor_bot(report, datadir, config_doc)
-    _doctor_watch(report, datadir, config_doc)
-    _doctor_discover(report, datadir, config_doc)
+    _doctor_bot(report, datadir, config_doc, now)
+    _doctor_watch(report, datadir, config_doc, now)
+    _doctor_discover(report, datadir, config_doc, now)
 
     repo = storage_guard.repo_root()
     if repo is not None and (repo / ".git").exists():
@@ -1362,6 +1578,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--claim", required=True, metavar="LABEL", help="the claim, e.g. 2026-27")
     p.add_argument("--from", dest="date_from", type=_date, required=True, metavar="YYYY-MM-DD")
     p.add_argument("--to", dest="date_to", type=_date, required=True, metavar="YYYY-MM-DD")
+    p = sub.add_parser(
+        "log", help="record a self-sourced application: the posting and the application at once"
+    )
+    p.add_argument("url", help="the job ad's link")
+    p.add_argument("--method", required=True, help="how you applied, e.g. company_site or email")
+    p.add_argument("--date", required=True, help="YYYY-MM-DD, today or yesterday")
+    p.add_argument("--company", help="the employer, when the page doesn't say (with --title)")
+    p.add_argument("--title", help="the role, when the page doesn't say (with --company)")
+    p = sub.add_parser(
+        "report",
+        help="join one claim's EI record to search.db, read-only, into a private report",
+    )
+    p.add_argument("--claim", required=True, metavar="LABEL", help="the claim, e.g. 2026-27")
     p = sub.add_parser("secret", help="store or check a secret in the macOS Keychain")
     p.add_argument("action", choices=("set", "verify"))
     p.add_argument("name", choices=sorted(secrets_store.ALLOWED_NAMES))
@@ -1427,6 +1656,8 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "migrate": cmd_migrate,
     "seed": cmd_seed,
     "export": cmd_export,
+    "log": cmd_log,
+    "report": cmd_report,
     "claim": cmd_claim,
     "secret": cmd_secret,
     "bot": cmd_bot,
@@ -1440,7 +1671,13 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
 }
 
 
-def main(argv: Sequence[str] | None = None, probe: SystemProbe | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    probe: SystemProbe | None = None,
+    *,
+    clock: Clock | None = None,
+) -> int:
+    """Run one command. `clock` is the time doctor measures ages against (tests fix it)."""
     args = build_parser().parse_args(argv)
     probe = probe or SystemProbe()
     try:
@@ -1450,6 +1687,8 @@ def main(argv: Sequence[str] | None = None, probe: SystemProbe | None = None) ->
         return EXIT_GUARD
     _warn_filevault(probe)
     try:
+        if args.command == "doctor":
+            return cmd_doctor(datadir, args, clock=clock)
         return COMMANDS[args.command](datadir, args)
     except (
         SeedError,

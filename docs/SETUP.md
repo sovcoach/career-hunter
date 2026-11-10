@@ -175,6 +175,8 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | A cap on weekend days | `schedule_limits` |
 | Which roles to keep at one company | that company's `role_filters` |
 | A staffing agency | `agency: true` on that watchlist entry |
+| How many of your recent Applied, Skipped and status decisions the scorer sees as examples (only the local model sees them; 0 for none) | `learning.labelled_examples` (default 5) |
+| When `doctor` warns about runs that did nothing useful, and when the bot says a part stopped working | `health.unproductive_runs`, `health.failure_runs` (default 3 each) |
 | Companies, title keywords, description keywords, and one role | `exclusions.yaml` |
 
 The templates use placeholder names such as Example Robotics, Example City, and Example Staffing Mill.
@@ -261,7 +263,7 @@ With the template files, the prompt names Example Staffing Mill, the title keywo
 
 SearXNG runs on this Mac and listens on `127.0.0.1` only. Leave `public_instance` and `image_proxy` off, leave the limiter off, and add `json` to `search.formats`. Leave engines that need an API key disabled. Set `discovery.searxng_url` to that loopback URL, for example `http://127.0.0.1:8888/search`. A null URL leaves discovery off.
 
-Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`. A pass sends the next `discovery.queries_per_run` site-restricted queries (default 12), `discovery.query_delay_seconds` apart (default 5), and the next pass carries on from there, so over several passes every title, place and host is asked. Titles come from your lanes, places from `search.location_rules`, and hosts are each supported ATS plus `discovery.career_hosts`. A posting URL in the results is fetched once from its ATS and goes through the same gates, scoring and digest as a watched posting, with no approval. A board is queued only after one request to its API confirms it exists; a board that does not exist is never queued again, and a company in `exclusions.companies` is never queued. Career pages are not queued. A down server prints `discovery miss: unreachable` and stores nothing; HTTP 429 or a CAPTCHA reported by SearXNG stops the pass, and either way later passes wait longer each time, up to seven days. `careerhunter discover` runs one pass by hand and prints each new pending row. `careerhunter discover list` prints the pending rows again.
+Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`. A pass sends the next `discovery.queries_per_run` site-restricted queries (default 12), `discovery.query_delay_seconds` apart (default 5), and the next pass carries on from there, so over several passes every title, place and host is asked. Titles come from your lanes, places from `search.location_rules`, and hosts are each supported ATS plus `discovery.career_hosts`. A posting URL in the results is fetched once from its ATS and goes through the same gates, scoring and digest as a watched posting, with no approval. A board is queued only after one request to its API confirms it exists; a board that does not exist is never queued again, and a company in `exclusions.companies` is never queued. Career pages are not queued. A down server prints `discovery miss: unreachable`, and one that answers with an error or a reply that is not a result list prints `discovery miss: bad-reply`; either stores nothing; HTTP 429 or a CAPTCHA reported by SearXNG stops the pass, and either way later passes wait longer each time, up to seven days. `careerhunter discover` runs one pass by hand and prints each new pending row. `careerhunter discover list` prints the pending rows again.
 
 ```bash
 make discover
@@ -368,6 +370,24 @@ If you really did apply to some jobs before the claim started, and want career-h
 
 You can fix `seed.yaml` and run this again at any time. Entries already imported are recognized and skipped, so nothing is duplicated. Existing entries aren't changed by re-running: the record is permanent by design. A mistaken entry is *voided* with a reason rather than deleted. The record keeps it, but reports leave it out.
 
+### Recording a job you applied to yourself
+
+When you apply to a job you found yourself, record the posting and the application in one step:
+
+```bash
+uv run careerhunter log https://jobs.example.com/ads/7 --method company_site --date 2026-10-20
+```
+
+`--method` is one of `company_site`, `linkedin_easy_apply`, `email`, `referral`, `agency`, `recruiter_inbound` or `other` (plain words such as `Company site` work too). `--date` is `YYYY-MM-DD`, `today` or `yesterday`, and must fall within the active claim. The page is fetched once for the company, title and location; if it doesn't show them, add `--company "Example Robotics" --title "Synthetic Analyst"`. A copy of the ad is saved when the page gives one. If you already logged an application to the same role at the same company (a repost counts: the title is compared without its requisition code), it is still recorded, and one more line names the earlier date, for example `You logged an application to this role on 2026-10-27.` Without a readable `config.yaml`, nothing is fetched or recorded. The bot's `/log` does the same from Telegram.
+
+### A report across both files
+
+```bash
+uv run careerhunter report --claim 2026-27
+```
+
+This joins the claim's EI record to `search.db`, opening both read-only, and writes a private report to `reports/` in the data folder (only the path is printed): each application's employer, role, date, method and latest EI status, beside the lane, fit and source `search.db` knows, with counts by lane. It is for you, not for Service Canada: use `export` for that. Applications on only one side are counted; `doctor` lists them.
+
 ## Step 9: Produce an EI job-search report
 
 Pick the period you need, in `YYYY-MM-DD` format:
@@ -419,7 +439,7 @@ Sealing never happens on its own, and the claim you are on can't be sealed. If `
 
 The bot lets you record applications, statuses and activities from your phone. It only ever talks to your own private chat with it, and it has no open ports: it calls Telegram, never the other way round.
 
-**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal. Watcher postings come as one digest per watch run, each row with company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link. A job ad you send with `/log` gets company, title, link, the fit word and, when it was already scored, the tier name and similarity. Status words and short references like `a7` go too. It never sends your notes, the names of the gaps it found (only how many), the numeric fit rating or EI record details. `alerts.max_per_poll` (default 10) caps how many postings go per poll; the rest follow on the next poll. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
+**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal. Watcher postings come as one digest per watch run, each row with company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link. A job you record with `/log` is answered with its company, title and a short reference. Status words and short references like `a7` go too. It never sends your notes, the names of the gaps it found (only how many), the numeric fit rating or EI record details. `alerts.max_per_poll` (default 10) caps how many postings go per poll; the rest follow on the next poll. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
 
 ### 10a. Create the bot and store its token
 
@@ -508,11 +528,27 @@ discover: 0 queued, 0 postings found
 
 `doctor` shows how old that stamp is; one older than two discovery intervals, or two watch intervals when those are longer, is a failure. If an earlier version installed `org.careerhunter.discover`, run `service install` again: it removes that agent and prints `removed …; discovery now runs inside the watch agent`, and `doctor` warns until you do. List, approve and reject write no log and do not refresh the stamp. `service uninstall` removes the bot and the watch agent, and an old discovery agent if one is left.
 
+`doctor` also tells "ran" apart from "did useful work". A watch run is useful when it fetched at least one board and, if postings were waiting to be scored, the local model answered; a discovery pass is useful when SearXNG gave a usable reply to every query. After `health.unproductive_runs` runs (or passes) in a row that weren't useful (default 3), `doctor` warns:
+
+```text
+watch useful    WARN the last 3 watch runs did no useful work; last useful run 300 min ago. See logs/watch.log
+discovery useful WARN the last 3 discovery passes got no usable reply; last useful pass 600 min ago
+health          WARN LM Studio failed the last 3 runs (unreachable); 4 postings held for scoring
+```
+
+A `health` line names a component that is failing now (LM Studio, SearXNG, or every board) once it has failed `health.failure_runs` runs in a row (default 3); the bot also sends one message about it then, and one when it works again (see 10d). Both settings take 1 to 50:
+
+```yaml
+health:
+  unproductive_runs: 3
+  failure_runs: 3
+```
+
 ### 10d. Using it
 
 | Send | What happens |
 |---|---|
-| `/log <link>` | Records a posting you found and shows it with **Applied** and **Skipped** buttons. If the page doesn't show the company and title, send `/log <link> \| Company \| Title`. |
+| `/log <link> \| method \| date` | Records a job you found and applied to yourself, in one message: the posting and the application, with a copy of the ad when the page gives one. The method is a word such as `email` or `Company site`; the date is `YYYY-MM-DD`, `today` or `yesterday`. Send just `/log <link>` to be asked for the method and the date with buttons. If the page doesn't show the company and title, add them: `/log <link> \| email \| today \| Company \| Title`. |
 | **Applied** | The bot asks how you applied, then when: **Today**, **Yesterday**, **This week**, **Last week** or **Other date** (reply with YYYY-MM-DD). It saves a copy of the job ad. If it can't, it asks you to reply with a PDF or screenshot of the ad. |
 | **Skipped** | Asks why, then records the skip. Skips never go into the EI record. |
 | `/status a7 interview_scheduled` | Updates an application. References like `a7` come from `/recent` and last 7 days. Send just `/status` to choose with buttons. |
@@ -520,6 +556,17 @@ discover: 0 queued, 0 postings found
 | `/recent` | Your latest applications, their references and current statuses. |
 
 Every date must fall inside your active EI claim, as with `seed`, and future dates are refused. Buttons work once: tap a button twice, or use an old one, and the bot says it has expired.
+
+With `alerts.weekly_digest: {day: monday, hour: 9}` in `config.yaml`, the bot also sends a weekly message at that local time (`schedule.timezone`) with counts for the week before, by lane: alerts, Applied, Skipped, responses (an employer's first reply: screening and later, or a rejection) and outcomes. It has numbers and lane names only, never titles:
+
+```text
+Weekly digest, 2026-10-19 09:00 to 2026-10-26 09:00
+operations: 2 alerts, 1 applied, 1 skipped, 2 responses, 2 outcomes
+Off-lane: 1 alerts, 0 applied, 1 skipped, 0 responses, 0 outcomes
+All lanes: 3 alerts, 1 applied, 2 skipped, 2 responses, 2 outcomes
+```
+
+The bot also tells you when something stops working. After `health.failure_runs` watch runs in a row (default 3) in which the local model, SearXNG, or every board failed, it sends one message, such as `Health: LM Studio has failed 3 runs in a row. 4 postings are waiting to be scored.`, and when that part works again, one more: `Health: LM Studio is working again.` It sends nothing more about the same outage in between.
 
 ---
 

@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from careerhunter import cli, service
-from tests.conftest import ACTIVE, FakeProbe, set_claims
+from tests.conftest import ACTIVE, DOCTOR_NOW, FakeProbe, set_claims
 
 RUNNING = """gui/501/org.careerhunter.bot = {
 \tstate = running
@@ -176,7 +176,7 @@ def ready(data_env: Path, probe: FakeProbe) -> Path:
 
 def doctor(probe: FakeProbe, capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
     capsys.readouterr()
-    code = cli.main(["doctor"], probe=probe)
+    code = cli.main(["doctor"], probe=probe, clock=lambda: DOCTOR_NOW)
     return code, capsys.readouterr().out
 
 
@@ -203,7 +203,7 @@ def test_doctor_with_a_healthy_service(
 ) -> None:
     service.install(ready, program_path=Path("/x"), runner=fake_launchctl())
     monkeypatch.setattr(service, "run_launchctl", fake_launchctl())
-    (ready / "logs" / "bot.heartbeat").write_text(dt.datetime.now(dt.UTC).isoformat())
+    (ready / "logs" / "bot.heartbeat").write_text(DOCTOR_NOW.isoformat())
     (ready / "logs" / "bot.heartbeat").chmod(0o600)
     code, out = doctor(probe, capsys)
     assert code == 0
@@ -234,7 +234,7 @@ def test_doctor_flags_an_unhealthy_service(
     monkeypatch.setattr(service, "run_launchctl", fake_launchctl(launchctl))
     if heartbeat:
         age = dt.timedelta(minutes=30 if heartbeat == "stale" else 0)
-        (ready / "logs" / "bot.heartbeat").write_text((dt.datetime.now(dt.UTC) - age).isoformat())
+        (ready / "logs" / "bot.heartbeat").write_text((DOCTOR_NOW - age).isoformat())
     code, out = doctor(probe, capsys)
     assert code == cli.EXIT_ERROR
     assert expected in out
@@ -259,12 +259,12 @@ def test_doctor_with_the_chat_set(
 
 def _heartbeat(ready: Path) -> None:
     path = ready / "logs" / "bot.heartbeat"
-    path.write_text(dt.datetime.now(dt.UTC).isoformat())
+    path.write_text(DOCTOR_NOW.isoformat())
     path.chmod(0o600)
 
 
 def _stamp(ready: Path, age: dt.timedelta) -> None:
-    moment = dt.datetime.now(dt.UTC) - age
+    moment = DOCTOR_NOW - age
     path = ready / "logs" / "watch.success"
     path.write_text(moment.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
 
@@ -293,6 +293,26 @@ def test_doctor_reports_a_loaded_watch_and_a_fresh_success(
     assert "watch service   OK  loaded" in out
     assert "watch           OK  last success 12 min ago" in out
     assert "watch interval" not in out
+
+
+def test_doctor_measures_every_age_against_its_clock(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same files read as stale once the injected clock moves on: no real clock."""
+    service.install(ready, program_path=Path("/x"), runner=fake_launchctl())
+    monkeypatch.setattr(service, "run_launchctl", fake_launchctl())
+    _heartbeat(ready)
+    _stamp(ready, dt.timedelta(minutes=12))
+    later = DOCTOR_NOW + dt.timedelta(hours=3)
+    capsys.readouterr()
+    code = cli.main(["doctor"], probe=probe, clock=lambda: later)
+    out = capsys.readouterr().out
+    assert code == cli.EXIT_ERROR
+    assert "bot heartbeat   BAD last poll 180 min ago" in out
+    assert "watch           BAD last success 192 min ago" in out
 
 
 def test_doctor_flags_an_unreadable_success_stamp(
@@ -449,7 +469,7 @@ def test_service_status_says_where_discovery_runs(
 
 
 def _discovery_stamp(ready: Path, age: dt.timedelta) -> None:
-    moment = dt.datetime.now(dt.UTC) - age
+    moment = DOCTOR_NOW - age
     (ready / "logs" / "discover.success").write_text(moment.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
 
 

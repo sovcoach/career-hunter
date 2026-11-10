@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from careerhunter.enums import FIT_LEVELS
+from careerhunter.filters import title_key
 from careerhunter.models import Application, Dating, Posting
 
 
@@ -348,6 +349,98 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
     return HeldCounts(unscored=int(row["unscored"]), no_fit=int(row["no_fit"]), off_lane=off_lane)
 
 
+COMPONENTS = ("lm_studio", "searxng", "boards")
+FAILURE_KINDS = ("unreachable", "bad-reply", "throttled", "failed")
+
+
+def record_component(
+    conn: sqlite3.Connection, component: str, *, failed: str | None, stamp: str
+) -> None:
+    """One run's outcome for a component (search migration 0018). `failed` is the kind
+    of failure, or None when the component worked. The caller holds the transaction.
+
+    A failure adds one to the runs in a row that failed it. Working clears the count,
+    and when the bot had sent a failure message for this outage, marks the recovery
+    message due. Either way the postings held for scoring are counted now. A run that
+    never reached the component does not call this, so it is counted as neither.
+    """
+    if component not in COMPONENTS:
+        raise ValueError(f"unknown component {component!r}")
+    if failed is not None and failed not in FAILURE_KINDS:
+        raise ValueError(f"unknown failure kind {failed!r}")
+    held = held_counts(conn).unscored
+    if failed is None:
+        conn.execute(
+            "UPDATE component_health SET failures = 0, last_failure = NULL, held = ?, "
+            "updated_at = ?, "
+            "recovery_due = CASE WHEN alerted_failures IS NOT NULL THEN 1 ELSE recovery_due END, "
+            "alerted_failures = NULL WHERE component = ?",
+            (held, stamp, component),
+        )
+    else:
+        conn.execute(
+            "UPDATE component_health SET failures = failures + 1, last_failure = ?, held = ?, "
+            "updated_at = ? WHERE component = ?",
+            (failed, held, stamp, component),
+        )
+
+
+@dataclass(frozen=True)
+class Health:
+    component: str
+    failures: int
+    last_failure: str | None
+    held: int | None
+    alerted_failures: int | None
+    recovery_due: bool
+
+
+def component_health(conn: sqlite3.Connection) -> list[Health]:
+    """Every component's row, in COMPONENTS order."""
+    rows = {str(row["component"]): row for row in conn.execute("SELECT * FROM component_health")}
+    return [
+        Health(
+            component=name,
+            failures=int(rows[name]["failures"]),
+            last_failure=None
+            if rows[name]["last_failure"] is None
+            else str(rows[name]["last_failure"]),
+            held=None if rows[name]["held"] is None else int(rows[name]["held"]),
+            alerted_failures=None
+            if rows[name]["alerted_failures"] is None
+            else int(rows[name]["alerted_failures"]),
+            recovery_due=bool(rows[name]["recovery_due"]),
+        )
+        for name in COMPONENTS
+        if name in rows
+    ]
+
+
+def mark_failure_told(conn: sqlite3.Connection, component: str, count: int, limit: int) -> None:
+    """The bot sent this outage's failure message, naming `count` failures. The caller
+    holds the transaction. If the component worked again since the bot read it (the
+    count went back below `limit`), the outage is over: its recovery message is due."""
+    cur = conn.execute(
+        "UPDATE component_health SET alerted_failures = ? "
+        "WHERE component = ? AND alerted_failures IS NULL AND failures >= ?",
+        (count, component, limit),
+    )
+    if cur.rowcount == 0:
+        conn.execute(
+            "UPDATE component_health SET recovery_due = 1 "
+            "WHERE component = ? AND alerted_failures IS NULL AND failures < ?",
+            (component, limit),
+        )
+
+
+def mark_recovery_told(conn: sqlite3.Connection, component: str) -> None:
+    """The bot sent this component's recovery message."""
+    conn.execute(
+        "UPDATE component_health SET recovery_due = 0 WHERE component = ? AND recovery_due = 1",
+        (component,),
+    )
+
+
 def set_posting_lane(conn: sqlite3.Connection, posting_id: int, lane: str | None) -> bool:
     """Record the lane a posting matched (None: off-lane), once. False if already set."""
     cur = conn.execute(
@@ -379,12 +472,14 @@ def finish_watch_run(
     boards_failed: int,
     boards_left: int,
     held: HeldCounts,
+    useful: bool | None = None,
 ) -> None:
-    """Set the finish time, the budget flag and every count in one UPDATE."""
+    """Set the finish time, the budget flag, every count and whether the run did useful
+    work (search migration 0018) in one UPDATE."""
     conn.execute(
         "UPDATE watch_runs SET finished_at = ?, budget_reached = ?, boards_fetched = ?, "
         "boards_failed = ?, boards_left = ?, held_unscored = ?, held_no_fit = ?, "
-        "held_off_lane = ? WHERE id = ? AND finished_at IS NULL",
+        "held_off_lane = ?, useful = ? WHERE id = ? AND finished_at IS NULL",
         (
             finished_at,
             int(budget_reached),
@@ -394,6 +489,7 @@ def finish_watch_run(
             held.unscored,
             held.no_fit,
             held.off_lane,
+            None if useful is None else int(useful),
             run_id,
         ),
     )
@@ -415,7 +511,9 @@ class PendingAlert:
 
 
 def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
-    """Watcher and discovery postings with a score and a fit, no skip, and no alert yet.
+    """Watcher and discovery postings with a score and a fit, no skip, no application,
+    no alert yet, not given up after Telegram refused it too often (#42), and not a
+    repost of a role the operator logged or skipped (#34).
     Oldest id first.
 
     A posting without a fit (unscored, or scored into a tier name not in config) is held.
@@ -423,17 +521,28 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
     """
     rows = conn.execute(
         """
-        SELECT p.id, p.fit, p.lane, p.lane_checked, p.first_seen, p.score_run_id,
-               r.finished_at, r.started_at
+        SELECT p.id, p.company_id, p.title, p.fit, p.lane, p.lane_checked, p.first_seen,
+               p.score_run_id, r.finished_at, r.started_at
         FROM postings p LEFT JOIN watch_runs r ON r.id = p.score_run_id
         WHERE p.source IN ('watcher', 'discovery')
           AND p.llm_output IS NOT NULL
           AND p.fit IS NOT NULL
           AND p.alerted_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
+          AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)
+          AND NOT EXISTS (SELECT 1 FROM alert_refusals r
+                          WHERE r.posting_id = p.id AND r.given_up_at IS NOT NULL)
         ORDER BY p.id
         """
-    )
+    ).fetchall()
+    # A repost of a role the operator logged or skipped is never alerted, even before
+    # the next watch run gives it its `already_handled` skip (#34).
+    handled = handled_title_keys(conn) if rows else {}
+    rows = [
+        row
+        for row in rows
+        if title_key(str(row["title"])) not in handled.get(int(row["company_id"]), set())
+    ]
     return [
         PendingAlert(
             posting_id=int(row["id"]),
@@ -516,6 +625,56 @@ def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
     return [alert.posting_id for alert in pending_alerts(conn)]
 
 
+def record_refusal(
+    conn: sqlite3.Connection, posting_id: int, stamp: str, *, give_up_after: int
+) -> bool:
+    """Count one Telegram refusal of this posting (search migration 0017). True when this
+    one reached `give_up_after`, so the posting is now given up. One statement, so two
+    writers can't lose a count."""
+    conn.execute(
+        "INSERT INTO alert_refusals (posting_id, refusals, last_refused_at) VALUES (?, 1, ?) "
+        "ON CONFLICT (posting_id) DO UPDATE SET refusals = refusals + 1, "
+        "last_refused_at = excluded.last_refused_at",
+        (posting_id, stamp),
+    )
+    cur = conn.execute(
+        "UPDATE alert_refusals SET given_up_at = ? "
+        "WHERE posting_id = ? AND given_up_at IS NULL AND refusals >= ?",
+        (stamp, posting_id, give_up_after),
+    )
+    return cur.rowcount == 1
+
+
+def refused_postings(conn: sqlite3.Connection) -> set[int]:
+    """Postings Telegram refused that are not given up: they go behind the others."""
+    rows = conn.execute("SELECT posting_id FROM alert_refusals WHERE given_up_at IS NULL")
+    return {int(row["posting_id"]) for row in rows}
+
+
+def clear_refusal(conn: sqlite3.Connection, posting_id: int) -> None:
+    """Telegram accepted the posting: forget its refusals."""
+    conn.execute("DELETE FROM alert_refusals WHERE posting_id = ?", (posting_id,))
+
+
+def given_up_count(conn: sqlite3.Connection) -> int:
+    """Postings the bot stopped sending after too many refusals."""
+    row = conn.execute("SELECT count(*) FROM alert_refusals WHERE given_up_at IS NOT NULL")
+    return int(row.fetchone()[0])
+
+
+def bot_state(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def set_bot_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
 def alerts_held_since(conn: sqlite3.Connection) -> str | None:
     """When the bot started holding watcher alerts because config was unreadable."""
     row = conn.execute("SELECT value FROM bot_state WHERE key = 'alerts_held_since'").fetchone()
@@ -542,10 +701,189 @@ def mark_alerted(conn: sqlite3.Connection, posting_id: int, alerted_at: str) -> 
     )
 
 
-def insert_skip(conn: sqlite3.Connection, posting_id: int, date: str, reason: str) -> int:
+# A posting the operator has dealt with: it has an application, or a skip they chose.
+_HANDLED = (
+    "(EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+    "OR EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id AND s.by_operator = 1))"
+)
+
+
+def handled_title_keys(conn: sqlite3.Connection) -> dict[int, set[str]]:
+    """The `filters.title_key` of every posting the operator logged or skipped, by company.
+
+    A posting counts once it has an application (any source, a self-sourced one
+    included) or a skip the operator chose (search migration 0016). A watcher skip does
+    not count, so a changed config can still let a repost through.
+    """
+    keys: dict[int, set[str]] = {}
+    rows = conn.execute(f"SELECT p.company_id, p.title FROM postings p WHERE {_HANDLED}")  # noqa: S608
+    for row in rows:
+        keys.setdefault(int(row["company_id"]), set()).add(title_key(str(row["title"])))
+    return keys
+
+
+def is_handled_repost(conn: sqlite3.Connection, company_id: int, title: str) -> bool:
+    """Whether `title` at this company is a role the operator already logged or skipped
+    (company plus `filters.title_key`), whatever its url or requisition id."""
+    return title_key(title) in handled_title_keys(conn).get(company_id, set())
+
+
+def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Watcher and discovery postings not alerted, with no skip and no application, that
+    repeat a role the operator already logged or skipped. Oldest id first."""
+    keys = handled_title_keys(conn)
+    if not keys:
+        return []
+    rows = conn.execute(
+        "SELECT p.id, p.company_id, c.name AS company, p.title FROM postings p "
+        "JOIN companies c ON c.id = p.company_id "
+        "WHERE p.source IN ('watcher', 'discovery') AND p.alerted_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "ORDER BY p.id"
+    ).fetchall()
+    return [
+        row
+        for row in rows
+        if title_key(str(row["title"])) in keys.get(int(row["company_id"]), set())
+    ]
+
+
+# A status that means the employer answered: screening and later, a rejection included.
+RESPONSE_STATUSES = (
+    "screening",
+    "assessment_submitted",
+    "interview_scheduled",
+    "offer",
+    "hired",
+    "rejected",
+)
+# A status that ends an application one way or another.
+OUTCOME_STATUSES = ("offer", "hired", "rejected", "no_response", "withdrawn")
+WEEK_COUNTS = ("alerts", "applied", "skipped", "responses", "outcomes")
+
+
+def _in(values: Sequence[str]) -> str:
+    return "(" + ", ".join(f"'{v}'" for v in values) + ")"
+
+
+def weekly_counts(conn: sqlite3.Connection, start: str, end: str) -> dict[str, dict[str, int]]:
+    """Counts by lane for the UTC window [start, end) (#43). Counts only.
+
+    - alerts: postings Telegram accepted an alert for in the window;
+    - applied: applications recorded in the window (their `applied` decision);
+    - skipped: skips the operator chose in the window;
+    - responses: applications whose first status of RESPONSE_STATUSES was recorded in
+      the window, so one application counts once;
+    - outcomes: statuses of OUTCOME_STATUSES recorded in the window.
+
+    The lane is the posting's stored lane name, `Off-lane` once checked with none, or
+    `No lane` when it was never checked (lanes off, or a self-sourced posting).
+    """
+    lane = (
+        "CASE WHEN p.lane IS NOT NULL THEN p.lane "
+        "WHEN p.lane_checked = 1 THEN 'Off-lane' ELSE 'No lane' END"
+    )
+    queries = {
+        "alerts": f"SELECT {lane} AS lane, count(*) FROM postings p "  # noqa: S608
+        "WHERE p.alerted_at >= ? AND p.alerted_at < ? GROUP BY 1",
+        "applied": f"SELECT {lane} AS lane, count(*) FROM decision_history d "  # noqa: S608
+        "JOIN applications a ON a.id = d.application_id JOIN postings p ON p.id = a.posting_id "
+        "WHERE d.status = 'applied' AND d.recorded_at >= ? AND d.recorded_at < ? GROUP BY 1",
+        "skipped": f"SELECT {lane} AS lane, count(*) FROM skips s "  # noqa: S608
+        "JOIN postings p ON p.id = s.posting_id "
+        "WHERE s.by_operator = 1 AND s.created_at >= ? AND s.created_at < ? GROUP BY 1",
+        "responses": f"SELECT {lane} AS lane, count(*) FROM ("  # noqa: S608
+        "SELECT d.application_id, min(d.recorded_at) AS first_at FROM decision_history d "
+        f"WHERE d.status IN {_in(RESPONSE_STATUSES)} GROUP BY d.application_id) f "
+        "JOIN applications a ON a.id = f.application_id JOIN postings p ON p.id = a.posting_id "
+        "WHERE f.first_at >= ? AND f.first_at < ? GROUP BY 1",
+        "outcomes": f"SELECT {lane} AS lane, count(*) FROM decision_history d "  # noqa: S608
+        "JOIN applications a ON a.id = d.application_id JOIN postings p ON p.id = a.posting_id "
+        f"WHERE d.status IN {_in(OUTCOME_STATUSES)} "
+        "AND d.recorded_at >= ? AND d.recorded_at < ? GROUP BY 1",
+    }
+    counts: dict[str, dict[str, int]] = {}
+    for name, sql in queries.items():
+        for row in conn.execute(sql, (start, end)):
+            lanes = counts.setdefault(str(row[0]), dict.fromkeys(WEEK_COUNTS, 0))
+            lanes[name] = int(row[1])
+    return counts
+
+
+@dataclass(frozen=True)
+class Example:
+    """One posting the operator labelled, as the scoring prompt shows it (#43). `company`
+    is kept only to leave the posting being scored out; it is not sent."""
+
+    company: str
+    title: str
+    lane: str | None  # the lane name, "off-lane", or None when not checked
+    gap_count: int | None
+    label: str  # "skipped", or the application's latest status
+
+
+def labelled_examples(conn: sqlite3.Connection, limit: int) -> list[Example]:
+    """The `limit` most recently labelled postings, newest label first.
+
+    Labels come only from the operator: an application (its latest status, `applied` or
+    later, from the bot or the CLI) or a skip they chose with the Skipped button. The
+    system never predicts one, and a watcher skip is not a label.
+    """
+    if limit < 1:
+        return []
+    rows = conn.execute(
+        """
+        WITH labels AS (
+            SELECT a.posting_id, d.status AS label, d.recorded_at AS at, d.id AS seq, 1 AS kind
+            FROM decision_history d JOIN applications a ON a.id = d.application_id
+            UNION ALL
+            SELECT s.posting_id, 'skipped', s.created_at, s.id, 0
+            FROM skips s WHERE s.by_operator = 1
+        ),
+        latest AS (
+            SELECT posting_id, label, at,
+                   row_number() OVER (PARTITION BY posting_id ORDER BY at DESC, kind DESC,
+                                      seq DESC) AS n
+            FROM labels
+        )
+        SELECT c.name AS company, p.title, p.lane, p.lane_checked, l.label,
+               CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
+                    THEN json_array_length(p.gaps) END AS gap_count
+        FROM latest l
+        JOIN postings p ON p.id = l.posting_id
+        JOIN companies c ON c.id = p.company_id
+        WHERE l.n = 1
+        ORDER BY l.at DESC, p.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [
+        Example(
+            company=str(row["company"]),
+            title=str(row["title"]),
+            lane=str(row["lane"]) if row["lane"] else ("off-lane" if row["lane_checked"] else None),
+            gap_count=None if row["gap_count"] is None else int(row["gap_count"]),
+            label=str(row["label"]),
+        )
+        for row in rows
+    ]
+
+
+def insert_skip(
+    conn: sqlite3.Connection,
+    posting_id: int,
+    date: str,
+    reason: str,
+    *,
+    by_operator: bool = False,
+) -> int:
+    """A skip. `by_operator` marks one the operator chose (search migration 0016); only
+    those suppress a repost of the same role. The watcher's own skips leave it False."""
     cur = conn.execute(
-        "INSERT INTO skips (posting_id, date, reason) VALUES (?, ?, ?)",
-        (posting_id, date, reason),
+        "INSERT INTO skips (posting_id, date, reason, by_operator) VALUES (?, ?, ?, ?)",
+        (posting_id, date, reason, int(by_operator)),
     )
     return int(cur.lastrowid or 0)
 

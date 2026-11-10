@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -13,12 +14,12 @@ import yaml
 
 from careerhunter import claims, cli, db, resume
 from careerhunter.claims import Claim
-from tests.conftest import ACTIVE, EARLIER, FIXTURES, FakeProbe, set_claims
+from tests.conftest import ACTIVE, DOCTOR_NOW, EARLIER, FIXTURES, FakeProbe, set_claims
 
 
 def doctor(probe: FakeProbe, capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
     capsys.readouterr()
-    code = cli.main(["doctor"], probe=probe)
+    code = cli.main(["doctor"], probe=probe, clock=lambda: DOCTOR_NOW)
     return code, capsys.readouterr().out
 
 
@@ -248,8 +249,61 @@ def test_reconciliation_gaps_are_reported(
     code, out = doctor(probe, capsys)
     assert code == cli.EXIT_ERROR
     assert (
-        f"reconcile       BAD {corr}: in the EI record for claim 2026-27 but missing from search.db"
+        f"orphan          BAD {corr}: in the EI record for claim 2026-27 but missing from search.db"
     ) in out
+
+
+def _bytes(ready: Path) -> dict[str, str]:
+    """The content of every database and non-empty WAL in the data folder."""
+    found = {}
+    for path in sorted(ready.glob("*.db*")):
+        if path.name.endswith("-shm") or (path.name.endswith("-wal") and not path.stat().st_size):
+            continue
+        found[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return found
+
+
+def test_an_orphan_on_either_side_is_reported_and_left_unchanged(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#34: doctor names orphans in both directions and never fixes them."""
+    conn = db.connect(ready / "search.db")
+    first, second = (
+        r[0] for r in conn.execute("SELECT correlation_id FROM applications ORDER BY id LIMIT 2")
+    )
+    # EI side only: the search row is gone.
+    conn.execute(
+        "DELETE FROM decision_history WHERE application_id = "
+        "(SELECT id FROM applications WHERE correlation_id = ?)",
+        (first,),
+    )
+    conn.execute("DELETE FROM applications WHERE correlation_id = ?", (first,))
+    # search.db only: a row linked to the claim that its file never got.
+    posting = conn.execute("SELECT id FROM postings LIMIT 1").fetchone()[0]
+    orphan = "ab" * 16
+    conn.execute(
+        "INSERT INTO applications (correlation_id, ei_claim, posting_id, date_applied, "
+        "date_precision, method) VALUES (?, '2026-27', ?, '2026-10-21', 'exact', 'email')",
+        (orphan, posting),
+    )
+    conn.close()
+    before = _bytes(ready)
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert (
+        f"orphan          BAD {first}: in the EI record for claim 2026-27 "
+        "but missing from search.db"
+    ) in out
+    assert (
+        f"orphan          BAD {orphan}: in search.db but missing from the EI record for claim "
+        "2026-27"
+    ) in out
+    assert "reconcile       --  left as they are; doctor never fixes either file" in out
+    assert second not in out
+    assert _bytes(ready) == before
+    code, again = doctor(probe, capsys)  # still there: nothing was repaired
+    assert code == cli.EXIT_ERROR and f"orphan          BAD {orphan}" in again
+    assert _bytes(ready) == before
 
 
 def test_loose_exports_and_snapshots_are_fixed(
@@ -431,7 +485,7 @@ def _write(path: Path, sql: str, *params: object) -> None:
 
 
 def _stamp(delta: dt.timedelta) -> str:
-    return (dt.datetime.now(dt.UTC) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (DOCTOR_NOW - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_lanes_and_watch_runs_on_a_fresh_setup(
@@ -533,4 +587,132 @@ def test_alerts_held_by_the_bot_are_bad(
     assert (
         "bot alerts      BAD held since 2026-10-28T16:00:00Z: the bot couldn't read config.yaml "
         "at its last poll"
+    ) in out
+
+
+# --- health: useful work and failing components (#42) -------------------------------------
+
+
+def _finished(ready: Path, minutes_ago: int, useful: int | None) -> None:
+    _write(
+        ready / "search.db",
+        "INSERT INTO watch_runs (started_at, finished_at, boards_fetched, boards_failed, "
+        "boards_left, held_unscored, held_no_fit, held_off_lane, useful) "
+        "VALUES (?, ?, 1, 0, 0, 0, 0, 0, ?)",
+        _stamp(dt.timedelta(minutes=minutes_ago + 5)),
+        _stamp(dt.timedelta(minutes=minutes_ago)),
+        useful,
+    )
+
+
+def _set_config(ready: Path, **sections: object) -> None:
+    path = ready / "config.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc.update(sections)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+
+def test_three_unproductive_runs_in_a_row_are_a_warning(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _finished(ready, 300, 1)
+    for minutes in (200, 100, 10):
+        _finished(ready, minutes, 0)
+    code, out = doctor(probe, capsys)
+    assert code == 0  # a warning, not a failure
+    assert (
+        "watch useful    WARN the last 3 watch runs did no useful work; last useful run "
+        "300 min ago. See logs/watch.log"
+    ) in out
+
+
+def test_fewer_than_the_threshold_is_ok_and_the_threshold_is_configurable(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _finished(ready, 300, 1)
+    _finished(ready, 100, 0)
+    _finished(ready, 10, 0)
+    _code, out = doctor(probe, capsys)
+    assert "watch useful    OK  last useful run 300 min ago" in out
+    _set_config(ready, health={"unproductive_runs": 2})
+    _code, out = doctor(probe, capsys)
+    assert "watch useful    WARN the last 2 watch runs did no useful work" in out
+
+
+def test_a_crashed_run_counts_and_a_run_before_0018_stops_the_count(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _finished(ready, 400, None)  # finished before the migration: unknown
+    _finished(ready, 300, 0)
+    _finished(ready, 200, 0)
+    _write(
+        ready / "search.db",
+        "INSERT INTO watch_runs (started_at) VALUES (?)",
+        _stamp(dt.timedelta(minutes=100)),
+    )  # never finished: it did nothing useful
+    _write(
+        ready / "search.db",
+        "INSERT INTO watch_runs (started_at) VALUES (?)",
+        _stamp(dt.timedelta(minutes=1)),
+    )  # still running: not counted either way
+    _code, out = doctor(probe, capsys)
+    assert (
+        "watch useful    WARN the last 3 watch runs did no useful work; no useful run recorded yet"
+    ) in out
+
+
+def test_no_run_yet_is_neither_ok_nor_a_warning(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _code, out = doctor(probe, capsys)
+    assert "watch useful    --  no useful run recorded yet" in out
+    assert "discovery useful" not in out  # discovery is off
+    assert "health " not in out
+
+
+def test_unproductive_discovery_passes_are_a_warning(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    doc = yaml.safe_load((ready / "config.yaml").read_text())
+    doc["discovery"]["searxng_url"] = "http://127.0.0.1:8888/search"
+    (ready / "config.yaml").write_text(yaml.safe_dump(doc, sort_keys=False))
+    _code, out = doctor(probe, capsys)
+    assert "discovery useful --  no useful pass yet" in out
+    _write(
+        ready / "search.db",
+        "UPDATE discovery_state SET useful_at = ?, unproductive = 3",
+        _stamp(dt.timedelta(minutes=600)),
+    )
+    _code, out = doctor(probe, capsys)
+    assert (
+        "discovery useful WARN the last 3 discovery passes got no usable reply; "
+        "last useful pass 600 min ago"
+    ) in out
+    _write(ready / "search.db", "UPDATE discovery_state SET unproductive = 0")
+    _code, out = doctor(probe, capsys)
+    assert "discovery useful OK  last useful pass 600 min ago" in out
+
+
+def test_a_failing_component_is_named_with_its_count_and_held_postings(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write(
+        ready / "search.db",
+        "UPDATE component_health SET failures = 3, last_failure = 'unreachable', held = 4 "
+        "WHERE component = 'lm_studio'",
+    )
+    _write(
+        ready / "search.db",
+        "UPDATE component_health SET failures = 1, last_failure = 'failed', held = 0 "
+        "WHERE component = 'boards'",
+    )
+    code, out = doctor(probe, capsys)
+    assert code == 0
+    assert (
+        "health          WARN LM Studio failed the last 3 runs (unreachable); "
+        "4 postings held for scoring"
+    ) in out
+    assert (
+        "health          OK  every board failed the last 1 run (failed); "
+        "0 postings held for scoring"
     ) in out

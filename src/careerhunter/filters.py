@@ -558,3 +558,40 @@ def too_old(
     if at_least is not None and at_least > max_days:
         return True
     return None
+
+
+# A requisition code: one token of letters, digits, hyphens and underscores, holding at
+# least three digits ("R12345", "JR-2041", "104332"). "Level 2" has a space, so it is not.
+_REQ_SHAPE = re.compile(r"[A-Za-z0-9_-]+")
+_BRACKETED = re.compile(r"[(\[]\s*([^()\[\]\s]+)\s*[)\]]")
+_TRAILING = re.compile(r"(?:\s+[-\u2013\u2014|:#/]|,)\s*([^\s\-\u2013\u2014|:#/,]\S*)\s*$")
+_NOT_WORD = re.compile(r"[\W_]+")
+_YEAR = re.compile(r"(?:19|20)\d{2}")
+
+
+def _requisition_code(token: str) -> bool:
+    return bool(_REQ_SHAPE.fullmatch(token)) and sum(ch.isdigit() for ch in token) >= 3
+
+
+def _trailing_code(token: str) -> bool:
+    """A requisition code at the end of a title. A year alone ("- 2026") is not one."""
+    return _requisition_code(token) and not _YEAR.fullmatch(token)
+
+
+def title_key(title: str) -> str:
+    """A title folded for repost matching (#34). Two postings at one company are the same
+    role when their keys are equal.
+
+    NFKC and case folding first. Then a bracketed segment, or a trailing segment after a
+    separator (a space then `-`, a dash, `|`, `:`, `#` or `/`; or a comma), is dropped
+    only when it is one requisition code: a single token of letters, digits, `-` or `_`,
+    with at least three digits and no spaces, such as "(R12345)", "[JR-2041]" or
+    "- 104332". "(Level 2)" and "(Remote)" are kept, and so is a trailing segment that is
+    only a year, 19xx or 20xx ("- 2026"), so the same role in another year is another
+    role. Last, every run of punctuation and spaces becomes one space.
+    """
+    text = unicodedata.normalize("NFKC", title).casefold()
+    text = _BRACKETED.sub(lambda m: " " if _requisition_code(m.group(1)) else m.group(0), text)
+    while (match := _TRAILING.search(text)) is not None and _trailing_code(match.group(1)):
+        text = text[: match.start()]
+    return " ".join(_NOT_WORD.sub(" ", text).split())

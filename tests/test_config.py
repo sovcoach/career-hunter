@@ -8,6 +8,8 @@ import yaml
 from careerhunter.config import (
     ConfigError,
     alerts_max_per_poll,
+    health_failure_runs,
+    health_unproductive_runs,
     load_config,
     load_exclusions,
     validate_config,
@@ -104,6 +106,34 @@ def test_alerts_max_per_poll_defaults_to_ten() -> None:
     assert alerts_max_per_poll({}) == 10
     assert alerts_max_per_poll({"alerts": None}) == 10
     assert alerts_max_per_poll({"alerts": {"max_per_poll": 3}}) == 3
+
+
+@pytest.mark.parametrize(
+    ("section", "message"),
+    [
+        ("3", "health must be a mapping"),
+        ({"unproductive_runs": 0}, "health.unproductive_runs must be an integer from 1 to 50"),
+        ({"failure_runs": 51}, "health.failure_runs must be an integer from 1 to 50"),
+        ({"failure_runs": 2.5}, "health.failure_runs"),
+        ({"unproductive_runs": True}, "health.unproductive_runs"),
+        ({"failure_run": 3}, "health has unknown keys"),
+    ],
+)
+def test_health_section_is_checked(section: object, message: str) -> None:
+    doc = example()
+    doc["health"] = section
+    assert any(message in problem for problem in validate_config(doc))
+
+
+def test_health_runs_default_to_three() -> None:
+    doc = example()
+    assert validate_config({**doc, "health": None}) == []
+    assert validate_config({**doc, "health": {"failure_runs": 1, "unproductive_runs": 50}}) == []
+    for read in (health_failure_runs, health_unproductive_runs):
+        assert read({}) == 3
+        assert read({"health": None}) == 3
+    assert health_failure_runs({"health": {"failure_runs": 5}}) == 5
+    assert health_unproductive_runs({"health": {"unproductive_runs": 7}}) == 7
 
 
 def _workday(**keys: object) -> dict[str, object]:
