@@ -349,6 +349,73 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
     return HeldCounts(unscored=int(row["unscored"]), no_fit=int(row["no_fit"]), off_lane=off_lane)
 
 
+COMPONENTS = ("lm_studio", "searxng", "boards")
+FAILURE_KINDS = ("unreachable", "bad-reply", "throttled", "failed")
+
+
+def record_component(
+    conn: sqlite3.Connection, component: str, *, failed: str | None, stamp: str
+) -> None:
+    """One run's outcome for a component (search migration 0018). `failed` is the kind
+    of failure, or None when the component worked. The caller holds the transaction.
+
+    A failure adds one to the runs in a row that failed it. Working clears the count,
+    and when the bot had sent a failure message for this outage, marks the recovery
+    message due. Either way the postings held for scoring are counted now. A run that
+    never reached the component does not call this, so it is counted as neither.
+    """
+    if component not in COMPONENTS:
+        raise ValueError(f"unknown component {component!r}")
+    if failed is not None and failed not in FAILURE_KINDS:
+        raise ValueError(f"unknown failure kind {failed!r}")
+    held = held_counts(conn).unscored
+    if failed is None:
+        conn.execute(
+            "UPDATE component_health SET failures = 0, last_failure = NULL, held = ?, "
+            "updated_at = ?, "
+            "recovery_due = CASE WHEN alerted_failures IS NOT NULL THEN 1 ELSE recovery_due END, "
+            "alerted_failures = NULL WHERE component = ?",
+            (held, stamp, component),
+        )
+    else:
+        conn.execute(
+            "UPDATE component_health SET failures = failures + 1, last_failure = ?, held = ?, "
+            "updated_at = ? WHERE component = ?",
+            (failed, held, stamp, component),
+        )
+
+
+@dataclass(frozen=True)
+class Health:
+    component: str
+    failures: int
+    last_failure: str | None
+    held: int | None
+    alerted_failures: int | None
+    recovery_due: bool
+
+
+def component_health(conn: sqlite3.Connection) -> list[Health]:
+    """Every component's row, in COMPONENTS order."""
+    rows = {str(row["component"]): row for row in conn.execute("SELECT * FROM component_health")}
+    return [
+        Health(
+            component=name,
+            failures=int(rows[name]["failures"]),
+            last_failure=None
+            if rows[name]["last_failure"] is None
+            else str(rows[name]["last_failure"]),
+            held=None if rows[name]["held"] is None else int(rows[name]["held"]),
+            alerted_failures=None
+            if rows[name]["alerted_failures"] is None
+            else int(rows[name]["alerted_failures"]),
+            recovery_due=bool(rows[name]["recovery_due"]),
+        )
+        for name in COMPONENTS
+        if name in rows
+    ]
+
+
 def set_posting_lane(conn: sqlite3.Connection, posting_id: int, lane: str | None) -> bool:
     """Record the lane a posting matched (None: off-lane), once. False if already set."""
     cur = conn.execute(
@@ -380,12 +447,14 @@ def finish_watch_run(
     boards_failed: int,
     boards_left: int,
     held: HeldCounts,
+    useful: bool | None = None,
 ) -> None:
-    """Set the finish time, the budget flag and every count in one UPDATE."""
+    """Set the finish time, the budget flag, every count and whether the run did useful
+    work (search migration 0018) in one UPDATE."""
     conn.execute(
         "UPDATE watch_runs SET finished_at = ?, budget_reached = ?, boards_fetched = ?, "
         "boards_failed = ?, boards_left = ?, held_unscored = ?, held_no_fit = ?, "
-        "held_off_lane = ? WHERE id = ? AND finished_at IS NULL",
+        "held_off_lane = ?, useful = ? WHERE id = ? AND finished_at IS NULL",
         (
             finished_at,
             int(budget_reached),
@@ -395,6 +464,7 @@ def finish_watch_run(
             held.unscored,
             held.no_fit,
             held.off_lane,
+            None if useful is None else int(useful),
             run_id,
         ),
     )

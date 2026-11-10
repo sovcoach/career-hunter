@@ -207,6 +207,7 @@ class _State:
     max_age: int = 7  # search.max_posting_age_days
     today: str = ""  # the configured date, YYYY-MM-DD
     model_down: bool = False
+    scorer_answered: bool = False  # the scorer replied at least once, parsed or not
     budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
     # reserve left for the passes after the boards. Never written anywhere.
@@ -426,20 +427,40 @@ def _finish_run(
 
     The held counts are read from search.db now, so they are true for a run the budget
     cut short too. A run that never gets here keeps its row unfinished, with no counts.
+
+    In the same transaction (#42): whether the run did useful work, and how the boards
+    and the local model fared. Useful means at least one board fetched and parsed and,
+    when postings were waiting to be scored, the scorer answered at least once; a
+    scorer that was down, held for a resume, or never reached before the budget ran out
+    leaves the run not useful. The boards failed when none was fetched and at least one
+    failed; the model failed when it stopped answering. A component the run never
+    reached is left as it was.
     """
     min_fit = off_lane_min_fit(config) if state.lanes_on else None
+    stamp = _iso(state.now())
     with db.transaction(conn):
         held = search_store.held_counts(conn, off_lane_min_fit=min_fit)
+        waiting = bool(state.attempted) or held.unscored > 0
+        useful = counts["fetched"] > 0 and (state.scorer_answered or not waiting)
         search_store.finish_watch_run(
             conn,
             run_id,
-            finished_at=_iso(state.now()),
+            finished_at=stamp,
             budget_reached=state.budget_cut or counts["left"] > 0,
             boards_fetched=counts["fetched"],
             boards_failed=counts["failed"],
             boards_left=counts["left"],
             held=held,
+            useful=useful,
         )
+        if counts["fetched"]:
+            search_store.record_component(conn, "boards", failed=None, stamp=stamp)
+        elif counts["failed"]:
+            search_store.record_component(conn, "boards", failed="failed", stamp=stamp)
+        if state.model_down:
+            search_store.record_component(conn, "lm_studio", failed="unreachable", stamp=stamp)
+        elif state.scorer_answered:
+            search_store.record_component(conn, "lm_studio", failed=None, stamp=stamp)
 
 
 def _fill_lanes(conn: sqlite3.Connection, state: _State, config: Mapping[str, Any]) -> None:
@@ -1247,6 +1268,7 @@ def _attempt(
             kept = "; old score kept" if rescore else ""
             lines.append(_line(name, ats, f"{title} left unscored (model unreachable){kept}"))
         return
+    state.scorer_answered = True
     if result is None:
         kept = "; old score kept" if rescore else ""
         lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
