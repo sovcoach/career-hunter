@@ -81,6 +81,14 @@ set once (`... WHERE lane_checked = 0`). A changed lane list does not move a pos
 already checked. An off-lane posting is still gated and scored like any other. Without
 `search.lanes`, nothing is checked and no posting is off-lane.
 
+Reposts (#34). A posting is never alerted when the operator already logged or skipped
+the same role: the same company row and the same `filters.title_key`, whatever its url,
+requisition id or month. A new one is skipped as `already_handled` when it is stored,
+and every run first gives that skip to any unalerted posting that became a repost since
+(the operator acted after it was stored). Only an application or a skip the operator
+chose counts (search migration 0016); a watcher skip does not. The bot leaves such
+postings out of its digest too, until the next run skips them.
+
 The run record. Each run writes a `watch_runs` row when it starts, in its own
 transaction, and stores its id with every score it makes and every fit it fills in
 (`postings.score_run_id`, search migration 0011), beside the score's checked key
@@ -140,6 +148,8 @@ BOARD_MAX_BYTES = ats_boards.BOARD_MAX_BYTES
 # Inline scoring of new postings stops once less than this is left of the budget.
 SCORE_RESERVE = 240.0
 _LEFT = "run budget reached; left for the next run"
+# The skip reason for a repost of a role the operator already logged or skipped (#34).
+ALREADY_HANDLED = "already_handled"
 
 # A board's own company label that carries no information. The watchlist name is used.
 _PLACEHOLDERS = frozenset(
@@ -327,6 +337,8 @@ def run(
     if state.lanes_on:
         with _isolated(conn, lines, "lane fill-in", state.hook):
             _fill_lanes(conn, state, rules)
+    with _isolated(conn, lines, "reposts", state.hook):
+        _suppress_reposts(conn, state, today)
     found: Pass | None = None
     if discovery is not None:
         with _isolated(conn, lines, "discovery", state.hook):
@@ -439,6 +451,19 @@ def _fill_lanes(conn: sqlite3.Connection, state: _State, config: Mapping[str, An
         )
     if filled:
         state.lines.append(f"watch: lanes filled in from config for {filled} postings")
+
+
+def _suppress_reposts(conn: sqlite3.Connection, state: _State, today: str) -> None:
+    """Skip as `already_handled` every unalerted posting that repeats a role the operator
+    logged or skipped since the last run (#34). Safe to run twice."""
+    with db.transaction(conn):
+        rows = search_store.unhandled_reposts(conn)
+        for row in rows:
+            search_store.insert_skip(conn, int(row["id"]), today, ALREADY_HANDLED)
+    for row in rows:
+        state.lines.append(
+            _line(str(row["company"]), None, f"{row['title']!r} skipped ({ALREADY_HANDLED})")
+        )
 
 
 def _lane_name(title: str, config: Mapping[str, Any]) -> str | None:
@@ -951,6 +976,8 @@ def _record_jobs(
             with db.transaction(conn):
                 found = search_store.find_or_create_posting(conn, posting, dating)
                 posting_id, inserted = found[1], found[3]
+                if inserted and search_store.is_handled_repost(conn, found[0], item.title):
+                    reason = ALREADY_HANDLED  # a role already logged or skipped (#34)
                 if inserted and reason and not search_store.posting_has_skip(conn, posting_id):
                     search_store.insert_skip(conn, posting_id, today, reason)
                 if inserted and item.posted is not None:

@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from careerhunter.enums import FIT_LEVELS
+from careerhunter.filters import title_key
 from careerhunter.models import Application, Dating, Posting
 
 
@@ -415,7 +416,8 @@ class PendingAlert:
 
 
 def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
-    """Watcher and discovery postings with a score and a fit, no skip, and no alert yet.
+    """Watcher and discovery postings with a score and a fit, no skip, no application,
+    no alert yet, and not a repost of a role the operator logged or skipped (#34).
     Oldest id first.
 
     A posting without a fit (unscored, or scored into a tier name not in config) is held.
@@ -423,17 +425,26 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
     """
     rows = conn.execute(
         """
-        SELECT p.id, p.fit, p.lane, p.lane_checked, p.first_seen, p.score_run_id,
-               r.finished_at, r.started_at
+        SELECT p.id, p.company_id, p.title, p.fit, p.lane, p.lane_checked, p.first_seen,
+               p.score_run_id, r.finished_at, r.started_at
         FROM postings p LEFT JOIN watch_runs r ON r.id = p.score_run_id
         WHERE p.source IN ('watcher', 'discovery')
           AND p.llm_output IS NOT NULL
           AND p.fit IS NOT NULL
           AND p.alerted_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
+          AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)
         ORDER BY p.id
         """
-    )
+    ).fetchall()
+    # A repost of a role the operator logged or skipped is never alerted, even before
+    # the next watch run gives it its `already_handled` skip (#34).
+    handled = handled_title_keys(conn) if rows else {}
+    rows = [
+        row
+        for row in rows
+        if title_key(str(row["title"])) not in handled.get(int(row["company_id"]), set())
+    ]
     return [
         PendingAlert(
             posting_id=int(row["id"]),
@@ -540,6 +551,54 @@ def mark_alerted(conn: sqlite3.Connection, posting_id: int, alerted_at: str) -> 
         "UPDATE postings SET alerted_at = ? WHERE id = ?",
         (alerted_at, posting_id),
     )
+
+
+# A posting the operator has dealt with: it has an application, or a skip they chose.
+_HANDLED = (
+    "(EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+    "OR EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id AND s.by_operator = 1))"
+)
+
+
+def handled_title_keys(conn: sqlite3.Connection) -> dict[int, set[str]]:
+    """The `filters.title_key` of every posting the operator logged or skipped, by company.
+
+    A posting counts once it has an application (any source, a self-sourced one
+    included) or a skip the operator chose (search migration 0016). A watcher skip does
+    not count, so a changed config can still let a repost through.
+    """
+    keys: dict[int, set[str]] = {}
+    rows = conn.execute(f"SELECT p.company_id, p.title FROM postings p WHERE {_HANDLED}")  # noqa: S608
+    for row in rows:
+        keys.setdefault(int(row["company_id"]), set()).add(title_key(str(row["title"])))
+    return keys
+
+
+def is_handled_repost(conn: sqlite3.Connection, company_id: int, title: str) -> bool:
+    """Whether `title` at this company is a role the operator already logged or skipped
+    (company plus `filters.title_key`), whatever its url or requisition id."""
+    return title_key(title) in handled_title_keys(conn).get(company_id, set())
+
+
+def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Watcher and discovery postings not alerted, with no skip and no application, that
+    repeat a role the operator already logged or skipped. Oldest id first."""
+    keys = handled_title_keys(conn)
+    if not keys:
+        return []
+    rows = conn.execute(
+        "SELECT p.id, p.company_id, c.name AS company, p.title FROM postings p "
+        "JOIN companies c ON c.id = p.company_id "
+        "WHERE p.source IN ('watcher', 'discovery') AND p.alerted_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "ORDER BY p.id"
+    ).fetchall()
+    return [
+        row
+        for row in rows
+        if title_key(str(row["title"])) in keys.get(int(row["company_id"]), set())
+    ]
 
 
 def insert_skip(
