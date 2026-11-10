@@ -3,7 +3,8 @@
 The client is not `fetch.py`. That client refuses loopback, which is right for a job
 ad and wrong for a model on this Mac. This client allows only `http` to `127.0.0.1`,
 `localhost` or `::1`, follows no redirects, and refuses any other host. The URL is a
-constant, not a config field.
+constant, not a config field. The model id is `scoring.chat_model` (default
+`local-model`).
 
 The prompt is built from lanes, location rules, hard gates and `gap_tiers`, the
 posting fields, and the resume when one is in use. The model lists gaps. This module
@@ -46,13 +47,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from careerhunter import loopback
+from careerhunter.config import DEFAULT_CHAT_MODEL, chat_model
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
 from careerhunter.resume import Resume
 from careerhunter.search_store import Example
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/chat/completions"
-MODEL_NAME = "local-model"
+MODEL_NAME = DEFAULT_CHAT_MODEL  # what is sent when scoring.chat_model is unset
 # The request does not stream, so no byte arrives until generation ends. One step has
 # to cover that wait, so the step limit is the whole total.
 TOTAL = 120.0
@@ -259,7 +261,7 @@ def _request_body(
     if shown:
         view["labelled_examples"] = shown
     payload = {
-        "model": MODEL_NAME,
+        "model": chat_model(config),
         "temperature": 0,
         "messages": [
             {

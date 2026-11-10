@@ -93,6 +93,14 @@ fit_rubric:
   # what it stores. embed-eval ranks a blend with it when it is set. Null leaves it unset.
   embedding_weight: null
 
+# Optional: the model identifiers sent to LM Studio on this Mac (see docs/SETUP.md,
+# "Run the local models"). Use the identifier LM Studio shows for each loaded model.
+# Text of 1 to 200 characters; unset or null sends local-model and local-embedding.
+# The server addresses are fixed loopback URLs and are not set here.
+scoring:
+  chat_model: null             # e.g. example-chat-model
+  embedding_model: null        # e.g. example-embedding-model
+
 schedule:
   # A zone name (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); UTC if unset.
   timezone: UTC

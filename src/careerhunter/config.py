@@ -35,6 +35,9 @@ LaunchAgent runs, default 60 and at least 15.
   useful work before doctor warns, and health.failure_runs: how many runs in a row the
   local model, SearXNG or every board may fail before the bot says so. Both are
   integers from 1 to 50, default 3.
+- scoring.chat_model and scoring.embedding_model: the model identifiers sent to the
+  local server, text of 1 to 200 characters with no control characters; defaults
+  `local-model` and `local-embedding`. The server URLs are not config.
 
 With lanes present, search.target_titles becomes optional; with gap_tiers present, the
 fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
@@ -95,6 +98,12 @@ LABELLED_EXAMPLES_LIMIT = 20
 DEFAULT_HEALTH_RUNS = 3
 HEALTH_RUNS_LIMIT = 50
 HEALTH_KEYS = ("unproductive_runs", "failure_runs")
+# scoring.chat_model and scoring.embedding_model: the model identifiers sent to the
+# local server. The URLs are loopback constants in score.py and embed.py, never config.
+DEFAULT_CHAT_MODEL = "local-model"
+DEFAULT_EMBEDDING_MODEL = "local-embedding"
+SCORING_KEYS = ("chat_model", "embedding_model")
+MAX_MODEL_ID = 200
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _CAREER_HOST = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -516,6 +525,33 @@ def _validate_health(section: Any, problems: list[str]) -> None:
             )
 
 
+def _model_id(value: Any) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= MAX_MODEL_ID
+        and value == value.strip()
+        and value.isprintable()
+    )
+
+
+def _validate_scoring(section: Any, problems: list[str]) -> None:
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        problems.append("scoring must be a mapping")
+        return
+    extra = set(section) - set(SCORING_KEYS)
+    if extra:
+        problems.append(f"scoring has unknown keys: {sorted(extra)}")
+    for key in SCORING_KEYS:
+        value = section.get(key)
+        if value is not None and not _model_id(value):
+            problems.append(
+                f"scoring.{key} must be a model identifier: text of 1 to {MAX_MODEL_ID} "
+                "characters, with no control characters and no leading or trailing spaces"
+            )
+
+
 def _validate_telegram(section: Any, problems: list[str]) -> None:
     if section is None:
         return
@@ -635,6 +671,7 @@ def validate_config(doc: Any) -> list[str]:
     _validate_alerts(doc.get("alerts"), problems)
     _validate_health(doc.get("health"), problems)
     _validate_learning(doc.get("learning"), problems)
+    _validate_scoring(doc.get("scoring"), problems)
     _validate_discovery(doc.get("discovery"), problems)
     problems.extend(validate_section(doc.get("ei")))
     return problems
@@ -732,6 +769,22 @@ def learning_labelled_examples(doc: Mapping[str, Any] | None) -> int:
     if _int(value) and 0 <= value <= LABELLED_EXAMPLES_LIMIT:
         return value
     return DEFAULT_LABELLED_EXAMPLES
+
+
+def _scoring_model(doc: Mapping[str, Any] | None, key: str, default: str) -> str:
+    section = doc.get("scoring") if isinstance(doc, Mapping) else None
+    value = section.get(key) if isinstance(section, Mapping) else None
+    return value if _model_id(value) else default
+
+
+def chat_model(doc: Mapping[str, Any] | None) -> str:
+    """The chat model id the scorer sends; `local-model` if unset."""
+    return _scoring_model(doc, "chat_model", DEFAULT_CHAT_MODEL)
+
+
+def embedding_model(doc: Mapping[str, Any] | None) -> str:
+    """The embedding model id the embedder sends; `local-embedding` if unset."""
+    return _scoring_model(doc, "embedding_model", DEFAULT_EMBEDDING_MODEL)
 
 
 def health_unproductive_runs(doc: Mapping[str, Any] | None) -> int:

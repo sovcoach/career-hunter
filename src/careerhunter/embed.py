@@ -2,8 +2,9 @@
 
 The client is not `fetch.py`. That client refuses loopback, which is right for a job
 ad and wrong for a model on this Mac. This client allows only `http` to `127.0.0.1`,
-`localhost` or `::1`, follows no redirects, and refuses any other host. The URL and
-the model id are constants, not config fields.
+`localhost` or `::1`, follows no redirects, and refuses any other host. The URL is a
+constant, not a config field. The model id is `scoring.embedding_model` (default
+`local-embedding`).
 
 A cosine is stored beside the LLM tier. It does not cause a skip, and
 `fit_rubric.embedding_weight` is not read. The resume is read only through
@@ -26,12 +27,13 @@ from pathlib import Path
 from typing import Any
 
 from careerhunter import db, loopback, resume, search_store
+from careerhunter.config import DEFAULT_EMBEDDING_MODEL, embedding_model
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
 from careerhunter.score import ScoreError, Transport, require_loopback
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/embeddings"
-MODEL_NAME = "local-embedding"
+MODEL_NAME = DEFAULT_EMBEDDING_MODEL  # what is sent when scoring.embedding_model is unset
 TOTAL = 60.0
 TIMEOUT = 30.0
 # A 1536-dimension vector is about 21 KB of JSON; the cap leaves room for larger models.
@@ -105,13 +107,15 @@ def embed_text(
     *,
     url: str = DEFAULT_URL,
     transport: Transport | None = None,
+    model: str = MODEL_NAME,
 ) -> list[float]:
-    """One embedding. A transport failure is EmbedError('unreachable', down=True); a
-    reply that is not a usable vector is EmbedError('bad-reply')."""
+    """One embedding, from the model named `model`. A transport failure is
+    EmbedError('unreachable', down=True); a reply that is not a usable vector is
+    EmbedError('bad-reply')."""
     send = default_transport if transport is None else transport
     try:
         require_loopback(url)
-        status, body = send(url, _request(text))
+        status, body = send(url, _request(text, model))
     except (ScoreError, OSError, http.client.HTTPException):
         raise EmbedError("unreachable", down=True) from None
     return _values(status, body)
@@ -160,6 +164,7 @@ class Embedder:
         self.config = config
         self.transport = transport
         self.url = url
+        self.model = embedding_model(config)
         self._cached: tuple[str, int, list[float]] | None = None
         self._failed: str | None = None
         self._reported: set[int] = set()
@@ -223,7 +228,7 @@ class Embedder:
                 return self._cached
         if self._failed is not None:  # already down this run: do not ask again
             raise EmbedError(self._failed)
-        values = embed_text(text, url=self.url, transport=self.transport)
+        values = embed_text(text, url=self.url, transport=self.transport, model=self.model)
         cosine(values, values)
         dim, blob = pack(values)
         with db.transaction(self.conn):
@@ -240,7 +245,9 @@ class Embedder:
         _digest, dim, resume_vec = own
         stored = search_store.posting_embedding(self.conn, posting_id)
         if stored is None:
-            values = embed_text(posting_text(posting), url=self.url, transport=self.transport)
+            values = embed_text(
+                posting_text(posting), url=self.url, transport=self.transport, model=self.model
+            )
             return self._save_new(posting_id, dim, resume_vec, values)
         pdim, pblob = stored
         try:
@@ -335,8 +342,8 @@ def unpack(dim: int, blob: bytes) -> list[float]:
     return [float(value) for value in struct.unpack(f"<{dim}f", blob)]
 
 
-def _request(text: str) -> bytes:
-    return json.dumps({"model": MODEL_NAME, "input": text}).encode()
+def _request(text: str, model: str) -> bytes:
+    return json.dumps({"model": model, "input": text}).encode()
 
 
 def _values(status: int, body: bytes) -> list[float]:

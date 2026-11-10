@@ -24,11 +24,11 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2); amended (#30) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
-| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023 |
+| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023; amended (#42, #44) |
 | 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30) |
 | 021 | The public repo is MIT | Accepted (Phase 5) |
 | 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32) |
-| 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37) |
+| 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37); amended (#43, #44) |
 
 ---
 
@@ -504,6 +504,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-019: Local embedding vectors live in search.db beside the LLM tier
 
+> **Amended: the model id is config (#44).** The embedding request's model id is `scoring.embedding_model` (default `local-embedding`), and the scoring request's is `scoring.chat_model` (default `local-model`). Each is text of 1 to 200 characters with no control characters and no leading or trailing spaces; any other key under `scoring` is refused, so neither URL can be set. The URLs stay the loopback constants below. Stored vectors do not record the model that made them: after `scoring.embedding_model` changes, stored posting vectors are compared with the new resume vector as they are. A vector of another dimension is a `dim-mismatch` miss; one of the same dimension gives a cosine across two models. A cosine still decides nothing.
+
 > **Amended: a bad reply has its own reason (#42).** An embedding miss is now `unreachable` only when the server could not be used (refused, out of time, or a reply over the cap); a reply that arrived but is not a usable vector (another status, a body of the wrong shape, an empty, zero or non-finite vector) is the new reason `bad-reply`. Only `unreachable` stops embedding for the rest of the run, as before. The log line is still `embedding miss posting <id>: <reason>` and nothing else. Scoring already told the two apart (ADR-023): a `ScoreError` is a down model, a reply that does not parse leaves the posting as it was.
 
 > **Amended: loopback deadlines (#30).** The scoring, embedding and SearXNG clients share one exchange with a total deadline: 120 seconds for scoring, 60 for embedding and 30 for discovery. The lookup, the connect, the reply headers and the body all count against it, and a watchdog shuts the socket down when it passes.
@@ -521,7 +523,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 **Decision.**
 - **Float32 vectors are BLOBs in ordinary tables in `search.db`.** Search migration 0004 adds `resume_embedding` (one row: SHA-256 of the resume bytes, dimension, vector, timestamp) and `posting_embeddings` (one row per posting: dimension, vector, timestamp). `postings.embedding_score` holds the cosine, from -1 to 1, or null. The resume text and the posting text are not stored. The EI files stay on schema 1. `fit_rating` stays null.
 - **No native extension.** `search.db` stays mode 0600 and opens with the standard library.
-- **The embedding client is loopback only.** It posts to `http://127.0.0.1:1234/v1/embeddings` on the local LM Studio server, with the model id `local-embedding`. No redirects, and it is not `fetch.py`.
+- **The embedding client is loopback only.** It posts to `http://127.0.0.1:1234/v1/embeddings` on the local LM Studio server, with the model id `local-embedding` (now `scoring.embedding_model`; see the amendment above). No redirects, and it is not `fetch.py`.
 - **The cosine is stored beside the LLM tier and never replaces it.** The existing skip rules stay as they are. A cosine does not cause a skip. The alert keeps company, title, and link, and adds `LLM: <tier>`. When a cosine is present, one more line is `similarity: 0.82`.
 - **A miss fails closed for that posting only.** If the resume file is missing, the embedding server is down, or a vector has the wrong dimension, that posting's cosine stays null. The watch log gets `embedding miss posting <id>: <reason>` and nothing else: no resume text, no posting text, and no vector. The run continues and still exits 0. The alert then has the LLM line only.
 - **The description is still not a column.** The first score pass embeds the in-memory text: company, title, location, work model, and the description when the board sent one. A later pass has only the stored fields. The vector is the only kept trace of that description. When the resume bytes change, stored posting vectors are compared again locally, without calling the model.
@@ -653,6 +655,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - The log files grow without limit. There is no rotation yet. *Amended for health (#42):* when a run opens `logs/watch.log` or `logs/discover.log` and it has reached 5 MB, the standard library's `RotatingFileHandler` rolls it over first, keeping five older files (`watch.log.1` to `watch.log.5`) in `logs/`. Every rotated file is set to 0600 again and the new one is created 0600, so a umask never loosens one; a symlink is never rolled over. A log can pass 5 MB by one run's lines. A rotation that fails stops the run, like a log that can't be opened.
 
 ## ADR-023: Scoring is grounded in an imported resume, and re-scored when it changes
+
+> **Amended: the model id is config (#44).** The scoring request names the model `scoring.chat_model` (default `local-model`); see ADR-019. The URL is unchanged. Changing the model does not re-score anything by itself.
 
 > **Amended for the learning loop (#43).** The scoring request may now carry `labelled_examples`: up to `learning.labelled_examples` (0 to 20, default 5; 0 sends none) of the postings the operator labelled most recently, each as its title, lane (`off-lane`, or null when not checked), gap count and label. A label comes only from the operator: an application, labelled with its latest status (`applied` or later, from the bot, the CLI or `seed`), or a skip chosen with the Skipped button (`skipped`, `skips.by_operator`). The system never predicts a label, and a watcher skip is not one. The examples are read once per watch run, the posting being scored (same company and title) is left out, and the company, gap names, notes, skip reasons and cosines are never sent. They go to the loopback model's request only: no column, log line or Telegram message carries them, and `llm_output` stays as before (canonical gaps while a resume is in use). Rules and thresholds (`gap_tiers`, gates, lanes, `off_lane_min_fit`) never change automatically. Embeddings stay out of the scoring decision until `embed-eval` shows they predict the operator's labels: ADR-019 stands.
 
