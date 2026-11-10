@@ -30,7 +30,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from careerhunter import htmltext
-from careerhunter.fetch import Fetched, FetchError, FetchTooLarge
+from careerhunter.fetch import Fetched, FetchError, FetchRefused, FetchTooLarge
 
 Fetcher = Callable[[str], Fetched]
 Poster = Callable[[str, object], Fetched]  # one POST of a JSON payload (fetch.post_json)
@@ -55,6 +55,7 @@ _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 # A BambooHR slug and a Workday tenant are subdomains: one DNS label each.
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _WORKDAY_HOST = re.compile(r"^wd[0-9]{1,3}$")
+_POST_DOMAIN = ".myworkdayjobs.com"  # Client.post_json sends only to its subdomains
 # A Workday posting path: /job/<location>/<title>_<id>, URL-safe segments only.
 _WORKDAY_PATH = re.compile(r"^/job(?:/[A-Za-z0-9._~%+-]+)+$")
 _WORKDAY_DAYS_AGO = re.compile(r"Posted ([0-9]{1,3}) Days Ago")
@@ -181,8 +182,19 @@ class Client:
         return fetched
 
     def post_json(self, url: str, payload: object) -> object:
+        """One POST, to a subdomain of myworkdayjobs.com only (the one board that posts).
+
+        Any other host is refused before the poster is called, so before any lookup:
+        defense in depth on top of the fetcher's address pinning.
+        """
         if self._poster is None:
             raise BoardParseError("no POST client")
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        sub = host.removesuffix(_POST_DOMAIN)
+        labels = sub.split(".") if sub and sub != host else []
+        if parts.scheme != "https" or not labels or not all(map(_HOST_LABEL.fullmatch, labels)):
+            raise FetchRefused("a POST goes only to a myworkdayjobs.com board")
         return _loads(self._checked(url, self._poster(url, payload)))
 
     def _checked(self, url: str, fetched: Fetched) -> bytes:

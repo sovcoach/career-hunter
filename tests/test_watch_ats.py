@@ -4,7 +4,10 @@ posting. Synthetic boards and companies only; no sockets, no sleeps."""
 from __future__ import annotations
 
 import sqlite3
+from functools import partial
 from typing import Any
+
+import pytest
 
 from careerhunter import ats
 from careerhunter import watch as w
@@ -977,6 +980,54 @@ def test_a_client_without_a_poster_refuses_a_post() -> None:
 
     with pytest.raises(ats.BoardParseError, match="no POST client"):
         ats.Client(Scripted({})).post_json(WD_LIST, {})
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "https://jobs.example.com/wday/cxs/examplerobotics/External/jobs",
+        "https://myworkdayjobs.com/wday/cxs/examplerobotics/External/jobs",
+        "https://examplerobotics.wd5.myworkdayjobs.com.example.net/jobs",
+        "https://examplerobotics.wd5.notmyworkdayjobs.com/jobs",
+        "https://.myworkdayjobs.com/jobs",
+        "http://examplerobotics.wd5.myworkdayjobs.com/jobs",
+        "https://10.0.0.5/jobs",
+    ],
+)
+def test_a_post_to_any_host_but_a_myworkdayjobs_subdomain_is_refused_before_a_lookup(
+    address: str,
+) -> None:
+    from careerhunter import fetch as f
+
+    looked_up: list[str] = []
+
+    def resolve(host: str, port: int, timeout: float) -> list[str]:
+        looked_up.append(host)
+        return ["93.184.216.34"]
+
+    poster = partial(f.post_json, resolver=resolve)
+    with pytest.raises(f.FetchRefused, match=r"only to a myworkdayjobs\.com board"):
+        ats.Client(Scripted({}), poster=poster).post_json(address, {})
+    assert looked_up == []
+
+
+def test_a_post_to_a_myworkdayjobs_subdomain_is_sent() -> None:
+    from careerhunter import fetch as f
+    from tests.test_fetch import FakeResponse, FakeWeb, ManualWatchdog
+
+    web = FakeWeb({WD_LIST: FakeResponse(body=b'{"jobPostings": []}')})
+    looked_up: list[str] = []
+
+    def resolve(host: str, port: int, timeout: float) -> list[str]:
+        looked_up.append(host)
+        return ["93.184.216.34"]
+
+    poster = partial(
+        f.post_json, resolver=resolve, connector=web.connector, watchdog=ManualWatchdog()
+    )
+    assert ats.Client(Scripted({}), poster=poster).post_json(WD_LIST, {}) == {"jobPostings": []}
+    assert looked_up == ["examplerobotics.wd5.myworkdayjobs.com"]
+    assert web.sent[0][0] == "POST"
 
 
 def test_the_watch_command_posts_workday_lists_under_the_board_cap(
