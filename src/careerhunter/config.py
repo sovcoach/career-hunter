@@ -27,6 +27,8 @@ LaunchAgent runs, default 60 and at least 15.
 - exclusions: role-level exclusions and "exclude roles already applied to";
 - alerts.max_per_poll: the per-poll cap on watcher alerts, an integer from 1 to 50,
   default 10.
+- alerts.weekly_digest: the day (monday to sunday) and hour (0 to 23) in
+  schedule.timezone of the weekly counts by lane, or null for none;
 - learning.labelled_examples: how many of the operator's recent labelled postings the
   scoring prompt shows the local model, an integer from 0 to 20, default 5 (0: none);
 - health.unproductive_runs: how many watch runs or discovery passes in a row may do no
@@ -87,6 +89,7 @@ DEFAULT_MAX_POSTING_AGE_DAYS = 7
 MAX_POSTING_AGE_LIMIT = 365
 DEFAULT_MAX_PER_POLL = 10
 MAX_PER_POLL_LIMIT = 50
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 DEFAULT_LABELLED_EXAMPLES = 5
 LABELLED_EXAMPLES_LIMIT = 20
 DEFAULT_HEALTH_RUNS = 3
@@ -457,7 +460,7 @@ def _validate_alerts(section: Any, problems: list[str]) -> None:
     if not isinstance(section, dict):
         problems.append("alerts must be a mapping")
         return
-    extra = set(section) - {"max_per_poll"}
+    extra = set(section) - {"max_per_poll", "weekly_digest"}
     if extra:
         problems.append(f"alerts has unknown keys: {sorted(extra)}")
     value = section.get("max_per_poll")
@@ -466,6 +469,16 @@ def _validate_alerts(section: Any, problems: list[str]) -> None:
             f"alerts.max_per_poll must be an integer from 1 to {MAX_PER_POLL_LIMIT} "
             f"(default {DEFAULT_MAX_PER_POLL})"
         )
+    weekly = section.get("weekly_digest")
+    if weekly is None:
+        return
+    if not isinstance(weekly, dict) or set(weekly) != {"day", "hour"}:
+        problems.append("alerts.weekly_digest must be a mapping with day and hour, or null")
+        return
+    if weekly["day"] not in WEEKDAYS:
+        problems.append("alerts.weekly_digest.day must be a weekday such as monday")
+    if not _int(weekly["hour"]) or not 0 <= weekly["hour"] <= 23:
+        problems.append("alerts.weekly_digest.hour must be an integer from 0 to 23")
 
 
 def _validate_learning(section: Any, problems: list[str]) -> None:
@@ -697,6 +710,19 @@ def _health(doc: Mapping[str, Any] | None, key: str) -> int:
     if _int(value) and 1 <= value <= HEALTH_RUNS_LIMIT:
         return value
     return DEFAULT_HEALTH_RUNS
+
+
+def weekly_digest(doc: Mapping[str, Any] | None) -> tuple[int, int] | None:
+    """(weekday, hour) of the weekly digest from an already validated config, Monday 0,
+    in schedule.timezone; None when it is off (#43)."""
+    section = doc.get("alerts") if isinstance(doc, Mapping) else None
+    weekly = section.get("weekly_digest") if isinstance(section, Mapping) else None
+    if not isinstance(weekly, Mapping) or weekly.get("day") not in WEEKDAYS:
+        return None
+    hour = weekly.get("hour")
+    if not _int(hour) or not 0 <= hour <= 23:
+        return None
+    return WEEKDAYS.index(weekly["day"]), hour
 
 
 def learning_labelled_examples(doc: Mapping[str, Any] | None) -> int:

@@ -171,6 +171,10 @@ telegram:
 # postings per poll (1-50, default 10); the rest carry over to the next poll.
 alerts:
   max_per_poll: 10
+  # Optional: a weekly message of counts by lane (alerts, Applied, Skipped, responses,
+  # outcomes), at this day and hour in schedule.timezone. Counts only: no titles. Null
+  # turns it off.
+  weekly_digest: null          # e.g. {day: monday, hour: 9}
 
 # Optional: the learning loop (#43). The scoring prompt shows the local model up to this
 # many postings you labelled recently: their title, lane, number of gaps, and what you

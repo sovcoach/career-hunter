@@ -557,6 +557,15 @@ health:
 
 Every date must fall inside your active EI claim, as with `seed`, and future dates are refused. Buttons work once: tap a button twice, or use an old one, and the bot says it has expired.
 
+With `alerts.weekly_digest: {day: monday, hour: 9}` in `config.yaml`, the bot also sends a weekly message at that local time (`schedule.timezone`) with counts for the week before, by lane: alerts, Applied, Skipped, responses (an employer's first reply: screening and later, or a rejection) and outcomes. It has numbers and lane names only, never titles:
+
+```text
+Weekly digest, 2026-10-19 09:00 to 2026-10-26 09:00
+operations: 2 alerts, 1 applied, 1 skipped, 2 responses, 2 outcomes
+Off-lane: 1 alerts, 0 applied, 1 skipped, 0 responses, 0 outcomes
+All lanes: 3 alerts, 1 applied, 2 skipped, 2 responses, 2 outcomes
+```
+
 The bot also tells you when something stops working. After `health.failure_runs` watch runs in a row (default 3) in which the local model, SearXNG, or every board failed, it sends one message, such as `Health: LM Studio has failed 3 runs in a row. 4 postings are waiting to be scored.`, and when that part works again, one more: `Health: LM Studio is working again.` It sends nothing more about the same outage in between.
 
 ---

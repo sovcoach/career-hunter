@@ -662,6 +662,19 @@ def given_up_count(conn: sqlite3.Connection) -> int:
     return int(row.fetchone()[0])
 
 
+def bot_state(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def set_bot_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
 def alerts_held_since(conn: sqlite3.Connection) -> str | None:
     """When the bot started holding watcher alerts because config was unreadable."""
     row = conn.execute("SELECT value FROM bot_state WHERE key = 'alerts_held_since'").fetchone()
@@ -734,6 +747,68 @@ def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         for row in rows
         if title_key(str(row["title"])) in keys.get(int(row["company_id"]), set())
     ]
+
+
+# A status that means the employer answered: screening and later, a rejection included.
+RESPONSE_STATUSES = (
+    "screening",
+    "assessment_submitted",
+    "interview_scheduled",
+    "offer",
+    "hired",
+    "rejected",
+)
+# A status that ends an application one way or another.
+OUTCOME_STATUSES = ("offer", "hired", "rejected", "no_response", "withdrawn")
+WEEK_COUNTS = ("alerts", "applied", "skipped", "responses", "outcomes")
+
+
+def _in(values: Sequence[str]) -> str:
+    return "(" + ", ".join(f"'{v}'" for v in values) + ")"
+
+
+def weekly_counts(conn: sqlite3.Connection, start: str, end: str) -> dict[str, dict[str, int]]:
+    """Counts by lane for the UTC window [start, end) (#43). Counts only.
+
+    - alerts: postings Telegram accepted an alert for in the window;
+    - applied: applications recorded in the window (their `applied` decision);
+    - skipped: skips the operator chose in the window;
+    - responses: applications whose first status of RESPONSE_STATUSES was recorded in
+      the window, so one application counts once;
+    - outcomes: statuses of OUTCOME_STATUSES recorded in the window.
+
+    The lane is the posting's stored lane name, `Off-lane` once checked with none, or
+    `No lane` when it was never checked (lanes off, or a self-sourced posting).
+    """
+    lane = (
+        "CASE WHEN p.lane IS NOT NULL THEN p.lane "
+        "WHEN p.lane_checked = 1 THEN 'Off-lane' ELSE 'No lane' END"
+    )
+    queries = {
+        "alerts": f"SELECT {lane} AS lane, count(*) FROM postings p "  # noqa: S608
+        "WHERE p.alerted_at >= ? AND p.alerted_at < ? GROUP BY 1",
+        "applied": f"SELECT {lane} AS lane, count(*) FROM decision_history d "  # noqa: S608
+        "JOIN applications a ON a.id = d.application_id JOIN postings p ON p.id = a.posting_id "
+        "WHERE d.status = 'applied' AND d.recorded_at >= ? AND d.recorded_at < ? GROUP BY 1",
+        "skipped": f"SELECT {lane} AS lane, count(*) FROM skips s "  # noqa: S608
+        "JOIN postings p ON p.id = s.posting_id "
+        "WHERE s.by_operator = 1 AND s.created_at >= ? AND s.created_at < ? GROUP BY 1",
+        "responses": f"SELECT {lane} AS lane, count(*) FROM ("  # noqa: S608
+        "SELECT d.application_id, min(d.recorded_at) AS first_at FROM decision_history d "
+        f"WHERE d.status IN {_in(RESPONSE_STATUSES)} GROUP BY d.application_id) f "
+        "JOIN applications a ON a.id = f.application_id JOIN postings p ON p.id = a.posting_id "
+        "WHERE f.first_at >= ? AND f.first_at < ? GROUP BY 1",
+        "outcomes": f"SELECT {lane} AS lane, count(*) FROM decision_history d "  # noqa: S608
+        "JOIN applications a ON a.id = d.application_id JOIN postings p ON p.id = a.posting_id "
+        f"WHERE d.status IN {_in(OUTCOME_STATUSES)} "
+        "AND d.recorded_at >= ? AND d.recorded_at < ? GROUP BY 1",
+    }
+    counts: dict[str, dict[str, int]] = {}
+    for name, sql in queries.items():
+        for row in conn.execute(sql, (start, end)):
+            lanes = counts.setdefault(str(row[0]), dict.fromkeys(WEEK_COUNTS, 0))
+            lanes[name] = int(row[1])
+    return counts
 
 
 @dataclass(frozen=True)

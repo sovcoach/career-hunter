@@ -66,7 +66,9 @@ from careerhunter.config import (
     health_failure_runs,
     load_config,
     telegram_chat_id,
+    weekly_digest,
 )
+from careerhunter.config import timezone as config_timezone
 from careerhunter.config import today as config_today
 from careerhunter.fetch import Fetched, fetch
 from careerhunter.ledger import PartialWriteError
@@ -328,6 +330,55 @@ def _failure_text(name: str, failures: int, held: int | None) -> str:
         waiting = f"{held} postings are waiting to be scored."
     runs = "1 run" if failures == 1 else f"{failures} runs"
     return f"Health: {name} has failed {runs} in a row. {waiting}"
+
+
+WEEKLY_KEY = "weekly_digest_sent"
+
+
+def _digest_week(
+    now: dt.datetime, zone: dt.tzinfo, weekday: int, hour: int
+) -> tuple[dt.datetime, dt.datetime]:
+    """The week the latest scheduled digest covers: [moment - 7 days, moment), where the
+    moment is the last `weekday` at `hour`, local time in `zone`, not after `now`.
+
+    The local wall time is kept across a daylight-saving change, so the week can be an
+    hour shorter or longer.
+    """
+    local = now.astimezone(zone)
+    day = local.date() - dt.timedelta(days=(local.weekday() - weekday) % 7)
+    moment = _local_moment(day, hour, zone)
+    if moment > now:
+        day -= dt.timedelta(days=7)
+        moment = _local_moment(day, hour, zone)
+    return _local_moment(day - dt.timedelta(days=7), hour, zone), moment
+
+
+def _local_moment(day: dt.date, hour: int, zone: dt.tzinfo) -> dt.datetime:
+    """`day` at `hour` in `zone`, as an aware UTC moment (PEP 495, fold 0). A wall time
+    a spring daylight-saving change skips is read with the offset before the change, so
+    it lands just after the gap; a wall time an autumn change repeats is the first one."""
+    return dt.datetime.combine(day, dt.time(hour), tzinfo=zone).astimezone(dt.UTC)
+
+
+def _weekly_text(start: dt.datetime, end: dt.datetime, counts: dict[str, dict[str, int]]) -> str:
+    """The digest text; `start` and `end` are local times in schedule.timezone."""
+    first = start.strftime("%Y-%m-%d %H:%M")
+    until = end.strftime("%Y-%m-%d %H:%M")
+    last = {"Off-lane": 1, "No lane": 2}  # lane names first, then these, in this order
+    lanes = sorted(counts, key=lambda name: (last.get(name, 0), name))
+    total = {key: sum(counts[lane][key] for lane in lanes) for key in search_store.WEEK_COUNTS}
+    lines = [f"Weekly digest, {first} to {until}"]
+    for lane in lanes:
+        lines.append(f"{_clip(lane, _CAPS['lane'])}: {_week_line(counts[lane])}")
+    lines.append(f"All lanes: {_week_line(total)}")
+    return "\n".join(lines)
+
+
+def _week_line(counts: Mapping[str, int]) -> str:
+    return (
+        f"{counts['alerts']} alerts, {counts['applied']} applied, {counts['skipped']} skipped, "
+        f"{counts['responses']} responses, {counts['outcomes']} outcomes"
+    )
 
 
 def _log_fields(raw: object) -> dict[str, str]:
@@ -770,6 +821,42 @@ class Bot:
                     "health message failed (%s); left for the next poll", type(exc).__name__
                 )
                 return
+
+    def send_weekly_digest(self) -> None:
+        """Counts by lane for the past week, once a week (#43).
+
+        At `alerts.weekly_digest` (a day and an hour in schedule.timezone), the first
+        poll at or after that moment sends one message covering the seven days before
+        it: per lane, the alerts, Applied, Skipped, responses and outcomes. Counts and
+        lane names only: no titles, notes or gap names. The week is recorded in
+        `bot_state` once Telegram accepts the message, so it goes once; a failed send
+        goes again next poll. A bot that was down for longer sends only the latest week.
+        Nothing is sent while config.yaml can't be read.
+        """
+        doc = self._alert_config()
+        if doc is None:
+            return
+        when = weekly_digest(doc)
+        if when is None:
+            return
+        zone = config_timezone(doc)
+        start, end = _digest_week(self.clock(), zone, *when)
+        week = end.astimezone(zone).date().isoformat()
+        try:
+            with self._search() as search:
+                if search_store.bot_state(search, WEEKLY_KEY) == week:
+                    return
+                counts = search_store.weekly_counts(search, _utc(start), _utc(end))
+        except (OSError, sqlite3.Error) as exc:
+            log.warning("weekly digest could not be read (%s)", type(exc).__name__)
+            return
+        text = _weekly_text(start.astimezone(zone), end.astimezone(zone), counts)
+        try:
+            self.send(text)
+            with self._search() as search, db.transaction(search):
+                search_store.set_bot_state(search, WEEKLY_KEY, week)
+        except (TelegramError, OSError, sqlite3.Error) as exc:
+            log.warning("weekly digest failed (%s); left for the next poll", type(exc).__name__)
 
     def send_pending_discovery(self) -> None:
         """Send pending discovery rows that are due. Name and URL only.
@@ -1549,6 +1636,7 @@ def run(
         bot.send_pending_alerts()
         bot.send_pending_discovery()
         bot.send_health()
+        bot.send_weekly_digest()
     return 0
 
 
