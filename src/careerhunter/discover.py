@@ -48,6 +48,8 @@ from careerhunter.fetch import FetchError
 
 MAX_BODY = 1_048_576
 MISS = "discovery miss: unreachable"
+# The server answered, with another status or a body that is not a usable result list.
+BAD_REPLY = "discovery miss: bad-reply"
 OFF = "discovery off"
 THROTTLED = "discovery stopped: rate limited or asked for a CAPTCHA"
 BACKOFF_CAP = dt.timedelta(days=7)
@@ -539,8 +541,9 @@ def posting(url: str) -> PostingRef | None:
 def _ask(talk: Transport, base: str, query: str) -> list[str] | str:
     """One query's result URLs, or the closed line that ends the pass.
 
-    A transport failure, another status or a reply that is not a result list is a miss;
-    HTTP 429 or an engine throttled is a stop.
+    A transport failure or a reply over the cap is `unreachable`; another status or a
+    reply that is not a usable result list is `bad-reply` (#42). Both are a miss. HTTP
+    429 or an engine throttled is a stop.
     """
     try:
         status, body = talk(request_url(base, query))
@@ -548,12 +551,14 @@ def _ask(talk: Transport, base: str, query: str) -> list[str] | str:
         return MISS
     if status == 429:
         return THROTTLED
-    if status != 200 or len(body) > MAX_BODY:
+    if len(body) > MAX_BODY:
         return MISS
+    if status != 200:
+        return BAD_REPLY
     if _throttled(body):
         return THROTTLED
     urls = _result_urls(body)
-    return MISS if urls is None else urls
+    return BAD_REPLY if urls is None else urls
 
 
 def _throttled(body: bytes) -> bool:

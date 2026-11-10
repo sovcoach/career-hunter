@@ -36,15 +36,18 @@ TOTAL = 60.0
 TIMEOUT = 30.0
 # A 1536-dimension vector is about 21 KB of JSON; the cap leaves room for larger models.
 MAX_REPLY = 1_048_576
-_REASONS = frozenset({"unreachable", "no-resume", "dim-mismatch"})
+_REASONS = frozenset({"unreachable", "bad-reply", "no-resume", "dim-mismatch"})
 
 
 class EmbedError(Exception):
-    """A closed reason: unreachable, no-resume, or dim-mismatch. The text is that reason.
+    """A closed reason: unreachable, bad-reply, no-resume, or dim-mismatch. The text is
+    that reason.
 
-    `down` is True when the server itself could not be used: refused, timed out, out of
-    time, or a reply over the cap. A reply that arrived but was not a vector is not.
-    The text is the same either way.
+    `unreachable` (with `down` True) is the server itself not usable: refused, timed
+    out, out of time, or a reply over the cap. `bad-reply` is a reply that arrived but
+    was not a usable vector: another status, a body that is not the JSON shape, or a
+    vector that is empty, zero or not finite (#42). Only `down` stops embedding for the
+    rest of the run.
     """
 
     def __init__(self, reason: str, *, down: bool = False) -> None:
@@ -103,7 +106,8 @@ def embed_text(
     url: str = DEFAULT_URL,
     transport: Transport | None = None,
 ) -> list[float]:
-    """One embedding. Any failure becomes EmbedError('unreachable')."""
+    """One embedding. A transport failure is EmbedError('unreachable', down=True); a
+    reply that is not a usable vector is EmbedError('bad-reply')."""
     send = default_transport if transport is None else transport
     try:
         require_loopback(url)
@@ -123,10 +127,10 @@ def cosine(left: Sequence[float], right: Sequence[float]) -> float:
         left_sq += a * a
         right_sq += b * b
     if left_sq == 0.0 or right_sq == 0.0:
-        raise EmbedError("unreachable")
+        raise EmbedError("bad-reply")
     score = dot / math.sqrt(left_sq * right_sq)
     if not math.isfinite(score):
-        raise EmbedError("unreachable")
+        raise EmbedError("bad-reply")
     if score > 1.0:
         return 1.0
     if score < -1.0:
@@ -319,7 +323,7 @@ def pack(values: Sequence[float]) -> tuple[int, bytes]:
     """Little-endian float32. An empty vector is a bad response."""
     dim = len(values)
     if dim < 1:
-        raise EmbedError("unreachable")
+        raise EmbedError("bad-reply")
     return dim, struct.pack(f"<{dim}f", *[float(value) for value in values])
 
 
@@ -337,26 +341,26 @@ def _request(text: str) -> bytes:
 
 def _values(status: int, body: bytes) -> list[float]:
     if status != 200:
-        raise EmbedError("unreachable")
+        raise EmbedError("bad-reply")
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        raise EmbedError("unreachable") from None
+        raise EmbedError("bad-reply") from None
     if not isinstance(payload, dict):
-        raise EmbedError("unreachable")
+        raise EmbedError("bad-reply")
     data = payload.get("data")
     if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-        raise EmbedError("unreachable")
+        raise EmbedError("bad-reply")
     raw = data[0].get("embedding")
     if not isinstance(raw, list) or not raw:
-        raise EmbedError("unreachable")
+        raise EmbedError("bad-reply")
     values: list[float] = []
     for item in raw:
         if isinstance(item, bool) or not isinstance(item, int | float):
-            raise EmbedError("unreachable")
+            raise EmbedError("bad-reply")
         number = float(item)
         if not math.isfinite(number):
-            raise EmbedError("unreachable")
+            raise EmbedError("bad-reply")
         values.append(number)
     return values
 

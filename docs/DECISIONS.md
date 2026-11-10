@@ -495,6 +495,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-019: Local embedding vectors live in search.db beside the LLM tier
 
+> **Amended: a bad reply has its own reason (#42).** An embedding miss is now `unreachable` only when the server could not be used (refused, out of time, or a reply over the cap); a reply that arrived but is not a usable vector (another status, a body of the wrong shape, an empty, zero or non-finite vector) is the new reason `bad-reply`. Only `unreachable` stops embedding for the rest of the run, as before. The log line is still `embedding miss posting <id>: <reason>` and nothing else. Scoring already told the two apart (ADR-023): a `ScoreError` is a down model, a reply that does not parse leaves the posting as it was.
+
 > **Amended: loopback deadlines (#30).** The scoring, embedding and SearXNG clients share one exchange with a total deadline: 120 seconds for scoring, 60 for embedding and 30 for discovery. The lookup, the connect, the reply headers and the body all count against it, and a watchdog shuts the socket down when it passes.
 > - The scoring request does not stream, so no byte arrives until the model has finished. One step has to cover that wait, so scoring's step limit is its whole total.
 > - A host name such as `localhost` is looked up inside the deadline, and only an answer in 127.0.0.0/8 or exactly `::1` is used.
@@ -530,6 +532,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - The report can show a weighted blend that the watcher never stores. That line is not the alert decision.
 
 ## ADR-020: Discovery asks a local SearXNG and queues companies for approval
+
+> **Amended: a bad reply has its own reason (#42).** A transport failure, or a reply over the 1 MB cap, still writes `discovery miss: unreachable`. A reply that arrives with another status, a body that is not UTF-8 JSON, no `results` list, or a non-empty list with no usable url now writes `discovery miss: bad-reply`, replacing the `unreachable` text the bullets below give for those cases. Both are a miss: nothing is stored, the cursor stays, and the pass counts as failed for the backoff. HTTP 429 and an engine throttled are still a stop.
 
 > **Amended: rotation, the watch agent and direct alerts (#40, #41).** Supersedes the query, interval, career-page and agent bullets below where they differ.
 > - **Rotation.** The queries are the full product of titles (lanes by priority, every variant, each once; else `search.target_titles`), places (`search.location_rules`: on-site and hybrid places, then remote regions; `search.locations` is no longer read) and hosts (one Greenhouse query as `greenhouse.io`, Lever, Ashby, SmartRecruiters, BambooHR, `myworkdayjobs.com`, then `discovery.career_hosts`). A cursor in `search.db` (search migration 0014, one row) marks the next one. A pass takes the next `discovery.queries_per_run` (default 12, 1 to 40), wrapping around, and moves the cursor in the same transaction as its queue rows, so a miss asks the same queries again.
