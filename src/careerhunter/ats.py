@@ -100,7 +100,7 @@ class Job:
     posted: dt.date | None = None
     posted_min_days: int | None = None
     # `<ats_type>:<board>:<posting id>`: the posting's identity on its board, however
-    # its URL reads (search migration 0015).
+    # its URL reads (search migrations 0015 and 0019).
     key: str | None = None
 
 
@@ -231,7 +231,23 @@ def board_url(ats_type: str, slug: str) -> str | None:
 
 def posting_key(posting: PostingRef) -> str:
     """The posting's identity on its board, the same as `Job.key` for that posting."""
+    if posting.board.ats == "workday":
+        return _workday_key(posting.board, posting.ref)
     return f"{posting.board.key}:{posting.ref}"
+
+
+def _workday_key(board: Board, path: str) -> str:
+    """`workday:<tenant>:<host>:<site>:<id>`, where `<id>` is the trailing `_<id>` of the
+    path's last segment, as it is (`JREQ205219-7` stays as it is: a -N suffix is not
+    stripped). On a live public board that tail is the tail of jobPostingInfo.jobPostingId
+    and begins with jobReqId; the title and location slugs before it are left out, so a
+    retitled or moved posting keeps its key. A path without a usable tail keys on the
+    whole path."""
+    last = path.rsplit("/", 1)[-1]
+    ident = last.rsplit("_", 1)[1] if "_" in last else ""
+    if not ident or _SLUG.fullmatch(ident) is None:
+        ident = path
+    return f"{board.key}:{ident}"
 
 
 def _key(ats: str, slug: str, ident: str | None) -> str | None:
@@ -346,7 +362,7 @@ def _workday_posting(data: object, board: Board, ref: str, today: dt.date | None
         company_field=None,
         posted=posted,
         posted_min_days=at_least,
-        key=f"{board.key}:{ref}",
+        key=_workday_key(board, ref),
     )
     return _workday_detail(stub, data)
 
@@ -446,12 +462,14 @@ def read(
     detail_limit: int | None = None,
     today: dt.date | None = None,
     too_old: TooOld = _never_too_old,
+    known_key: Known = _nothing_known,
 ) -> BoardRead:
     """Every job on one board this run.
 
     A list request that fails raises: a fetch error as it is, a non-200 reply as
     BoardHTTPError, a bad body as BoardParseError, and the board stores nothing. Detail
-    requests are made only for postings whose URL is not `known`, at most
+    requests are made only for postings whose URL is not `known` and whose key is not
+    `known_key` (a Workday posting retitled since it was stored has a new URL), at most
     `detail_limit` (DETAIL_LIMIT by default). A detail that answers with a non-200
     status other than 429, or with a body that does not parse, leaves out that posting
     only, with a note. A fetch
@@ -468,15 +486,17 @@ def read(
     limit = DETAIL_LIMIT if detail_limit is None else detail_limit
     if board.ats == "smartrecruiters":
         stubs, notes = _smartrecruiters_list_pages(board.slug, client)
-        found = _with_details(stubs, client, known, too_old, limit, _smartrecruiters_detail)
+        found = _with_details(
+            stubs, client, (known, known_key), too_old, limit, _smartrecruiters_detail
+        )
         found.notes[:0] = notes
         return found
     if board.ats == "bamboohr":
         stubs = _bamboohr_list(board.slug, client.get_json(url))
-        return _with_details(stubs, client, known, too_old, limit, _bamboohr_detail)
+        return _with_details(stubs, client, (known, known_key), too_old, limit, _bamboohr_detail)
     if board.ats == "workday":
         stubs, notes = _workday_list_pages(board, url, client, today)
-        found = _with_details(stubs, client, known, too_old, limit, _workday_detail)
+        found = _with_details(stubs, client, (known, known_key), too_old, limit, _workday_detail)
         found.notes[:0] = notes
         return found
     return BoardRead(_parse(board.ats, board.slug, client.get_json(url)))
@@ -485,12 +505,13 @@ def read(
 def _with_details(
     stubs: list[Job | Skip],
     client: Client,
-    known: Known,
+    knowns: tuple[Known, Known],
     too_old: TooOld,
     limit: int,
     parse_detail: Callable[[Job, object], Job],
 ) -> BoardRead:
     """Fill in each new posting's description from its detail request."""
+    known, known_key = knowns
     out = BoardRead([])
     fetched = 0
     left = 0
@@ -498,7 +519,10 @@ def _with_details(
         if isinstance(item, Skip) or item.detail_url is None:
             out.jobs.append(item)
             continue
-        if (item.url is not None and known(item.url)) or too_old(item):
+        stored = (item.url is not None and known(item.url)) or (
+            item.key is not None and known_key(item.key)
+        )
+        if stored or too_old(item):
             out.jobs.append(item)  # stored already, or skipped for its age: no detail
             continue
         if out.stopped is not None or fetched >= limit:
@@ -772,7 +796,7 @@ def _workday_job(item: object, board: Board, today: dt.date | None) -> Job | Ski
         detail_url=f"{_workday_base(board)}{path}",
         posted=posted,
         posted_min_days=at_least,
-        key=f"{board.key}:{path}",
+        key=_workday_key(board, path),
     )
 
 

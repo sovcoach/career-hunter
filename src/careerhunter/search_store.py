@@ -42,9 +42,30 @@ def upsert_company(
 
 
 def find_posting(
-    conn: sqlite3.Connection, company_id: int, posting: Posting, dating: Dating
+    conn: sqlite3.Connection,
+    company_id: int,
+    posting: Posting,
+    dating: Dating,
+    *,
+    ats_key: str | None = None,
 ) -> int | None:
-    """Match an existing posting using the schema's identity rules, strongest first."""
+    """Match an existing posting using the schema's identity rules, strongest first.
+
+    `ats_key` is the posting's identity on its board (search migration 0015), the
+    strongest: a Workday posting retitled or moved since it was stored has a new URL
+    but the same key, so it is the same posting.
+    """
+    if ats_key:
+        row = conn.execute(
+            "SELECT id, company_id FROM postings WHERE ats_key = ?", (ats_key,)
+        ).fetchone()
+        if row:
+            if row["company_id"] != company_id:
+                raise IdentityConflict(
+                    f"{posting.company} / {posting.title}: board identity {ats_key!r} is "
+                    "already recorded for a posting at a different company"
+                )
+            return int(row["id"])
     if posting.url:
         row = conn.execute(
             "SELECT id, company_id FROM postings WHERE url = ?", (posting.url,)
@@ -113,11 +134,11 @@ def create_posting(conn: sqlite3.Connection, company_id: int, posting: Posting) 
 
 
 def find_or_create_posting(
-    conn: sqlite3.Connection, posting: Posting, dating: Dating
+    conn: sqlite3.Connection, posting: Posting, dating: Dating, *, ats_key: str | None = None
 ) -> tuple[int, int, bool, bool]:
     """Returns (company_id, posting_id, company inserted, posting inserted)."""
     company_id, company_new = upsert_company(conn, posting.company, source=posting.source)
-    posting_id = find_posting(conn, company_id, posting, dating)
+    posting_id = find_posting(conn, company_id, posting, dating, ats_key=ats_key)
     if posting_id is not None:
         return company_id, posting_id, company_new, False
     return company_id, create_posting(conn, company_id, posting), company_new, True

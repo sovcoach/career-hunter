@@ -1264,12 +1264,12 @@ def _raising_for(
 ) -> None:
     real = search_store.find_or_create_posting
 
-    def patched(conn: sqlite3.Connection, posting: Posting, dating: object) -> object:
+    def patched(conn: sqlite3.Connection, posting: Posting, dating: object, **kw: Any) -> object:
         if posting.company == who:
             if after_real:
-                real(conn, posting, dating)  # type: ignore[arg-type]
+                real(conn, posting, dating, **kw)  # type: ignore[arg-type]
             raise error
-        return real(conn, posting, dating)  # type: ignore[arg-type]
+        return real(conn, posting, dating, **kw)  # type: ignore[arg-type]
 
     monkeypatch.setattr(search_store, "find_or_create_posting", patched)
 
@@ -1354,11 +1354,13 @@ def test_a_crash_midway_through_a_board_keeps_every_earlier_posting(
     real = search_store.find_or_create_posting
     seen: list[str] = []
 
-    def second_new_job_fails(conn: sqlite3.Connection, posting: Posting, dating: Any) -> Any:
+    def second_new_job_fails(
+        conn: sqlite3.Connection, posting: Posting, dating: Any, **kw: Any
+    ) -> Any:
         seen.append(posting.title)
         if posting.title == "Coordinator 1004":
             raise RuntimeError("synthetic")
-        return real(conn, posting, dating)
+        return real(conn, posting, dating, **kw)
 
     monkeypatch.setattr(search_store, "find_or_create_posting", second_new_job_fails)
     again = Scripted({board("Example B"): jobs_for("Example B", 1001, 1002, 1003, 1004, 1005)})
@@ -1663,10 +1665,10 @@ def test_an_integrity_error_mid_run_still_finishes(
 ) -> None:
     real = search_store.find_or_create_posting
 
-    def conflicts(conn: sqlite3.Connection, posting: Posting, dating: Any) -> Any:
+    def conflicts(conn: sqlite3.Connection, posting: Posting, dating: Any, **kw: Any) -> Any:
         if posting.company == "Example Robotics":
             raise sqlite3.IntegrityError("synthetic")
-        return real(conn, posting, dating)
+        return real(conn, posting, dating, **kw)
 
     def fake(address: str, **_kw: object) -> Fetched:
         if address == url("greenhouse", "examplerobotics"):

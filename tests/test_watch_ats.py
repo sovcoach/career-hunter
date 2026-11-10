@@ -728,6 +728,96 @@ def test_workday_pages_stop_at_the_page_limit(search: sqlite3.Connection, monkey
     ) in lines
 
 
+def _wd_custom(path: str, title: str, where: str) -> dict[str, object]:
+    return {
+        "title": title,
+        "externalPath": path,
+        "locationsText": where,
+        "postedOn": "Posted Today",
+    }
+
+
+def test_a_retitled_and_moved_workday_posting_with_the_same_id_is_the_stored_one(
+    search: sqlite3.Connection,
+) -> None:
+    """The key is the trailing `_<id>`; the title and location slugs are not (#35)."""
+    wd_run(search, workday_board("examplerobotics"))
+    moved = "/job/Example-Town/Senior-Operations-Coordinator_JR00001"
+    again = Posted(
+        routes({f"{WD_BASE}{moved}": wd_info("x", location="Example Town")}),
+        {0: fetched(wd_page([_wd_custom(moved, "Senior Operations Coordinator", "Example Town")]))},
+    )
+    lines = wd_run(search, again)
+    assert again.calls == []  # known by its key: no detail request
+    assert "watch: Example Robotics (workday): 0 new, 1 already recorded" in lines
+    site = "https://examplerobotics.wd5.myworkdayjobs.com/External"
+    assert stored(search) == [
+        ("Operations Coordinator", "Example City", None, f"{site}{wd_path(1)}", None)
+    ]
+    keys = [r[0] for r in search.execute("SELECT ats_key FROM postings")]
+    assert keys == ["workday:examplerobotics:wd5:external:JR00001"]
+
+
+def test_workday_postings_of_one_requisition_with_different_suffixes_stay_apart(
+    search: sqlite3.Connection,
+) -> None:
+    """A -N suffix is kept: JREQ00009-1 and JREQ00009-2 are two postings (#35)."""
+    paths = [f"/job/Example-City/Operations-Coordinator_JREQ00009-{n}" for n in (1, 2)]
+    fetcher = Posted(
+        routes({f"{WD_BASE}{p}": wd_info("x") for p in paths}),  # one jobReqId in both details
+        {
+            0: fetched(
+                wd_page([_wd_custom(p, "Operations Coordinator", "Example City") for p in paths])
+            )
+        },
+    )
+    lines = wd_run(search, fetcher)
+    assert "watch: Example Robotics (workday): 2 new, 0 already recorded" in lines
+    keys = [r[0] for r in search.execute("SELECT ats_key FROM postings ORDER BY id")]
+    assert keys == [
+        "workday:examplerobotics:wd5:external:JREQ00009-1",
+        "workday:examplerobotics:wd5:external:JREQ00009-2",
+    ]
+
+
+def test_a_board_key_held_by_another_company_is_an_identity_conflict(
+    search: sqlite3.Connection,
+) -> None:
+    import pytest
+
+    from careerhunter import search_store
+    from careerhunter.models import Dating, Posting
+
+    wd_run(search, workday_board("examplerobotics"))
+    other, _ = search_store.upsert_company(search, "Sample Logistics", source="watcher")
+    posting = Posting(
+        company="Sample Logistics", title="Clerk", first_seen=DAY, location="", source="watcher"
+    )
+    with pytest.raises(search_store.IdentityConflict, match="board identity"):
+        search_store.find_posting(
+            search,
+            other,
+            posting,
+            Dating(precision="day", day=DAY),
+            ats_key="workday:examplerobotics:wd5:external:JR00001",
+        )
+
+
+def test_a_workday_posting_key_is_the_same_from_discovery_and_from_the_board() -> None:
+    board = ats.Board("workday", "ExampleRobotics", "wd5", "External")
+    ref = "/job/Example-City/Operations-Coordinator_JREQ00009-7"
+    assert ats.posting_key(ats.PostingRef(board, ref)) == (
+        "workday:examplerobotics:wd5:external:JREQ00009-7"
+    )
+    job = ats._workday_job(_wd_custom(ref, "Operations Coordinator", "Example City"), board, None)
+    assert isinstance(job, ats.Job) and job.key == ats.posting_key(ats.PostingRef(board, ref))
+    for path in ("/job/Example-City/Operations-Coordinator", "/job/Example-City/Clerk_JR%2001"):
+        # no usable trailing id: the whole path is the id, as before
+        assert ats.posting_key(ats.PostingRef(board, path)) == (
+            f"workday:examplerobotics:wd5:external:{path}"
+        )
+
+
 def test_workday_paging_stops_at_a_repeated_page(
     search: sqlite3.Connection, monkeypatch: Any
 ) -> None:
