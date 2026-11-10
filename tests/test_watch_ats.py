@@ -488,6 +488,39 @@ def test_an_unknown_bamboohr_company_is_a_bad_reply_and_stores_nothing(
     assert search.execute("SELECT count(*) FROM companies").fetchone()[0] == 0
 
 
+def test_the_watch_command_asks_bamboohr_for_json_and_an_html_200_still_fails(
+    data_env: Any, probe: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    """The Accept header is a hint; the JSON parse is the gate (#35)."""
+    import yaml
+
+    from careerhunter import cli
+
+    assert cli.main(["init"], probe=probe) == 0
+    path = data_env / "config.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["watchlist"] = [BH]
+    path.write_text(yaml.safe_dump(doc))
+    asked: list[tuple[str, object]] = []
+
+    def fake_get(address: str, **kw: object) -> Fetched:
+        asked.append((address, kw.get("accept")))
+        return Fetched(address, 200, "text/html", b"<html>synthetic careers page</html>")
+
+    monkeypatch.setattr(cli, "fetch_url", fake_get)
+    monkeypatch.setattr(cli, "score_posting", lambda *a, **k: None)
+    assert cli.main(["watch"], probe=probe) == 0
+    err = capsys.readouterr().err
+    assert asked == [(BH_LIST, "application/json")]
+    assert "watch: Example Robotics (bamboohr): HTTP 200, invalid JSON; nothing recorded" in err
+    assert "watch: 0 boards fetched, 1 failed, 0 left" in err
+    conn = sqlite3.connect(data_env / "search.db")
+    try:
+        assert conn.execute("SELECT count(*) FROM postings").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_bad_bamboohr_payloads_log_and_store_nothing(search: sqlite3.Connection) -> None:
     for body in ({"meta": {}}, {"result": {"id": "41"}}, [1]):
         lines = w.run(search, [BH], today=DAY, fetcher=Scripted(routes({BH_LIST: body})))
@@ -852,6 +885,7 @@ def test_the_watch_command_posts_workday_lists_under_the_board_cap(
 
     def fake_get(address: str, **kw: object) -> Fetched:
         caps.append(kw.get("max_bytes"))
+        assert kw.get("accept") == "application/json"
         return board(address)
 
     def fake_post(address: str, payload: object, **kw: object) -> Fetched:

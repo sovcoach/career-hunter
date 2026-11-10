@@ -933,6 +933,30 @@ def test_a_get_sends_no_body() -> None:
     assert web.sent == [("GET", None, {"User-Agent": f.USER_AGENT, "Accept": "*/*"})]
 
 
+def test_a_board_api_get_asks_for_json() -> None:
+    web = FakeWeb({"https://jobs.example.com/careers/list": FakeResponse(body=b"{}")})
+    f.fetch(
+        "https://jobs.example.com/careers/list",
+        resolver=resolver({"jobs.example.com": [PUBLIC]}),
+        connector=web.connector,
+        accept=f.JSON,
+    )
+    assert web.sent == [("GET", None, {"User-Agent": f.USER_AGENT, "Accept": "application/json"})]
+
+
+def test_an_html_reply_to_a_json_get_is_returned_as_it_came() -> None:
+    """Asking for JSON gates nothing here: the caller's JSON parse does."""
+    page = FakeResponse(headers={"Content-Type": "text/html"}, body=b"<html>synthetic</html>")
+    web = FakeWeb({"https://jobs.example.com/careers/list": page})
+    got = f.fetch(
+        "https://jobs.example.com/careers/list",
+        resolver=resolver({"jobs.example.com": [PUBLIC]}),
+        connector=web.connector,
+        accept=f.JSON,
+    )
+    assert (got.status, got.content_type, got.body) == (200, "text/html", b"<html>synthetic</html>")
+
+
 def test_a_post_to_a_private_address_is_refused_before_dialling() -> None:
     web = FakeWeb({})
     with pytest.raises(f.FetchRefused, match="private"):

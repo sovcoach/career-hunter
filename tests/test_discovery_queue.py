@@ -283,14 +283,14 @@ def test_the_real_confirmer_asks_through_the_board_capped_fetcher(
     api = "https://boards-api.greenhouse.io/v1/boards/newrobotics"
 
     def fake_get(address: str, **kw: object) -> Fetched:
-        caps.append((kw.get("max_bytes"), kw.get("budget") is not None))
+        caps.append((kw.get("max_bytes"), kw.get("budget") is not None, kw.get("accept")))
         assert address == api
         return fetched({"name": "New Robotics", "content": ""})
 
     monkeypatch.setattr(cli, "fetch_url", fake_get)
     confirm = real_confirmer(Deadline(150))
     assert confirm(Board("greenhouse", "newrobotics")) == Confirmed(True, ("New Robotics",))
-    assert caps == [(ats.BOARD_MAX_BYTES, True)]
+    assert caps == [(ats.BOARD_MAX_BYTES, True, "application/json")]
 
 
 # --- every pass makes progress on new boards -------------------------------------------
