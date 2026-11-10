@@ -20,12 +20,18 @@ socket timeout starts again on every `recv`, so it cannot bound a slow drip on i
 own: the lookup waits only for the time left, each body chunk re-arms the socket
 timeout to the time left, and a watchdog shuts the socket down when the deadline
 passes, which also covers the headers.
+
+A POST (`post_json`, for Workday's job list) goes through the same three steps, the
+same reply cap and the same deadline. Its own body is at most MAX_POST_BYTES. A
+redirect in reply to a POST is not followed: re-sending the body to another address,
+or turning it into a GET, would not be the request that was asked for.
 """
 
 from __future__ import annotations
 
 import http.client
 import ipaddress
+import json
 import socket
 import ssl
 import threading
@@ -52,6 +58,7 @@ from careerhunter.deadline import (
 from careerhunter.deadline import start_timer as _timer
 
 MAX_BYTES = 5 * 1024 * 1024
+MAX_POST_BYTES = 64 * 1024  # the request body of one POST
 MAX_REDIRECTS = 5
 TIMEOUT = 20.0  # one step: the lookup, the connect, the headers, or one chunk of the body
 DEADLINE = 60.0  # the whole call: every redirect hop and the body
@@ -98,7 +105,9 @@ class Response(Protocol):
 
 
 class Connection(Protocol):
-    def request(self, method: str, url: str, *, headers: dict[str, str]) -> None: ...
+    def request(
+        self, method: str, url: str, body: bytes | None = None, *, headers: dict[str, str]
+    ) -> None: ...
 
     def getresponse(self) -> Response: ...
 
@@ -257,8 +266,14 @@ def fetch(
     budget: Deadline | None = None,
     clock: Clock = time.monotonic,
     watchdog: Watchdog | None = None,
+    json_body: bytes | None = None,
 ) -> Fetched:
-    """One GET, within `deadline` seconds, or within `budget` when that ends sooner."""
+    """One GET, within `deadline` seconds, or within `budget` when that ends sooner.
+
+    With `json_body`, one POST of that JSON instead (see `post_json`).
+    """
+    if json_body is not None and len(json_body) > MAX_POST_BYTES:
+        raise FetchRefused("the request body is too large")
     limit = Deadline(deadline, clock).sooner(budget)
     arm = watchdog or _timer
     for _ in range(max_redirects + 1):
@@ -268,11 +283,26 @@ def fetch(
         armed = arm(limit.remaining(), hop.fire)
         try:
             path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
-            conn.request("GET", path, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+            if json_body is None:
+                conn.request("GET", path, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+            else:
+                conn.request(
+                    "POST",
+                    path,
+                    json_body,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(json_body)),
+                    },
+                )
             if hop.fired or limit.expired():
                 raise FetchTimeout(_late(host))
             response = conn.getresponse()
             if response.status in (301, 302, 303, 307, 308):
+                if json_body is not None:
+                    raise FetchFailed("a POST was redirected; not followed")
                 location = response.getheader("Location")
                 if not location:
                     raise FetchFailed("a redirect had no destination")
@@ -318,3 +348,12 @@ def fetch(
         finally:
             hop.close(armed)
     raise FetchFailed(f"more than {max_redirects} redirects")
+
+
+def post_json(url: str, payload: object, **options: Any) -> Fetched:
+    """One POST of `payload` as JSON: pinned, capped and under one deadline like a GET.
+
+    `options` are `fetch`'s keyword arguments. A redirect is not followed.
+    """
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    return fetch(url, json_body=body, **options)

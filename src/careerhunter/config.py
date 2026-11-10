@@ -37,9 +37,11 @@ skips, alerts, or stored scores. embed-eval may rank a blend with it.
 discovery.searxng_url and discovery.career_hosts are optional. A null URL leaves
 discovery off. The URL is plain http to a loopback host, with no userinfo. A career
 host is a hostname only. discovery.interval_minutes is optional. Missing or null
-means 1440 minutes, and a set value is an integer of at least 60. When the URL is
-set, service install uses that interval for the discovery LaunchAgent. Every
-problem is reported in one pass.
+means 1440 minutes, and a set value is an integer of at least 60. Discovery runs
+inside the watch agent, and the interval is the least time between two passes.
+discovery.queries_per_run (1 to 40, default 12) and discovery.query_delay_seconds (2
+to 30, default 5) are optional; together the pauses of one pass are at most 120
+seconds. Every problem is reported in one pass.
 
 schedule.timezone is the only place a time zone is set. It takes an IANA name
 (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); a fixed offset doesn't
@@ -66,8 +68,17 @@ DEFAULT_WATCH_INTERVAL_MINUTES = 60
 MIN_WATCH_INTERVAL_MINUTES = 15
 DEFAULT_DISCOVERY_INTERVAL_MINUTES = 1440
 MIN_DISCOVERY_INTERVAL_MINUTES = 60
+# discovery.queries_per_run: how many queries one pass sends (#40).
+DEFAULT_QUERIES_PER_RUN = 12
+QUERIES_PER_RUN_LIMITS = (1, 40)
+# discovery.query_delay_seconds: the pause between two queries of one pass.
+DEFAULT_QUERY_DELAY_SECONDS = 5
+QUERY_DELAY_LIMITS = (2, 30)
+MAX_PASS_PAUSES = 120
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 DEFAULT_OFF_LANE_MIN_FIT = "high"
+DEFAULT_MAX_POSTING_AGE_DAYS = 7
+MAX_POSTING_AGE_LIMIT = 365
 DEFAULT_MAX_PER_POLL = 10
 MAX_PER_POLL_LIMIT = 50
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -189,7 +200,13 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
     if not isinstance(section, dict):
         problems.append("discovery must be a mapping")
         return
-    extra = set(section) - {"searxng_url", "career_hosts", "interval_minutes"}
+    extra = set(section) - {
+        "searxng_url",
+        "career_hosts",
+        "interval_minutes",
+        "queries_per_run",
+        "query_delay_seconds",
+    }
     if extra:
         problems.append(f"discovery has unknown keys: {sorted(extra)}")
     if "searxng_url" in section:
@@ -198,6 +215,29 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
         _career_hosts(section["career_hosts"], problems)
     if "interval_minutes" in section:
         _discovery_interval(section["interval_minutes"], problems)
+    low, high = QUERIES_PER_RUN_LIMITS
+    if not _int(value := section.get("queries_per_run", DEFAULT_QUERIES_PER_RUN)) or not (
+        low <= value <= high
+    ):
+        problems.append(
+            f"discovery.queries_per_run must be an integer from {low} to {high} "
+            f"(default {DEFAULT_QUERIES_PER_RUN})"
+        )
+    low, high = QUERY_DELAY_LIMITS
+    if not _int(value := section.get("query_delay_seconds", DEFAULT_QUERY_DELAY_SECONDS)) or not (
+        low <= value <= high
+    ):
+        problems.append(
+            f"discovery.query_delay_seconds must be an integer from {low} to {high} "
+            f"(default {DEFAULT_QUERY_DELAY_SECONDS})"
+        )
+    elif discovery_queries_per_run({"discovery": section}) * value > MAX_PASS_PAUSES:
+        # The pauses of one pass must leave time for the queries inside its share of
+        # the watch run (discover.PASS_SECONDS).
+        problems.append(
+            "discovery.queries_per_run times discovery.query_delay_seconds must be at most "
+            f"{MAX_PASS_PAUSES} seconds"
+        )
 
 
 def _discovery_interval(value: Any, problems: list[str]) -> None:
@@ -359,10 +399,15 @@ def _validate_seniority(gates: dict[str, Any], problems: list[str]) -> None:
         problems.append("hard_gates.seniority_in_description must be true or false")
 
 
+_WORKDAY_HOST = re.compile(r"wd[0-9]{1,3}")
+_WORKDAY_SITE = re.compile(r"[A-Za-z0-9_-]+")
+
+
 def _validate_watchlist_item(item: dict[str, Any], where: str, problems: list[str]) -> None:
     ats = item.get("ats_type")
     if ats is not None and ats not in ATS_TYPES:
         problems.append(f"{where}.ats_type must be one of {list(ATS_TYPES)}")
+    _validate_workday_identity(item, where, problems)
     if not isinstance(item.get("agency", False), bool):
         problems.append(f"{where}.agency must be true or false")
     filters = _optional_mapping(item, "role_filters", where, problems)
@@ -374,6 +419,25 @@ def _validate_watchlist_item(item: dict[str, Any], where: str, problems: list[st
         _optional_str_list(filters, "locations", f"{where}.role_filters", problems)
         if "work_models" in filters:
             _work_models(filters["work_models"], f"{where}.role_filters.work_models", problems)
+
+
+def _validate_workday_identity(item: dict[str, Any], where: str, problems: list[str]) -> None:
+    """A Workday board is a tenant (ats_slug) on a wdN host with a site (#35).
+
+    `ats_host` and `ats_site` belong to Workday entries only. A Workday entry without
+    them is valid; the watcher logs and skips it.
+    """
+    for key in ("ats_host", "ats_site"):
+        if key not in item:
+            continue
+        if item.get("ats_type") != "workday":
+            problems.append(f"{where}.{key} is for ats_type workday only")
+            continue
+        value = item[key]
+        pattern = _WORKDAY_HOST if key == "ats_host" else _WORKDAY_SITE
+        if not isinstance(value, str) or pattern.fullmatch(value) is None:
+            shape = "wd and up to three digits" if key == "ats_host" else "one path segment"
+            problems.append(f"{where}.{key} must be {shape}")
 
 
 def _validate_alerts(section: Any, problems: list[str]) -> None:
@@ -428,6 +492,12 @@ def validate_config(doc: Any) -> list[str]:
             _validate_location_rules(rules, problems)
         if "resume" in search:
             _resume_path(search["resume"], problems)
+        age = search.get("max_posting_age_days", DEFAULT_MAX_POSTING_AGE_DAYS)
+        if not _int(age) or not 1 <= age <= MAX_POSTING_AGE_LIMIT:
+            problems.append(
+                f"search.max_posting_age_days must be an integer from 1 to "
+                f"{MAX_POSTING_AGE_LIMIT} (default {DEFAULT_MAX_POSTING_AGE_DAYS})"
+            )
         if search.get("off_lane_min_fit", DEFAULT_OFF_LANE_MIN_FIT) not in FIT_LEVELS:
             problems.append(
                 f"search.off_lane_min_fit must be one of {' | '.join(FIT_LEVELS)} "
@@ -571,6 +641,31 @@ def alerts_max_per_poll(doc: Mapping[str, Any] | None) -> int:
     if _int(value) and 1 <= value <= MAX_PER_POLL_LIMIT:
         return value
     return DEFAULT_MAX_PER_POLL
+
+
+def discovery_queries_per_run(doc: Mapping[str, Any] | None) -> int:
+    """How many queries one discovery pass sends. 12 when it is not set."""
+    section = doc.get("discovery") if isinstance(doc, Mapping) else None
+    value = section.get("queries_per_run") if isinstance(section, Mapping) else None
+    low, high = QUERIES_PER_RUN_LIMITS
+    return value if _int(value) and low <= value <= high else DEFAULT_QUERIES_PER_RUN
+
+
+def discovery_query_delay_seconds(doc: Mapping[str, Any] | None) -> int:
+    """Seconds between two discovery queries. 5 when it is not set."""
+    section = doc.get("discovery") if isinstance(doc, Mapping) else None
+    value = section.get("query_delay_seconds") if isinstance(section, Mapping) else None
+    low, high = QUERY_DELAY_LIMITS
+    return value if _int(value) and low <= value <= high else DEFAULT_QUERY_DELAY_SECONDS
+
+
+def max_posting_age_days(doc: Mapping[str, Any] | None) -> int:
+    """How many days old a posting may be (#36). 7 when it is not set."""
+    search = doc.get("search") if isinstance(doc, Mapping) else None
+    value = search.get("max_posting_age_days") if isinstance(search, Mapping) else None
+    if _int(value) and 1 <= value <= MAX_POSTING_AGE_LIMIT:
+        return value
+    return DEFAULT_MAX_POSTING_AGE_DAYS
 
 
 def off_lane_min_fit(doc: Mapping[str, Any] | None) -> str:

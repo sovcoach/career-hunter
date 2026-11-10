@@ -1234,11 +1234,10 @@ def test_a_discovery_message_is_the_name_and_url_only(env: Env, keep_umask: None
     career = _candidate(env, "jobs.example.com", "https://jobs.example.com/careers", kind="career")
     assert _poll(env) == 0
     sends = _sends(env)
-    assert [item["text"] for item in sends] == [
+    assert [item["text"] for item in sends] == [  # a career page is no longer sent (#41)
         "newrobotics\nhttps://boards.greenhouse.io/newrobotics",
-        "jobs.example.com\nhttps://jobs.example.com/careers",
     ]
-    for params, row_id in zip(sends, (board, career), strict=True):
+    for params, row_id in zip(sends, (board,), strict=True):
         assert _keyboard_labels(params) == ["Approve", "Reject"]
         for row in params["reply_markup"]["inline_keyboard"]:
             for button in row:
@@ -1269,10 +1268,10 @@ def test_a_discovery_message_is_the_name_and_url_only(env: Env, keep_umask: None
         source="discovery",
     )
     conn = env.search()
-    assert search_store.pending_alert_ids(conn) == [watcher]
+    assert search_store.pending_alert_ids(conn) == [watcher, found]  # discovery alerts (#41)
     assert found != watcher
     conn.close()
-    assert noticed == {board: "2026-10-28T16:00:00Z", career: "2026-10-28T16:00:00Z"}
+    assert noticed == {board: "2026-10-28T16:00:00Z", career: None}
     assert env.datadir.config_path.read_bytes() == config_bytes
     assert exclusions.read_bytes() == exclusion_bytes
     assert ei_path.read_bytes() == b"synthetic-ei\n"
@@ -1309,7 +1308,7 @@ def test_telegram_approve_and_reject_follow_the_cli(
     assert _poll(env) == 0
     messages = {params["text"].split("\n", 1)[0]: mid for mid, params in env.api.sent()}
     assert _press_at(env, messages["newrobotics"], "Approve") == "callback:discover_approve"
-    assert _press_at(env, messages["jobs.example.com"], "Approve") == "callback:discover_approve"
+    assert "jobs.example.com" not in messages  # career pages are no longer sent (#41)
     assert _press_at(env, messages["sampletown"], "Reject") == "callback:discover_reject"
     with caplog.at_level(logging.INFO, logger="careerhunter.bot"):
         assert (
@@ -1335,17 +1334,14 @@ def test_telegram_approve_and_reject_follow_the_cli(
     assert companies["newrobotics"]["watchlist"] == 1
     assert companies["newrobotics"]["ats_type"] == "greenhouse"
     assert companies["newrobotics"]["ats_slug"] == "newrobotics"
-    assert companies["jobs.example.com"]["source"] == "discovery"
-    assert companies["jobs.example.com"]["watchlist"] == 0
-    assert companies["jobs.example.com"]["careers_url"] == "https://jobs.example.com/careers"
-    assert companies["jobs.example.com"]["ats_type"] is None
+    assert "jobs.example.com" not in companies
     assert "sampletown" not in companies
     assert companies["exampleorg"]["source"] == "manual"
     assert companies["exampleorg"]["ats_type"] == "greenhouse"
     assert companies["exampleorg"]["ats_slug"] == "exampleorg"
     assert statuses == {
         board: "approved",
-        career: "approved",
+        career: "pending",  # still listed by `discover list`, and approvable there
         rejected: "rejected",
         refused: "pending",
     }
@@ -1379,6 +1375,70 @@ def test_six_pending_rows_are_one_digest(env: Env, keep_umask: None) -> None:
     before = len(_sends(env))
     assert _poll(env) == 0
     assert len(_sends(env)) == before
+
+
+def test_one_rows_tap_in_a_discovery_digest_leaves_the_others_valid(
+    env: Env, keep_umask: None
+) -> None:
+    ids = [
+        _candidate(env, f"board0{i}", f"https://boards.greenhouse.io/board0{i}")
+        for i in range(1, 7)
+    ]
+    assert _poll(env) == 0
+    ((message_id, params),) = [
+        (mid, sent) for mid, sent in env.api.sent() if "reply_markup" in sent
+    ]
+    rows = params["reply_markup"]["inline_keyboard"]
+    tokens = [[button["callback_data"] for button in row] for row in rows]
+    assert len({token for row in tokens for token in row}) == 12  # a token per button
+
+    def tap(token: str) -> str:
+        update = env.callback(token, message_id)
+        # Telegram echoes the message's keyboard as it is now: the first, then each edit.
+        edited = [p for name, p in env.api.calls if name == "editMessageReplyMarkup"]
+        update["callback_query"]["message"]["reply_markup"] = (
+            edited[-1]["reply_markup"] if edited else params["reply_markup"]
+        )
+        return env.bot.handle_safely(update)
+
+    assert tap(tokens[0][0]) == "callback:discover_approve"  # row 1: Approve
+    assert tap(tokens[0][1]) == "callback:rejected"  # row 1's other button is spent
+    assert tap(tokens[1][1]) == "callback:discover_reject"  # row 2 is still live
+    assert tap(tokens[5][0]) == "callback:discover_approve"  # and so is row 6
+    edits = [p for name, p in env.api.calls if name == "editMessageReplyMarkup"]
+    assert len(edits[0]["reply_markup"]["inline_keyboard"]) == 5  # row 1 taken off
+    assert len(edits[-1]["reply_markup"]["inline_keyboard"]) == 3  # rows 3, 4 and 5 left
+    conn = env.search()
+    statuses = {
+        int(row["id"]): row["status"]
+        for row in conn.execute("SELECT id, status FROM discovery_candidates")
+    }
+    conn.close()
+    assert [statuses[i] for i in ids] == [
+        "approved",
+        "rejected",
+        "pending",
+        "pending",
+        "pending",
+        "approved",
+    ]
+
+
+def test_discovery_rows_are_not_sent_while_config_is_unreadable(env: Env, keep_umask: None) -> None:
+    good = env.datadir.config_path.read_bytes()
+    _candidate(env, "board01", "https://boards.greenhouse.io/board01")
+    env.datadir.config_path.write_text("search: [unclosed\n")
+    env.bot.send_pending_discovery()
+    assert _sends(env) == []
+    conn = env.search()
+    assert conn.execute("SELECT notified_at FROM discovery_candidates").fetchone()[0] is None
+    assert search_store.alerts_held_since(conn) is not None
+    conn.close()
+    env.datadir.config_path.write_bytes(good)
+    env.bot.send_pending_discovery()
+    assert [item["text"] for item in _sends(env)] == [
+        "board01\nhttps://boards.greenhouse.io/board01"
+    ]
 
 
 def test_rows_past_the_digest_wait_for_the_next_poll(env: Env, keep_umask: None) -> None:

@@ -71,6 +71,7 @@ class FakeWeb:
         self.routes = routes
         self.dialled: list[tuple[str, str, str, int]] = []
         self.requests: list[tuple[str, str]] = []
+        self.sent: list[tuple[str, bytes | None, dict[str, str]]] = []  # method, body, headers
         self.timeouts: list[float] = []
         self.rearmed: list[float] = []
         self.aborts = 0
@@ -86,8 +87,11 @@ class FakeWeb:
         web = self
 
         class Conn:
-            def request(self, method: str, url: str, *, headers: dict[str, str]) -> None:
+            def request(
+                self, method: str, url: str, body: bytes | None = None, *, headers: dict[str, str]
+            ) -> None:
                 web.requests.append((host, url))
+                web.sent.append((method, body, dict(headers)))
                 self.key = f"{scheme}://{host}{url}"
                 if web.clock is not None:
                     web.clock.advance(web.request_cost)
@@ -897,3 +901,102 @@ def test_a_body_of_unknown_length_ending_after_a_fire_is_a_timeout(dog: ManualWa
 )
 def test_a_complete_body_is_returned_whole(headers: str, body: bytes, expected: bytes) -> None:
     assert fetch_wired(WireResponse(wire(headers, body))).body == expected
+
+
+# POST with a JSON body (#35): the same pinning, caps and deadline as a GET.
+
+
+def test_a_post_sends_its_json_through_the_checked_address() -> None:
+    web = FakeWeb({"https://acme.wd5.example.com/wday/jobs": FakeResponse(body=b'{"ok":1}')})
+    got = f.post_json(
+        "https://acme.wd5.example.com/wday/jobs",
+        {"limit": 20, "offset": 0},
+        resolver=resolver({"acme.wd5.example.com": [PUBLIC]}),
+        connector=web.connector,
+    )
+    assert got.status == 200 and got.body == b'{"ok":1}'
+    assert web.dialled == [("https", "acme.wd5.example.com", PUBLIC, 443)]
+    method, body, headers = web.sent[0]
+    assert method == "POST"
+    assert body == b'{"limit":20,"offset":0}'
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Content-Length"] == str(len(body))
+
+
+def test_a_get_sends_no_body() -> None:
+    web = FakeWeb({"https://jobs.example.com/": FakeResponse()})
+    f.fetch(
+        "https://jobs.example.com/",
+        resolver=resolver({"jobs.example.com": [PUBLIC]}),
+        connector=web.connector,
+    )
+    assert web.sent == [("GET", None, {"User-Agent": f.USER_AGENT, "Accept": "*/*"})]
+
+
+def test_a_post_to_a_private_address_is_refused_before_dialling() -> None:
+    web = FakeWeb({})
+    with pytest.raises(f.FetchRefused, match="private"):
+        f.post_json(
+            "https://inside.example.org/jobs",
+            {},
+            resolver=resolver({"inside.example.org": ["10.0.0.5"]}),
+            connector=web.connector,
+        )
+    assert web.dialled == []
+
+
+def test_a_post_reply_is_capped() -> None:
+    big = FakeResponse(body=b"x" * 2048, step=512)
+    web = FakeWeb({"https://jobs.example.com/list": big})
+    with pytest.raises(f.FetchTooLarge):
+        f.post_json(
+            "https://jobs.example.com/list",
+            {},
+            resolver=resolver({"jobs.example.com": [PUBLIC]}),
+            connector=web.connector,
+            max_bytes=1024,
+        )
+    assert big.reads == 3
+
+
+def test_a_post_shares_the_total_deadline() -> None:
+    clock = FakeClock()
+    drip = FakeResponse(body=b"x" * 1000, step=1, clock=clock, cost=1.0)
+    web = FakeWeb({"https://jobs.example.com/list": drip})
+    with pytest.raises(f.FetchTimeout):
+        f.post_json(
+            "https://jobs.example.com/list",
+            {},
+            resolver=resolver({"jobs.example.com": [PUBLIC]}),
+            connector=web.connector,
+            clock=clock,
+            deadline=10.0,
+        )
+    assert drip.reads == 10
+
+
+def test_a_redirected_post_is_not_followed() -> None:
+    web = FakeWeb(
+        {
+            "https://jobs.example.com/list": FakeResponse(
+                307, {"Location": "https://cdn.example.net/x"}
+            )
+        }
+    )
+    resolve = resolver({"jobs.example.com": [PUBLIC], "cdn.example.net": ["93.184.216.35"]})
+    with pytest.raises(f.FetchFailed, match="POST was redirected"):
+        f.post_json("https://jobs.example.com/list", {}, resolver=resolve, connector=web.connector)
+    assert resolve.calls == ["jobs.example.com"]
+    assert len(web.dialled) == 1
+
+
+def test_a_request_body_over_its_cap_is_refused_without_a_lookup() -> None:
+    resolve = resolver({"jobs.example.com": [PUBLIC]})
+    with pytest.raises(f.FetchRefused, match="request body"):
+        f.post_json(
+            "https://jobs.example.com/list",
+            {"searchText": "x" * f.MAX_POST_BYTES},
+            resolver=resolve,
+            connector=FakeWeb({}).connector,
+        )
+    assert resolve.calls == []

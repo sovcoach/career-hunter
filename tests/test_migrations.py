@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], "ei_record": [1]}[track]
+    expected = {"search": list(range(1, 16)), "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -574,8 +574,250 @@ def test_0011_leaves_existing_postings_without_requirements_or_a_run(tmp_path: P
             "VALUES (?, 'Coordinator', '2026-10-01', 'watcher', '{}', 'high')",
             (company,),
         )
-        assert db.migrate(conn, "search") == [11]
+        assert db.migrate(conn, "search", db.load_migrations("search")[:11]) == [11]
         row = conn.execute("SELECT title, fit, key_requirements, score_run_id FROM postings")
         assert tuple(row.fetchone()) == ("Coordinator", "high", None, None)
+    finally:
+        conn.close()
+
+
+def _at_eleven_with_discovery_rows(path: Path) -> sqlite3.Connection:
+    """A schema-11 file with a board, a career page and a posting tied to a company."""
+    conn = db.connect(path)
+    assert db.migrate(conn, "search", db.load_migrations("search")[:11]) == list(range(1, 12))
+    company = conn.execute(
+        "INSERT INTO companies (name, ats_type, ats_slug, source) "
+        "VALUES ('Example Widgets', 'workday', 'examplewidgets', 'watcher')"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO postings (company_id, title, first_seen, source) "
+        "VALUES (?, 'Coordinator', '2026-10-01', 'watcher')",
+        (company,),
+    )
+    conn.execute(
+        "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, suggested_name, "
+        "status, first_seen, notified_at) VALUES ('board', 'https://jobs.lever.co/examplecorp', "
+        "'lever', 'examplecorp', 'examplecorp', 'pending', '2026-10-02', '2026-10-02T09:00:00Z')"
+    )
+    conn.execute(
+        "INSERT INTO discovery_candidates (kind, url, suggested_name, status, first_seen) "
+        "VALUES ('career', 'https://careers.example.org/', 'careers.example.org', "
+        "'rejected', '2026-10-03')"
+    )
+    return conn
+
+
+def test_0012_rebuilds_the_discovery_queue_and_keeps_every_row(tmp_path: Path) -> None:
+    conn = _at_eleven_with_discovery_rows(tmp_path / "search.db")
+    try:
+        before = [tuple(r) for r in conn.execute("SELECT * FROM discovery_candidates ORDER BY id")]
+        assert db.migrate(conn, "search", db.load_migrations("search")[:12]) == [12]
+        after = conn.execute(
+            "SELECT id, kind, url, ats_type, ats_slug, suggested_name, status, first_seen, "
+            "created_at, notified_at, ats_host, ats_site FROM discovery_candidates ORDER BY id"
+        )
+        assert [tuple(r) for r in after] == [(*row, None, None) for row in before]
+        indexes = {
+            str(r[0])
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'discovery_candidates' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        assert indexes == {"ux_discovery_board", "ux_discovery_career_url"}
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'discovery_candidates_new'"
+            ).fetchone()[0]
+            == 0
+        )
+        company = conn.execute("SELECT ats_type, ats_host, ats_site FROM companies").fetchone()
+        assert tuple(company) == ("workday", None, None)
+    finally:
+        conn.close()
+
+
+def test_0012_leaves_foreign_keys_enforced_and_consistent(tmp_path: Path) -> None:
+    conn = _at_eleven_with_discovery_rows(tmp_path / "search.db")
+    try:
+        assert db.migrate(conn, "search", db.load_migrations("search")[:12]) == [12]
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            conn.execute(
+                "INSERT INTO postings (company_id, title, first_seen, source) "
+                "VALUES (999, 'Orphan', '2026-10-01', 'watcher')"
+            )
+    finally:
+        conn.close()
+    reopened = db.connect(tmp_path / "search.db")
+    try:
+        assert reopened.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        reopened.close()
+
+
+def test_0012_queues_the_new_ats_types_and_a_gone_board(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:12])
+        for ats, host, site in (
+            ("smartrecruiters", None, None),
+            ("bamboohr", None, None),
+            ("workday", "wd5", "External"),
+        ):
+            conn.execute(
+                "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, ats_host, "
+                "ats_site, suggested_name, status, first_seen) "
+                "VALUES ('board', 'https://example.test/', ?, 'examplecorp', ?, ?, "
+                "'examplecorp', 'gone', '2026-10-02')",
+                (ats, host, site),
+            )
+        assert conn.execute("SELECT count(*) FROM discovery_candidates").fetchone()[0] == 3
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("cols", "why"),
+    [
+        ({"ats_type": "workday"}, "a Workday board needs its host and site"),
+        ({"ats_type": "workday", "ats_host": "wd5"}, "a Workday board needs its site"),
+        ({"ats_type": "workday", "ats_host": "wdx", "ats_site": "S"}, "the host is wd and digits"),
+        ({"ats_type": "workday", "ats_host": "wd5x", "ats_site": "S"}, "digits only after wd"),
+        ({"ats_type": "lever", "ats_host": "wd5"}, "only Workday has a host"),
+        ({"ats_type": "lever", "ats_site": "S"}, "only Workday has a site"),
+        ({"ats_type": "icims"}, "not a board the watcher reads"),
+        ({"kind": "career", "ats_type": None, "status": "gone"}, "a career page is never gone"),
+        ({"status": "lost"}, "not a status"),
+    ],
+)
+def test_0012_discovery_rows_are_checked(tmp_path: Path, cols: dict[str, object], why: str) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:12])
+        row: dict[str, object] = {
+            "kind": "board",
+            "url": "https://example.test/",
+            "ats_type": "lever",
+            "ats_slug": "examplecorp",
+            "ats_host": None,
+            "ats_site": None,
+            "suggested_name": "examplecorp",
+            "status": "pending",
+            "first_seen": "2026-10-02",
+        }
+        row.update(cols)
+        if row["kind"] == "career":
+            row["ats_slug"] = None
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, ats_host, "
+                "ats_site, suggested_name, status, first_seen) VALUES (:kind, :url, :ats_type, "
+                ":ats_slug, :ats_host, :ats_site, :suggested_name, :status, :first_seen)",
+                row,
+            )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("ats", "host", "site", "ok"),
+    [
+        ("workday", "wd5", "External", True),
+        ("workday", "wd12", "Careers_Site", True),
+        ("workday", None, None, True),  # stored before 0012, or not filled in yet
+        ("workday", "wd", "External", False),
+        ("workday", None, "External", False),
+        ("greenhouse", "wd5", None, False),
+        ("greenhouse", None, "External", False),
+        ("workday", "wd5", " ", False),
+    ],
+)
+def test_0012_company_workday_identity_is_checked(
+    tmp_path: Path, ats: str, host: str | None, site: str | None, ok: bool
+) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:12])
+        insert = (
+            "INSERT INTO companies (name, ats_type, ats_slug, ats_host, ats_site, source) "
+            "VALUES ('Example Widgets', ?, 'examplewidgets', ?, ?, 'watcher')"
+        )
+        if ok:
+            conn.execute(insert, (ats, host, site))
+        else:
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(insert, (ats, host, site))
+    finally:
+        conn.close()
+
+
+def test_0013_leaves_existing_postings_without_a_posted_date(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:12])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (?, 'Coordinator', '2026-10-01', 'watcher')",
+            (company,),
+        )
+        assert db.migrate(conn, "search", db.load_migrations("search")[:13]) == [13]
+        assert conn.execute("SELECT posted_date FROM postings").fetchone()[0] is None
+        conn.execute("UPDATE postings SET posted_date = '2026-10-30'")
+        for bad in ("2026-10-30T10:00:00Z", "2026-13-01", "yesterday"):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute("UPDATE postings SET posted_date = ?", (bad,))
+    finally:
+        conn.close()
+
+
+def test_0014_starts_discovery_at_the_first_query_with_no_backoff(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:14])
+        row = conn.execute("SELECT * FROM discovery_state").fetchall()
+        assert [tuple(r) for r in row] == [(1, 0, None, 0, None)]
+        for sql in (
+            "INSERT INTO discovery_state (id) VALUES (2)",
+            "UPDATE discovery_state SET cursor = -1",
+            "UPDATE discovery_state SET failures = 1",  # a failure needs its backoff time
+            "UPDATE discovery_state SET backoff_until = '2026-11-01T00:00:00Z'",
+            "UPDATE discovery_state SET last_pass_at = '2026-11-01'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(sql)
+    finally:
+        conn.close()
+
+
+def test_0015_keeps_one_posting_per_ats_key(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:15])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        for title in ("One", "Two"):
+            conn.execute(
+                "INSERT INTO postings (company_id, title, first_seen, source) "
+                "VALUES (?, ?, '2026-10-30', 'watcher')",
+                (company, title),
+            )
+        assert (
+            conn.execute("SELECT count(*) FROM postings WHERE ats_key IS NULL").fetchone()[0] == 2
+        )
+        conn.execute(
+            "UPDATE postings SET ats_key = 'greenhouse:examplewidgets:1' WHERE title = 'One'"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE postings SET ats_key = 'greenhouse:examplewidgets:1' WHERE title = 'Two'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE postings SET ats_key = '' WHERE title = 'Two'")
     finally:
         conn.close()

@@ -38,6 +38,9 @@ search:
   off_lane_min_fit: high
   # Optional: where each work model is acceptable. With no work model from the board,
   # a location saying "remote" counts as remote and anything else as on-site.
+  # Optional. Postings older than this many days (by the board's posted date, or
+  # the day first seen when the board gives none) are skipped as too_old. 1 to 365.
+  max_posting_age_days: 7
   location_rules:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here
     remote: [Canada]                    # fully remote only within these regions
@@ -102,9 +105,12 @@ schedule_limits:
   weekend_days_per_month: 2
   over_limit: flag
 
-# Companies to watch directly. `careerhunter watch` fetches greenhouse, lever and
-# ashby from ats_slug (one path segment) and ignores careers_url. Other ats_type
-# values are kept here and not fetched yet. ats_type is one of:
+# Companies to watch directly. `careerhunter watch` fetches greenhouse, lever,
+# ashby, smartrecruiters and bamboohr from ats_slug (one path segment; for bamboohr,
+# the company's subdomain) and ignores careers_url. A workday board also needs its
+# host and site: ats_slug is the tenant, ats_host the wdN host and ats_site the site,
+# as in https://<tenant>.<wdN>.myworkdayjobs.com/<site>. Other ats_type values are
+# kept here and not fetched. ats_type is one of:
 # greenhouse, lever, ashby, workday, successfactors, icims, taleo, smartrecruiters,
 # jobvite, bamboohr, other
 watchlist:
@@ -119,18 +125,29 @@ watchlist:
     role_filters:              # optional: only these roles at this company
       role_families: [support, operations]
       work_models: [remote, hybrid]
+  # A Workday board, for example:
+  # - name: Example Freight
+  #   ats_type: workday
+  #   ats_slug: examplefreight   # the tenant
+  #   ats_host: wd5
+  #   ats_site: External
   - name: Example Staffing
     agency: true               # optional: a staffing agency, labelled as such
 
 # Optional discovery settings (ADR-020). A null URL leaves discovery off.
 # A set URL is plain http to 127.0.0.1, localhost, or ::1, with no userinfo.
-# career_hosts lists extra career-page hostnames: no scheme, path, wildcard, or "..".
-# interval_minutes is optional. Missing or null means 1440, and the minimum is 60.
-# When the URL is set, service install runs careerhunter discover on this interval.
+# career_hosts lists extra hostnames to search with site:, no scheme, path,
+# wildcard, or "..". Career pages are not queued.
+# Discovery runs inside the watch agent, at most once per interval_minutes
+# (missing or null means 1440; the minimum is 60). Each pass sends the next
+# queries_per_run queries (1 to 40), query_delay_seconds apart (2 to 30); the
+# two multiplied are at most 120 seconds.
 discovery:
   searxng_url: null
   career_hosts: []
   interval_minutes: 1440
+  queries_per_run: 12
+  query_delay_seconds: 5
 
 # EI claims. career-hunter keeps one EI job-search record file per claim,
 # ei_record_<label>.db. Set the active claim here: it is never worked out for you.

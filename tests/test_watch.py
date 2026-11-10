@@ -80,6 +80,7 @@ def one_greenhouse(
                 "absolute_url": f"https://boards.greenhouse.io/{slug}/jobs/{ident}",
                 "location": {"name": "Example City"},
                 "requisition_id": f"REQ-{ident}",
+                "first_published": "2026-10-30T09:00:00-04:00",
             }
         ]
     }
@@ -302,6 +303,7 @@ def test_lever_board_normalizes_including_a_missing_work_model(
             "text": "Warehouse Clerk",
             "categories": {"location": "Example City", "team": "Ops"},
             "hostedUrl": "https://jobs.lever.co/samplelogistics/abc-123",
+            "createdAt": 1793361600000,
             "workplaceType": "hybrid",
         },
         {
@@ -378,6 +380,7 @@ def test_ashby_work_model_prefers_workplace_type(
                 "isRemote": True,
                 "workplaceType": "Hybrid",
                 "jobUrl": "https://jobs.ashbyhq.com/exampleorg/uuid-1",
+                "publishedAt": "2026-10-30T16:21:55.393+00:00",
             },
             {"id": "uuid-2", "title": "Remote Only", "location": "Example City", "isRemote": True},
             {"id": "uuid-3", "title": "Office Role", "isRemote": False, "workplaceType": "OnSite"},
@@ -465,6 +468,7 @@ def test_one_board_failing_does_not_stop_the_run(
                             "id": "uuid-1",
                             "title": "Operations Coordinator",
                             "jobUrl": "https://jobs.ashbyhq.com/exampleorg/uuid-1",
+                            "publishedAt": "2026-10-30T16:21:55.393+00:00",
                         }
                     ]
                 }
@@ -516,6 +520,7 @@ def test_a_429_records_retry_after_and_does_not_parse_the_body(
                         "id": "abc-123",
                         "text": "Warehouse Clerk",
                         "hostedUrl": "https://jobs.lever.co/samplelogistics/abc-123",
+                        "createdAt": 1793361600000,
                     }
                 ]
             ),
@@ -889,7 +894,7 @@ def test_unfetched_entries_make_no_request(search: sqlite3.Connection, datadir: 
     assert fetcher.calls == []
     assert companies(search) == []
     assert lines == [
-        "watch: Workday Example (workday): not fetched yet; skipped",
+        "watch: Workday Example (workday): no ats_host or ats_site; skipped",
         "watch: Icims Example (icims): not a board this command fetches; skipped",
         "watch: No Type: no ats_type; skipped",
         "watch: Numeric Type: no ats_type; skipped",
@@ -943,6 +948,7 @@ def test_watch_command_records_the_example_boards_without_a_socket(
                         "id": "abc-123",
                         "text": "Operations Coordinator",
                         "hostedUrl": "https://jobs.lever.co/samplelogistics/abc-123",
+                        "createdAt": 1793361600000,
                         "categories": {"location": "Canada"},
                         "workplaceType": "remote",
                     }
@@ -1146,9 +1152,8 @@ def test_watch_fetches_an_approved_discovery_board_only(
         int(row["id"])
         for row in search.execute("SELECT id FROM postings WHERE source = 'discovery'")
     ]
-    assert alerted == watcher_ids
     assert discovery_ids
-    assert not set(discovery_ids) & set(alerted)
+    assert alerted == watcher_ids + discovery_ids  # discovery postings alert too (#41)
     career_row = search.execute(
         "SELECT watchlist, source, careers_url FROM companies WHERE name = ?",
         ("jobs.example.com",),
@@ -1535,6 +1540,7 @@ def _lever_board() -> Fetched:
                 "id": "abc-123",
                 "text": "Operations Coordinator",
                 "hostedUrl": "https://jobs.lever.co/samplelogistics/abc-123",
+                "createdAt": 1793361600000,
                 "categories": {"location": "Example City"},
                 "workplaceType": "remote",
             }

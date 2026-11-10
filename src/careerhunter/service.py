@@ -9,9 +9,9 @@ Keychain, which needs the logged-in user's session.
   not a loop.
 - The watch agent runs `careerhunter watch` once per
   `schedule.watcher_interval_minutes` and exits. It has no `KeepAlive`.
-- The discovery agent runs `careerhunter discover` once per
-  `discovery.interval_minutes` and exits. It has no `KeepAlive`. Install adds it
-  only when `discovery.searxng_url` is set.
+- Discovery runs inside the watch agent (#40). The separate discovery agent of
+  earlier versions (`org.careerhunter.discover`) is retired: `retire_discovery_agent`
+  boots it out and removes its plist, and `careerhunter service install` calls it.
 - launchd's own stdout and stderr go to /dev/null. Each command writes its own log,
   into the data folder's logs/, only after the storage guard has passed, so launchd
   never creates a log file under /Volumes while the drive is missing.
@@ -30,15 +30,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from careerhunter.config import (
-    DEFAULT_WATCH_INTERVAL_MINUTES,
-    MIN_DISCOVERY_INTERVAL_MINUTES,
-    MIN_WATCH_INTERVAL_MINUTES,
-)
+from careerhunter.config import DEFAULT_WATCH_INTERVAL_MINUTES, MIN_WATCH_INTERVAL_MINUTES
 
 LABEL = "org.careerhunter.bot"
 WATCH_LABEL = "org.careerhunter.watch"
-DISCOVER_LABEL = "org.careerhunter.discover"
+DISCOVER_LABEL = "org.careerhunter.discover"  # retired; only ever removed now
 Runner = Callable[[list[str]], tuple[int, str]]
 
 
@@ -136,19 +132,6 @@ def watch_plist(program_path: Path, data_dir: Path, minutes: int) -> bytes:
     )
 
 
-def discover_plist(program_path: Path, data_dir: Path, minutes: int) -> bytes:
-    """One discovery search per interval. No KeepAlive."""
-    return _interval_plist(
-        DISCOVER_LABEL,
-        program_path,
-        data_dir,
-        "discover",
-        minutes,
-        minimum=MIN_DISCOVERY_INTERVAL_MINUTES,
-        field="discovery_interval_minutes",
-    )
-
-
 def _domain() -> str:
     return f"gui/{os.getuid()}"
 
@@ -206,14 +189,8 @@ def install(
     runner: Runner | None = None,
     home: Path | None = None,
     watch_interval_minutes: int = DEFAULT_WATCH_INTERVAL_MINUTES,
-    discovery_interval_minutes: int | None = None,
 ) -> list[Path]:
-    """Install whichever requested agent is missing.
-
-    ``discovery_interval_minutes`` None does not install the discovery agent.
-    A set value installs that agent even when the bot and watch plists already
-    exist, and does not bootstrap those two again.
-    """
+    """Install whichever of the bot and watch agents is missing."""
     runner = runner or run_launchctl
     binary = program_path or program()
     # Build every body before writing so a bad interval leaves nothing new behind.
@@ -221,13 +198,6 @@ def install(
         (plist_path(home), plist(binary, data_dir)),
         (watch_plist_path(home), watch_plist(binary, data_dir, watch_interval_minutes)),
     ]
-    if discovery_interval_minutes is not None:
-        planned.append(
-            (
-                discover_plist_path(home),
-                discover_plist(binary, data_dir, discovery_interval_minutes),
-            )
-        )
     missing = [(path, body) for path, body in planned if not path.exists()]
     if not missing:
         names = " and ".join(path.name for path, _body in planned)
@@ -237,6 +207,21 @@ def install(
         _install_one(path, body, runner)
         made.append(path)
     return made
+
+
+def retire_discovery_agent(runner: Runner | None = None, home: Path | None = None) -> Path | None:
+    """Boot out and remove the separate discovery agent of earlier versions, if any.
+
+    Returns the plist removed, or None when there was none. A bootout that fails (the
+    agent was not loaded) still removes the plist, so launchd never loads it again.
+    """
+    runner = runner or run_launchctl
+    path = discover_plist_path(home)
+    if not path.exists():
+        return None
+    runner(["bootout", f"{_domain()}/{DISCOVER_LABEL}"])
+    path.unlink()
+    return path
 
 
 def uninstall(runner: Runner | None = None, home: Path | None = None) -> bool:

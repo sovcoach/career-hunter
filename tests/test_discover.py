@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import http.client
 import inspect
 import json
@@ -12,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from careerhunter import cli, db, discover, loopback, search_store
+from careerhunter import ats, cli, db, discover, loopback, search_store
 from careerhunter.platform_checks import SystemProbe
 from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
 from tests.test_score import BROKEN, broken_connection
@@ -80,23 +81,87 @@ def inited(data_env: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str
     return data_env
 
 
-def test_queries_stop_at_twelve_and_use_the_first_title_variant() -> None:
+HOSTS = (
+    "greenhouse.io",
+    "jobs.lever.co",
+    "jobs.ashbyhq.com",
+    "jobs.smartrecruiters.com",
+    "bamboohr.com",
+    "myworkdayjobs.com",
+)
+
+
+def test_queries_walk_every_title_variant_place_and_host_in_order() -> None:
     config = {
         "search": {
-            "lanes": [{"titles": ["One", ["Alpha", "Beta"], "Three", "Four"]}],
-            "locations": ["Example City", "Sample Town"],
+            "lanes": [
+                {"name": "B", "priority": 2, "titles": ["Three"]},
+                {"name": "A", "priority": 1, "titles": ["One", ["Alpha", "Beta"], "one"]},
+            ],
+            "location_rules": {"onsite_hybrid": ["Example City"], "remote": ["Example Region"]},
+            "locations": ["Unused Town"],
         },
         "discovery": {"career_hosts": ["jobs.example.com"]},
     }
     queries = discover.build_queries(config)
-    assert len(queries) == 12
-    assert queries[0] == "site:boards.greenhouse.io One Example City"
-    assert any("Alpha" in query for query in queries)
-    assert "Beta" not in "\n".join(queries)
+    hosts = [*HOSTS, "jobs.example.com"]
+    expected = [
+        f"site:{host} {title} {place}"
+        for title in ("One", "Alpha", "Beta", "Three")  # lane priority, every variant, once
+        for place in ("Example City", "Example Region")
+        for host in hosts
+    ]
+    assert queries == expected
+    assert not any("Unused Town" in query for query in queries)
     assert discover.build_queries({"search": {}}) == []
     bare = discover.build_queries({"search": {"target_titles": ["One"]}})
-    assert bare[0] == "site:boards.greenhouse.io One"
-    assert len(bare) == 4
+    assert bare == [f"site:{host} One" for host in HOSTS]
+
+
+def test_the_cursor_takes_the_next_slice_and_wraps() -> None:
+    queries = [f"q{n}" for n in range(5)]
+    assert discover.take(queries, 0, 2) == (["q0", "q1"], 2)
+    assert discover.take(queries, 4, 2) == (["q4", "q0"], 1)
+    assert discover.take(queries, 3, 12) == (["q3", "q4", "q0", "q1", "q2"], 3)  # once each
+    assert discover.take(queries, 17, 1) == (["q2"], 3)  # the list got shorter: wrap first
+    assert discover.take([], 3, 2) == ([], 0)
+
+
+def test_the_cursor_covers_every_query_across_runs_and_wraps(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    config = {
+        "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "queries_per_run": 4},
+        "search": {
+            "target_titles": ["One", "Two"],
+            "location_rules": {"onsite_hybrid": ["Example City"]},
+        },
+    }
+    every = discover.build_queries(config)
+    assert len(every) == 12
+    asked: list[str] = []
+    for _run in range(4):
+        talk = _Talk(json.dumps({"results": []}).encode())
+        assert discover.run(conn, config, today="2026-11-02", transport=talk).notice is None
+        asked += [urllib.parse.parse_qs(urllib.parse.urlsplit(c).query)["q"][0] for c in talk.calls]
+    assert asked[:12] == every  # three runs cover every combination once
+    assert asked[12:] == every[:4]  # then it wraps
+    conn.close()
+
+
+def test_a_miss_leaves_the_cursor_where_it_was(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    config = {**_SEARCH, "discovery": {**_SEARCH["discovery"], "queries_per_run": 2}}
+    ok = _Talk(json.dumps({"results": []}).encode())
+    discover.run(conn, config, today="2026-11-02", transport=ok)
+    discover.run(conn, config, today="2026-11-02", transport=_Talk(b"", status=0, fail_at=2))
+    assert conn.execute("SELECT cursor FROM discovery_state").fetchone()[0] == 2
+    _clear_backoff(conn)
+    again = _Talk(json.dumps({"results": []}).encode())
+    discover.run(conn, config, today="2026-11-02", transport=again)
+    first = [c for c in ok.calls]
+    assert again.calls[0] != first[0]  # it moved on after the first run
+    assert conn.execute("SELECT cursor FROM discovery_state").fetchone()[0] == 4
+    conn.close()
 
 
 def test_no_titles_makes_no_request(tmp_path: Path) -> None:
@@ -170,13 +235,16 @@ def test_a_miss_writes_nothing(tmp_path: Path) -> None:
     outcome = discover.run(conn, config, today="2026-11-02", transport=down)
     assert outcome.notice == discover.MISS
     assert outcome.rows == ()
+    _clear_backoff(conn)
     bad = _Talk(b"<html>", status=200)
     outcome = discover.run(conn, config, today="2026-11-02", transport=bad)
     assert outcome.notice == discover.MISS
+    _clear_backoff(conn)
     partial = _Talk(_body(["https://jobs.lever.co/freshlogistics/post-1"]), fail_at=3, status=500)
     outcome = discover.run(conn, config, today="2026-11-02", transport=partial)
     assert outcome.notice == discover.MISS
     assert partial.calls
+    _clear_backoff(conn)
     huge = _Talk(b"x" * (discover.MAX_BODY + 1))
     outcome = discover.run(conn, config, today="2026-11-02", transport=huge)
     assert outcome.notice == discover.MISS
@@ -205,8 +273,7 @@ def test_the_command_queues_reduced_urls_and_drops_the_snippet(
         "1 board newrobotics greenhouse newrobotics",
         "2 board freshlogistics lever freshlogistics",
         "3 board exampleorg ashby exampleorg",
-        "4 career jobs.example.com - https://jobs.example.com/careers",
-    ]
+    ]  # a career page is not queued (#41); its host is only a site: host
     assert len(talk.calls) == 12
     assert all("format=json" in call for call in talk.calls)
     asked = [
@@ -232,6 +299,8 @@ def test_the_command_queues_reduced_urls_and_drops_the_snippet(
     assert postings is not None and postings[0] == 0
     assert list(inited.glob("ei_record_*.db")) == []
     assert not (inited / "logs" / "watch.success").exists()
+    later = dt.datetime(2026, 11, 2, 10, tzinfo=dt.UTC)  # past the last pass's claim
+    monkeypatch.setattr(discover, "_utc_now", lambda: later)
     assert cli.main(["discover"], probe=probe) == 0
     again = capsys.readouterr()
     assert again.out == ""
@@ -592,10 +661,12 @@ def test_approve_and_reject_leave_config_and_the_ei_file_alone(
     assert pending is not None and pending[0] == 1
 
 
-def test_the_alert_query_stays_on_watcher_postings(search: sqlite3.Connection) -> None:
+def test_the_alert_query_takes_watcher_and_discovery_postings_only(
+    search: sqlite3.Connection,
+) -> None:
+    """Discovery postings alert directly (#41); a posting logged by hand never does."""
     text = inspect.getsource(search_store.pending_alerts)
-    assert "p.source = 'watcher'" in text
-    assert "discovery" not in text
+    assert "p.source IN ('watcher', 'discovery')" in text
     watcher, _inserted = search_store.upsert_company(search, "Example Robotics", source="watcher")
     other, _also = search_store.upsert_company(search, "Example Org", source="discovery")
     search.execute(
@@ -610,7 +681,13 @@ def test_the_alert_query_stays_on_watcher_postings(search: sqlite3.Connection) -
         "'high')",
         (other,),
     )
-    assert search_store.pending_alert_ids(search) == [watcher_id]
+    found_id = int(search.execute("SELECT last_insert_rowid()").fetchone()[0])
+    search.execute(
+        "INSERT INTO postings (company_id, title, first_seen, source, llm_output, fit) "
+        "VALUES (?, 'Logged By Hand', '2026-11-02', 'manual', 'synthetic', 'high')",
+        (other,),
+    )
+    assert search_store.pending_alert_ids(search) == [watcher_id, found_id]
 
 
 def test_the_queue_has_no_snippet_column(tmp_path: Path) -> None:
@@ -639,6 +716,14 @@ _SEARCH = {
     "search": {"target_titles": ["One"], "locations": ["Example City"]},
 }
 _GOOD = "https://job-boards.greenhouse.io/newrobotics/jobs/42"
+
+
+def _exists(board: object) -> ats.Confirmed:
+    return ats.Confirmed(True)
+
+
+def _clear_backoff(conn: sqlite3.Connection) -> None:
+    conn.execute("UPDATE discovery_state SET failures = 0, backoff_until = NULL")
 
 
 def _rows(conn: sqlite3.Connection) -> int:
@@ -695,7 +780,9 @@ def test_a_reply_of_the_wrong_shape_is_a_miss_that_stores_nothing(
 def test_a_result_without_a_url_is_skipped_and_the_good_one_kept(tmp_path: Path) -> None:
     body = json.dumps({"results": [{"url": _GOOD}, {"title": "t"}]}).encode()
     conn = _search_db(tmp_path)
-    outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=_Talk(body))
+    outcome = discover.run(
+        conn, _SEARCH, today="2026-11-02", transport=_Talk(body), confirm=_exists
+    )
     assert outcome.notice is None
     assert [row.url for row in outcome.rows] == ["https://boards.greenhouse.io/newrobotics"]
     assert _rows(conn) == 1
@@ -707,7 +794,7 @@ def test_an_empty_result_list_is_a_normal_reply(tmp_path: Path) -> None:
     talk = _Talk(json.dumps({"results": []}).encode())
     outcome = discover.run(conn, _SEARCH, today="2026-11-02", transport=talk)
     assert outcome == discover.Outcome(None, ())
-    assert len(talk.calls) == 4  # every query was sent; none was a miss
+    assert len(talk.calls) == 6  # every query was sent; none was a miss
     conn.close()
 
 
@@ -912,3 +999,362 @@ def test_list_without_its_files_exits_1_and_writes_no_log(
     assert cli.main(["discover", "list"], probe=probe) == cli.EXIT_ERROR
     assert capsys.readouterr().err == err
     assert not (inited / "logs" / "discover.log").exists()
+
+
+@pytest.mark.parametrize(
+    ("address", "ats", "slug", "board_url"),
+    [
+        (
+            "https://jobs.smartrecruiters.com/ExampleRobotics/744000000000001-operations-lead",
+            "smartrecruiters",
+            "ExampleRobotics",
+            "https://jobs.smartrecruiters.com/ExampleRobotics",
+        ),
+        (
+            "https://careers.smartrecruiters.com/ExampleRobotics",
+            "smartrecruiters",
+            "ExampleRobotics",
+            "https://jobs.smartrecruiters.com/ExampleRobotics",
+        ),
+        (
+            "https://examplerobotics.bamboohr.com/careers/41",
+            "bamboohr",
+            "examplerobotics",
+            "https://examplerobotics.bamboohr.com/careers",
+        ),
+        (
+            "https://ExampleRobotics.bamboohr.com/careers",
+            "bamboohr",
+            "examplerobotics",
+            "https://examplerobotics.bamboohr.com/careers",
+        ),
+    ],
+)
+def test_smartrecruiters_and_bamboohr_urls_reduce_to_a_board(
+    address: str, ats: str, slug: str, board_url: str
+) -> None:
+    hit = discover.classify(address, [])
+    assert hit is not None
+    assert (hit.kind, hit.ats_type, hit.ats_slug, hit.url) == ("board", ats, slug, board_url)
+    assert hit.ats_host is None and hit.ats_site is None
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "https://examplefreight.wd5.myworkdayjobs.com/External",
+        "https://examplefreight.wd5.myworkdayjobs.com/en-US/External",
+        "https://examplefreight.wd5.myworkdayjobs.com/External/job/Example-City/Clerk_JR00042",
+        "https://ExampleFreight.wd5.myworkdayjobs.com/en-US/External/job/Example-City/Clerk_JR1",
+    ],
+)
+def test_workday_urls_reduce_to_tenant_host_and_site(address: str) -> None:
+    hit = discover.classify(address, [])
+    assert hit is not None
+    assert (hit.kind, hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site) == (
+        "board",
+        "workday",
+        "examplefreight",
+        "wd5",
+        "External",
+    )
+    assert hit.url == "https://examplefreight.wd5.myworkdayjobs.com/External"
+    assert hit.suggested_name == "examplefreight"
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "https://jobs.smartrecruiters.com/",
+        "https://jobs.smartrecruiters.com/ExampleRobotics/not-a-posting",
+        "https://jobs.smartrecruiters.com/ExampleRobotics/1/extra",
+        "https://www.bamboohr.com/careers",
+        "https://www.bamboohr.com/careers/41",
+        "https://examplerobotics.bamboohr.com/",
+        "https://examplerobotics.bamboohr.com/careers/abc",
+        "https://examplerobotics.bamboohr.com/login.php",
+        "https://a.b.bamboohr.com/careers",
+        "https://www.myworkdayjobs.com/External",
+        "https://examplefreight.myworkdayjobs.com/External",
+        "https://examplefreight.wdx.myworkdayjobs.com/External",
+        "https://examplefreight.wd5.myworkdayjobs.com/",
+        "https://examplefreight.wd5.myworkdayjobs.com/en-US",
+        "https://examplefreight.wd5.myworkdayjobs.com/wday/cxs/examplefreight/External/jobs",
+        "https://examplefreight.wd5.myworkdayjobs.com/External/details/Clerk_1",
+        "https://examplefreight.wd5.myworkdayjobs.com/External/job",
+        "http://examplefreight.wd5.myworkdayjobs.com/External",
+    ],
+)
+def test_other_urls_on_the_new_ats_hosts_are_dropped(address: str) -> None:
+    assert discover.classify(address, []) is None
+
+
+def test_new_ats_boards_are_queued_once_and_watched_ones_are_not(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    config = {
+        "watchlist": [
+            {
+                "name": "Example Freight",
+                "ats_type": "workday",
+                "ats_slug": "ExampleFreight",
+                "ats_host": "wd5",
+                "ats_site": "External",
+            }
+        ]
+    }
+    hits = [
+        discover.classify(address, [])
+        for address in (
+            "https://examplefreight.wd5.myworkdayjobs.com/External/job/Example-City/Clerk_JR1",
+            "https://examplefreight.wd5.myworkdayjobs.com/Careers",
+            "https://examplefreight.wd5.myworkdayjobs.com/en-US/Careers",
+            "https://examplerobotics.bamboohr.com/careers/41",
+            "https://jobs.smartrecruiters.com/ExampleRobotics/744000000000001",
+        )
+    ]
+    found = discover._store(conn, config, [h for h in hits if h is not None], "2026-11-01", [])
+    assert [(row.ats_type, row.ref) for row in found] == [
+        ("workday", "examplefreight"),
+        ("bamboohr", "examplerobotics"),
+        ("smartrecruiters", "ExampleRobotics"),
+    ]
+    row = conn.execute(
+        "SELECT ats_host, ats_site FROM discovery_candidates WHERE ats_type = 'workday'"
+    ).fetchone()
+    assert tuple(row) == ("wd5", "Careers")
+    conn.close()
+
+
+def test_approving_a_workday_board_stores_its_identity(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    hit = discover.classify("https://examplefreight.wd5.myworkdayjobs.com/External", [])
+    assert hit is not None
+    (queued,) = discover._store(conn, {}, [hit], "2026-11-01", [])
+    discover.approve(conn, queued.id)
+    row = conn.execute(
+        "SELECT name, ats_type, ats_slug, ats_host, ats_site, watchlist, source FROM companies"
+    ).fetchone()
+    assert tuple(row) == (
+        "examplefreight",
+        "workday",
+        "examplefreight",
+        "wd5",
+        "External",
+        1,
+        "discovery",
+    )
+    conn.close()
+
+
+def test_approving_a_board_whose_stored_site_differs_is_refused(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    db.migrate(conn, "search")
+    from careerhunter import search_store
+
+    with db.transaction(conn):
+        search_store.upsert_company(
+            conn,
+            "examplefreight",
+            ats_type="workday",
+            ats_slug="examplefreight",
+            ats_host="wd5",
+            ats_site="Careers",
+        )
+    hit = discover.classify("https://examplefreight.wd5.myworkdayjobs.com/External", [])
+    assert hit is not None
+    (queued,) = discover._store(conn, {}, [hit], "2026-11-01", [])
+    with pytest.raises(discover.DiscoverError, match="disagrees"):
+        discover.approve(conn, queued.id)
+    conn.close()
+
+
+# --- etiquette: spacing, backoff and stop signals (#40) --------------------------------
+
+_ETIQUETTE = {
+    "discovery": {
+        "searxng_url": "http://127.0.0.1:8888/search",
+        "queries_per_run": 3,
+        "query_delay_seconds": 7,
+        "interval_minutes": 60,
+    },
+    "search": {"target_titles": ["One"]},
+}
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.moment = dt.datetime(2026, 11, 2, 9, 0, tzinfo=dt.UTC)
+
+    def __call__(self) -> dt.datetime:
+        return self.moment
+
+    def advance(self, **delta: float) -> None:
+        self.moment += dt.timedelta(**delta)
+
+
+def _empty() -> _Talk:
+    return _Talk(json.dumps({"results": []}).encode())
+
+
+def _state(conn: sqlite3.Connection) -> tuple[object, ...]:
+    row = conn.execute("SELECT cursor, failures, backoff_until FROM discovery_state").fetchone()
+    return tuple(row)
+
+
+def test_queries_are_spaced_by_the_configured_delay(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    pauses: list[float] = []
+    talk = _empty()
+    discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk, sleep=pauses.append)
+    assert len(talk.calls) == 3
+    assert pauses == [7, 7]  # between queries, not before the first or after the last
+    conn.close()
+
+
+def test_failed_passes_back_off_exponentially_and_a_success_clears_it(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    clock = _Clock()
+    down = _Talk(b"", status=0, fail_at=1)
+    run = {"today": "2026-11-02", "now": clock}
+    assert discover.run(conn, _ETIQUETTE, transport=down, **run).notice == discover.MISS
+    assert _state(conn) == (0, 1, "2026-11-02T11:00:00Z")  # 60 minutes times 2
+    clock.advance(minutes=119)
+    waiting = _empty()
+    outcome = discover.run(conn, _ETIQUETTE, transport=waiting, **run)
+    assert outcome == discover.Outcome("discovery backing off until 2026-11-02T11:00:00Z", ())
+    assert waiting.calls == []
+    clock.advance(minutes=1)
+    assert discover.run(conn, _ETIQUETTE, transport=down, **run).notice == discover.MISS
+    assert _state(conn) == (0, 2, "2026-11-02T15:00:00Z")  # 60 times 4, from 11:00
+    clock.advance(hours=4)
+    assert discover.run(conn, _ETIQUETTE, transport=_empty(), **run).notice is None
+    assert _state(conn) == (3, 0, None)
+    conn.close()
+
+
+def test_the_backoff_is_capped_at_seven_days() -> None:
+    assert discover.backoff_for(1, 60) == dt.timedelta(hours=2)
+    assert discover.backoff_for(3, 1440) == dt.timedelta(days=7)
+    assert discover.backoff_for(99, 60) == dt.timedelta(days=7)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param((429, b""), id="http-429"),
+        pytest.param(
+            (
+                200,
+                json.dumps(
+                    {
+                        "results": [{"url": _GOOD}],
+                        "unresponsive_engines": [["example engine", "CAPTCHA"]],
+                    }
+                ).encode(),
+            ),
+            id="captcha",
+        ),
+        pytest.param(
+            (
+                200,
+                json.dumps(
+                    {
+                        "results": [],
+                        "unresponsive_engines": [["example engine", "too many requests"]],
+                    }
+                ).encode(),
+            ),
+            id="too-many-requests",
+        ),
+        pytest.param(
+            (
+                200,
+                json.dumps(
+                    {
+                        "results": [],
+                        "unresponsive_engines": [["example engine", "Suspended: CAPTCHA"]],
+                    }
+                ).encode(),
+            ),
+            id="suspended-captcha",
+        ),
+    ],
+)
+def test_a_429_or_a_captcha_stops_the_pass_and_starts_the_backoff(
+    tmp_path: Path, reply: tuple[int, bytes]
+) -> None:
+    conn = _search_db(tmp_path)
+    calls: list[str] = []
+
+    def talk(url: str) -> tuple[int, bytes]:
+        calls.append(url)
+        return reply
+
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk)
+    assert outcome == discover.Outcome(discover.THROTTLED, ())
+    assert len(calls) == 1  # stopped at once
+    assert _rows(conn) == 0
+    assert _state(conn)[:2] == (0, 1)
+    conn.close()
+
+
+def test_another_engine_error_is_not_a_stop(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    body = json.dumps(
+        {"results": [{"url": _GOOD}], "unresponsive_engines": [["example engine", "timeout"]]}
+    ).encode()
+    outcome = discover.run(
+        conn, _ETIQUETTE, today="2026-11-02", transport=_Talk(body), confirm=_exists
+    )
+    assert outcome.notice is None
+    assert _rows(conn) == 1
+    conn.close()
+
+
+@pytest.mark.parametrize("value", [1, 31, "5", True])
+def test_the_query_delay_is_checked(value: object) -> None:
+    from careerhunter.config import discovery_query_delay_seconds, validate_config
+
+    doc = {"discovery": {"query_delay_seconds": value}}
+    assert any("discovery.query_delay_seconds" in p for p in validate_config(doc))
+    assert discovery_query_delay_seconds(doc) == 5
+
+
+def test_a_manual_run_right_after_another_pass_is_skipped(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(inited)
+    talk = _Talk(json.dumps({"results": []}).encode())
+    monkeypatch.setattr(discover, "default_transport", talk)
+    assert cli.main(["discover"], probe=probe) == 0
+    sent = len(talk.calls)
+    capsys.readouterr()
+    assert cli.main(["discover"], probe=probe) == 0  # the clock has not moved
+    assert capsys.readouterr().err == f"{cli.BUSY}\n"
+    assert len(talk.calls) == sent
+
+
+def test_two_claims_inside_the_gap_cannot_both_win(tmp_path: Path) -> None:
+    first = _search_db(tmp_path)
+    second = db.connect(tmp_path / "search.db")
+    moment = dt.datetime(2026, 11, 2, 9, tzinfo=dt.UTC)
+    gap = dt.timedelta(minutes=60)
+    assert discover.claim_pass(first, moment, gap) is True
+    assert discover.claim_pass(second, moment + dt.timedelta(minutes=59), gap) is False
+    assert discover.claim_pass(second, moment + dt.timedelta(minutes=60), gap) is True
+    first.close()
+    second.close()
+
+
+def test_the_pauses_of_a_pass_must_fit_its_share_of_the_watch_run() -> None:
+    from careerhunter.config import validate_config
+
+    doc = {"discovery": {"queries_per_run": 40, "query_delay_seconds": 5}}
+    assert any("must be at most 120 seconds" in p for p in validate_config(doc))
+    doc = {"discovery": {"queries_per_run": 24, "query_delay_seconds": 5}}
+    assert not any("discovery" in p for p in validate_config(doc))

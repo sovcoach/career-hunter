@@ -9,6 +9,7 @@ import pytest
 from careerhunter import watch as w
 from careerhunter.fetch import FetchTooLarge
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, url
+from tests.test_watch_ats import Posted, bamboohr_board, smartrecruiters_board, workday_board
 
 GREENHOUSE = company("Example Robotics", "greenhouse", "examplerobotics")
 
@@ -88,10 +89,13 @@ def _board(
     model: str = "onsite",
     description: str = "A friendly team.",
     pay: str | None = None,
-) -> tuple[dict[str, object], str, object]:
-    """One job on a board of `ats`, in that board's own fields. `pay` goes where that
-    board keeps pay: Greenhouse content, a Lever list, the Ashby salary summary."""
+) -> tuple[dict[str, object], dict[str, object]]:
+    """One job on a board of `ats`, in that board's own fields, and every URL the board
+    is read from with its payload. `pay` goes where that board keeps pay: Greenhouse
+    content, a Lever list, the Ashby salary summary, a SmartRecruiters ad section, the
+    BambooHR or Workday description. A Workday board is a `Posted` fetcher under ""."""
     slug = "examplerobotics"
+    item = company("Example Robotics", ats, slug)
     if ats == "greenhouse":
         html = f"<p>{description}</p>" + (f"<ul><li>{pay}</li></ul>" if pay else "")
         escaped = html.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -102,8 +106,8 @@ def _board(
             "location": {"name": location},
             "content": escaped,
         }
-        payload: object = {"jobs": [job]}
-    elif ats == "lever":
+        return item, {url(ats, slug): {"jobs": [job]}}
+    if ats == "lever":
         job = {
             "id": "abc-123",
             "text": title,
@@ -114,29 +118,47 @@ def _board(
         }
         if pay:
             job["lists"] = [{"text": "Compensation", "content": f"<li>{pay}</li>"}]
-        payload = [job]
-    else:
-        job = {
-            "id": "uuid-1",
-            "title": title,
-            "jobUrl": f"https://jobs.ashbyhq.com/{slug}/uuid-1",
-            "location": location,
-            "workplaceType": _ASHBY_MODEL[model],
-            "descriptionPlain": description,
-        }
-        if pay:
-            job["compensation"] = {"scrapeableCompensationSalarySummary": pay}
-        payload = {"jobs": [job]}
-    return company("Example Robotics", ats, slug), url(ats, slug), payload
+        return item, {url(ats, slug): [job]}
+    if ats == "workday":
+        board = workday_board(
+            slug, title=title, location=location, model=model, description=description, pay=pay
+        )
+        return {**item, "ats_host": "wd5", "ats_site": "External"}, {"": board}
+    if ats == "bamboohr":
+        return item, bamboohr_board(
+            slug, title=title, location=location, model=model, description=description, pay=pay
+        )
+    if ats == "smartrecruiters":
+        return item, smartrecruiters_board(
+            slug, title=title, location=location, model=model, description=description, pay=pay
+        )
+    job = {
+        "id": "uuid-1",
+        "title": title,
+        "jobUrl": f"https://jobs.ashbyhq.com/{slug}/uuid-1",
+        "location": location,
+        "workplaceType": _ASHBY_MODEL[model],
+        "descriptionPlain": description,
+    }
+    if pay:
+        job["compensation"] = {"scrapeableCompensationSalarySummary": pay}
+    return item, {url(ats, slug): {"jobs": [job]}}
 
 
 def _reason(conn: sqlite3.Connection, ats: str, config: object = None, **job: str) -> str | None:
-    item, board, payload = _board(ats, **job)
+    item, routes = _board(ats, **job)
+    posted = routes.get("")
+    fetcher = (
+        posted
+        if isinstance(posted, Posted)
+        else Scripted({address: fetched(body) for address, body in routes.items()})
+    )
     w.run(
         conn,
         [item],
         today=DAY,
-        fetcher=Scripted({board: fetched(payload)}),
+        fetcher=fetcher,
+        poster=posted.post if isinstance(posted, Posted) else None,
         config=config or MATRIX_CONFIG,  # type: ignore[arg-type]
         exclusions=MATRIX_EXCLUSIONS,
     )
@@ -145,7 +167,7 @@ def _reason(conn: sqlite3.Connection, ats: str, config: object = None, **job: st
     return reasons[0] if reasons else None
 
 
-ATS = ("greenhouse", "lever", "ashby")
+ATS = ("greenhouse", "lever", "ashby", "smartrecruiters", "bamboohr", "workday")
 GATE_CASES: dict[str, tuple[dict[str, str], str | None]] = {
     "kept": ({}, None),
     "description_keyword": ({"description": "An unpaid trial week."}, "excluded_description"),
@@ -188,18 +210,29 @@ def test_seniority_in_the_description_runs_on_every_ats(
 @pytest.mark.parametrize(
     ("ats", "job", "expected"),
     [
-        # Remote: Greenhouse infers it from the text; Lever and Ashby give it.
+        # Remote: Greenhouse infers it from the text; Lever, Ashby and SmartRecruiters give it.
         ("greenhouse", {"location": "Remote - Other Region"}, "location_rule"),
         ("lever", {"location": "Other Region", "model": "remote"}, "location_rule"),
         ("ashby", {"location": "Other Region", "model": "remote"}, "location_rule"),
         ("greenhouse", {"location": "Remote - Example Region"}, None),
+        ("bamboohr", {"location": "Remote - Other Region"}, "location_rule"),
+        ("bamboohr", {"location": "Remote - Example Region"}, None),
+        ("workday", {"location": "Remote - Other Region"}, "location_rule"),
+        ("workday", {"location": "Remote - Example Region"}, None),
         ("lever", {"location": "Example Region", "model": "remote"}, None),
         ("ashby", {"location": "Example Region", "model": "remote"}, None),
+        ("smartrecruiters", {"location": "Other Region", "model": "remote"}, "location_rule"),
+        ("smartrecruiters", {"location": "Example Region", "model": "remote"}, None),
+        ("smartrecruiters", {"location": "Other City", "model": "hybrid"}, "location_rule"),
+        ("smartrecruiters", {"location": "", "model": "remote"}, None),
         # Hybrid is checked like on-site.
         ("lever", {"location": "Other City", "model": "hybrid"}, "location_rule"),
         ("ashby", {"location": "Other City", "model": "hybrid"}, "location_rule"),
-        # Blank location: Greenhouse has no work model, so it is empty; the others give one.
+        # Blank location: Greenhouse, BambooHR and Workday give no work model, so it is empty; the
+        # others give one.
         ("greenhouse", {"location": ""}, "empty_location"),
+        ("bamboohr", {"location": ""}, "empty_location"),
+        ("workday", {"location": ""}, "empty_location"),
         ("lever", {"location": "", "model": "remote"}, None),
         ("ashby", {"location": "", "model": "remote"}, None),
     ],
@@ -219,7 +252,8 @@ def test_lever_closing_text_and_salary_description_reach_the_gates(
     ):
         search.execute("DELETE FROM skips")
         search.execute("DELETE FROM postings")
-        item, board, payload = _board("lever")
+        item, routes = _board("lever")
+        ((board, payload),) = routes.items()
         text = "Fluent French is required." if reason == "required_language" else "Salary $40,000"
         payload[0][field] = text  # type: ignore[index]
         w.run(
@@ -234,7 +268,8 @@ def test_lever_closing_text_and_salary_description_reach_the_gates(
 
 def test_lever_salary_range_is_not_read(search: sqlite3.Connection) -> None:
     """Its interval values are not documented, so a range there decides nothing."""
-    item, board, payload = _board("lever")
+    item, routes = _board("lever")
+    ((board, payload),) = routes.items()
     payload[0]["salaryRange"] = {  # type: ignore[index]
         "currency": "CAD",
         "interval": "per-year-salary",

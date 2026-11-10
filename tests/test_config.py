@@ -104,3 +104,64 @@ def test_alerts_max_per_poll_defaults_to_ten() -> None:
     assert alerts_max_per_poll({}) == 10
     assert alerts_max_per_poll({"alerts": None}) == 10
     assert alerts_max_per_poll({"alerts": {"max_per_poll": 3}}) == 3
+
+
+def _workday(**keys: object) -> dict[str, object]:
+    return {
+        "name": "Example Robotics",
+        "ats_type": "workday",
+        "ats_slug": "examplerobotics",
+        **keys,
+    }
+
+
+@pytest.mark.parametrize(
+    ("item", "message"),
+    [
+        (_workday(ats_host="wd", ats_site="External"), "ats_host must be wd and up to three"),
+        (_workday(ats_host="wd5x", ats_site="External"), "ats_host must be wd and up to three"),
+        (_workday(ats_host=5, ats_site="External"), "ats_host must be wd and up to three"),
+        (_workday(ats_host="wd5", ats_site="a/b"), "ats_site must be one path segment"),
+        (_workday(ats_host="wd5", ats_site=""), "ats_site must be one path segment"),
+        (
+            {"name": "X", "ats_type": "lever", "ats_slug": "x", "ats_host": "wd5"},
+            "ats_host is for ats_type workday only",
+        ),
+        ({"name": "X", "ats_site": "External"}, "ats_site is for ats_type workday only"),
+    ],
+)
+def test_workday_identity_problems_reported(item: dict[str, object], message: str) -> None:
+    doc = example()
+    doc["watchlist"] = [item]
+    assert any(message in p for p in validate_config(doc))
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        _workday(ats_host="wd5", ats_site="External"),
+        _workday(ats_host="wd103", ats_site="Careers_Site-1"),
+        _workday(),  # valid; the watcher logs and skips it
+    ],
+)
+def test_workday_identity_accepted(item: dict[str, object]) -> None:
+    doc = example()
+    doc["watchlist"] = [item]
+    assert validate_config(doc) == []
+
+
+@pytest.mark.parametrize("value", [0, 41, "12", True, 1.5, None])
+def test_discovery_queries_per_run_is_checked(value: object) -> None:
+    from careerhunter.config import discovery_queries_per_run
+
+    doc = example()
+    doc["discovery"]["queries_per_run"] = value  # type: ignore[index]
+    assert any("discovery.queries_per_run" in p for p in validate_config(doc))
+    assert discovery_queries_per_run(doc) == 12
+
+
+def test_discovery_queries_per_run_is_read() -> None:
+    from careerhunter.config import discovery_queries_per_run
+
+    assert discovery_queries_per_run({"discovery": {"queries_per_run": 40}}) == 40
+    assert discovery_queries_per_run({}) == 12

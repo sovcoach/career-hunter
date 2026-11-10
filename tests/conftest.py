@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import re
+import socket
 import sqlite3
+import threading
 import zlib
 from collections.abc import Iterator
 from pathlib import Path
@@ -245,18 +247,43 @@ def memory_keyring() -> Iterator[InMemoryKeyring]:
     keyring.set_keyring(previous)
 
 
+class RealNetworkBlocked(RuntimeError):
+    """A test tried to use the network. Not an OSError, so no client takes it for a
+    network failure; a client that catches every exception (the bounded resolver's
+    lookup thread) still cannot hide it, because each attempt also fails the test."""
+
+
 @pytest.fixture(autouse=True)
-def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No test may open a network connection or resolve a name. Fakes stand in for both."""
+def no_network(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[list[str]]:
+    """No test may open a connection or resolve a name. Fakes stand in for both.
 
-    def refuse(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("a test tried to use the network")
+    Every connect, connect_ex, create_connection and getaddrinfo raises
+    RealNetworkBlocked, saying what was asked for, and is recorded; a recorded attempt
+    fails the test at teardown even when the code under test caught the error. A test
+    opts out only with ``@pytest.mark.allow_network``, and none does.
+    """
+    attempts: list[str] = []
+    if request.node.get_closest_marker("allow_network") is not None:
+        yield attempts
+        return
 
-    import socket
+    def refuse(what: str) -> Any:
+        def refused(*args: Any, **kwargs: Any) -> Any:
+            target = args[1] if what.startswith("socket.") and len(args) > 1 else args[:1]
+            attempts.append(f"{what} {target!r}")
+            raise RealNetworkBlocked(f"a test tried to use the network: {what} {target!r}")
 
-    monkeypatch.setattr(socket.socket, "connect", refuse)
-    monkeypatch.setattr(socket, "create_connection", refuse)
-    monkeypatch.setattr(socket, "getaddrinfo", refuse)
+        return refused
+
+    monkeypatch.setattr(socket.socket, "connect", refuse("socket.connect"))
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse("socket.connect_ex"))
+    monkeypatch.setattr(socket, "create_connection", refuse("create_connection"))
+    monkeypatch.setattr(socket, "getaddrinfo", refuse("getaddrinfo"))
+    yield attempts
+    if attempts:
+        pytest.fail(f"a test tried to use the network: {attempts}")
 
 
 @pytest.fixture(autouse=True)
@@ -294,3 +321,61 @@ def loopback_watchdog(monkeypatch: pytest.MonkeyPatch) -> Any:
     watchdog = ManualWatchdog()
     monkeypatch.setattr(loopback, "_timer", watchdog)
     return watchdog
+
+
+@pytest.fixture(autouse=True)
+def no_discovery_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """No test waits between discovery queries; the pauses are recorded instead."""
+    from careerhunter import discover
+
+    pauses: list[float] = []
+    monkeypatch.setattr(discover, "_sleep", pauses.append)
+    # A fixed wall clock for the discovery backoff, so no test depends on today.
+    monkeypatch.setattr(discover, "_utc_now", lambda: dt.datetime(2026, 11, 2, 9, tzinfo=dt.UTC))
+    return pauses
+
+
+@pytest.fixture(autouse=True)
+def confirmed_boards(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """No test asks a real board API to confirm a discovered board: every board exists.
+
+    The boards asked about are recorded. A test that needs another answer replaces
+    `cli._confirmer` itself, or passes `confirm` to `discover.run`.
+    """
+    from careerhunter import ats, cli
+
+    asked: list[object] = []
+
+    def confirmer(share: object) -> object:
+        def confirm(board: ats.Board) -> ats.Confirmed:
+            asked.append(board)
+            return ats.Confirmed(True)
+
+        return confirm
+
+    monkeypatch.setattr(cli, "_confirmer", confirmer)
+    return asked
+
+
+@pytest.fixture(autouse=True)
+def close_left_connections(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Close every search or EI connection a test opened and left open.
+
+    A test that fails before its own close() used to leave its connection to the
+    garbage collector, whose ResourceWarning (an error under filterwarnings) then
+    broke whichever later test was running. Closing twice is harmless.
+    """
+    opened: list[sqlite3.Connection] = []
+    real_connect = db.connect
+    here = threading.get_ident()
+
+    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = real_connect(*args, **kwargs)
+        if threading.get_ident() == here:  # a worker thread's connection is its own
+            opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(db, "connect", connect)
+    yield
+    for conn in opened:
+        conn.close()
