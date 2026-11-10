@@ -32,6 +32,7 @@ from careerhunter import (
     bot,
     claims,
     db,
+    demo,
     discover,
     embed,
     embed_eval,
@@ -1648,6 +1649,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="rank stored cosines against LLM tiers; the report stays in the data folder",
     )
     sub.add_parser("doctor", help="check the setup and report what is missing")
+    sub.add_parser(
+        "demo",
+        help="run the pipeline on synthetic data in memory; reads and writes no files",
+    )
     return parser
 
 
@@ -1679,6 +1684,9 @@ def main(
 ) -> int:
     """Run one command. `clock` is the time doctor measures ages against (tests fix it)."""
     args = build_parser().parse_args(argv)
+    if args.command == "demo":
+        # No data folder is read or written, so there is nothing for the guard to check.
+        return demo.run()
     probe = probe or SystemProbe()
     try:
         datadir = storage_guard.check(require_exists=args.command != "init", probe=probe)

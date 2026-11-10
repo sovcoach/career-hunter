@@ -284,6 +284,37 @@ def _digest_row(numbered: _Numbered) -> str:
     return "\n".join(lines)
 
 
+def _entries(
+    fields: Mapping[int, search_store.DigestFields],
+    rows: list[lanes.Ordered],
+    doc: Mapping[str, Any],
+) -> list[_DigestEntry]:
+    return [
+        _DigestEntry(
+            fields[row.posting_id], company_label(fields[row.posting_id].company, doc), row
+        )
+        for row in rows
+        if row.posting_id in fields
+    ]
+
+
+def digest_texts(search: sqlite3.Connection, doc: Mapping[str, Any]) -> list[str]:
+    """The text of every digest message for the pending alerts, in send order.
+
+    For `careerhunter demo`: it reads `search` and sends nothing. The per-poll cap and
+    the run grouping of a real poll are not applied, and no posting is marked alerted.
+    """
+    pending = search_store.pending_alerts(search)
+    rows = lanes.alert_order(pending, doc)
+    fields = search_store.digest_fields(search, [row.posting_id for row in rows])
+    entries = _entries(fields, rows, doc)
+    messages = _pack(entries)
+    return [
+        _digest_text(message, (index, len(messages)) if len(messages) > 1 else None, len(entries))
+        for index, message in enumerate(messages, start=1)
+    ]
+
+
 def _digest_header(count: int, part: tuple[int, int] | None) -> str:
     head = f"New postings: {count}"
     return head if part is None else f"{head} (part {part[0]} of {part[1]})"
@@ -654,13 +685,7 @@ class Bot:
         except (OSError, sqlite3.Error) as exc:
             log.warning("alert digest could not be read (%s)", type(exc).__name__)
             return False
-        entries = [
-            _DigestEntry(
-                fields[row.posting_id], company_label(fields[row.posting_id].company, doc), row
-            )
-            for row in rows
-            if row.posting_id in fields
-        ]
+        entries = _entries(fields, rows, doc)
         messages = _pack(entries)
         for index, message in enumerate(messages, start=1):
             part = (index, len(messages)) if len(messages) > 1 else None
