@@ -267,7 +267,7 @@ Nothing left over counts as fetched or failed. The last line is `watch: <n> boar
 
 ### Run logs
 
-`careerhunter watch` and a search run of `careerhunter discover` write each line to `logs/watch.log` or `logs/discover.log` the moment it is produced, then to stderr. launchd discards stderr, so the file is what keeps a trace. It is opened only after the storage guard passes, without following a symlink, and must be a regular file at mode 0600. A crash leaves its traceback in that file only, never on stderr. See ADR-022.
+`careerhunter watch` and a search run of `careerhunter discover` write each line to `logs/watch.log` or `logs/discover.log` the moment it is produced, then to stderr. launchd discards stderr, so the file is what keeps a trace. It is opened only after the storage guard passes, without following a symlink, and must be a regular file at mode 0600. A log that has reached 5 MB when a run opens it is rolled over first by the standard library's `RotatingFileHandler`, keeping five older files (`.1` to `.5`) in `logs/`, every one at 0600. A crash leaves its traceback in that file only, never on stderr. See ADR-022.
 
 ## The Telegram bot (Phase 2)
 

@@ -626,7 +626,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 **Trade-offs.**
 - A posting stored after the budget ran out is scored on a later run from its stored fields only, without the description.
 - A database error that would have affected only one company still stops the run.
-- The log files grow without limit. There is no rotation yet.
+- The log files grow without limit. There is no rotation yet. *Amended for health (#42):* when a run opens `logs/watch.log` or `logs/discover.log` and it has reached 5 MB, the standard library's `RotatingFileHandler` rolls it over first, keeping five older files (`watch.log.1` to `watch.log.5`) in `logs/`. Every rotated file is set to 0600 again and the new one is created 0600, so a umask never loosens one; a symlink is never rolled over. A log can pass 5 MB by one run's lines. A rotation that fails stops the run, like a log that can't be opened.
 
 ## ADR-023: Scoring is grounded in an imported resume, and re-scored when it changes
 

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from careerhunter import runlog
 from careerhunter.runlog import RunLog, RunLogError
 
 
@@ -171,3 +172,90 @@ def test_a_failed_permission_change_closes_the_file_and_writes_nothing(
     with pytest.raises(OSError):
         os.fstat(opened[0])  # closed
     assert path.read_bytes() == b""
+
+
+# --- rotation (#42) ----------------------------------------------------------------------
+
+
+def _mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+def test_a_full_log_is_rolled_over_and_every_file_stays_private(
+    tmp_path: Path, keep_umask: None
+) -> None:
+    """The mode holds on rotation, even with a loose umask and a loosened old file."""
+    os.umask(0o022)
+    path = tmp_path / "logs" / "watch.log"
+    with RunLog(path, io.StringIO(), max_bytes=40) as log:
+        log.append("watch: the first run, long enough to fill the log")
+    os.chmod(path, 0o644)  # loosened by hand: rotation must not carry that over
+    with RunLog(path, io.StringIO(), max_bytes=40) as log:
+        log.append("watch: the second run")
+    rotated = path.with_name("watch.log.1")
+    assert rotated.read_text() == "watch: the first run, long enough to fill the log\n"
+    assert path.read_text() == "watch: the second run\n"
+    assert _mode(path) == _mode(rotated) == 0o600
+    assert _mode(path.parent) == 0o700
+
+
+def test_a_log_below_the_cap_is_appended_to(tmp_path: Path) -> None:
+    path = tmp_path / "logs" / "discover.log"
+    for line in ("discover: one", "discover: two"):
+        with RunLog(path, io.StringIO(), max_bytes=1000) as log:
+            log.append(line)
+    assert path.read_text() == "discover: one\ndiscover: two\n"
+    assert not path.with_name("discover.log.1").exists()
+
+
+def test_only_the_last_backups_are_kept(tmp_path: Path, keep_umask: None) -> None:
+    os.umask(0o022)
+    path = tmp_path / "logs" / "watch.log"
+    for run in range(runlog.BACKUPS + 3):
+        with RunLog(path, io.StringIO(), max_bytes=1) as log:
+            log.append(f"watch: run {run}")
+    names = sorted(p.name for p in path.parent.iterdir())
+    assert names == ["watch.log"] + [f"watch.log.{i}" for i in range(1, runlog.BACKUPS + 1)]
+    assert path.read_text() == f"watch: run {runlog.BACKUPS + 2}\n"
+    assert path.with_name("watch.log.1").read_text() == f"watch: run {runlog.BACKUPS + 1}\n"
+    assert {_mode(p) for p in path.parent.iterdir()} == {0o600}
+
+
+def test_a_symlink_is_never_rolled_over(tmp_path: Path) -> None:
+    target = tmp_path / "elsewhere.txt"
+    target.write_text("x" * 100)
+    path = tmp_path / "logs" / "watch.log"
+    path.parent.mkdir(mode=0o700)
+    path.symlink_to(target)
+    assert runlog.rotate_if_full(path, max_bytes=1) is False
+    with pytest.raises(RunLogError):
+        RunLog(path, io.StringIO(), max_bytes=1)
+    assert path.is_symlink() and target.read_text() == "x" * 100
+
+
+def test_a_rotation_that_fails_stops_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "logs" / "watch.log"
+    with RunLog(path, io.StringIO()) as log:
+        log.append("watch: a line")
+
+    def refuse(self: object) -> None:
+        raise PermissionError("synthetic")
+
+    monkeypatch.setattr(runlog._PrivateRotation, "doRollover", refuse)
+    with pytest.raises(RunLogError, match="PermissionError"):
+        RunLog(path, io.StringIO(), max_bytes=1)
+
+
+def test_the_handler_would_open_a_private_file(tmp_path: Path, keep_umask: None) -> None:
+    os.umask(0o000)
+    path = tmp_path / "bare.log"
+    handler = runlog._PrivateRotation(path, 2)
+    try:
+        stream = handler._open()
+        stream.write("x\n")
+        stream.close()
+    finally:
+        handler.close()
+    assert _mode(path) == 0o600
