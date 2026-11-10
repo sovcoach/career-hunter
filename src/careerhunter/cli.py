@@ -424,8 +424,16 @@ def repo_push_checks(repo: Path) -> list[tuple[str, str]]:
 
 HEARTBEAT_STALE = dt.timedelta(minutes=5)
 
+Clock = Callable[[], dt.datetime]
 
-def _doctor_bot(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
+
+def _utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
+
+
+def _doctor_bot(
+    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
+) -> None:
     """The Telegram chat setting, and whether the bot service is up and polling."""
     if config_doc is not None:
         if telegram_chat_id(config_doc) is None:
@@ -449,7 +457,7 @@ def _doctor_bot(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | 
     except (OSError, ValueError):
         report.line("bot heartbeat", "BAD", "none yet; the bot hasn't completed a poll")
         return
-    age = dt.datetime.now(dt.UTC) - beat
+    age = now - beat
     if age > HEARTBEAT_STALE:
         minutes = int(age.total_seconds() // 60)
         report.line("bot heartbeat", "BAD", f"last poll {minutes} min ago; see logs/bot.log")
@@ -457,7 +465,9 @@ def _doctor_bot(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | 
         report.line("bot heartbeat", "OK", "polled within the last 5 minutes")
 
 
-def _doctor_watch(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
+def _doctor_watch(
+    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
+) -> None:
     """Whether the watch agent is loaded, and how old the last finished run is."""
     current = service.status(label=service.WATCH_LABEL)
     if not current.installed:
@@ -470,7 +480,7 @@ def _doctor_watch(report: _Report, datadir: DataDir, config_doc: dict[str, Any] 
         report.line("watch service", "OK", "loaded")
     if current.installed:
         _doctor_watch_interval(report, config_doc)
-    _doctor_watch_success(report, datadir, config_doc)
+    _doctor_watch_success(report, datadir, config_doc, now)
 
 
 def _doctor_interval(
@@ -515,6 +525,7 @@ def _doctor_stamp(
     name: str,
     filename: str,
     limit: dt.timedelta,
+    now: dt.datetime,
 ) -> None:
     path = datadir.logs / filename
     try:
@@ -527,14 +538,14 @@ def _doctor_stamp(
         return
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=dt.UTC)
-    age = dt.datetime.now(dt.UTC) - stamp.astimezone(dt.UTC)
+    age = now - stamp.astimezone(dt.UTC)
     minutes = max(0, int(age.total_seconds() // 60))
     detail = f"last success {minutes} min ago"
     report.line(name, "BAD" if age > limit else "OK", detail)
 
 
 def _doctor_watch_success(
-    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None
+    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
 ) -> None:
     _doctor_stamp(
         report,
@@ -542,10 +553,13 @@ def _doctor_watch_success(
         name="watch",
         filename="watch.success",
         limit=dt.timedelta(minutes=2 * watch_interval_minutes(config_doc)),
+        now=now,
     )
 
 
-def _doctor_discover(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
+def _doctor_discover(
+    report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
+) -> None:
     """Discovery runs inside the watch agent (#40). A null URL is off.
 
     The separate agent of earlier versions left installed is a warning, which does not
@@ -568,6 +582,7 @@ def _doctor_discover(report: _Report, datadir: DataDir, config_doc: dict[str, An
         name="discovery",
         filename="discover.success",
         limit=dt.timedelta(minutes=2 * every),
+        now=now,
     )
 
 
@@ -1110,7 +1125,7 @@ def _doctor_lanes(report: _Report, config_doc: dict[str, Any] | None) -> None:
     report.line("lanes", "OK", f"{count}; off-lane postings alert at {minimum} fit or better")
 
 
-def _doctor_watch_runs(report: _Report, search: sqlite3.Connection) -> None:
+def _doctor_watch_runs(report: _Report, search: sqlite3.Connection, now: dt.datetime) -> None:
     """The last watch run: unfinished for too long is BAD; held counts from the last finish."""
     latest = search.execute("SELECT * FROM watch_runs ORDER BY id DESC LIMIT 1").fetchone()
     if latest is None:
@@ -1118,7 +1133,7 @@ def _doctor_watch_runs(report: _Report, search: sqlite3.Connection) -> None:
         return
     if latest["finished_at"] is None:
         started = dt.datetime.fromisoformat(str(latest["started_at"]))
-        age = dt.datetime.now(dt.UTC) - started
+        age = now - started
         minutes = max(0, int(age.total_seconds() // 60))
         if age > _RUN_GRACE:
             report.line(
@@ -1220,8 +1235,12 @@ def _doctor_resume(
     report.line("resume", "OK", "matches its import")
 
 
-def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
-    """Check everything and report. Reads only, apart from tightening file modes."""
+def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | None = None) -> int:
+    """Check everything and report. Reads only, apart from tightening file modes.
+
+    Every age is measured against one reading of `clock` (UTC), so a test can fix it.
+    """
+    now = (clock or _utc_now)().astimezone(dt.UTC)
     report = _Report()
     report.line("data dir", "OK", f"{datadir.root} (volume {datadir.mount_point}, encrypted)")
 
@@ -1257,7 +1276,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
         report.line("ei claim", "OK", f"{settings.active.label} active ({settings.active.period})")
     else:
         report.line("ei claim", "--", "none active (set ei.active_claim in config.yaml)")
-    for warning in claims.warnings(settings, config_today(config_doc)):
+    for warning in claims.warnings(settings, config_today(config_doc, now)):
         report.line("ei claim", "WARN", warning)
     if config_doc is not None:
         zone = timezone_name(config_doc)
@@ -1288,7 +1307,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
     _doctor_resume(report, datadir, config_doc, search)
     _doctor_lanes(report, config_doc)
     if search is not None:
-        _doctor_watch_runs(report, search)
+        _doctor_watch_runs(report, search, now)
         _doctor_alert_hold(report, search)
 
     records: dict[str, sqlite3.Connection] = {}
@@ -1326,9 +1345,9 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace) -> int:
     _doctor_private_folder(report, "exports/", datadir.exports)
     _doctor_private_folder(report, "snapshots/", datadir.snapshots)
     _doctor_private_folder(report, "logs/", datadir.logs)
-    _doctor_bot(report, datadir, config_doc)
-    _doctor_watch(report, datadir, config_doc)
-    _doctor_discover(report, datadir, config_doc)
+    _doctor_bot(report, datadir, config_doc, now)
+    _doctor_watch(report, datadir, config_doc, now)
+    _doctor_discover(report, datadir, config_doc, now)
 
     repo = storage_guard.repo_root()
     if repo is not None and (repo / ".git").exists():
@@ -1440,7 +1459,13 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
 }
 
 
-def main(argv: Sequence[str] | None = None, probe: SystemProbe | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    probe: SystemProbe | None = None,
+    *,
+    clock: Clock | None = None,
+) -> int:
+    """Run one command. `clock` is the time doctor measures ages against (tests fix it)."""
     args = build_parser().parse_args(argv)
     probe = probe or SystemProbe()
     try:
@@ -1450,6 +1475,8 @@ def main(argv: Sequence[str] | None = None, probe: SystemProbe | None = None) ->
         return EXIT_GUARD
     _warn_filevault(probe)
     try:
+        if args.command == "doctor":
+            return cmd_doctor(datadir, args, clock=clock)
         return COMMANDS[args.command](datadir, args)
     except (
         SeedError,

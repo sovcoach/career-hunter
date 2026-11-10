@@ -13,12 +13,12 @@ import yaml
 
 from careerhunter import claims, cli, db, resume
 from careerhunter.claims import Claim
-from tests.conftest import ACTIVE, EARLIER, FIXTURES, FakeProbe, set_claims
+from tests.conftest import ACTIVE, DOCTOR_NOW, EARLIER, FIXTURES, FakeProbe, set_claims
 
 
 def doctor(probe: FakeProbe, capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
     capsys.readouterr()
-    code = cli.main(["doctor"], probe=probe)
+    code = cli.main(["doctor"], probe=probe, clock=lambda: DOCTOR_NOW)
     return code, capsys.readouterr().out
 
 
@@ -431,7 +431,7 @@ def _write(path: Path, sql: str, *params: object) -> None:
 
 
 def _stamp(delta: dt.timedelta) -> str:
-    return (dt.datetime.now(dt.UTC) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (DOCTOR_NOW - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_lanes_and_watch_runs_on_a_fresh_setup(
