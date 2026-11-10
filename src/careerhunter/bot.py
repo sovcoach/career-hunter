@@ -60,7 +60,13 @@ import yaml
 from careerhunter import claims, db, enums, lanes, ledger, search_store, selfsourced, snapshots
 from careerhunter import discover as discovery
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating
-from careerhunter.config import ConfigError, alerts_max_per_poll, load_config, telegram_chat_id
+from careerhunter.config import (
+    ConfigError,
+    alerts_max_per_poll,
+    health_failure_runs,
+    load_config,
+    telegram_chat_id,
+)
 from careerhunter.config import today as config_today
 from careerhunter.fetch import Fetched, fetch
 from careerhunter.ledger import PartialWriteError
@@ -307,6 +313,21 @@ def _pack(entries: list[_DigestEntry]) -> list[list[_Numbered]]:
     if current:
         messages.append(current)
     return messages
+
+
+HEALTH_NAMES = {"lm_studio": "LM Studio", "searxng": "SearXNG", "boards": "Every board"}
+
+
+def _failure_text(name: str, failures: int, held: int | None) -> str:
+    """The one message for an outage: the component, the count, the postings held."""
+    if held is None:
+        waiting = "The number of postings waiting to be scored is not known."
+    elif held == 1:
+        waiting = "1 posting is waiting to be scored."
+    else:
+        waiting = f"{held} postings are waiting to be scored."
+    runs = "1 run" if failures == 1 else f"{failures} runs"
+    return f"Health: {name} has failed {runs} in a row. {waiting}"
 
 
 def _log_fields(raw: object) -> dict[str, str]:
@@ -709,6 +730,46 @@ class Bot:
             log.info("config.yaml can be read again; watcher alerts resumed")
         else:
             log.warning("config.yaml could not be read (%s); watcher alerts held", reason)
+
+    def send_health(self) -> None:
+        """One failure message and one recovery message per outage (#42).
+
+        A component (the local model, SearXNG, or every board) that has failed
+        `health.failure_runs` watch runs in a row gets one message naming it, the count
+        and the postings held for scoring; when it next works, one message says so.
+        Neither names a host or a path. What was sent is recorded only after Telegram
+        accepts it, so a message that fails goes again next poll; if the answer is lost
+        after Telegram accepted it, it can come twice. Nothing is sent while config.yaml
+        can't be read.
+        """
+        doc = self._alert_config()
+        if doc is None:
+            return
+        limit = health_failure_runs(doc)
+        try:
+            with self._search() as search:
+                states = search_store.component_health(search)
+        except (OSError, sqlite3.Error) as exc:
+            log.warning("health could not be read (%s)", type(exc).__name__)
+            return
+        for health in states:
+            name = HEALTH_NAMES[health.component]
+            try:
+                if health.recovery_due:
+                    self.send(f"Health: {name} is working again.")
+                    with self._search() as search, db.transaction(search):
+                        search_store.mark_recovery_told(search, health.component)
+                if health.failures >= limit and health.alerted_failures is None:
+                    self.send(_failure_text(name, health.failures, health.held))
+                    with self._search() as search, db.transaction(search):
+                        search_store.mark_failure_told(
+                            search, health.component, health.failures, limit
+                        )
+            except (TelegramError, OSError, sqlite3.Error) as exc:
+                log.warning(
+                    "health message failed (%s); left for the next poll", type(exc).__name__
+                )
+                return
 
     def send_pending_discovery(self) -> None:
         """Send pending discovery rows that are due. Name and URL only.
@@ -1487,6 +1548,7 @@ def run(
         bot.heartbeat()
         bot.send_pending_alerts()
         bot.send_pending_discovery()
+        bot.send_health()
     return 0
 
 

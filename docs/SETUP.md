@@ -555,6 +555,8 @@ health:
 
 Every date must fall inside your active EI claim, as with `seed`, and future dates are refused. Buttons work once: tap a button twice, or use an old one, and the bot says it has expired.
 
+The bot also tells you when something stops working. After `health.failure_runs` watch runs in a row (default 3) in which the local model, SearXNG, or every board failed, it sends one message, such as `Health: LM Studio has failed 3 runs in a row. 4 postings are waiting to be scored.`, and when that part works again, one more: `Health: LM Studio is working again.` It sends nothing more about the same outage in between.
+
 ---
 
 ## Troubleshooting

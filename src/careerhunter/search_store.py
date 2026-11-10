@@ -416,6 +416,31 @@ def component_health(conn: sqlite3.Connection) -> list[Health]:
     ]
 
 
+def mark_failure_told(conn: sqlite3.Connection, component: str, count: int, limit: int) -> None:
+    """The bot sent this outage's failure message, naming `count` failures. The caller
+    holds the transaction. If the component worked again since the bot read it (the
+    count went back below `limit`), the outage is over: its recovery message is due."""
+    cur = conn.execute(
+        "UPDATE component_health SET alerted_failures = ? "
+        "WHERE component = ? AND alerted_failures IS NULL AND failures >= ?",
+        (count, component, limit),
+    )
+    if cur.rowcount == 0:
+        conn.execute(
+            "UPDATE component_health SET recovery_due = 1 "
+            "WHERE component = ? AND alerted_failures IS NULL AND failures < ?",
+            (component, limit),
+        )
+
+
+def mark_recovery_told(conn: sqlite3.Connection, component: str) -> None:
+    """The bot sent this component's recovery message."""
+    conn.execute(
+        "UPDATE component_health SET recovery_due = 0 WHERE component = ? AND recovery_due = 1",
+        (component,),
+    )
+
+
 def set_posting_lane(conn: sqlite3.Connection, posting_id: int, lane: str | None) -> bool:
     """Record the lane a posting matched (None: off-lane), once. False if already set."""
     cur = conn.execute(
