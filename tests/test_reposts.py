@@ -24,7 +24,9 @@ BOARD = company("Example Widgets", "greenhouse", SLUG)
     [
         ("Analyst (R12345)", "Analyst (R67890)"),
         ("Analyst [JR-2041]", "analyst"),
-        ("Analyst - 104332", "Analyst"),
+        ("Analyst - 104332", "Analyst"),  # six digits: still a code, still stripped
+        ("Analyst - 2026-104332", "Analyst"),  # a code that starts with a year
+        ("Analyst - 3026", "Analyst"),  # not 19xx or 20xx: a code
         ("Analyst \u2013 R12345", "ANALYST"),  # an en dash
         ("Analyst, R12345", "Analyst"),
         ("Analyst #12345", "Analyst"),
@@ -46,6 +48,9 @@ def test_title_keys_that_match(left: str, right: str) -> None:
         ("Analyst - Team A", "Analyst"),  # a space: not one token
         ("Analyst Team-12345", "Analyst Team"),  # no space before the hyphen
         ("Analyst (Ops 12345)", "Analyst"),  # a space inside the brackets
+        ("Analyst - 2026", "Analyst - 2027"),  # a trailing year is not a requisition code
+        ("Analyst - 2026", "Analyst"),
+        ("Analyst, 1999", "Analyst, 2001"),
     ],
 )
 def test_title_keys_that_do_not_match(left: str, right: str) -> None:
