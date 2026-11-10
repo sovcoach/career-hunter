@@ -253,8 +253,35 @@ def env(datadir: DataDir) -> Env:
     return Env(Bot(datadir, api, CHAT, clock=clock, fetcher=web), api, web, clock, datadir)
 
 
+def alerted(
+    env: Env,
+    url: str | None = AD_URL,
+    company: str = "Example Robotics",
+    title: str = "Synthetic Analyst",
+) -> int:
+    """A scored watcher posting, sent in the digest with its Applied and Skipped buttons."""
+    s = db.connect(env.datadir.search_db_path)
+    try:
+        db.migrate(s, "search")
+        with db.transaction(s):
+            _, posting_id, _, _ = search_store.find_or_create_posting(
+                s,
+                Posting(company, title, "2026-10-27", url=url, source="watcher"),
+                Dating("exact", day="2026-10-27"),
+            )
+            s.execute(
+                "UPDATE postings SET llm_output = '{}', gaps = '[]', fit = 'high', "
+                "lane_checked = 1 WHERE id = ?",
+                (posting_id,),
+            )
+    finally:
+        s.close()
+    env.bot.send_pending_alerts()
+    return posting_id
+
+
 def apply(env: Env, choice: str = "Today", url: str = AD_URL, method: str = "Company site") -> None:
-    env.say(f"/log {url}")
+    alerted(env, url)
     env.press("Applied")
     env.press(method)
     env.press(choice)
@@ -293,7 +320,7 @@ def test_messages_outside_the_allowlist_get_no_reply_and_write_nothing(
 
 
 def test_a_strangers_button_press_is_ignored(env: Env) -> None:
-    env.say(f"/log {AD_URL}")
+    alerted(env)
     before = list(env.api.calls)
     env.press("Applied", sender=STRANGER, chat=STRANGER)
     assert env.api.calls == before  # not even answerCallbackQuery
@@ -307,7 +334,7 @@ def answers(env: Env) -> list[dict[str, Any]]:
 
 
 def test_a_forged_token_is_rejected(env: Env) -> None:
-    env.say(f"/log {AD_URL}")
+    alerted(env)
     mid = env.api.last()[0]
     env.bot.handle_safely(env.callback("A" * 22, mid))
     assert answers(env)[-1]["text"] == "That button has expired."
@@ -316,13 +343,13 @@ def test_a_forged_token_is_rejected(env: Env) -> None:
 
 @pytest.mark.parametrize("data", ["x" * 100, "../../etc", "", None, 12345, "short"])
 def test_malformed_callback_data_is_rejected(env: Env, data: Any) -> None:
-    env.say(f"/log {AD_URL}")
+    alerted(env)
     env.bot.handle_safely(env.callback(data, env.api.last()[0]))
     assert answers(env)[-1]["text"] == "That button has expired."
 
 
 def test_a_token_can_be_used_once_and_spends_its_keyboard(env: Env) -> None:
-    env.say(f"/log {AD_URL}")
+    alerted(env)
     alert_id = env.api.last()[0]
     env.press("Applied", message_id=alert_id)
     env.press("Applied", message_id=alert_id)  # the same button again
@@ -333,14 +360,14 @@ def test_a_token_can_be_used_once_and_spends_its_keyboard(env: Env) -> None:
 
 
 def test_an_expired_token_is_rejected(env: Env) -> None:
-    env.say(f"/log {AD_URL}")
+    alerted(env)
     env.clock.now = NOW + dt.timedelta(days=8)
     env.press("Applied")
     assert answers(env)[-1]["text"] == "That button has expired."
 
 
 def test_a_token_from_another_message_is_rejected(env: Env) -> None:
-    env.say(f"/log {AD_URL}")
+    alerted(env)
     env.press("Applied", message_id=1)
     assert answers(env)[-1]["text"] == "That button has expired."
 
@@ -376,27 +403,120 @@ def test_an_unknown_action_writes_nothing(env: Env) -> None:
 # --- /log and Applied, with each date choice -----------------------------------------------
 
 
-def test_log_sends_an_alert_with_company_title_link_and_no_fit(env: Env) -> None:
-    env.say(f"/log {AD_URL}")
-    text = env.api.texts()[-1]
-    assert text == f"Example Robotics — Synthetic Analyst\n{AD_URL}\nFit: not scored"
-    labels = [b["text"] for b in env.api.last()[1]["reply_markup"]["inline_keyboard"][0]]
-    assert labels == ["Applied", "Skipped"]
-    s = env.search()
+def test_log_in_one_step_records_the_posting_and_the_application(env: Env) -> None:
+    """/log <link> | method | date: one message, one ledger call, both layers (#34)."""
+    env.say(f"/log {AD_URL} | Company site | 2026-10-21")
+    assert (
+        env.api.texts()[-1]
+        == "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved."
+    )
+    s, e = env.search(), env.ei()
+    assert e is not None
     assert tuple(s.execute("SELECT title, location, source, url FROM postings").fetchone()) == (
         "Synthetic Analyst",
         "Example City",
         "self_sourced",
         AD_URL,
     )
+    (row,) = ei_apps(env)
+    assert (row["employer"], row["method"], row["date_applied"]) == (
+        "Example Robotics",
+        "company_site",
+        "2026-10-21",
+    )
+    assert ledger.reconcile(s, {ACTIVE.label: e}) == []
     s.close()
+    e.close()
+    assert not any(
+        b["text"].startswith(("Applied", "Skipped"))
+        for _, p in env.api.sent()
+        for r in p.get("reply_markup", {}).get("inline_keyboard", [])
+        for b in r
+    )  # no alert: the application is already recorded
+
+
+@pytest.mark.parametrize(
+    ("choice", "precision", "day", "week"),
+    [("Today", "exact", "2026-10-28", None), ("Last week", "week", None, "2026-10-19")],
+)
+def test_a_bare_log_asks_the_method_then_the_date(
+    env: Env, choice: str, precision: str, day: str | None, week: str | None
+) -> None:
+    env.say(f"/log {AD_URL}")
+    assert env.api.texts()[-1] == "Example Robotics — Synthetic Analyst\nHow did you apply?"
+    assert env.counts()["search.postings"] == 0  # nothing is written until the end
+    env.press("Email")
+    assert env.counts()["search.postings"] == 0
+    env.press(choice)
+    assert env.api.texts()[-1].startswith("Recorded: Example Robotics — Synthetic Analyst (ref a1)")
+    (row,) = ei_apps(env)
+    assert (row["method"], row["date_precision"], row["date_applied"], row["week_of"]) == (
+        "email",
+        precision,
+        day,
+        week,
+    )
+
+
+def test_a_bare_log_with_another_date(env: Env) -> None:
+    env.say(f"/log {AD_URL}")
+    env.press("Referral")
+    env.press("Other date")
+    env.say("2026-10-30", reply_to=env.prompt_id())  # in the future: asked again
+    assert "in the future" in env.api.texts()[-1]
+    env.say("2026-10-20", reply_to=env.prompt_id())
+    (row,) = ei_apps(env)
+    assert (row["method"], row["date_applied"]) == ("referral", "2026-10-20")
 
 
 def test_log_without_details_on_the_page_asks_for_them(env: Env) -> None:
-    env.say(f"/log {SHELL_URL}")
-    assert "/log <link> | Company | Title" in env.api.texts()[-1]
-    env.say(f"/log {SHELL_URL} | Sample Logistics | Synthetic Clerk")
-    assert env.api.texts()[-1].startswith("Sample Logistics — Synthetic Clerk")
+    env.say(f"/log {SHELL_URL} | email | 2026-10-21")
+    assert "/log <link> | method | date | Company | Title" in env.api.texts()[-1]
+    assert env.counts()["search.postings"] == 0
+    env.say(f"/log {SHELL_URL} | email | 2026-10-21 | Sample Logistics | Synthetic Clerk")
+    assert env.api.texts()[-2] == "Recorded: Sample Logistics — Synthetic Clerk (ref a1)."
+    assert "PDF or screenshot" in env.api.texts()[-1]
+
+
+ROLE_AD = "https://jobs.example.com/ads/"
+
+
+def test_a_repost_logged_again_names_only_the_earlier_date(env: Env) -> None:
+    """Same company row and title key, another requisition code: still recorded, with
+    one more line that names the earlier date and nothing else (#34)."""
+    env.say(f"/log {ROLE_AD}a | email | 2026-10-20 | Example Robotics | Analyst (R12345)")
+    env.say(f"/log {ROLE_AD}b | email | 2026-10-27 | Example Robotics | Analyst (R67890)")
+    assert env.api.texts()[-2] == (
+        "Recorded: Example Robotics — Analyst (R67890) (ref a2).\n"
+        "You logged an application to this role on 2026-10-20."
+    )
+    assert "PDF or screenshot" in env.api.texts()[-1]
+    assert [r["role"] for r in ei_apps(env)] == ["Analyst (R12345)", "Analyst (R67890)"]
+
+
+def test_another_level_logged_has_no_earlier_line(env: Env) -> None:
+    env.say(f"/log {ROLE_AD}a | email | 2026-10-20 | Example Robotics | Analyst (Level 2)")
+    env.say(f"/log {ROLE_AD}b | email | 2026-10-21 | Example Robotics | Analyst (Level 3)")
+    assert "You logged an application" not in env.api.everything_sent()
+    assert len(ei_apps(env)) == 2
+
+
+@pytest.mark.parametrize(
+    ("command", "message"),
+    [
+        (f"/log {AD_URL} | carrier pigeon | today", "The method must be one of"),
+        (f"/log {AD_URL} | email | 2026-10-29", "in the future"),
+        (f"/log {AD_URL} | email | 2026-07-01", "outside the active EI claim"),
+        (f"/log {AD_URL} | email", "Send: /log <link> | method | date"),
+        (f"/log {AD_URL} | email | today | Only Company", "Send: /log <link> | method | date"),
+    ],
+)
+def test_a_refused_log_writes_nothing(env: Env, command: str, message: str) -> None:
+    env.say(command)
+    assert message in env.api.texts()[-1]
+    counts = env.counts()
+    assert counts["search.postings"] == counts["ei.applications"] == 0
+    assert not list((env.datadir.root / "snapshots").rglob("*.*"))
 
 
 def test_log_of_a_refused_link_writes_nothing(env: Env) -> None:
@@ -406,6 +526,24 @@ def test_log_of_a_refused_link_writes_nothing(env: Env) -> None:
     env.say("/log http://10.0.0.1/x")
     assert "couldn't read that link" in env.api.texts()[-1]
     assert not env.datadir.search_db_path.exists() or env.counts()["search.postings"] == 0
+
+
+def test_a_forged_log_payload_is_refused(env: Env) -> None:
+    s = db.connect(env.datadir.search_db_path)
+    db.migrate(s, "search")
+    s.execute(
+        "INSERT INTO bot_tokens (token, keyboard, chat_id, message_id, action, payload, "
+        "expires_at) VALUES (?, 'k', ?, 55, 'log_date', ?, '2099-01-01T00:00:00Z')",
+        (
+            "D" * 22,
+            CHAT,
+            json.dumps({"log": {"url": AD_URL}, "method": "email", "choice": "today"}),
+        ),
+    )
+    s.close()
+    env.bot.handle_safely(env.callback("D" * 22, 55))
+    assert env.api.texts()[-1] == "That button isn't recognized."
+    assert env.counts()["ei.applications"] == 0
 
 
 @pytest.mark.parametrize(
@@ -471,13 +609,13 @@ def test_a_bad_date_is_refused_and_asked_again(env: Env, reply: str, message: st
 
 def test_the_same_application_twice_is_refused(env: Env) -> None:
     apply(env)
-    apply(env)
+    env.say(f"/log {AD_URL} | Company site | 2026-10-28")  # the same posting and day again
     assert env.api.texts()[-1] == "That application is already recorded."
     assert env.counts()["ei.applications"] == 1
 
 
 def test_no_snapshot_then_an_uploaded_pdf(env: Env) -> None:
-    env.say(f"/log {SHELL_URL} | Sample Logistics | Synthetic Clerk")
+    alerted(env, SHELL_URL, "Sample Logistics", "Synthetic Clerk")
     env.press("Applied")
     env.press("Email")
     env.press("Today")
@@ -514,7 +652,7 @@ def test_workday_json_is_used_for_a_javascript_page(env: Env) -> None:
     api = "https://example.wd3.myworkdayjobs.com/wday/cxs/example/External/job/Example-City/Synthetic_R-9"
     env.web.routes[ad] = SHELL
     env.web.routes[api] = json.dumps({"jobPostingInfo": {"title": "Synthetic Analyst"}}).encode()
-    env.say(f"/log {ad} | Example Robotics | Synthetic Analyst")
+    alerted(env, ad)
     env.press("Applied")
     env.press("Company site")
     env.press("Today")
@@ -527,7 +665,7 @@ def test_workday_json_is_used_for_a_javascript_page(env: Env) -> None:
 
 
 def test_skipped_with_a_reason_writes_search_only(env: Env) -> None:
-    env.say(f"/log {AD_URL}")
+    alerted(env)
     env.press("Skipped")
     env.press("Location")
     assert env.api.texts()[-1] == "Skipped: Example Robotics — Synthetic Analyst."
@@ -537,7 +675,7 @@ def test_skipped_with_a_reason_writes_search_only(env: Env) -> None:
 
 
 def test_skipped_with_a_typed_reason(env: Env) -> None:
-    env.say(f"/log {AD_URL}")
+    alerted(env)
     env.press("Skipped")
     env.press("Other")
     env.say("synthetic reason: rotating weekends", reply_to=env.prompt_id())
@@ -675,7 +813,7 @@ def test_activity_with_no_active_claim(env: Env) -> None:
 
 def test_recent_lists_references_and_statuses(env: Env) -> None:
     apply(env)
-    env.say(f"/log {SHELL_URL} | Sample Logistics | Synthetic Clerk")
+    alerted(env, SHELL_URL, "Sample Logistics", "Synthetic Clerk")
     env.press("Applied")
     env.press("Agency")
     env.press("Yesterday")
@@ -717,9 +855,8 @@ def test_nothing_sent_carries_learning_fields_or_ei_details(env: Env) -> None:
                 notes=sentinels[0],
             ),
         )
-        posting_id = s.execute("SELECT id FROM postings").fetchone()[0]
-        env.bot.alert(s, posting_id)
         s.close()
+    env.say(f"/log {AD_URL} | email | 2026-10-21")  # the same posting, another application
     env.say("/recent")
     env.say("/status")
     env.say("/status a1 rejected")
@@ -1688,10 +1825,10 @@ def test_an_unreadable_config_holds_watcher_alerts_and_logs_only_the_changes(
     assert _held_since(env) is None
 
 
-def test_a_job_ad_is_not_held_and_uses_the_company_fallback(
+def test_config_unreadable_by_the_last_step_of_a_bare_log_writes_nothing(
     env: Env, keep_umask: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Config turns unreadable after /log read it: the job ad still gets its reply."""
+    """The bare /log read config; by the date button it can't be read: fail closed."""
     reads = {"n": 0}
     real = Bot._config
 
@@ -1703,8 +1840,10 @@ def test_a_job_ad_is_not_held_and_uses_the_company_fallback(
 
     monkeypatch.setattr(Bot, "_config", flaky)
     env.say(f"/log {AD_URL}")
-    assert reads["n"] >= 2  # the alert read config again, and it failed
-    assert env.api.texts()[-1] == f"Example Robotics — Synthetic Analyst\n{AD_URL}\nFit: not scored"
+    env.press("Email")
+    env.press("Today")
+    assert env.api.texts()[-1] == botmod.CONFIG_UNREADABLE
+    assert env.counts()["search.postings"] == env.counts()["ei.applications"] == 0
     env.bot.send_pending_alerts()  # the watcher side is held meanwhile
     assert _held_since(env) is not None
 
@@ -1719,6 +1858,7 @@ def test_a_job_ad_with_config_unreadable_from_the_start_is_refused_and_writes_no
     assert reply == "Config can't be read, so nothing was recorded. Run careerhunter doctor."
     assert reply == botmod.CONFIG_UNREADABLE
     assert str(env.datadir.root) not in reply and "unclosed" not in reply
+    assert env.web.calls == []  # nothing is fetched either
     assert not env.datadir.search_db_path.exists() or env.counts()["search.postings"] == 0
 
 

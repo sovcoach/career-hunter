@@ -462,16 +462,23 @@ def test_chat_id_is_the_only_recipient(env: Env, keep_umask: None) -> None:
 # --- the job-ad alert and the edges of a row -------------------------------------------------
 
 
-def test_a_job_ad_that_is_a_scored_watcher_posting_shows_its_tier_and_cosine(
+def test_a_job_ad_that_is_a_scored_watcher_posting_is_logged_against_it(
     env: Env, keep_umask: None
 ) -> None:
+    """/log of a link the watcher already stored records the application on that posting,
+    and sends neither its tier nor its cosine (#34)."""
     posting = _insert(env, "Example Robotics", "Synthetic Analyst", test_bot.AD_URL)
-    _set(env, posting, embedding_score=0.82, alerted_at="2026-10-28T09:00:00Z")
-    env.say(f"/log {test_bot.AD_URL}")
-    assert env.api.texts()[-1] == (
-        f"Example Robotics — Synthetic Analyst\n{test_bot.AD_URL}\n"
-        "Fit: High\nLLM: strong\nsimilarity: 0.82"
-    )
+    _set(env, posting, embedding_score=0.82)
+    env.say(f"/log {test_bot.AD_URL} | email | 2026-10-21")
+    assert env.api.texts()[-1].startswith("Recorded: Example Robotics — Synthetic Analyst")
+    sent = env.api.everything_sent()
+    assert "strong" not in sent and "0.82" not in sent
+    s = env.search()
+    assert s.execute("SELECT count(*) FROM postings").fetchone()[0] == 1
+    assert s.execute("SELECT posting_id FROM applications").fetchone()[0] == posting
+    s.close()
+    assert _poll(env) == 0
+    assert _digests(env) == []  # it has an application, so it is never alerted
 
 
 def test_a_row_leaves_out_what_it_cannot_show(env: Env, keep_umask: None) -> None:

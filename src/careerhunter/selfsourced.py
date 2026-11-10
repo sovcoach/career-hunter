@@ -55,6 +55,11 @@ class LogError(Exception):
     """The application was not recorded. The message is user-facing and fixed."""
 
 
+class NamesMissing(LogError):
+    """The page shows no company and title, and none were given; each front end says how
+    to give them."""
+
+
 @dataclass(frozen=True)
 class Logged:
     company: str
@@ -143,7 +148,7 @@ def describe(
     found_company = company or info.company
     found_title = title or info.title
     if not found_company or not found_title:
-        raise LogError("I couldn't find the company and title on that page; give them too.")
+        raise NamesMissing("I couldn't find the company and title on that page.")
     return Posting(
         company=found_company,
         title=found_title,

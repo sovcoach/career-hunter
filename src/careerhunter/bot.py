@@ -22,17 +22,18 @@ postings go out as one digest per watch run. A digest row carries the company, t
 location, lane,
 fit word (`Fit: High`, `Medium` or `Low`), the number of gaps, the schedule flag in
 words, up to three key requirements the model took from the posting, and the link.
-A job ad sent with /log gets its own alert: company, title, link, `Fit: not scored`,
-the LLM tier name and a cosine when one is stored. Status words and references are
-sent too. A discovery row sends the suggested name and the reduced URL only. A
+/log records a self-sourced application at once (#34) and replies with the company,
+the title and a reference; it sends no alert. Status words and references are sent
+too. A discovery row sends the suggested name and the reduced URL only. A
 watchlist agency with no separate employer stored is labelled " (agency)". Never
 notes, 0-10 fit ratings, gap names, model text, vectors, snippets, queries, EI
 record details or claim labels.
 
-Dates: after Applied and a method, the bot asks when, with buttons (today, yesterday,
-this week, last week, or another date typed as YYYY-MM-DD). Exact days record precision
-`exact`; the week buttons record `week`. /activity takes an optional YYYY-MM-DD, else
-asks the same way. Future dates are refused, and everything passes the claim check.
+Dates: after Applied (or a bare /log) and a method, the bot asks when, with buttons
+(today, yesterday, this week, last week, or another date typed as YYYY-MM-DD). Exact
+days record precision `exact`; the week buttons record `week`. /activity takes an
+optional YYYY-MM-DD, else asks the same way. Future dates are refused, and everything
+passes the claim check.
 """
 
 from __future__ import annotations
@@ -43,7 +44,6 @@ import hashlib
 import json
 import logging
 import logging.handlers
-import math
 import os
 import re
 import secrets
@@ -57,15 +57,14 @@ from typing import Any
 
 import yaml
 
-from careerhunter import claims, db, enums, lanes, ledger, search_store, snapshots
+from careerhunter import claims, db, enums, lanes, ledger, search_store, selfsourced, snapshots
 from careerhunter import discover as discovery
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating
 from careerhunter.config import ConfigError, alerts_max_per_poll, load_config, telegram_chat_id
 from careerhunter.config import today as config_today
-from careerhunter.fetch import Fetched, FetchError, fetch
+from careerhunter.fetch import Fetched, fetch
 from careerhunter.ledger import PartialWriteError
 from careerhunter.models import Activity, Application, Dating, Posting
-from careerhunter.search_store import IdentityConflict
 from careerhunter.secrets_store import SecretError, get_secret
 from careerhunter.seed import monday_of
 from careerhunter.storage_guard import DataDir
@@ -118,9 +117,15 @@ DATE_BUTTONS = [
 ]
 LATER_STATUSES = [s for s in enums.STATUSES if s != "applied"]
 
+LOG_USAGE = (
+    "Send: /log <link> | method | date, or just /log <link>. "
+    "Add | Company | Title when the page doesn't show them."
+)
+
 HELP = (
     "Commands:\n"
-    "/log <link>: record a posting you found (or /log <link> | Company | Title)\n"
+    "/log <link> | method | date: record a job you applied to yourself, in one step "
+    "(or /log <link> to be asked; add | Company | Title if the page doesn't show them)\n"
     "/status <ref> <status>: update an application, or /status to choose\n"
     "/activity <type> [YYYY-MM-DD] <description>: a recruiter call, agency "
     "registration and so on\n"
@@ -193,54 +198,11 @@ def parse_date(text: str, today: dt.date) -> Dating:
     return Dating("exact", day=day.isoformat())
 
 
-def _tier_name(raw: object) -> str | None:
-    if not isinstance(raw, str):
-        return None
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    tier = payload.get("tier")
-    if not isinstance(tier, str) or not tier.strip() or "\n" in tier or "\r" in tier:
-        return None
-    return tier.strip()
-
-
-def _cosine(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    number = float(value)
-    if not math.isfinite(number):
-        return None
-    return number
-
-
 def _fit_label(raw: object) -> str:
     """`High`, `Medium` or `Low`; anything else, a job ad included, is `not scored`."""
     if isinstance(raw, str) and raw in enums.FIT_LEVELS:
         return raw.capitalize()
     return "not scored"
-
-
-def _alert_text(
-    label: str,
-    title: str,
-    url: str | None,
-    fit: object,
-    tier: str | None,
-    score: float | None,
-) -> str:
-    lines = [f"{label} — {title}"]
-    if url:
-        lines.append(url)
-    lines.append(f"Fit: {_fit_label(fit)}")
-    if tier:
-        lines.append(f"LLM: {tier}")
-    if score is not None:
-        lines.append(f"similarity: {score:.2f}")
-    return "\n".join(lines)
 
 
 # The digest (#39). Telegram allows 4096 characters of message text, counted in UTF-16
@@ -342,6 +304,17 @@ def _pack(entries: list[_DigestEntry]) -> list[list[_Numbered]]:
     if current:
         messages.append(current)
     return messages
+
+
+def _log_fields(raw: object) -> dict[str, str]:
+    """The posting a bare /log found, as its own button stored it. Anything else is
+    refused: a payload is ours, but it is still checked field by field."""
+    keys = ("url", "company", "title", "location")
+    if not isinstance(raw, dict) or not all(isinstance(raw.get(k), str) for k in keys):
+        raise Refusal("That button isn't recognized.")
+    if not raw["url"] or not raw["company"] or not raw["title"]:
+        raise Refusal("That button isn't recognized.")
+    return {k: str(raw[k]) for k in keys}
 
 
 class Bot:
@@ -827,75 +800,54 @@ class Bot:
         return f"command:{command[1:]}"
 
     def _cmd_log(self, rest: str) -> None:
+        """A self-sourced application (#34). `/log <link> | method | date` records it at
+        once; a bare `/log <link>` asks for the method, then the date. Either way the
+        posting and the application are written together, by one ledger call, only at
+        the end. `| Company | Title` after the date fills in what the page doesn't show.
+
+        Fails closed without config.yaml: no date and no claim check, so nothing is
+        fetched or written, and the reply is the fixed CONFIG_UNREADABLE text.
+        """
         parts = [p.strip() for p in rest.split("|")]
         url, extra = parts[0], parts[1:]
-        if not url or len(extra) not in (0, 2) or any(not p for p in extra):
-            raise Refusal("Send: /log <link>, or /log <link> | Company | Title")
-        if len(url) > 2000 or len(" ".join(extra)) > MAX_TEXT:
+        if not url or len(extra) not in (0, 2, 4) or any(not p for p in extra):
+            raise Refusal(LOG_USAGE)
+        if len(url) > selfsourced.MAX_URL or len(" ".join(extra)) > MAX_TEXT:
             raise Refusal("That's too long.")
-        try:
-            doc = self._config()
-        except (ConfigError, OSError, yaml.YAMLError, ValueError):
-            # Fail closed: no date and no claim check without config. Fixed text only.
-            raise Refusal(CONFIG_UNREADABLE) from None
+        doc = self._read_config()  # fails closed: no date and no claim check without it
         today = self._today(doc)
-        info = snapshots.PostingInfo()
+        method: str | None = None
+        dating: Dating | None = None
+        company, title = (extra[2], extra[3]) if len(extra) == 4 else (None, None)
         try:
-            page = self.fetcher(url)
-            info = snapshots.posting_info(page.body)
-        except FetchError as exc:
-            if not extra:
-                raise Refusal(f"I couldn't read that link: {exc}.") from None
-        company = extra[0] if extra else info.company
-        title = extra[1] if extra else info.title
-        if not company or not title:
-            raise Refusal(
-                "I couldn't find the company and title on that page. "
-                "Send: /log <link> | Company | Title"
-            )
-        posting = Posting(
-            company=company,
-            title=title,
-            first_seen=today.isoformat(),
-            location=info.location or "",
-            url=url,
-            source="self_sourced",
-        )
-        with self._writable(doc) as (search, _):
-            try:
-                with db.transaction(search):
-                    _, posting_id, _, _ = search_store.find_or_create_posting(
-                        search, posting, Dating("exact", day=today.isoformat())
-                    )
-            except IdentityConflict:
-                raise Refusal("That link is already recorded for another company.") from None
-            self.alert(search, posting_id)
-
-    def alert(self, search: sqlite3.Connection, posting_id: int) -> None:
-        """A job ad sent with /log: company, title, link, the fit, the tier, a cosine.
-
-        Watcher postings go out in the digest instead (`send_pending_alerts`). A job ad
-        is never scored, so it says `Fit: not scored`, unless the link was already a
-        scored watcher posting. Config is read here for the agency label, and if it
-        can't be, the company is shown without one.
-        """
-        posting = search_store.posting_by_id(search, posting_id)
-        if posting is None:
-            raise Refusal("That posting isn't in search.db any more.")
-        label = self._labelled_company(posting.company)
-        row = search.execute(
-            "SELECT fit, scout_metadata, embedding_score FROM postings WHERE id = ?",
-            (posting_id,),
-        ).fetchone()
-        fit = row["fit"] if row is not None else None
-        tier = _tier_name(row["scout_metadata"]) if row is not None else None
-        score = _cosine(row["embedding_score"]) if row is not None else None
-        text = _alert_text(label, posting.title, posting.url, fit, tier, score)
-        payload = {"posting_id": posting_id}
-        self._keyboard(
-            search, text, [[("Applied", "apply", payload), ("Skipped", "skip", payload)]], ALERT_TTL
-        )
-        search_store.mark_alerted(search, posting_id, self._now())
+            if extra:
+                method = selfsourced.parse_method(extra[0])
+                dating = selfsourced.parse_day(extra[1], today)
+            posting = selfsourced.describe(url, self.fetcher, today, company=company, title=title)
+        except selfsourced.NamesMissing as exc:
+            raise Refusal(f"{exc} Send: /log <link> | method | date | Company | Title") from None
+        except selfsourced.LogError as exc:
+            raise Refusal(str(exc)) from None
+        found = {
+            "url": url,
+            "company": posting.company,
+            "title": posting.title,
+            "location": posting.location,
+        }
+        if method is None or dating is None:
+            rows = [
+                [(a, "log_method", {"log": found, "method": m}) for a, m in pair]
+                for pair in (METHOD_BUTTONS[i : i + 2] for i in range(0, len(METHOD_BUTTONS), 2))
+            ]
+            with self._search() as search:
+                self._keyboard(
+                    search,
+                    f"{posting.company} — {posting.title}\nHow did you apply?",
+                    rows,
+                    STEP_TTL,
+                )
+            return
+        self._finish_log(found, method, dating, doc)
 
     def _cmd_status(self, rest: str) -> None:
         parts = rest.split()
@@ -1095,6 +1047,30 @@ class Bot:
                 return
             dating = choice_dating(str(p.get("choice")), self._today(self._config()))
             self._finish_apply(int(p["posting_id"]), str(p["method"]), dating)
+        elif action == "log_method":
+            if p.get("method") not in enums.METHODS:
+                raise Refusal("That method isn't recognized.")
+            found = _log_fields(p.get("log"))
+            rows = [
+                [(label, "log_date", {"log": found, "method": p["method"], "choice": c})]
+                for label, c in DATE_BUTTONS
+            ]
+            with self._search() as search:
+                self._keyboard(search, "When did you apply?", rows, STEP_TTL)
+        elif action == "log_date":
+            found = _log_fields(p.get("log"))
+            if p.get("choice") == "other":
+                with self._search() as search:
+                    self._prompt(
+                        search,
+                        "Reply with the date you applied, as YYYY-MM-DD.",
+                        "apply_date",
+                        {"log": found, "method": p.get("method")},
+                    )
+                return
+            doc = self._read_config()
+            dating = choice_dating(str(p.get("choice")), self._today(doc))
+            self._finish_log(found, str(p.get("method")), dating, doc)
         elif action == "skip":
             rows = [
                 [(a, "skip_reason", {"posting_id": p["posting_id"], "reason": r}) for a, r in pair]
@@ -1166,7 +1142,12 @@ class Bot:
         assert row is not None  # noqa: S101 - usable implies a row
         kind, payload = str(row["kind"]), json.loads(row["payload"])
         try:
-            if kind == "apply_date":
+            if kind == "apply_date" and "log" in payload:
+                doc = self._read_config()
+                dating = parse_date(text, self._today(doc))
+                found = _log_fields(payload["log"])
+                self._finish_log(found, str(payload.get("method")), dating, doc)
+            elif kind == "apply_date":
                 dating = parse_date(text, self._today(self._config()))
                 self._finish_apply(int(payload["posting_id"]), str(payload["method"]), dating)
             elif kind == "activity_date":
@@ -1220,22 +1201,81 @@ class Bot:
                 raise Refusal("That application is already recorded.") from None
             if path and posting.snapshot_path is None:
                 search_store.set_posting_snapshot(search, posting_id, path)
-            app_row = search_store.application_by_correlation(search, recorded.correlation_id)
-            assert app_row is not None  # noqa: S101 - just recorded
-            ref = self._ref(search, int(app_row["id"]))
-            text = f"Recorded: {posting.company} — {posting.title} (ref {ref})."
-            if path:
-                self.send(text + " Job ad saved.")
-            else:
-                self.send(text)
-                self._prompt(
-                    search,
-                    "No copy of the job ad was saved. Reply to this message with a PDF or "
-                    "screenshot of it.",
-                    "snapshot",
-                    {"correlation_id": recorded.correlation_id},
-                    ALERT_TTL,
+            self._confirm(
+                search, recorded.correlation_id, posting.company, posting.title, bool(path)
+            )
+
+    def _finish_log(
+        self, found: dict[str, str], method: str, dating: Dating, doc: dict[str, Any]
+    ) -> None:
+        """Write a self-sourced posting and its application in one ledger call (#34)."""
+        if method not in enums.METHODS:
+            raise Refusal("That method isn't recognized.")
+        today = self._today(doc)
+        posting = Posting(
+            company=found["company"],
+            title=found["title"],
+            first_seen=today.isoformat(),
+            location=found["location"],
+            url=found["url"],
+            source="self_sourced",
+        )
+        with self._writable(doc) as (search, active):
+            try:
+                logged = selfsourced.record(
+                    self.datadir.root, search, active, posting, method, dating, today, self.fetcher
                 )
+            except selfsourced.LogError as exc:
+                raise Refusal(str(exc)) from None
+            self._confirm(
+                search,
+                logged.correlation_id,
+                logged.company,
+                logged.title,
+                logged.snapshot_saved,
+                earlier=logged.earlier,
+            )
+
+    def _confirm(
+        self,
+        search: sqlite3.Connection,
+        correlation_id: str,
+        company: str,
+        title: str,
+        saved: bool,
+        *,
+        earlier: str | None = None,
+    ) -> None:
+        """`Recorded: … (ref aN).`, and the request for a copy of the ad when none was kept.
+
+        `earlier` is the one line naming the date the same role was logged before (#34).
+        """
+        app_row = search_store.application_by_correlation(search, correlation_id)
+        assert app_row is not None  # noqa: S101 - just recorded
+        ref = self._ref(search, int(app_row["id"]))
+        text = f"Recorded: {company} — {title} (ref {ref})."
+        if saved:
+            text += " Job ad saved."
+        if earlier:
+            text += "\n" + earlier
+        self.send(text)
+        if saved:
+            return
+        self._prompt(
+            search,
+            "No copy of the job ad was saved. Reply to this message with a PDF or "
+            "screenshot of it.",
+            "snapshot",
+            {"correlation_id": correlation_id},
+            ALERT_TTL,
+        )
+
+    def _read_config(self) -> dict[str, Any]:
+        """config.yaml for a self-sourced write; unreadable fails closed with fixed text."""
+        try:
+            return self._config()
+        except (ConfigError, OSError, yaml.YAMLError, ValueError):
+            raise Refusal(CONFIG_UNREADABLE) from None
 
     def _finish_skip(self, posting_id: int, reason: str) -> None:
         doc = self._config()

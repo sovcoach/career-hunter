@@ -278,6 +278,9 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
             logged = selfsourced.record(
                 datadir.root, w.search, w.active, posting, method, dating, today, fetch_page
             )
+    except selfsourced.NamesMissing as exc:
+        _err(f"error: {exc} Add --company and --title.")
+        return EXIT_ERROR
     except selfsourced.LogError as exc:
         _err(f"error: {exc}")
         return EXIT_ERROR
