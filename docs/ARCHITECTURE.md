@@ -27,6 +27,7 @@ A small "storage guard" runs before every command and checks that the data folde
 | `claims.py` | The `ei` config section, the per-precision claim check, creating each claim's file, the refusal to write while an earlier claim is unsealed, and sealing. |
 | `ledger.py` | Writes decisions to both layers in a fixed order, builds the sanitized EI copy, and reconciles the two layers. |
 | `selfsourced.py` | A self-sourced application in one step, for `careerhunter log` and the bot's `/log`: reads the link once for the company and title, saves the job-ad copy, and writes the posting and the application through one `ledger.record_application` call, under one correlation ID. |
+| `report.py` | `careerhunter report`: the one code path that attaches a claim's EI record to `search.db`, both read-only, to join them on `correlation_id` into a private report (ADR-014 as amended). |
 | `ei_store.py` | Reads and writes on one EI record file. It imports no search code and opens nothing itself. |
 | `search_store.py` | Reads and writes on `search.db`, including the posting identity rules. |
 | `seed.py` | Validates `seed.yaml`, runs the claim check, then imports each record into its layer. Idempotent by natural keys. |

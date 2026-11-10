@@ -321,6 +321,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-014: Two data layers: `search.db`, and one EI record file per claim
 
+> **Amended: one read-only report attaches (#34).** `careerhunter report --claim <label>` is the one code path that joins the two layers. It opens `search.db` read-only (`mode=ro`), attaches that claim's file read-only (`mode=ro`) as `ei`, and sets `query_only`, so neither file can be written through it. It joins on the random `correlation_id` only; there are still no cross-database foreign keys. The report is a private file, `reports/report-<claim>-<utc>.txt` (0600, folder 0700), never overwritten, and the terminal prints only its relative path. It lists each application's EI employer, role, date, method and latest EI status beside its lane, fit word and source in `search.db`, with counts by lane; orphans on either side are counted and left to `doctor` to name. Voided EI rows are counted and left out. No other code path attaches: `ei_store` still opens nothing, export still reads only the claim's file, and `doctor` still queries each file on its own. A test fails if `ATTACH` appears in any other source file. Writes are unchanged: they still go through the ledger's fixed order, not an attached transaction.
+
 **Context.**
 - Phase 1 kept everything in one `careerhunter.db`. Postings with fit ratings and gaps sat beside the applications that Service Canada may ask for.
 - From Phase 2 on, the bots will store fit ratings, gaps, LLM output, scout metadata and skip reasons. None of that belongs in a record EI can request.

@@ -378,6 +378,14 @@ uv run careerhunter log https://jobs.example.com/ads/7 --method company_site --d
 
 `--method` is one of `company_site`, `linkedin_easy_apply`, `email`, `referral`, `agency`, `recruiter_inbound` or `other` (plain words such as `Company site` work too). `--date` is `YYYY-MM-DD`, `today` or `yesterday`, and must fall within the active claim. The page is fetched once for the company, title and location; if it doesn't show them, add `--company "Example Robotics" --title "Synthetic Analyst"`. A copy of the ad is saved when the page gives one. If you already logged an application to the same role at the same company (a repost counts: the title is compared without its requisition code), it is still recorded, and one more line names the earlier date, for example `You logged an application to this role on 2026-10-27.` Without a readable `config.yaml`, nothing is fetched or recorded. The bot's `/log` does the same from Telegram.
 
+### A report across both files
+
+```bash
+uv run careerhunter report --claim 2026-27
+```
+
+This joins the claim's EI record to `search.db`, opening both read-only, and writes a private report to `reports/` in the data folder (only the path is printed): each application's employer, role, date, method and latest EI status, beside the lane, fit and source `search.db` knows, with counts by lane. It is for you, not for Service Canada: use `export` for that. Applications on only one side are counted; `doctor` lists them.
+
 ## Step 9: Produce an EI job-search report
 
 Pick the period you need, in `YYYY-MM-DD` format:

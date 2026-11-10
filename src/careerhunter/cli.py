@@ -44,6 +44,7 @@ from careerhunter import (
     storage_guard,
     watch,
 )
+from careerhunter import report as claim_report
 from careerhunter.bot import BotStartupError
 from careerhunter.claims import ActiveClaim, ClaimError, ClaimSettings, settings_from_config
 from careerhunter.config import (
@@ -295,6 +296,36 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
 def fetch_page(url: str) -> Fetched:
     """The safe fetch (ADR-016) for `careerhunter log`. Tests replace it."""
     return fetch_url(url)
+
+
+def cmd_report(datadir: DataDir, args: argparse.Namespace) -> int:
+    """Join one claim's EI record to search.db, both read-only, into a private report.
+
+    The only command that attaches one database to another (ADR-014 as amended). It
+    writes reports/report-<claim>-<utc>.txt (0600) and prints only that relative path.
+    """
+    bad = claims.label_problem(args.claim)
+    if bad:
+        raise ValueError(bad)
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    try:
+        conn = claim_report.connect(datadir.search_db_path, datadir.ei_record_path(args.claim))
+    except claim_report.ReportError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    except sqlite3.DatabaseError:
+        _err(f"error: the record for claim {args.claim} can't be read as a claim record")
+        return EXIT_ERROR
+    try:
+        built = claim_report.build(conn, args.claim)
+    finally:
+        conn.close()
+    now = _utc_now()
+    path = claim_report.write(datadir.root, args.claim, claim_report.render(built, now), now)
+    print(path.relative_to(datadir.root).as_posix())
+    return EXIT_OK
 
 
 def cmd_claim(datadir: DataDir, args: argparse.Namespace) -> int:
@@ -1388,6 +1419,8 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
             search.close()
 
     _doctor_private_folder(report, "exports/", datadir.exports)
+    if (datadir.root / "reports").exists():
+        _doctor_private_folder(report, "reports/", datadir.root / "reports")
     _doctor_private_folder(report, "snapshots/", datadir.snapshots)
     _doctor_private_folder(report, "logs/", datadir.logs)
     _doctor_bot(report, datadir, config_doc, now)
@@ -1434,6 +1467,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--date", required=True, help="YYYY-MM-DD, today or yesterday")
     p.add_argument("--company", help="the employer, when the page doesn't say (with --title)")
     p.add_argument("--title", help="the role, when the page doesn't say (with --company)")
+    p = sub.add_parser(
+        "report",
+        help="join one claim's EI record to search.db, read-only, into a private report",
+    )
+    p.add_argument("--claim", required=True, metavar="LABEL", help="the claim, e.g. 2026-27")
     p = sub.add_parser("secret", help="store or check a secret in the macOS Keychain")
     p.add_argument("action", choices=("set", "verify"))
     p.add_argument("name", choices=sorted(secrets_store.ALLOWED_NAMES))
@@ -1500,6 +1538,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "seed": cmd_seed,
     "export": cmd_export,
     "log": cmd_log,
+    "report": cmd_report,
     "claim": cmd_claim,
     "secret": cmd_secret,
     "bot": cmd_bot,

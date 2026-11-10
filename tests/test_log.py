@@ -288,3 +288,32 @@ def test_a_link_owned_by_another_company_is_refused(
     assert _log(probe, "--company", "Example Robotics", "--title", "Synthetic Analyst") == 1
     assert "already recorded for another company" in capsys.readouterr().err
     assert _rows(_ei(ready), "SELECT count(*) FROM applications") == [(0,)]
+
+
+def test_a_page_without_names_says_how_to_give_them(
+    ready: Path,
+    probe: FakeProbe,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "fetch_page", Pages(b"<html><title></title></html>"))
+    assert _log(probe) == cli.EXIT_ERROR
+    assert "Add --company and --title." in capsys.readouterr().err
+
+
+def test_a_link_that_is_too_long_or_a_bad_method_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(selfsourced.LogError, match="too long"):
+        selfsourced.describe(
+            "https://jobs.example.com/" + "a" * 2000, Pages(), dt.date(2026, 10, 1)
+        )
+    with pytest.raises(selfsourced.LogError, match="isn't recognized"):
+        selfsourced.record(
+            tmp_path,
+            None,
+            None,
+            None,
+            "pigeon",
+            Dating("exact", day="2026-10-01"),  # type: ignore[arg-type]
+            dt.date(2026, 10, 1),
+            Pages(),
+        )
