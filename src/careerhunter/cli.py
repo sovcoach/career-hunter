@@ -1254,6 +1254,20 @@ def _doctor_alert_hold(report: _Report, search: sqlite3.Connection) -> None:
         )
 
 
+def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
+    """Postings the bot gave up on after Telegram refused them too often (#42)."""
+    given_up = search_store.given_up_count(search)
+    if given_up:
+        report.line(
+            "bot refusals",
+            "WARN",
+            f"{plural(given_up, 'posting', 'postings')} refused by Telegram "
+            f"{bot.REFUSALS_TO_GIVE_UP} times; given up and never sent (see logs/bot.log)",
+        )
+    else:
+        report.line("bot refusals", "OK", "no posting given up")
+
+
 def _doctor_resume(
     report: _Report,
     datadir: DataDir,
@@ -1385,6 +1399,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
     if search is not None:
         _doctor_watch_runs(report, search, now)
         _doctor_alert_hold(report, search)
+        _doctor_refusals(report, search)
 
     records: dict[str, sqlite3.Connection] = {}
     unreadable = search is None and datadir.search_db_path.exists()

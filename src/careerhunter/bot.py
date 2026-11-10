@@ -117,6 +117,9 @@ DATE_BUTTONS = [
 ]
 LATER_STATUSES = [s for s in enums.STATUSES if s != "applied"]
 
+# Telegram refusing one posting sent alone this many times gives it up (#42).
+REFUSALS_TO_GIVE_UP = 3
+
 LOG_USAGE = (
     "Send: /log <link> | method | date, or just /log <link>. "
     "Add | Company | Title when the page doesn't show them."
@@ -332,8 +335,6 @@ class Bot:
         self.chat_id = chat_id
         self.clock = clock
         self.fetcher = fetcher
-        # Watcher postings Telegram refused on their own; they go behind the others.
-        self._refused: set[int] = set()
 
     # --- plumbing ------------------------------------------------------------------
 
@@ -520,8 +521,10 @@ class Bot:
         no run (scored before search migration 0011) go first, then runs oldest first,
         so a later run cannot push an earlier run's postings back. At most
         ``alerts.max_per_poll`` postings go per poll; the rest carry over in order.
-        A posting Telegram refused on its own goes behind the others for as long as
-        this bot runs, so it can't take the same slot every poll.
+        A posting Telegram refused on its own goes behind the others, so it can't take
+        the same slot every poll; the refusals are counted in search.db (search migration
+        0017), so a restart remembers them. After REFUSALS_TO_GIVE_UP refusals the bot
+        gives up on it: it is never sent again, stays unalerted, and doctor counts it.
 
         Each message goes out first and ``alerted_at`` is set only after Telegram
         accepts it. No answer, a bad reply or HTTP 429 stops the poll with everything
@@ -551,6 +554,7 @@ class Bot:
         stale_before = _utc(self.clock() - STALE_RUN)
         groups: dict[tuple[int, int], list[lanes.Ordered]] = {}
         refused: list[tuple[tuple[int, int], lanes.Ordered]] = []
+        behind = self._refused_now()
         for item in lanes.alert_order(pending, doc):
             alert = by_id[item.posting_id]
             if alert.run_id is not None and not (
@@ -559,7 +563,7 @@ class Bot:
             ):
                 continue  # its run is still going: wait for it
             key = (0, 0) if alert.run_id is None else (1, alert.run_id)
-            if item.posting_id in self._refused:
+            if item.posting_id in behind:
                 refused.append((key, item))
             else:
                 groups.setdefault(key, []).append(item)
@@ -599,13 +603,39 @@ class Bot:
                 return False
         return True
 
+    def _refused_now(self) -> set[int]:
+        """Postings refused before and not given up. Unreadable: none go behind."""
+        try:
+            with self._search() as search:
+                return search_store.refused_postings(search)
+        except (OSError, sqlite3.Error) as exc:
+            log.warning("alert refusals could not be read (%s)", type(exc).__name__)
+            return set()
+
+    def _refused(self, posting_id: int) -> None:
+        """Count a refusal of one posting sent alone; give up at REFUSALS_TO_GIVE_UP."""
+        with self._search() as search, db.transaction(search):
+            given_up = search_store.record_refusal(
+                search, posting_id, self._now(), give_up_after=REFUSALS_TO_GIVE_UP
+            )
+        if given_up:
+            log.warning(
+                "an alert was refused %d times (TelegramRejected); given up, see doctor",
+                REFUSALS_TO_GIVE_UP,
+            )
+        else:
+            log.warning("an alert was refused (TelegramRejected); left for the next poll")
+
     def _send_one_by_one(self, message: list[_Numbered], total: int) -> bool:
         for entry in message:
             try:
                 self._send_rows([entry], None, total=total)
             except TelegramRejected:
-                self._refused.add(entry.entry.fields.posting_id)
-                log.warning("an alert was refused (TelegramRejected); left for the next poll")
+                try:
+                    self._refused(entry.entry.fields.posting_id)
+                except (OSError, sqlite3.Error) as exc:
+                    log.warning("alert refusal not recorded (%s)", type(exc).__name__)
+                    return False
             except (TelegramError, OSError, sqlite3.Error) as exc:
                 log.warning("alert digest failed (%s); left for the next poll", type(exc).__name__)
                 return False
@@ -652,8 +682,7 @@ class Bot:
                     )
                 for numbered in message:
                     search_store.mark_alerted(search, numbered.entry.fields.posting_id, now)
-        for numbered in message:
-            self._refused.discard(numbered.entry.fields.posting_id)
+                    search_store.clear_refusal(search, numbered.entry.fields.posting_id)
 
     def _alert_config(self) -> dict[str, Any] | None:
         """This poll's config, or None while it can't be read (the hold is recorded)."""

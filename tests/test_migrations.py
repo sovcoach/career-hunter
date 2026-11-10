@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 17)), "ei_record": [1]}[track]
+    expected = {"search": list(range(1, 18)), "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -849,5 +849,36 @@ def test_0016_leaves_every_existing_skip_to_the_watcher(tmp_path: Path) -> None:
         )
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("UPDATE skips SET by_operator = 2")
+    finally:
+        conn.close()
+
+
+def test_0017_counts_refusals_per_posting(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:17])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (?, 'Coordinator', '2026-10-30', 'watcher')",
+            (company,),
+        )
+        conn.execute(
+            "INSERT INTO alert_refusals (posting_id, refusals, last_refused_at) "
+            "VALUES (1, 1, '2026-10-30T09:00:00Z')"
+        )
+        for sql in (
+            "INSERT INTO alert_refusals (posting_id, refusals, last_refused_at) "
+            "VALUES (1, 1, '2026-10-30T09:00:00Z')",  # one row per posting
+            "INSERT INTO alert_refusals (posting_id, refusals, last_refused_at) "
+            "VALUES (999, 1, '2026-10-30T09:00:00Z')",  # a posting that exists
+            "UPDATE alert_refusals SET refusals = 0",
+            "UPDATE alert_refusals SET last_refused_at = '2026-10-30'",
+            "UPDATE alert_refusals SET given_up_at = 'soon'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(sql)
     finally:
         conn.close()

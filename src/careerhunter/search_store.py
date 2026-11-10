@@ -417,7 +417,8 @@ class PendingAlert:
 
 def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
     """Watcher and discovery postings with a score and a fit, no skip, no application,
-    no alert yet, and not a repost of a role the operator logged or skipped (#34).
+    no alert yet, not given up after Telegram refused it too often (#42), and not a
+    repost of a role the operator logged or skipped (#34).
     Oldest id first.
 
     A posting without a fit (unscored, or scored into a tier name not in config) is held.
@@ -434,6 +435,8 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
           AND p.alerted_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
           AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)
+          AND NOT EXISTS (SELECT 1 FROM alert_refusals r
+                          WHERE r.posting_id = p.id AND r.given_up_at IS NOT NULL)
         ORDER BY p.id
         """
     ).fetchall()
@@ -525,6 +528,43 @@ def _requirements(raw: object) -> tuple[str, ...]:
 def pending_alert_ids(conn: sqlite3.Connection) -> list[int]:
     """The ids of `pending_alerts`, oldest id first, before any lane ordering."""
     return [alert.posting_id for alert in pending_alerts(conn)]
+
+
+def record_refusal(
+    conn: sqlite3.Connection, posting_id: int, stamp: str, *, give_up_after: int
+) -> bool:
+    """Count one Telegram refusal of this posting (search migration 0017). True when this
+    one reached `give_up_after`, so the posting is now given up. One statement, so two
+    writers can't lose a count."""
+    conn.execute(
+        "INSERT INTO alert_refusals (posting_id, refusals, last_refused_at) VALUES (?, 1, ?) "
+        "ON CONFLICT (posting_id) DO UPDATE SET refusals = refusals + 1, "
+        "last_refused_at = excluded.last_refused_at",
+        (posting_id, stamp),
+    )
+    cur = conn.execute(
+        "UPDATE alert_refusals SET given_up_at = ? "
+        "WHERE posting_id = ? AND given_up_at IS NULL AND refusals >= ?",
+        (stamp, posting_id, give_up_after),
+    )
+    return cur.rowcount == 1
+
+
+def refused_postings(conn: sqlite3.Connection) -> set[int]:
+    """Postings Telegram refused that are not given up: they go behind the others."""
+    rows = conn.execute("SELECT posting_id FROM alert_refusals WHERE given_up_at IS NULL")
+    return {int(row["posting_id"]) for row in rows}
+
+
+def clear_refusal(conn: sqlite3.Connection, posting_id: int) -> None:
+    """Telegram accepted the posting: forget its refusals."""
+    conn.execute("DELETE FROM alert_refusals WHERE posting_id = ?", (posting_id,))
+
+
+def given_up_count(conn: sqlite3.Connection) -> int:
+    """Postings the bot stopped sending after too many refusals."""
+    row = conn.execute("SELECT count(*) FROM alert_refusals WHERE given_up_at IS NOT NULL")
+    return int(row.fetchone()[0])
 
 
 def alerts_held_since(conn: sqlite3.Connection) -> str | None:

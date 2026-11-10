@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from careerhunter import bot as botmod
-from careerhunter import claims, db, ledger, search_store, telegram
+from careerhunter import claims, cli, db, ledger, search_store, telegram
 from careerhunter.claims import ClaimSettings
 from careerhunter.models import Application, Dating, Posting
 from tests import test_bot
@@ -419,7 +419,7 @@ def test_a_refused_digest_is_sent_row_by_row_and_the_bad_row_goes_last(
     _post(env, "Waiting Row", fit="medium")
     refused = telegram.TelegramRejected("sendMessage: Bad Request")
     _Failing(env, refused, refused, None)  # the digest, then the bad row alone, then the good
-    env.bot.send_pending_alerts()  # one bot, polling twice: what it refused, it remembers
+    env.bot.send_pending_alerts()  # what it refused is counted in search.db
     alerted = _alerted(env)
     assert alerted["Bad Row"] is None and alerted["Good Row"] is not None
     assert alerted["Waiting Row"] is None
@@ -430,6 +430,98 @@ def test_a_refused_digest_is_sent_row_by_row_and_the_bad_row_goes_last(
     env.bot.send_pending_alerts()
     assert _heads(env)[-2:] == ["Example Org — Waiting Row", "Example Org — Bad Row"]
     assert set(_alerted(env).values()) != {None}
+
+
+def _refusals(env: Env) -> list[tuple[str, int, bool]]:
+    conn = env.search()
+    try:
+        rows = conn.execute(
+            "SELECT p.title, r.refusals, r.given_up_at IS NOT NULL AS given_up "
+            "FROM alert_refusals r JOIN postings p ON p.id = r.posting_id ORDER BY p.id"
+        )
+        return [(str(r["title"]), int(r["refusals"]), bool(r["given_up"])) for r in rows]
+    finally:
+        conn.close()
+
+
+def _restarted(env: Env) -> None:
+    """A new Bot on the same data folder: nothing carried over in memory."""
+    env.bot = botmod.Bot(env.datadir, env.api, CHAT, clock=env.clock, fetcher=env.web)
+
+
+def test_a_refusal_is_remembered_after_a_restart(env: Env, keep_umask: None) -> None:
+    _config(env, max_per_poll=1)
+    _post(env, "Bad Row")
+    _post(env, "Waiting Row", fit="medium")
+    refused = telegram.TelegramRejected("sendMessage: Bad Request")
+    _Failing(env, refused, refused)  # the digest, then the row alone
+    env.bot.send_pending_alerts()
+    assert _refusals(env) == [("Bad Row", 1, False)]
+    _restarted(env)
+    env.bot.send_pending_alerts()  # the refused row still goes behind the waiting one
+    assert _heads(env)[-1] == "Example Org — Waiting Row"
+    env.bot.send_pending_alerts()
+    assert _heads(env)[-1] == "Example Org — Bad Row"  # accepted now
+    assert _refusals(env) == []  # an accepted posting's refusals are forgotten
+
+
+def test_three_refusals_give_a_posting_up_and_doctor_counts_it(
+    env: Env,
+    keep_umask: None,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="careerhunter.bot")
+    _post(env, "Bad Row")
+    refused = telegram.TelegramRejected("sendMessage: Bad Request")
+    for count in (1, 2, 3):
+        _Failing(env, refused, refused)
+        _restarted(env)
+        env.bot.send_pending_alerts()
+        assert _refusals(env) == [("Bad Row", count, count == 3)]
+    assert "an alert was refused 3 times (TelegramRejected); given up, see doctor" in [
+        r.getMessage() for r in caplog.records
+    ]
+    before = len(env.api.sent())
+    env.bot.send_pending_alerts()
+    assert len(env.api.sent()) == before  # never sent again
+    assert _alerted(env) == {"Bad Row": None}  # held: never counted as sent
+    conn = env.search()
+    try:
+        assert search_store.pending_alert_ids(conn) == []
+        assert search_store.given_up_count(conn) == 1
+    finally:
+        conn.close()
+    report = cli._Report()
+    conn = env.search()
+    try:
+        capsys.readouterr()
+        cli._doctor_refusals(report, conn)
+    finally:
+        conn.close()
+    assert capsys.readouterr().out.strip() == (
+        "bot refusals    WARN 1 posting refused by Telegram 3 times; given up and never sent "
+        "(see logs/bot.log)"
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        telegram.TelegramUnreachable("sendMessage: TimeoutError"),
+        telegram.TelegramBadReply("sendMessage: the reply was not JSON"),
+        telegram.TelegramRateLimited("sendMessage: HTTP 429"),
+    ],
+)
+def test_a_failure_that_is_not_a_refusal_is_not_counted(
+    env: Env, keep_umask: None, error: Exception
+) -> None:
+    _post(env, "Coordinator")
+    _Failing(env, error)
+    env.bot.send_pending_alerts()
+    assert _refusals(env) == []
+    assert _alerted(env) == {"Coordinator": None}
 
 
 def test_config_unreadable_sends_no_digest(env: Env, keep_umask: None) -> None:
