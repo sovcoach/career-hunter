@@ -728,6 +728,27 @@ def test_workday_pages_stop_at_the_page_limit(search: sqlite3.Connection, monkey
     ) in lines
 
 
+def test_workday_paging_stops_at_a_repeated_page(
+    search: sqlite3.Connection, monkeypatch: Any
+) -> None:
+    """A board that ignores the offset serves the same full page again (#35)."""
+    monkeypatch.setattr(ats, "WORKDAY_PAGE", 2)
+    same = wd_page([wd_row(1), wd_row(2)], total=9)
+    fetcher = Posted(
+        routes({f"{WD_BASE}{wd_path(n)}": wd_info("x") for n in (1, 2)}),
+        {0: fetched(same), 2: fetched(same), 4: fetched(wd_page([wd_row(3)]))},
+    )
+    lines = wd_run(search, fetcher)
+    assert [payload["offset"] for _, payload in fetcher.posts] == [0, 2]  # type: ignore[index]
+    assert fetcher.calls == [f"{WD_BASE}{wd_path(n)}" for n in (1, 2)]
+    assert [row[3].rsplit("_", 1)[1] for row in stored(search)] == ["JR00001", "JR00002"]
+    assert (
+        "watch: Example Robotics (workday): repeated page at offset 2 (the same postings as "
+        "the page before); later postings left for the next run"
+    ) in lines
+    assert lines[-1] == "watch: 1 boards fetched, 0 failed, 0 left"
+
+
 def test_an_unknown_workday_site_or_tenant_fails_and_stores_nothing(
     search: sqlite3.Connection,
 ) -> None:

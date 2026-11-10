@@ -722,14 +722,28 @@ def _workday_base(board: Board) -> str:
 def _workday_list_pages(
     board: Board, url: str, client: Client, today: dt.date | None
 ) -> tuple[list[Job | Skip], list[str]]:
+    """Every page, by offset, until a short page, a repeated page or the page limit.
+
+    A page whose externalPaths are the previous page's, in order, means the board is
+    ignoring the offset: paging stops there, what was read is kept, and a note says so,
+    the same as the page limit.
+    """
     jobs: list[Job | Skip] = []
     offset = 0
+    previous: list[object] | None = None
     for _page in range(MAX_PAGES):
         payload = {"appliedFacets": {}, "limit": WORKDAY_PAGE, "offset": offset, "searchText": ""}
         data = client.post_json(url, payload)
         rows = data.get("jobPostings") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             raise BoardParseError("unexpected JSON shape")
+        paths = [row.get("externalPath") if isinstance(row, dict) else None for row in rows]
+        if rows and paths == previous:
+            return jobs, [
+                f"repeated page at offset {offset} (the same postings as the page before); "
+                "later postings left for the next run"
+            ]
+        previous = paths
         jobs.extend(_workday_job(item, board, today) for item in rows)
         offset += len(rows)
         if len(rows) < WORKDAY_PAGE:
