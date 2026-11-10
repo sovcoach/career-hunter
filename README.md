@@ -20,6 +20,7 @@ Your information never leaves your machine and is never stored in this code repo
 |---|---|
 | `careerhunter init` | Creates your private data folder on the encrypted drive, copies in starter config files, and creates the databases |
 | `careerhunter seed` | Imports your existing applications and activities from a simple YAML file, each into the right place. Re-running is safe: nothing is duplicated |
+| `careerhunter log <link> --method … --date …` | Records a job you found and applied to yourself in one step: the posting and the application go into both files under one ID, with a copy of the ad when the page gives one. `--company` and `--title` fill in what the page doesn't show |
 | `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
 | `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
 | `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |

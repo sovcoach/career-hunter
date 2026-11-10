@@ -368,6 +368,16 @@ If you really did apply to some jobs before the claim started, and want career-h
 
 You can fix `seed.yaml` and run this again at any time. Entries already imported are recognized and skipped, so nothing is duplicated. Existing entries aren't changed by re-running: the record is permanent by design. A mistaken entry is *voided* with a reason rather than deleted. The record keeps it, but reports leave it out.
 
+### Recording a job you applied to yourself
+
+When you apply to a job you found yourself, record the posting and the application in one step:
+
+```bash
+uv run careerhunter log https://jobs.example.com/ads/7 --method company_site --date 2026-10-20
+```
+
+`--method` is one of `company_site`, `linkedin_easy_apply`, `email`, `referral`, `agency`, `recruiter_inbound` or `other` (plain words such as `Company site` work too). `--date` is `YYYY-MM-DD`, `today` or `yesterday`, and must fall within the active claim. The page is fetched once for the company, title and location; if it doesn't show them, add `--company "Example Robotics" --title "Synthetic Analyst"`. A copy of the ad is saved when the page gives one. If you already logged an application to the same role at the same company (a repost counts: the title is compared without its requisition code), it is still recorded, and one more line names the earlier date, for example `You logged an application to this role on 2026-10-27.` Without a readable `config.yaml`, nothing is fetched or recorded. The bot's `/log` does the same from Telegram.
+
 ## Step 9: Produce an EI job-search report
 
 Pick the period you need, in `YYYY-MM-DD` format:

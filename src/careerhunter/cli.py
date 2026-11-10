@@ -39,6 +39,7 @@ from careerhunter import (
     resume,
     search_store,
     secrets_store,
+    selfsourced,
     service,
     storage_guard,
     watch,
@@ -59,8 +60,8 @@ from careerhunter.config import (
 from careerhunter.config import today as config_today
 from careerhunter.deadline import Deadline
 from careerhunter.export import export, plural
+from careerhunter.fetch import Fetched, post_json
 from careerhunter.fetch import fetch as fetch_url
-from careerhunter.fetch import post_json
 from careerhunter.filters import PostingText
 from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.platform_checks import SystemProbe
@@ -250,6 +251,47 @@ def cmd_export(datadir: DataDir, args: argparse.Namespace) -> int:
     for path in (result.pdf, result.applications_csv, result.activities_csv):
         print(f"wrote {path}")
     return EXIT_OK
+
+
+def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
+    """A self-sourced application in one step (#34): the posting and the application go
+    to both layers under one correlation id, in one ledger call.
+
+    Fails closed like the bot's `/log`: without a readable config.yaml there is no date
+    and no claim check, so nothing is fetched or written.
+    """
+    if not datadir.config_path.is_file():
+        _err("error: config.yaml is missing, so nothing was recorded")
+        return EXIT_ERROR
+    if (args.company is None) != (args.title is None):
+        _err("error: give --company and --title together, or neither")
+        return EXIT_ERROR
+    doc = load_config(datadir.config_path)
+    today = config_today(doc)
+    try:
+        method = selfsourced.parse_method(args.method)
+        dating = selfsourced.parse_day(args.date, today)
+        posting = selfsourced.describe(
+            args.url, fetch_page, today, company=args.company, title=args.title
+        )
+        with _writable(datadir) as w:
+            logged = selfsourced.record(
+                datadir.root, w.search, w.active, posting, method, dating, today, fetch_page
+            )
+    except selfsourced.LogError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    where = f"EI claim {logged.ei_claim}" if logged.ei_claim else "search.db only, no active claim"
+    print(f"Recorded: {logged.company} — {logged.title} ({where}).")
+    print("Job ad saved." if logged.snapshot_saved else "No copy of the job ad was saved.")
+    if logged.earlier:
+        print(logged.earlier)
+    return EXIT_OK
+
+
+def fetch_page(url: str) -> Fetched:
+    """The safe fetch (ADR-016) for `careerhunter log`. Tests replace it."""
+    return fetch_url(url)
 
 
 def cmd_claim(datadir: DataDir, args: argparse.Namespace) -> int:
@@ -1381,6 +1423,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--claim", required=True, metavar="LABEL", help="the claim, e.g. 2026-27")
     p.add_argument("--from", dest="date_from", type=_date, required=True, metavar="YYYY-MM-DD")
     p.add_argument("--to", dest="date_to", type=_date, required=True, metavar="YYYY-MM-DD")
+    p = sub.add_parser(
+        "log", help="record a self-sourced application: the posting and the application at once"
+    )
+    p.add_argument("url", help="the job ad's link")
+    p.add_argument("--method", required=True, help="how you applied, e.g. company_site or email")
+    p.add_argument("--date", required=True, help="YYYY-MM-DD, today or yesterday")
+    p.add_argument("--company", help="the employer, when the page doesn't say (with --title)")
+    p.add_argument("--title", help="the role, when the page doesn't say (with --company)")
     p = sub.add_parser("secret", help="store or check a secret in the macOS Keychain")
     p.add_argument("action", choices=("set", "verify"))
     p.add_argument("name", choices=sorted(secrets_store.ALLOWED_NAMES))
@@ -1446,6 +1496,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "migrate": cmd_migrate,
     "seed": cmd_seed,
     "export": cmd_export,
+    "log": cmd_log,
     "claim": cmd_claim,
     "secret": cmd_secret,
     "bot": cmd_bot,
