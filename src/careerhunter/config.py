@@ -27,6 +27,10 @@ LaunchAgent runs, default 60 and at least 15.
 - exclusions: role-level exclusions and "exclude roles already applied to";
 - alerts.max_per_poll: the per-poll cap on watcher alerts, an integer from 1 to 50,
   default 10.
+- health.unproductive_runs: how many watch runs or discovery passes in a row may do no
+  useful work before doctor warns, and health.failure_runs: how many runs in a row the
+  local model, SearXNG or every board may fail before the bot says so. Both are
+  integers from 1 to 50, default 3.
 
 With lanes present, search.target_titles becomes optional; with gap_tiers present, the
 fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
@@ -81,6 +85,9 @@ DEFAULT_MAX_POSTING_AGE_DAYS = 7
 MAX_POSTING_AGE_LIMIT = 365
 DEFAULT_MAX_PER_POLL = 10
 MAX_PER_POLL_LIMIT = 50
+DEFAULT_HEALTH_RUNS = 3
+HEALTH_RUNS_LIMIT = 50
+HEALTH_KEYS = ("unproductive_runs", "failure_runs")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _CAREER_HOST = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -457,6 +464,24 @@ def _validate_alerts(section: Any, problems: list[str]) -> None:
         )
 
 
+def _validate_health(section: Any, problems: list[str]) -> None:
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        problems.append("health must be a mapping")
+        return
+    extra = set(section) - set(HEALTH_KEYS)
+    if extra:
+        problems.append(f"health has unknown keys: {sorted(extra)}")
+    for key in HEALTH_KEYS:
+        value = section.get(key)
+        if value is not None and (not _int(value) or not 1 <= value <= HEALTH_RUNS_LIMIT):
+            problems.append(
+                f"health.{key} must be an integer from 1 to {HEALTH_RUNS_LIMIT} "
+                f"(default {DEFAULT_HEALTH_RUNS})"
+            )
+
+
 def _validate_telegram(section: Any, problems: list[str]) -> None:
     if section is None:
         return
@@ -574,6 +599,7 @@ def validate_config(doc: Any) -> list[str]:
 
     _validate_telegram(doc.get("telegram"), problems)
     _validate_alerts(doc.get("alerts"), problems)
+    _validate_health(doc.get("health"), problems)
     _validate_discovery(doc.get("discovery"), problems)
     problems.extend(validate_section(doc.get("ei")))
     return problems
@@ -641,6 +667,24 @@ def alerts_max_per_poll(doc: Mapping[str, Any] | None) -> int:
     if _int(value) and 1 <= value <= MAX_PER_POLL_LIMIT:
         return value
     return DEFAULT_MAX_PER_POLL
+
+
+def _health(doc: Mapping[str, Any] | None, key: str) -> int:
+    section = doc.get("health") if isinstance(doc, Mapping) else None
+    value = section.get(key) if isinstance(section, Mapping) else None
+    if _int(value) and 1 <= value <= HEALTH_RUNS_LIMIT:
+        return value
+    return DEFAULT_HEALTH_RUNS
+
+
+def health_unproductive_runs(doc: Mapping[str, Any] | None) -> int:
+    """Unproductive runs in a row before doctor warns; 3 if unset (#42)."""
+    return _health(doc, "unproductive_runs")
+
+
+def health_failure_runs(doc: Mapping[str, Any] | None) -> int:
+    """Failed runs of one component in a row before the bot says so; 3 if unset (#42)."""
+    return _health(doc, "failure_runs")
 
 
 def discovery_queries_per_run(doc: Mapping[str, Any] | None) -> int:

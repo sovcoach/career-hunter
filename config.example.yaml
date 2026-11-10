@@ -171,3 +171,11 @@ telegram:
 # postings per poll (1-50, default 10); the rest carry over to the next poll.
 alerts:
   max_per_poll: 10
+
+# Optional: health (#42). doctor warns after this many watch runs, or discovery passes,
+# in a row that did no useful work; the bot sends one message after this many runs in
+# a row in which the local model, SearXNG, or every board failed, and one when it
+# works again. Each from 1 to 50, default 3.
+health:
+  unproductive_runs: 3
+  failure_runs: 3
