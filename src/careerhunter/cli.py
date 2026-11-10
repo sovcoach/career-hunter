@@ -51,6 +51,8 @@ from careerhunter.config import (
     ConfigError,
     discovery_enabled,
     discovery_interval_minutes,
+    health_failure_runs,
+    health_unproductive_runs,
     load_config,
     load_exclusions,
     off_lane_min_fit,
@@ -1241,6 +1243,95 @@ def _doctor_watch_runs(report: _Report, search: sqlite3.Connection, now: dt.date
         report.line("watch held", "OK", detail)
 
 
+COMPONENT_NAMES = {"lm_studio": "LM Studio", "searxng": "SearXNG", "boards": "every board"}
+
+
+def _ago(now: dt.datetime, stamp: str) -> str:
+    minutes = max(0, int((now - dt.datetime.fromisoformat(stamp)).total_seconds() // 60))
+    return f"{minutes} min ago"
+
+
+def _unproductive_watch_runs(search: sqlite3.Connection, now: dt.datetime) -> int:
+    """Watch runs in a row, newest first, that did no useful work (#42).
+
+    A finished run with `useful` 0 counts, and so does a run unfinished past its grace:
+    it crashed or was killed, so it did nothing useful. A run still in progress is not
+    counted either way. The count stops at a useful run, and at a run finished before
+    search migration 0018, whose usefulness is unknown.
+    """
+    count = 0
+    for row in search.execute(
+        "SELECT started_at, finished_at, useful FROM watch_runs ORDER BY id DESC"
+    ):
+        if row["finished_at"] is None:
+            if now - dt.datetime.fromisoformat(str(row["started_at"])) > _RUN_GRACE:
+                count += 1
+            continue
+        if row["useful"] != 0:
+            break
+        count += 1
+    return count
+
+
+def _doctor_usefulness(
+    report: _Report,
+    search: sqlite3.Connection,
+    config_doc: dict[str, Any] | None,
+    now: dt.datetime,
+) -> None:
+    """Did useful work, beside the ran stamps: a warning after N unproductive in a row."""
+    limit = health_unproductive_runs(config_doc)
+    last = search.execute("SELECT max(finished_at) FROM watch_runs WHERE useful = 1").fetchone()[0]
+    when = f"last useful run {_ago(now, str(last))}" if last else "no useful run recorded yet"
+    streak = _unproductive_watch_runs(search, now)
+    if streak >= limit:
+        report.line(
+            "watch useful",
+            "WARN",
+            f"the last {streak} watch runs did no useful work; {when}. See logs/watch.log",
+        )
+    elif last:
+        report.line("watch useful", "OK", when)
+    else:
+        report.line("watch useful", "--", when)
+    if not discovery_enabled(config_doc):
+        return
+    row = search.execute("SELECT useful_at, unproductive FROM discovery_state").fetchone()
+    useful_at, unproductive = (None, 0) if row is None else (row[0], int(row[1]))
+    when = f"last useful pass {_ago(now, str(useful_at))}" if useful_at else "no useful pass yet"
+    if unproductive >= limit:
+        report.line(
+            "discovery useful",
+            "WARN",
+            f"the last {unproductive} discovery passes got no usable reply; {when}",
+        )
+    elif useful_at:
+        report.line("discovery useful", "OK", when)
+    else:
+        report.line("discovery useful", "--", when)
+
+
+def _doctor_components(
+    report: _Report, search: sqlite3.Connection, config_doc: dict[str, Any] | None
+) -> None:
+    """A component failing now: a warning at health.failure_runs runs in a row."""
+    limit = health_failure_runs(config_doc)
+    for health in search_store.component_health(search):
+        if not health.failures:
+            continue
+        held = (
+            ""
+            if health.held is None
+            else f"; {plural(health.held, 'posting', 'postings')} held for scoring"
+        )
+        report.line(
+            "health",
+            "WARN" if health.failures >= limit else "OK",
+            f"{COMPONENT_NAMES[health.component]} failed the last "
+            f"{plural(health.failures, 'run', 'runs')} ({health.last_failure}){held}",
+        )
+
+
 def _doctor_alert_hold(report: _Report, search: sqlite3.Connection) -> None:
     """Whether the bot is holding watcher alerts because it couldn't read config.yaml."""
     since = search_store.alerts_held_since(search)
@@ -1398,6 +1489,8 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
     _doctor_lanes(report, config_doc)
     if search is not None:
         _doctor_watch_runs(report, search, now)
+        _doctor_usefulness(report, search, config_doc, now)
+        _doctor_components(report, search, config_doc)
         _doctor_alert_hold(report, search)
         _doctor_refusals(report, search)
 

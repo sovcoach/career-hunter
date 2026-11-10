@@ -526,6 +526,22 @@ discover: 0 queued, 0 postings found
 
 `doctor` shows how old that stamp is; one older than two discovery intervals, or two watch intervals when those are longer, is a failure. If an earlier version installed `org.careerhunter.discover`, run `service install` again: it removes that agent and prints `removed …; discovery now runs inside the watch agent`, and `doctor` warns until you do. List, approve and reject write no log and do not refresh the stamp. `service uninstall` removes the bot and the watch agent, and an old discovery agent if one is left.
 
+`doctor` also tells "ran" apart from "did useful work". A watch run is useful when it fetched at least one board and, if postings were waiting to be scored, the local model answered; a discovery pass is useful when SearXNG gave a usable reply to every query. After `health.unproductive_runs` runs (or passes) in a row that weren't useful (default 3), `doctor` warns:
+
+```text
+watch useful    WARN the last 3 watch runs did no useful work; last useful run 300 min ago. See logs/watch.log
+discovery useful WARN the last 3 discovery passes got no usable reply; last useful pass 600 min ago
+health          WARN LM Studio failed the last 3 runs (unreachable); 4 postings held for scoring
+```
+
+A `health` line names a component that is failing now (LM Studio, SearXNG, or every board) once it has failed `health.failure_runs` runs in a row (default 3); the bot also sends one message about it then, and one when it works again (see 10d). Both settings take 1 to 50:
+
+```yaml
+health:
+  unproductive_runs: 3
+  failure_runs: 3
+```
+
 ### 10d. Using it
 
 | Send | What happens |
