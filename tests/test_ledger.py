@@ -266,7 +266,8 @@ def test_a_skip_writes_nothing_to_the_ei_file(
     )
     assert snapshot(active.conn) == before
     assert active.conn.total_changes == changes
-    assert search.execute("SELECT reason FROM skips").fetchone()[0] == "too far"
+    row = search.execute("SELECT reason, by_operator FROM skips").fetchone()
+    assert tuple(row) == ("too far", 1)  # the operator's skip, so its reposts are held
 
 
 def test_without_an_active_claim_only_search_is_written(

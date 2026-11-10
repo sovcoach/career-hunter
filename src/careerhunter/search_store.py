@@ -542,10 +542,19 @@ def mark_alerted(conn: sqlite3.Connection, posting_id: int, alerted_at: str) -> 
     )
 
 
-def insert_skip(conn: sqlite3.Connection, posting_id: int, date: str, reason: str) -> int:
+def insert_skip(
+    conn: sqlite3.Connection,
+    posting_id: int,
+    date: str,
+    reason: str,
+    *,
+    by_operator: bool = False,
+) -> int:
+    """A skip. `by_operator` marks one the operator chose (search migration 0016); only
+    those suppress a repost of the same role. The watcher's own skips leave it False."""
     cur = conn.execute(
-        "INSERT INTO skips (posting_id, date, reason) VALUES (?, ?, ?)",
-        (posting_id, date, reason),
+        "INSERT INTO skips (posting_id, date, reason, by_operator) VALUES (?, ?, ?, ?)",
+        (posting_id, date, reason, int(by_operator)),
     )
     return int(cur.lastrowid or 0)
 

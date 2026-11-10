@@ -165,12 +165,16 @@ def record_discovery_decision(
 
 
 def record_skip(search: sqlite3.Connection, posting: Posting, date: str, reason: str) -> int:
-    """A skip is search-only: the EI record never hears about it."""
+    """The operator's skip. Search-only: the EI record never hears about it.
+
+    It is marked as the operator's (search migration 0016), so a repost of the same role
+    is not alerted again (`already_handled`).
+    """
     with transaction(search):
         _, posting_id, _, _ = search_store.find_or_create_posting(
             search, posting, Dating("exact", date)
         )
-        return search_store.insert_skip(search, posting_id, date, reason)
+        return search_store.insert_skip(search, posting_id, date, reason, by_operator=True)
 
 
 def record_activity(active: ActiveClaim | None, activity: Activity) -> bool:

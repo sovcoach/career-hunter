@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 16)), "ei_record": [1]}[track]
+    expected = {"search": list(range(1, 17)), "ei_record": [1]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -819,5 +819,35 @@ def test_0015_keeps_one_posting_per_ats_key(tmp_path: Path) -> None:
             )
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("UPDATE postings SET ats_key = '' WHERE title = 'Two'")
+    finally:
+        conn.close()
+
+
+def test_0016_leaves_every_existing_skip_to_the_watcher(tmp_path: Path) -> None:
+    """No fill: a skip stored before 0016 is never taken for the operator's."""
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:15])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'watcher')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source, alerted_at) "
+            "VALUES (?, 'Coordinator', '2026-10-30', 'watcher', '2026-10-30T09:00:00Z')",
+            (company,),
+        )
+        for reason in ("not a fit", "seniority", "too_old"):
+            conn.execute(
+                "INSERT INTO skips (posting_id, date, reason) VALUES (1, '2026-10-30', ?)",
+                (reason,),
+            )
+        assert db.migrate(conn, "search", db.load_migrations("search")[:16]) == [16]
+        assert [r[0] for r in conn.execute("SELECT by_operator FROM skips")] == [0, 0, 0]
+        conn.execute(
+            "INSERT INTO skips (posting_id, date, reason, by_operator) "
+            "VALUES (1, '2026-10-31', 'any free text at all', 1)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE skips SET by_operator = 2")
     finally:
         conn.close()
