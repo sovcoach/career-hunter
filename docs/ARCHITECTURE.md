@@ -156,7 +156,7 @@ search.db ◀────────────── 3. COMMIT ────�
 - A skip writes `search.db` only. With no active claim, applications go to `search.db` only.
 - Before any of this, `init`, `migrate` and `seed` refuse to run while an earlier claim's file is unsealed, or a claim file isn't in config.
 
-`doctor` reconciles the two layers in both directions. It opens each file on its own connection, read-only, and never attaches one to another.
+`doctor` reconciles the two layers in both directions. It opens each file on its own connection, read-only, and never attaches one to another (only `careerhunter report` does, read-only). An application on one side only, or linked to a claim with no file, is an `orphan` line; one on both sides that disagrees is a `reconcile` line. Both are BAD, and doctor fixes neither: it says so in one more line, and the files are left byte for byte as they were.
 
 ## Data flow
 

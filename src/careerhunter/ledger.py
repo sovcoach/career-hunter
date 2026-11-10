@@ -222,8 +222,13 @@ def attach_snapshot(
 
 @dataclass(frozen=True)
 class Gap:
+    """One way the two layers disagree. `kind` is `orphan` when the application exists
+    on one side only (or links to a claim with no file), `mismatch` when both sides have
+    it but disagree. `doctor` reports both and fixes neither."""
+
     correlation_id: str
     problem: str
+    kind: str = "mismatch"
 
 
 def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]) -> list[Gap]:
@@ -242,7 +247,7 @@ def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]
         statuses = ei_store.status_sequences(conn)
         for corr in sorted(statuses):
             if corr not in links:
-                gaps.append(Gap(corr, f"in {where} but missing from search.db"))
+                gaps.append(Gap(corr, f"in {where} but missing from search.db", "orphan"))
                 continue
             if links[corr] != label:
                 other = links[corr] or "no claim"
@@ -257,10 +262,14 @@ def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]
                 )
         for corr, claim_label in sorted(links.items()):
             if claim_label == label and corr not in statuses:
-                gaps.append(Gap(corr, f"in search.db but missing from {where}"))
+                gaps.append(Gap(corr, f"in search.db but missing from {where}", "orphan"))
     for corr, linked in sorted(links.items()):
         if linked is not None and linked not in records:
             gaps.append(
-                Gap(corr, f"search.db links it to claim {linked}, which has no record file")
+                Gap(
+                    corr,
+                    f"search.db links it to claim {linked}, which has no record file",
+                    "orphan",
+                )
             )
     return gaps

@@ -1405,8 +1405,13 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
         elif search is not None:
             gaps = reconcile(search, records)
             for gap in gaps:
-                report.line("reconcile", "BAD", f"{gap.correlation_id}: {gap.problem}")
-            if not gaps:
+                name = "orphan" if gap.kind == "orphan" else "reconcile"
+                report.line(name, "BAD", f"{gap.correlation_id}: {gap.problem}")
+            if gaps:
+                # Reported only: doctor never repairs either layer (#34). Re-running
+                # seed repairs seed rows; anything else is the operator's to decide.
+                report.line("reconcile", "--", "left as they are; doctor never fixes either file")
+            else:
                 report.line(
                     "reconcile",
                     "OK",

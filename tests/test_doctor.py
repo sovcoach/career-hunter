@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -248,8 +249,61 @@ def test_reconciliation_gaps_are_reported(
     code, out = doctor(probe, capsys)
     assert code == cli.EXIT_ERROR
     assert (
-        f"reconcile       BAD {corr}: in the EI record for claim 2026-27 but missing from search.db"
+        f"orphan          BAD {corr}: in the EI record for claim 2026-27 but missing from search.db"
     ) in out
+
+
+def _bytes(ready: Path) -> dict[str, str]:
+    """The content of every database and non-empty WAL in the data folder."""
+    found = {}
+    for path in sorted(ready.glob("*.db*")):
+        if path.name.endswith("-shm") or (path.name.endswith("-wal") and not path.stat().st_size):
+            continue
+        found[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return found
+
+
+def test_an_orphan_on_either_side_is_reported_and_left_unchanged(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#34: doctor names orphans in both directions and never fixes them."""
+    conn = db.connect(ready / "search.db")
+    first, second = (
+        r[0] for r in conn.execute("SELECT correlation_id FROM applications ORDER BY id LIMIT 2")
+    )
+    # EI side only: the search row is gone.
+    conn.execute(
+        "DELETE FROM decision_history WHERE application_id = "
+        "(SELECT id FROM applications WHERE correlation_id = ?)",
+        (first,),
+    )
+    conn.execute("DELETE FROM applications WHERE correlation_id = ?", (first,))
+    # search.db only: a row linked to the claim that its file never got.
+    posting = conn.execute("SELECT id FROM postings LIMIT 1").fetchone()[0]
+    orphan = "ab" * 16
+    conn.execute(
+        "INSERT INTO applications (correlation_id, ei_claim, posting_id, date_applied, "
+        "date_precision, method) VALUES (?, '2026-27', ?, '2026-10-21', 'exact', 'email')",
+        (orphan, posting),
+    )
+    conn.close()
+    before = _bytes(ready)
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert (
+        f"orphan          BAD {first}: in the EI record for claim 2026-27 "
+        "but missing from search.db"
+    ) in out
+    assert (
+        f"orphan          BAD {orphan}: in search.db but missing from the EI record for claim "
+        "2026-27"
+    ) in out
+    assert "reconcile       --  left as they are; doctor never fixes either file" in out
+    assert second not in out
+    assert _bytes(ready) == before
+    code, again = doctor(probe, capsys)  # still there: nothing was repaired
+    assert code == cli.EXIT_ERROR and f"orphan          BAD {orphan}" in again
+    assert _bytes(ready) == before
 
 
 def test_loose_exports_and_snapshots_are_fixed(
