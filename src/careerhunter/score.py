@@ -41,7 +41,7 @@ import json
 import re
 import unicodedata
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +49,7 @@ from careerhunter import loopback
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
 from careerhunter.resume import Resume
+from careerhunter.search_store import Example
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/chat/completions"
 MODEL_NAME = "local-model"
@@ -152,8 +153,13 @@ def score_posting(
     url: str = DEFAULT_URL,
     transport: Transport | None = None,
     resume: Resume | None = None,
+    examples: Sequence[Example] = (),
 ) -> Score | None:
     """The score, or None when the reply does not parse.
+
+    `examples` are postings the operator labelled (#43): each goes in the request only,
+    as its title, lane, gap count and label. Not the company, the description, a cosine
+    or a note. The one being scored (same company and title) is left out.
 
     Raises ScoreError when the model does not answer. None leaves the posting unscored.
     The caller does not alert it.
@@ -164,7 +170,7 @@ def score_posting(
     send = default_transport if transport is None else transport
     require_loopback(url)
     try:
-        status, body = send(url, _request_body(posting, config, resume))
+        status, body = send(url, _request_body(posting, config, resume, examples))
     except (ScoreError, OSError, http.client.HTTPException):
         raise ScoreError("the local model could not be reached") from None
     if status != 200:
@@ -224,7 +230,10 @@ def _copies_resume(gaps: list[_Gap], resume_text: str) -> bool:
 
 
 def _request_body(
-    posting: PostingText, config: Mapping[str, Any], resume: Resume | None = None
+    posting: PostingText,
+    config: Mapping[str, Any],
+    resume: Resume | None = None,
+    examples: Sequence[Example] = (),
 ) -> bytes:
     view: dict[str, Any] = {
         "lanes": _section(config, "search", "lanes"),
@@ -241,6 +250,14 @@ def _request_body(
     }
     if resume is not None:
         view["resume"] = resume.text
+    shown = [
+        {"title": ex.title, "lane": ex.lane, "gaps": ex.gap_count, "label": ex.label}
+        for ex in examples
+        if (ex.company.casefold(), ex.title.casefold())
+        != (posting.company.casefold(), posting.title.casefold())
+    ]
+    if shown:
+        view["labelled_examples"] = shown
     payload = {
         "model": MODEL_NAME,
         "temperature": 0,
@@ -255,7 +272,10 @@ def _request_body(
                     "Use an empty gaps array when nothing is missing. "
                     "requirements: up to three key requirements the posting itself "
                     f"states, each a short phrase of at most {MAX_REQUIREMENT} characters, "
-                    "whether or not they are gaps. No prose."
+                    "whether or not they are gaps. No prose. "
+                    "labelled_examples, when present, are other postings and what the "
+                    "candidate decided about them (applied and its latest status, or "
+                    "skipped); use them only to calibrate, never as requirements."
                 ),
             },
             {"role": "user", "content": json.dumps(view)},

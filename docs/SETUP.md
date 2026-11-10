@@ -175,6 +175,8 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | A cap on weekend days | `schedule_limits` |
 | Which roles to keep at one company | that company's `role_filters` |
 | A staffing agency | `agency: true` on that watchlist entry |
+| How many of your recent Applied, Skipped and status decisions the scorer sees as examples (only the local model sees them; 0 for none) | `learning.labelled_examples` (default 5) |
+| When `doctor` warns about runs that did nothing useful, and when the bot says a part stopped working | `health.unproductive_runs`, `health.failure_runs` (default 3 each) |
 | Companies, title keywords, description keywords, and one role | `exclusions.yaml` |
 
 The templates use placeholder names such as Example Robotics, Example City, and Example Staffing Mill.

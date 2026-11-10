@@ -53,6 +53,7 @@ from careerhunter.config import (
     discovery_interval_minutes,
     health_failure_runs,
     health_unproductive_runs,
+    learning_labelled_examples,
     load_config,
     load_exclusions,
     off_lane_min_fit,
@@ -846,12 +847,17 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
         except resume.ResumeError as exc:
             problem = str(exc)
 
+        # The operator's labelled postings, read once per run (#43). They reach the
+        # local model's request only.
+        examples = search_store.labelled_examples(conn, learning_labelled_examples(doc))
+
         def scorer(posting: PostingText) -> Score | None:
             return score_posting(
                 posting,
                 doc,
                 transport=partial(score_transport, budget=budget),
                 resume=loaded,
+                examples=examples,
             )
 
         watch.run(

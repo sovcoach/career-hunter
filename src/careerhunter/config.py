@@ -27,6 +27,8 @@ LaunchAgent runs, default 60 and at least 15.
 - exclusions: role-level exclusions and "exclude roles already applied to";
 - alerts.max_per_poll: the per-poll cap on watcher alerts, an integer from 1 to 50,
   default 10.
+- learning.labelled_examples: how many of the operator's recent labelled postings the
+  scoring prompt shows the local model, an integer from 0 to 20, default 5 (0: none);
 - health.unproductive_runs: how many watch runs or discovery passes in a row may do no
   useful work before doctor warns, and health.failure_runs: how many runs in a row the
   local model, SearXNG or every board may fail before the bot says so. Both are
@@ -85,6 +87,8 @@ DEFAULT_MAX_POSTING_AGE_DAYS = 7
 MAX_POSTING_AGE_LIMIT = 365
 DEFAULT_MAX_PER_POLL = 10
 MAX_PER_POLL_LIMIT = 50
+DEFAULT_LABELLED_EXAMPLES = 5
+LABELLED_EXAMPLES_LIMIT = 20
 DEFAULT_HEALTH_RUNS = 3
 HEALTH_RUNS_LIMIT = 50
 HEALTH_KEYS = ("unproductive_runs", "failure_runs")
@@ -464,6 +468,23 @@ def _validate_alerts(section: Any, problems: list[str]) -> None:
         )
 
 
+def _validate_learning(section: Any, problems: list[str]) -> None:
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        problems.append("learning must be a mapping")
+        return
+    extra = set(section) - {"labelled_examples"}
+    if extra:
+        problems.append(f"learning has unknown keys: {sorted(extra)}")
+    value = section.get("labelled_examples")
+    if value is not None and (not _int(value) or not 0 <= value <= LABELLED_EXAMPLES_LIMIT):
+        problems.append(
+            f"learning.labelled_examples must be an integer from 0 to {LABELLED_EXAMPLES_LIMIT} "
+            f"(default {DEFAULT_LABELLED_EXAMPLES}; 0 sends none)"
+        )
+
+
 def _validate_health(section: Any, problems: list[str]) -> None:
     if section is None:
         return
@@ -600,6 +621,7 @@ def validate_config(doc: Any) -> list[str]:
     _validate_telegram(doc.get("telegram"), problems)
     _validate_alerts(doc.get("alerts"), problems)
     _validate_health(doc.get("health"), problems)
+    _validate_learning(doc.get("learning"), problems)
     _validate_discovery(doc.get("discovery"), problems)
     problems.extend(validate_section(doc.get("ei")))
     return problems
@@ -675,6 +697,15 @@ def _health(doc: Mapping[str, Any] | None, key: str) -> int:
     if _int(value) and 1 <= value <= HEALTH_RUNS_LIMIT:
         return value
     return DEFAULT_HEALTH_RUNS
+
+
+def learning_labelled_examples(doc: Mapping[str, Any] | None) -> int:
+    """How many labelled examples go in the scoring prompt; 5 if unset, 0 for none (#43)."""
+    section = doc.get("learning") if isinstance(doc, Mapping) else None
+    value = section.get("labelled_examples") if isinstance(section, Mapping) else None
+    if _int(value) and 0 <= value <= LABELLED_EXAMPLES_LIMIT:
+        return value
+    return DEFAULT_LABELLED_EXAMPLES
 
 
 def health_unproductive_runs(doc: Mapping[str, Any] | None) -> int:

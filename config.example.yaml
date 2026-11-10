@@ -172,6 +172,13 @@ telegram:
 alerts:
   max_per_poll: 10
 
+# Optional: the learning loop (#43). The scoring prompt shows the local model up to this
+# many postings you labelled recently: their title, lane, number of gaps, and what you
+# decided (applied and its latest status, or skipped). 0 to 20, default 5; 0 sends none.
+# Only the local model sees them. Rules and thresholds never change by themselves.
+learning:
+  labelled_examples: 5
+
 # Optional: health (#42). doctor warns after this many watch runs, or discovery passes,
 # in a row that did no useful work; the bot sends one message after this many runs in
 # a row in which the local model, SearXNG, or every board failed, and one when it

@@ -736,6 +736,66 @@ def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ]
 
 
+@dataclass(frozen=True)
+class Example:
+    """One posting the operator labelled, as the scoring prompt shows it (#43). `company`
+    is kept only to leave the posting being scored out; it is not sent."""
+
+    company: str
+    title: str
+    lane: str | None  # the lane name, "off-lane", or None when not checked
+    gap_count: int | None
+    label: str  # "skipped", or the application's latest status
+
+
+def labelled_examples(conn: sqlite3.Connection, limit: int) -> list[Example]:
+    """The `limit` most recently labelled postings, newest label first.
+
+    Labels come only from the operator: an application (its latest status, `applied` or
+    later, from the bot or the CLI) or a skip they chose with the Skipped button. The
+    system never predicts one, and a watcher skip is not a label.
+    """
+    if limit < 1:
+        return []
+    rows = conn.execute(
+        """
+        WITH labels AS (
+            SELECT a.posting_id, d.status AS label, d.recorded_at AS at, d.id AS seq, 1 AS kind
+            FROM decision_history d JOIN applications a ON a.id = d.application_id
+            UNION ALL
+            SELECT s.posting_id, 'skipped', s.created_at, s.id, 0
+            FROM skips s WHERE s.by_operator = 1
+        ),
+        latest AS (
+            SELECT posting_id, label, at,
+                   row_number() OVER (PARTITION BY posting_id ORDER BY at DESC, kind DESC,
+                                      seq DESC) AS n
+            FROM labels
+        )
+        SELECT c.name AS company, p.title, p.lane, p.lane_checked, l.label,
+               CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
+                    THEN json_array_length(p.gaps) END AS gap_count
+        FROM latest l
+        JOIN postings p ON p.id = l.posting_id
+        JOIN companies c ON c.id = p.company_id
+        WHERE l.n = 1
+        ORDER BY l.at DESC, p.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [
+        Example(
+            company=str(row["company"]),
+            title=str(row["title"]),
+            lane=str(row["lane"]) if row["lane"] else ("off-lane" if row["lane_checked"] else None),
+            gap_count=None if row["gap_count"] is None else int(row["gap_count"]),
+            label=str(row["label"]),
+        )
+        for row in rows
+    ]
+
+
 def insert_skip(
     conn: sqlite3.Connection,
     posting_id: int,
