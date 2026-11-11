@@ -92,7 +92,7 @@ def test_fragments_are_stitched_exactly_as_sent(env: Env, parts: list[str]) -> N
     later(env, 5)
     env.bot.tick()
     (row,) = jd_rows(env)
-    assert row["text"] == "".join(parts)
+    assert row["text"] == botmod.STITCH_SEPARATOR.join(parts)
     assert env.api.texts()[-1] == (
         "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job description saved."
     )
@@ -102,10 +102,34 @@ def test_fragments_are_stitched_exactly_as_sent(env: Env, parts: list[str]) -> N
     assert e is not None
     assert ledger.reconcile(s, {ACTIVE.label: e}) == []
     path = s.execute("SELECT jd_path FROM applications").fetchone()[0]
-    assert (env.datadir.root / path).read_text() == "".join(parts)
+    assert (env.datadir.root / path).read_text() == botmod.STITCH_SEPARATOR.join(parts)
     assert (env.datadir.root / path).stat().st_mode & 0o777 == 0o600
     s.close()
     e.close()
+
+
+def test_parts_split_at_blank_lines_get_them_back_and_no_words_fuse(env: Env) -> None:
+    """Telegram splits a long paste at blank lines and delivers each part with the
+    whitespace at the split removed; joining them with nothing fused words, as the manual
+    check with the real client found."""
+    paragraphs = [
+        "About the role\nExample Robotics is looking for a synthetic",
+        "duties analyst for made-up robotics",
+        "tickets and notes.",
+    ]
+    pasted = "\n\n".join(paragraphs)
+    delivered = [p.strip() for p in paragraphs]  # as Telegram hands them over
+    env.say(HEADER + "\n" + delivered[0])
+    for part in delivered[1:]:
+        later(env, 1)
+        env.say(part)
+    later(env, 5)
+    env.bot.tick()
+    (row,) = jd_rows(env)
+    assert row["text"] == pasted  # the paragraph breaks are back
+    for fused in ("syntheticduties", "roboticstickets", "ticketsnotes"):
+        assert fused not in row["text"]
+    assert row["text"].split() == pasted.split()  # every word, in order
 
 
 def test_a_fragment_after_the_window_gets_the_failed_stitch_reply(env: Env) -> None:
@@ -160,7 +184,7 @@ def test_another_chat_inside_the_window_is_ignored(env: Env, kwargs: dict[str, A
     env.say(PART_3)
     later(env, 5)
     env.bot.tick()
-    assert jd_rows(env)[0]["text"] == PART_1 + PART_3
+    assert jd_rows(env)[0]["text"] == PART_1 + "\n\n" + PART_3
 
 
 @pytest.mark.parametrize(
@@ -369,7 +393,7 @@ def test_the_loop_polls_briefly_while_stitching_and_orders_a_batch(
     timeouts = [p["timeout"] for m, p in api.calls if m == "getUpdates"]
     assert timeouts == [botmod.POLL_TIMEOUT, botmod.STITCH_POLL_TIMEOUT]
     (row,) = jd_rows(env)
-    assert row["text"] == PART_1 + PART_2
+    assert row["text"] == PART_1 + "\n\n" + PART_2
     log = (env.datadir.logs / "bot.log").read_text()
     assert "job description stitched from 2 messages" in log
     assert "synthetic" not in log.lower() and "Example Robotics" not in log

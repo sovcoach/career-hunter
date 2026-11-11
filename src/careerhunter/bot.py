@@ -32,7 +32,8 @@ record details or claim labels.
 Job descriptions (ADR-024): `/log <link> | method | date [| Company | Title]` may carry
 the JD after its first line. Telegram splits a long paste into several messages, so
 after such a /log, each plain text message from the same chat that arrives within
-JD_STITCH_SECONDS of the one before is added to the JD, as Telegram sent it; nothing is
+JD_STITCH_SECONDS of the one before is added to the JD after a blank line (Telegram
+splits a paste at blank lines and drops them, so that is what puts them back); nothing is
 fetched or recorded until that window closes, and the bot polls with a short timeout
 while it is open. A PDF, HTML or text file whose caption is the /log line is the JD
 too. Without a JD (and none could be fetched), the application is still recorded and
@@ -126,6 +127,7 @@ MAX_CAPTION = 1024  # Telegram's own caption limit
 # before is part of the same JD. Set in code, with no config key.
 JD_STITCH_SECONDS = 4
 STITCH_POLL_TIMEOUT = 1  # getUpdates' timeout while a JD is being stitched
+STITCH_SEPARATOR = "\n\n"  # between the parts of a split paste
 LATE_FRAGMENT_SECONDS = 60  # a plain text this soon after a saved JD was likely part of it
 FILE_KINDS = ("document", "photo", "video", "audio", "voice", "sticker", "animation")
 
@@ -1077,7 +1079,9 @@ class Bot:
         return event
 
     def _finish_stitch(self, stitch: _Stitch) -> str:
-        joined = "".join(stitch.parts)  # exactly as Telegram sent them
+        # Telegram splits at a blank line and drops the whitespace there, so a blank line
+        # goes back between the parts; otherwise words fuse across the split.
+        joined = STITCH_SEPARATOR.join(stitch.parts)
         jd: jobdesc.JobDescription | None = None
         if joined.strip():
             try:
