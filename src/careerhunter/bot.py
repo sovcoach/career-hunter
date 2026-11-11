@@ -29,6 +29,17 @@ watchlist agency with no separate employer stored is labelled " (agency)". Never
 notes, 0-10 fit ratings, gap names, model text, vectors, snippets, queries, EI
 record details or claim labels.
 
+Job descriptions (ADR-024): `/log <link> | method | date [| Company | Title]` may carry
+the JD after its first line. Telegram splits a long paste into several messages, so
+after such a /log, each plain text message from the same chat that arrives within
+JD_STITCH_SECONDS of the one before is added to the JD, as Telegram sent it; nothing is
+fetched or recorded until that window closes, and the bot polls with a short timeout
+while it is open. A PDF, HTML or text file whose caption is the /log line is the JD
+too. Without a JD (and none could be fetched), the application is still recorded and
+the reply asks for the JD as a reply to it. The JD comes in through Telegram and is
+never sent back: no reply quotes it, and the log counts the messages it was made of.
+A LinkedIn link is never fetched, so it needs `| Company | Title`.
+
 Dates: after Applied (or a bare /log) and a method, the bot asks when, with buttons
 (today, yesterday, this week, last week, or another date typed as YYYY-MM-DD). Exact
 days record precision `exact`; the week buttons record `week`. /activity takes an
@@ -57,7 +68,18 @@ from typing import Any
 
 import yaml
 
-from careerhunter import claims, db, enums, lanes, ledger, search_store, selfsourced, snapshots
+from careerhunter import (
+    claims,
+    db,
+    enums,
+    jobdesc,
+    lanes,
+    ledger,
+    search_store,
+    selfsourced,
+    snapshots,
+    urls,
+)
 from careerhunter import discover as discovery
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating
 from careerhunter.config import (
@@ -99,6 +121,13 @@ STEP_TTL = dt.timedelta(days=1)
 REF_TTL = dt.timedelta(days=7)
 MAX_UPLOAD = 20 * 1024 * 1024
 MAX_TEXT = 500
+MAX_CAPTION = 1024  # Telegram's own caption limit
+# A long paste arrives as several messages: each one within this many seconds of the one
+# before is part of the same JD. Set in code, with no config key.
+JD_STITCH_SECONDS = 4
+STITCH_POLL_TIMEOUT = 1  # getUpdates' timeout while a JD is being stitched
+LATE_FRAGMENT_SECONDS = 60  # a plain text this soon after a saved JD was likely part of it
+FILE_KINDS = ("document", "photo", "video", "audio", "voice", "sticker", "animation")
 
 METHOD_BUTTONS = [
     ("Company site", "company_site"),
@@ -132,11 +161,37 @@ LOG_USAGE = (
     "Send: /log <link> | method | date, or just /log <link>. "
     "Add | Company | Title when the page doesn't show them."
 )
+LINKEDIN_REFUSAL = (
+    "LinkedIn links are never fetched, so give the company and title: "
+    "/log <link> | method | date | Company | Title"
+)
+JD_NEEDS_FULL_LOG = (
+    "Send the job description with /log <link> | method | date on the first line "
+    "(or as the caption of its file)."
+)
+JD_REQUEST = (
+    "No job description was saved. Reply to this message with it, as text or as a PDF, "
+    "HTML or text file."
+)
+JD_NO_TEXT = (
+    "The file was kept as the job ad, but it has no text I can read. Reply to this message "
+    "with the job description as text, or as another PDF, HTML or text file."
+)
+JD_NO_TEXT_AGAIN = (
+    "The file was kept as the job ad, but it has no text I can read. Send the job "
+    "description as text, or as another PDF, HTML or text file."
+)
+JD_LATE = (
+    "The job description was saved without that message. Reply to the Recorded message "
+    "with the whole description as a .txt file."
+)
 
 HELP = (
     "Commands:\n"
     "/log <link> | method | date: record a job you applied to yourself, in one step "
-    "(or /log <link> to be asked; add | Company | Title if the page doesn't show them)\n"
+    "(or /log <link> to be asked; add | Company | Title if the page doesn't show them). "
+    "Paste the job description on the lines after it, or send its PDF, HTML or text "
+    "file with the /log line as the caption\n"
     "/status <ref> <status>: update an application, or /status to choose\n"
     "/activity <type> [YYYY-MM-DD] <description>: a recruiter call, agency "
     "registration and so on\n"
@@ -412,6 +467,19 @@ def _week_line(counts: Mapping[str, int]) -> str:
     )
 
 
+@dataclass
+class _Stitch:
+    """A /log whose JD is still arriving: its first line, parsed, and the JD so far."""
+
+    url: str
+    method: str
+    dating: Dating
+    company: str | None
+    title: str | None
+    parts: list[str]
+    last: dt.datetime
+
+
 def _log_fields(raw: object) -> dict[str, str]:
     """The posting a bare /log found, as its own button stored it. Anything else is
     refused: a payload is ours, but it is still checked field by field."""
@@ -438,6 +506,8 @@ class Bot:
         self.chat_id = chat_id
         self.clock = clock
         self.fetcher = fetcher
+        self._stitch: _Stitch | None = None  # in memory only: a crash writes nothing
+        self._jd_saved_at: dt.datetime | None = None
 
     # --- plumbing ------------------------------------------------------------------
 
@@ -536,6 +606,21 @@ class Bot:
             "INSERT INTO bot_prompts (chat_id, message_id, kind, payload, expires_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (self.chat_id, int(result["message_id"]), kind, json.dumps(payload), self._later(ttl)),
+        )
+
+    def _expect_reply(
+        self,
+        search: sqlite3.Connection,
+        message_id: int,
+        kind: str,
+        payload: dict[str, Any],
+        ttl: dt.timedelta = STEP_TTL,
+    ) -> None:
+        """Accept a reply to a message already sent, as to a prompt."""
+        search.execute(
+            "INSERT INTO bot_prompts (chat_id, message_id, kind, payload, expires_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (self.chat_id, message_id, kind, json.dumps(payload), self._later(ttl)),
         )
 
     def _ref(self, search: sqlite3.Connection, application_id: int) -> str:
@@ -940,8 +1025,74 @@ class Bot:
         return "ignored:kind"
 
     def handle_safely(self, update: dict[str, Any]) -> str:
+        if self._stitch is not None and not self._keeps_stitch(update):
+            self.close_stitch()
+        return self._guarded(lambda: self.handle(update))
+
+    # --- stitching a long JD ---------------------------------------------------------
+
+    @property
+    def stitching(self) -> bool:
+        return self._stitch is not None
+
+    def _is_fragment(self, message: Mapping[str, Any]) -> bool:
+        """Plain text from the allowlisted chat: not a command, a reply, a forward or a file."""
+        text = message.get("text")
+        return (
+            self._allowed(message.get("chat"), message.get("from"))
+            and isinstance(text, str)
+            and not text.startswith("/")
+            and "reply_to_message" not in message
+            and not any(key.startswith("forward") for key in message)
+            and not any(kind in message for kind in FILE_KINDS)
+        )
+
+    def _in_window(self, since: dt.datetime, seconds: float) -> bool:
+        return self.clock() - since <= dt.timedelta(seconds=seconds)
+
+    def _keeps_stitch(self, update: object) -> bool:
+        """True when this update leaves an open stitch open: a fragment in time, or a
+        message from another chat, which is ignored anyway."""
+        assert self._stitch is not None  # noqa: S101 - only called while stitching
+        message = update.get("message") if isinstance(update, dict) else None
+        if not isinstance(message, dict):
+            return False
+        if not self._allowed(message.get("chat"), message.get("from")):
+            return True
+        return self._is_fragment(message) and self._in_window(self._stitch.last, JD_STITCH_SECONDS)
+
+    def tick(self) -> None:
+        """Close the stitch once JD_STITCH_SECONDS have passed since its last message."""
+        if self._stitch is not None and not self._in_window(self._stitch.last, JD_STITCH_SECONDS):
+            self.close_stitch()
+
+    def close_stitch(self) -> str:
+        """Record the /log whose JD was being stitched. Returns the event label."""
+        stitch, self._stitch = self._stitch, None
+        if stitch is None:
+            return "log:none"
+        log.info("job description stitched from %d messages", len(stitch.parts))
+        event = self._guarded(lambda: self._finish_stitch(stitch))
+        log.info("update handled: %s", event)
+        return event
+
+    def _finish_stitch(self, stitch: _Stitch) -> str:
+        joined = "".join(stitch.parts)  # exactly as Telegram sent them
+        jd: jobdesc.JobDescription | None = None
+        if joined.strip():
+            try:
+                jd = jobdesc.from_paste(joined)
+            except jobdesc.JobDescError as exc:
+                raise Refusal(f"Not recorded: {exc}") from None
+        doc = self._read_config()
+        self._log_now(
+            stitch.url, stitch.method, stitch.dating, stitch.company, stitch.title, doc, jd
+        )
+        return "log:stitched"
+
+    def _guarded(self, work: Callable[[], str]) -> str:
         try:
-            return self.handle(update)
+            return work()
         except Refusal as exc:
             self.send(str(exc))
             return "refused"
@@ -968,15 +1119,37 @@ class Bot:
             return "ignored:chat"
         if any(key.startswith("forward") for key in message):
             return "ignored:forward"
+        if self._stitch is not None and self._is_fragment(message):
+            self._stitch.parts.append(str(message["text"]))
+            self._stitch.last = self.clock()
+            return "log:fragment"
         reply_to = message.get("reply_to_message")
         if isinstance(reply_to, dict) and isinstance(reply_to.get("message_id"), int):
             return self._prompt_reply(message, reply_to["message_id"])
         text = message.get("text")
         if isinstance(text, str) and text.startswith("/"):
+            first, newline, body = text.partition("\n")
+            if newline and _is_log(first):
+                self._cmd_log(first.strip().partition(" ")[2], body=body)
+                return "command:log"
             return self._command(text)
+        caption = message.get("caption")
+        document = message.get("document")
+        if isinstance(document, dict) and isinstance(caption, str) and _is_log(caption):
+            if len(caption) > MAX_CAPTION or "\n" in caption.strip():
+                raise Refusal(JD_NEEDS_FULL_LOG)
+            self._cmd_log(caption.strip().partition(" ")[2], document=document)
+            return "command:log"
         if "document" in message or "photo" in message:
             self.send("To attach a job ad, reply to the message that asked for it.")
             return "file:unprompted"
+        if (
+            isinstance(text, str)
+            and self._jd_saved_at is not None
+            and self._in_window(self._jd_saved_at, LATE_FRAGMENT_SECONDS)
+        ):
+            self.send(JD_LATE)
+            return "log:late-fragment"
         self.send(HELP)
         return "help"
 
@@ -1001,11 +1174,17 @@ class Bot:
             return "command:unknown"
         return f"command:{command[1:]}"
 
-    def _cmd_log(self, rest: str) -> None:
+    def _cmd_log(
+        self, rest: str, *, body: str | None = None, document: dict[str, Any] | None = None
+    ) -> None:
         """A self-sourced application (#34). `/log <link> | method | date` records it at
         once; a bare `/log <link>` asks for the method, then the date. Either way the
         posting and the application are written together, by one ledger call, only at
         the end. `| Company | Title` after the date fills in what the page doesn't show.
+
+        `body` is the text after the /log line: the JD, which may go on in the messages
+        that follow, so it is recorded when the stitch window closes. `document` is a JD
+        file whose caption was the /log line. Both need the method and the date.
 
         Fails closed without config.yaml: no date and no claim check, so nothing is
         fetched or written, and the reply is the fixed CONFIG_UNREADABLE text.
@@ -1016,6 +1195,8 @@ class Bot:
             raise Refusal(LOG_USAGE)
         if len(url) > selfsourced.MAX_URL or len(" ".join(extra)) > MAX_TEXT:
             raise Refusal("That's too long.")
+        if (body is not None or document is not None) and not extra:
+            raise Refusal(JD_NEEDS_FULL_LOG)
         doc = self._read_config()  # fails closed: no date and no claim check without it
         today = self._today(doc)
         method: str | None = None
@@ -1025,13 +1206,20 @@ class Bot:
             if extra:
                 method = selfsourced.parse_method(extra[0])
                 dating = selfsourced.parse_day(extra[1], today)
-            posting = selfsourced.describe(url, self.fetcher, today, company=company, title=title)
-        except selfsourced.NamesMissing as exc:
-            raise Refusal(f"{exc} Send: /log <link> | method | date | Company | Title") from None
         except selfsourced.LogError as exc:
             raise Refusal(str(exc)) from None
+        if urls.no_fetch(url) and not (company and title):
+            raise Refusal(LINKEDIN_REFUSAL)
+        if body is not None and method is not None and dating is not None:
+            self._stitch = _Stitch(url, method, dating, company, title, [body], self.clock())
+            return
+        jd = self._document_jd(document) if document is not None else None
+        if method is not None and dating is not None:
+            self._log_now(url, method, dating, company, title, doc, jd)
+            return
+        posting = self._describe(url, today, company, title)
         found = {
-            "url": url,
+            "url": posting.url or url,
             "company": posting.company,
             "title": posting.title,
             "location": posting.location,
@@ -1050,6 +1238,53 @@ class Bot:
                 )
             return
         self._finish_log(found, method, dating, doc)
+
+    def _describe(
+        self, url: str, today: dt.date, company: str | None, title: str | None
+    ) -> Posting:
+        try:
+            return selfsourced.describe(url, self.fetcher, today, company=company, title=title)
+        except selfsourced.LinkedInNamesMissing:
+            raise Refusal(LINKEDIN_REFUSAL) from None
+        except selfsourced.NamesMissing as exc:
+            raise Refusal(f"{exc} Send: /log <link> | method | date | Company | Title") from None
+        except selfsourced.LogError as exc:
+            raise Refusal(str(exc)) from None
+
+    def _log_now(
+        self,
+        url: str,
+        method: str,
+        dating: Dating,
+        company: str | None,
+        title: str | None,
+        doc: dict[str, Any],
+        jd: jobdesc.JobDescription | None,
+    ) -> None:
+        """Fetch what the page shows, then record the /log with its JD, if any."""
+        posting = self._describe(url, self._today(doc), company, title)
+        found = {
+            "url": posting.url or url,
+            "company": posting.company,
+            "title": posting.title,
+            "location": posting.location,
+        }
+        self._finish_log(found, method, dating, doc, jd)
+
+    def _download(self, file: Mapping[str, Any]) -> bytes:
+        if not isinstance(file.get("file_id"), str):
+            raise Refusal("Please send the job description as a PDF, HTML or text file.")
+        if int(file.get("file_size") or 0) > MAX_UPLOAD:
+            raise Refusal("That file is over 20 MB.")
+        info = self.api.call("getFile", {"file_id": file["file_id"]})
+        return self.api.download(str(info.get("file_path", "")), MAX_UPLOAD)
+
+    def _document_jd(self, document: Mapping[str, Any]) -> jobdesc.JobDescription:
+        """A JD file sent to the bot, read from its bytes. An encrypted PDF is refused."""
+        try:
+            return jobdesc.from_file(self._download(document))
+        except jobdesc.JobDescError as exc:
+            raise Refusal(str(exc)) from None
 
     def _cmd_status(self, rest: str) -> None:
         parts = rest.split()
@@ -1360,6 +1595,8 @@ class Bot:
                 if not reason or len(reason) > MAX_TEXT:
                     raise Refusal("Please reply with a short reason.")
                 self._finish_skip(int(payload["posting_id"]), reason)
+            elif kind == "snapshot" and payload.get("jd") is True:
+                self._attach_jd(message, str(payload["correlation_id"]))
             elif kind == "snapshot":
                 self._attach_upload(message, str(payload["correlation_id"]))
         except Refusal as exc:
@@ -1408,7 +1645,12 @@ class Bot:
             )
 
     def _finish_log(
-        self, found: dict[str, str], method: str, dating: Dating, doc: dict[str, Any]
+        self,
+        found: dict[str, str],
+        method: str,
+        dating: Dating,
+        doc: dict[str, Any],
+        jd: jobdesc.JobDescription | None = None,
     ) -> None:
         """Write a self-sourced posting and its application in one ledger call (#34)."""
         if method not in enums.METHODS:
@@ -1425,10 +1667,23 @@ class Bot:
         with self._writable(doc) as (search, active):
             try:
                 logged = selfsourced.record(
-                    self.datadir.root, search, active, posting, method, dating, today, self.fetcher
+                    self.datadir.root,
+                    search,
+                    active,
+                    posting,
+                    method,
+                    dating,
+                    today,
+                    self.fetcher,
+                    jd,
                 )
             except selfsourced.LogError as exc:
                 raise Refusal(str(exc)) from None
+            state = (
+                "saved"
+                if logged.jd_saved
+                else ("no_text" if logged.jd_file_without_text else "missing")
+            )
             self._confirm(
                 search,
                 logged.correlation_id,
@@ -1436,6 +1691,7 @@ class Bot:
                 logged.title,
                 logged.snapshot_saved,
                 earlier=logged.earlier,
+                jd=state,
             )
 
     def _confirm(
@@ -1447,20 +1703,40 @@ class Bot:
         saved: bool,
         *,
         earlier: str | None = None,
+        jd: str | None = None,
     ) -> None:
         """`Recorded: … (ref aN).`, and the request for a copy of the ad when none was kept.
 
         `earlier` is the one line naming the date the same role was logged before (#34).
+        `jd` is set for a /log: `saved`, `missing` or `no_text`. A saved JD can be
+        replaced by replying to the Recorded message; otherwise the JD is asked for, in
+        place of the copy of the ad (a JD file is that copy too).
         """
         app_row = search_store.application_by_correlation(search, correlation_id)
         assert app_row is not None  # noqa: S101 - just recorded
         ref = self._ref(search, int(app_row["id"]))
         text = f"Recorded: {company} — {title} (ref {ref})."
-        if saved:
+        if saved and jd != "saved":
             text += " Job ad saved."
+        if jd == "saved":
+            text += " Job description saved."
         if earlier:
             text += "\n" + earlier
-        self.send(text)
+        message_id = self.send(text)
+        payload = {"correlation_id": correlation_id, "jd": True}
+        if jd == "saved":
+            self._jd_saved_at = self.clock()
+            self._expect_reply(search, message_id, "snapshot", payload, ALERT_TTL)
+            return
+        if jd is not None:
+            self._prompt(
+                search,
+                JD_REQUEST if jd == "missing" else JD_NO_TEXT,
+                "snapshot",
+                payload,
+                ALERT_TTL,
+            )
+            return
         if saved:
             return
         self._prompt(
@@ -1515,6 +1791,32 @@ class Bot:
             self.send(f"Recorded activity: {_words(kind)}.")
         else:
             self.send("That activity is already recorded.")
+
+    def _attach_jd(self, message: dict[str, Any], correlation_id: str) -> None:
+        """A JD sent as a reply, as text or as a file, attached through the ledger."""
+        document, text = message.get("document"), message.get("text")
+        if isinstance(document, dict):
+            jd = self._document_jd(document)
+        elif isinstance(text, str) and text.strip():
+            try:
+                jd = jobdesc.from_paste(text)
+            except jobdesc.JobDescError as exc:
+                raise Refusal(str(exc)) from None
+        else:
+            raise Refusal(
+                "Please send the job description as text, or as a PDF, HTML or text file."
+            )
+        doc = self._config()
+        with self._writable(doc) as (search, active):
+            saved = jobdesc.save(self.datadir.root, jd, self._today(doc))
+            try:
+                ledger.attach_job_description(search, active, correlation_id, saved)
+            except ledger.AttachRefused as exc:
+                raise Refusal(str(exc)) from None
+        if not jd.has_text:
+            raise Refusal(JD_NO_TEXT_AGAIN)
+        self._jd_saved_at = self.clock()
+        self.send("Job description saved.")
 
     def _attach_upload(self, message: dict[str, Any], correlation_id: str) -> None:
         document, photo = message.get("document"), message.get("photo")
@@ -1571,6 +1873,11 @@ def setup_logging(datadir: DataDir, token: str) -> None:
         log.addHandler(handler)
     log.setLevel(logging.INFO)
     log.propagate = False
+
+
+def _is_log(line: str) -> bool:
+    words = line.split(maxsplit=1)
+    return bool(words) and words[0].split("@", 1)[0].lower() == "/log"
 
 
 def startup(
@@ -1636,7 +1943,7 @@ def run(
     while max_polls is None or polls < max_polls:
         polls += 1
         params: dict[str, Any] = {
-            "timeout": POLL_TIMEOUT,
+            "timeout": STITCH_POLL_TIMEOUT if bot.stitching else POLL_TIMEOUT,
             "allowed_updates": ["message", "callback_query"],
         }
         if offset is not None:
@@ -1647,9 +1954,13 @@ def run(
             failures += 1
             log.warning("getUpdates failed (%s in a row): %s", failures, exc)
             sleep(min(60.0, 2.0**failures))
+            bot.tick()
             continue
         failures = 0
-        for update in updates if isinstance(updates, list) else []:
+        batch = [u for u in updates if isinstance(u, dict)] if isinstance(updates, list) else []
+        # A long paste's fragments in one batch are added in update_id order.
+        batch.sort(key=lambda u: u["update_id"] if isinstance(u.get("update_id"), int) else 0)
+        for update in batch:
             update_id = update.get("update_id") if isinstance(update, dict) else None
             if isinstance(update_id, int):
                 # Acknowledge first, so an update that crashes the handler isn't retried
@@ -1657,6 +1968,7 @@ def run(
                 offset = update_id + 1
                 bot.save_offset(offset)
             log.info("update handled: %s", bot.handle_safely(update))
+        bot.tick()
         bot.heartbeat()
         bot.send_pending_alerts()
         bot.send_pending_discovery()

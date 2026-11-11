@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 from pathlib import Path
 
@@ -229,6 +230,7 @@ def test_a_repost_logged_again_is_recorded_with_the_earlier_date(
     assert capsys.readouterr().out.splitlines() == [
         f"Recorded: Example Robotics — Analyst (R67890) (EI claim {ACTIVE.label}).",
         "Job ad saved.",
+        "No job description was saved.",
         f"You logged an application to this role on {DAY}.",
     ]
     assert _rows(_ei(ready), "SELECT role, date_applied FROM applications ORDER BY id") == [
@@ -317,3 +319,104 @@ def test_a_link_that_is_too_long_or_a_bad_method_is_refused(tmp_path: Path) -> N
             dt.date(2026, 10, 1),
             Pages(),
         )
+
+
+# --- the job description (ADR-024) -------------------------------------------------------
+
+LINKEDIN = "https://www.linkedin.com/jobs/view/4000000002/?trk=public_jobs_topcard"
+
+
+def _jds(ready: Path) -> list[tuple[object, ...]]:
+    return _rows(_ei(ready), "SELECT text, jd_source, file_type FROM job_descriptions ORDER BY id")
+
+
+def test_a_jd_file_is_recorded(
+    ready: Path, probe: FakeProbe, pages: Pages, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    jd = tmp_path / "jd.txt"
+    jd.write_text("Synthetic analyst duties.\n")
+    assert _log(probe, "--jd-file", str(jd)) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "Job description saved." in out and "Synthetic analyst" not in out
+    assert _jds(ready) == [("Synthetic analyst duties.\n", "file", "txt")]
+
+
+def test_a_jd_on_stdin_is_recorded_verbatim(
+    ready: Path,
+    probe: FakeProbe,
+    pages: Pages,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    text = "  About the role\n\nSynthetic duties.\n"
+    monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(text.encode())))
+    assert _log(probe, "--jd-stdin") == cli.EXIT_OK
+    assert _jds(ready) == [(text, "pasted", "txt")]
+
+
+def test_no_jd_is_said_and_flagged(
+    ready: Path, probe: FakeProbe, pages: Pages, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _log(probe) == cli.EXIT_OK
+    assert "No job description was saved." in capsys.readouterr().out
+    assert _rows(_ei(ready), "SELECT jd_expected FROM applications") == [(1,)]
+
+
+def test_the_two_jd_flags_cannot_be_used_together(
+    ready: Path, probe: FakeProbe, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit):
+        _log(probe, "--jd-stdin", "--jd-file", str(tmp_path / "jd.txt"))
+
+
+@pytest.mark.parametrize(
+    ("data", "message"), [(b"\x89PNG\r\n\x1a\n", "not a PDF, HTML"), (b"", "No text")]
+)
+def test_a_bad_jd_file_records_nothing(
+    ready: Path,
+    probe: FakeProbe,
+    pages: Pages,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    data: bytes,
+    message: str,
+) -> None:
+    jd = tmp_path / "jd.bin"
+    jd.write_bytes(data)
+    assert _log(probe, "--jd-file", str(jd)) == cli.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert message in err and "Nothing was recorded." in err
+    assert _rows(_ei(ready), "SELECT count(*) FROM applications") == [(0,)]
+
+
+def test_a_missing_jd_file_is_an_error(
+    ready: Path, probe: FakeProbe, pages: Pages, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _log(probe, "--jd-file", str(tmp_path / "missing.txt")) != cli.EXIT_OK
+    assert "could not be read" in capsys.readouterr().err
+
+
+def test_a_linkedin_link_needs_the_names_and_is_never_fetched(
+    ready: Path, probe: FakeProbe, pages: Pages, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _log(probe, url=LINKEDIN) == cli.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "LinkedIn links are never fetched" in err and "Add --company and --title." in err
+    assert _log(probe, "--company", "Example Robotics", "--title", "Analyst", url=LINKEDIN) == 0
+    assert pages.calls == []
+    assert _rows(_ei(ready), "SELECT posting_url FROM applications") == [
+        ("https://www.linkedin.com/jobs/view/4000000002/",)
+    ]
+
+
+def test_a_stored_link_is_matched_canonically(ready: Path, probe: FakeProbe, pages: Pages) -> None:
+    assert _log(probe, url=AD_URL + "?utm_source=mail") == cli.EXIT_OK
+    stored = _rows(ready / "search.db", "SELECT url FROM postings")
+    assert stored == [(AD_URL,)]  # saved canonical
+    assert (
+        cli.main(
+            ["log", AD_URL + "#apply", "--method", "email", "--date", "2026-10-21"], probe=probe
+        )
+        == cli.EXIT_OK
+    )
+    assert _rows(ready / "search.db", "SELECT count(*) FROM postings") == [(1,)]

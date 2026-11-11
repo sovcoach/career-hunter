@@ -562,7 +562,7 @@ def test_a_job_ad_that_is_a_scored_watcher_posting_is_logged_against_it(
     posting = _insert(env, "Example Robotics", "Synthetic Analyst", test_bot.AD_URL)
     _set(env, posting, embedding_score=0.82)
     env.say(f"/log {test_bot.AD_URL} | email | 2026-10-21")
-    assert env.api.texts()[-1].startswith("Recorded: Example Robotics — Synthetic Analyst")
+    assert env.api.texts()[-2].startswith("Recorded: Example Robotics — Synthetic Analyst")
     sent = env.api.everything_sent()
     assert "strong" not in sent and "0.82" not in sent
     s = env.search()

@@ -408,10 +408,10 @@ def test_an_unknown_action_writes_nothing(env: Env) -> None:
 def test_log_in_one_step_records_the_posting_and_the_application(env: Env) -> None:
     """/log <link> | method | date: one message, one ledger call, both layers (#34)."""
     env.say(f"/log {AD_URL} | Company site | 2026-10-21")
-    assert (
-        env.api.texts()[-1]
-        == "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved."
-    )
+    assert env.api.texts()[-2:] == [
+        "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved.",
+        botmod.JD_REQUEST,  # the page has no JD to fetch
+    ]
     s, e = env.search(), env.ei()
     assert e is not None
     assert tuple(s.execute("SELECT title, location, source, url FROM postings").fetchone()) == (
@@ -450,7 +450,8 @@ def test_a_bare_log_asks_the_method_then_the_date(
     env.press("Email")
     assert env.counts()["search.postings"] == 0
     env.press(choice)
-    assert env.api.texts()[-1].startswith("Recorded: Example Robotics — Synthetic Analyst (ref a1)")
+    assert env.api.texts()[-2].startswith("Recorded: Example Robotics — Synthetic Analyst (ref a1)")
+    assert env.api.texts()[-1] == botmod.JD_REQUEST  # the button flow ends with the request
     (row,) = ei_apps(env)
     assert (row["method"], row["date_precision"], row["date_applied"], row["week_of"]) == (
         "email",
@@ -477,7 +478,7 @@ def test_log_without_details_on_the_page_asks_for_them(env: Env) -> None:
     assert env.counts()["search.postings"] == 0
     env.say(f"/log {SHELL_URL} | email | 2026-10-21 | Sample Logistics | Synthetic Clerk")
     assert env.api.texts()[-2] == "Recorded: Sample Logistics — Synthetic Clerk (ref a1)."
-    assert "PDF or screenshot" in env.api.texts()[-1]
+    assert env.api.texts()[-1] == botmod.JD_REQUEST  # a JD file is the copy of the ad too
 
 
 ROLE_AD = "https://jobs.example.com/ads/"
@@ -492,7 +493,7 @@ def test_a_repost_logged_again_names_only_the_earlier_date(env: Env) -> None:
         "Recorded: Example Robotics — Analyst (R67890) (ref a2).\n"
         "You logged an application to this role on 2026-10-20."
     )
-    assert "PDF or screenshot" in env.api.texts()[-1]
+    assert env.api.texts()[-1] == botmod.JD_REQUEST
     assert [r["role"] for r in ei_apps(env)] == ["Analyst (R12345)", "Analyst (R67890)"]
 
 
