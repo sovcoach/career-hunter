@@ -629,7 +629,7 @@ health:
 | `/log <link> \| method \| date` | Records a job you found and applied to yourself, in one message: the posting and the application, with a copy of the ad when the page gives one. The method is a word such as `email` or `Company site`; the date is `YYYY-MM-DD`, `today` or `yesterday`. Send just `/log <link>` to be asked for the method and the date with buttons. If the page doesn't show the company and title, add them: `/log <link> \| email \| today \| Company \| Title`. A LinkedIn link is never fetched, so it always needs them. |
 | `/log …` with the job description | Paste the job description on the lines after the `/log` line, in the same message. Telegram splits a long paste into several messages; the bot joins every plain text message that arrives within 4 seconds of the one before, and records the application once they stop. Or send the job description as a PDF, HTML or text file with the `/log` line as its caption. The reply ends `Job description saved.` and never repeats the text. |
 | A reply with the job description | When no job description was saved, the bot asks for it: reply to that message with the text, or with a PDF, HTML or text file. If a long paste wasn't joined in full, the bot says so: reply to the `Recorded` message with the whole description as a `.txt` file, which replaces the one saved. |
-| **Applied** | The bot asks how you applied, then when: **Today**, **Yesterday**, **This week**, **Last week** or **Other date** (reply with YYYY-MM-DD). It saves a copy of the job ad. If it can't, it asks you to reply with a PDF or screenshot of the ad. |
+| **Applied** | The bot asks how you applied, then when: **Today**, **Yesterday**, **This week**, **Last week** or **Other date** (reply with YYYY-MM-DD). It saves a copy of the job ad when the page gives one, then asks for the job description: reply with the text, or with a PDF, HTML or text file (which also becomes the copy of the ad if none was saved). |
 | **Skipped** | Asks why, then records the skip. Skips never go into the EI record. |
 | `/status a7 interview_scheduled` | Updates an application. References like `a7` come from `/recent` and last 7 days. Send just `/status` to choose with buttons. |
 | `/activity networking 2026-10-27 Coffee with a recruiter` | Records a job-search activity. Leave out the date to choose it with buttons. |
@@ -725,7 +725,7 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    `config.yaml` should say `OK`. If it lists problems, fix them and run it again. A 0.3.0 `search.db` is behind, so this line is expected, and `doctor` exits 1:
 
    ```text
-   search.db       BAD schema version 2, expected 20; run: careerhunter migrate
+   search.db       BAD schema version 2, expected 19; run: careerhunter migrate
    ```
 
 6. **Migrate**:
@@ -737,8 +737,8 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    Expected output (the claim will be yours):
 
    ```text
-   search.db: applied [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]; schema version 20
-   ei_record_2026-27.db: applied [2]; schema version 2
+   search.db: applied [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]; schema version 19
+   ei_record_2026-27.db: applied nothing; schema version 1
    EI claim 2026-27 (from 2026-08-02)
    ```
 
@@ -768,7 +768,7 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    Every line should be `OK` or `--`, and these show the upgrade took:
 
    ```text
-   search.db       OK  schema version 20
+   search.db       OK  schema version 19
    resume/         OK  2 files, all owner-only
    resume          OK  matches its import
    ```

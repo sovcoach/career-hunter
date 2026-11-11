@@ -562,10 +562,10 @@ def test_applied_records_both_layers(
     env: Env, choice: str, precision: str, day: str | None, week: str | None
 ) -> None:
     apply(env, choice)
-    assert (
-        env.api.texts()[-1]
-        == "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved."
-    )
+    assert env.api.texts()[-2:] == [
+        "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved.",
+        botmod.JD_REQUEST,  # the watcher keeps no description, so the JD is asked for
+    ]
     (row,) = ei_apps(env)
     assert (row["date_precision"], row["date_applied"], row["week_of"]) == (precision, day, week)
     assert (row["employer"], row["role"], row["method"]) == (
@@ -617,14 +617,22 @@ def test_the_same_application_twice_is_refused(env: Env) -> None:
     assert env.counts()["ei.applications"] == 1
 
 
-def test_no_snapshot_then_an_uploaded_pdf(env: Env) -> None:
+def test_a_snapshot_prompt_from_before_jds_still_takes_a_pdf(env: Env) -> None:
+    """A request for the ad sent by an earlier version, still open after the upgrade."""
     alerted(env, SHELL_URL, "Sample Logistics", "Synthetic Clerk")
     env.press("Applied")
     env.press("Email")
     env.press("Today")
     assert env.api.texts()[-2] == "Recorded: Sample Logistics — Synthetic Clerk (ref a1)."
-    assert "PDF or screenshot" in env.api.texts()[-1]
-    prompt = env.prompt_id()
+    (row,) = ei_apps(env)
+    s = db.connect(env.datadir.search_db_path)
+    s.execute(
+        "INSERT INTO bot_prompts (chat_id, message_id, kind, payload, expires_at) "
+        "VALUES (?, 5000, 'snapshot', ?, '2099-01-01T00:00:00Z')",
+        (CHAT, json.dumps({"correlation_id": row["correlation_id"]})),
+    )
+    s.close()
+    prompt = 5000
     env.api.files["documents/f1.bin"] = b"<html>not a pdf</html>"
     env.say(reply_to=prompt, document={"file_id": "f1", "file_size": 22})
     assert "isn't a PDF, PNG or JPEG" in env.api.texts()[-1]
@@ -659,7 +667,7 @@ def test_workday_json_is_used_for_a_javascript_page(env: Env) -> None:
     env.press("Applied")
     env.press("Company site")
     env.press("Today")
-    assert env.api.texts()[-1].endswith("Job ad saved.")
+    assert env.api.texts()[-2].endswith("Job ad saved.")
     saved = (env.datadir.root / ei_apps(env)[0]["snapshot_path"]).read_bytes()
     assert b"Synthetic Analyst" in saved and b"wday/cxs" in saved
 

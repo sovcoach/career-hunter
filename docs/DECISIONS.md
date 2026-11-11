@@ -469,7 +469,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-017: A snapshot of every job ad applied to
 
-> **Amended by [ADR-024](#adr-024-each-application-keeps-its-job-description).** A JD file can be the snapshot: when an application has no job-ad copy, its JD's file (a paste as `.txt`, a PDF, HTML or text file as sent) fills `snapshot_path` in both layers, so a LinkedIn application has one too. A `/log` with no JD asks for the JD instead of a PDF or screenshot; Applied from an alert still asks for the ad.
+> **Amended by [ADR-024](#adr-024-each-application-keeps-its-job-description).** A JD file can be the snapshot: when an application has no job-ad copy, its JD's file (a paste as `.txt`, a PDF, HTML or text file as sent) fills `snapshot_path` in both layers, so a LinkedIn application has one too. A `/log` with no JD, and every Applied from an alert, asks for the JD instead of a PDF or screenshot of the ad. A request for the ad sent before 0.5.0 still takes a PDF, PNG or JPEG.
 
 **Context.**
 - ADR-005 planned job-ad copies for the EI record, and the schema has had `snapshot_path` since Phase 1.
@@ -733,7 +733,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - **Where a JD comes from.** A paste is kept verbatim: UTF-8, no NUL, at most 100,000 characters. A file's type comes from its bytes: a PDF through `pdftext.py` (the resume's PDF reader, with its caps; an encrypted one is refused and nothing is saved), HTML through `htmltext.py`, or strict UTF-8 text, at most 20 MB. A PDF that opens but has no text, such as a scan, is kept as the job ad, but it is not a JD. Without a paste or a file, the JD is fetched: the page's JSON-LD `JobPosting.description`, or the ATS's public JSON. A pasted JD wins over a fetched one.
 - **A JD file can be the snapshot (amends ADR-017).** Every JD is saved as a snapshot file (a paste or a fetched text as `.txt`, a file in its own type), owner-only. When an application has no job-ad snapshot, its JD file becomes one, in both layers.
 - **Canonical links, and hosts never fetched.** A logged link is stored in its canonical form (`urls.canonical`: lowercase scheme and host, no fragment, no tracking parameters, LinkedIn job links as `https://www.linkedin.com/jobs/view/<id>/`), and links already stored are compared canonically, never rewritten. `fetch.py` refuses LinkedIn (`linkedin.com`, its subdomains, and `lnkd.in`) for every caller, on the first URL and every redirect hop, before any lookup. A LinkedIn `/log` therefore needs the company and title.
-- **Through Telegram one way (amends ADR-015).** A JD can come in through Telegram: after the `/log` line, as later messages stitched within 4 seconds of each other, or as a file captioned with the `/log` line. It is never sent back: no reply quotes it, and the bot log records only how many messages it was made of. With no JD, the application is still recorded and flagged, and the reply asks for the JD as a reply.
+- **Through Telegram one way (amends ADR-015).** A JD can come in through Telegram: after the `/log` line, as later messages stitched within 4 seconds of each other, or as a file captioned with the `/log` line. It is never sent back: no reply quotes it, and the bot log records only how many messages it was made of. With no JD, the application is still recorded and flagged, and the reply asks for the JD as a reply. Applied from an alert does the same, so every new application is recorded with a JD or has a pending request for one.
 - **Shown everywhere by reference.** `doctor` warns with the count of applications missing a JD. The report and the export name each application's JD as `JD <first 8 of sha256> (<source>)`, `JD missing` or `JD missing (pre-feature)`, and the export writes the JDs themselves into a private folder beside the CSV and PDF.
 
 **Alternatives.**
@@ -744,5 +744,5 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 **Trade-offs.**
 - Stitching relies on Telegram sending the parts of a split paste within 4 seconds, and joins them exactly as sent. A message typed within that window is taken as part of the JD. If Telegram drops whitespace at a split, the JD differs from the paste; that is checked by hand with the real client.
-- Applications recorded before 0.5.0, and those recorded from an alert's Applied button, have no JD until one is attached.
+- Applications recorded before 0.5.0 have no JD until one is attached. The watcher keeps no description (it is used in memory for the filters and scoring only), so Applied from an alert records no JD and always asks for it, and a JD request replaces the screenshot request there: a page that is only a JavaScript shell needs the JD sent as text or a PDF, HTML or text file, not an image.
 - A scanned PDF gives no text, so its application stays flagged until the JD is sent as text.

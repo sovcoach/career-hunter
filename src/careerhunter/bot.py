@@ -1640,8 +1640,15 @@ class Bot:
                 raise Refusal("That application is already recorded.") from None
             if path and posting.snapshot_path is None:
                 search_store.set_posting_snapshot(search, posting_id, path)
+            # The watcher keeps no description (it is used in memory for the filters and
+            # scoring only), so an application from an alert always asks for its JD.
             self._confirm(
-                search, recorded.correlation_id, posting.company, posting.title, bool(path)
+                search,
+                recorded.correlation_id,
+                posting.company,
+                posting.title,
+                bool(path),
+                jd="missing",
             )
 
     def _finish_log(
@@ -1702,15 +1709,15 @@ class Bot:
         title: str,
         saved: bool,
         *,
+        jd: str,
         earlier: str | None = None,
-        jd: str | None = None,
     ) -> None:
-        """`Recorded: … (ref aN).`, and the request for a copy of the ad when none was kept.
+        """`Recorded: … (ref aN).`, then the request for the JD when none was saved.
 
-        `earlier` is the one line naming the date the same role was logged before (#34).
-        `jd` is set for a /log: `saved`, `missing` or `no_text`. A saved JD can be
-        replaced by replying to the Recorded message; otherwise the JD is asked for, in
-        place of the copy of the ad (a JD file is that copy too).
+        `jd` is `saved`, `missing` or `no_text`, for /log and for Applied alike. A saved
+        JD can be replaced by replying to the Recorded message; otherwise the JD is asked
+        for, in place of the copy of the ad (a JD file is that copy too). `earlier` is
+        the one line naming the date the same role was logged before (#34).
         """
         app_row = search_store.application_by_correlation(search, correlation_id)
         assert app_row is not None  # noqa: S101 - just recorded
@@ -1728,24 +1735,8 @@ class Bot:
             self._jd_saved_at = self.clock()
             self._expect_reply(search, message_id, "snapshot", payload, ALERT_TTL)
             return
-        if jd is not None:
-            self._prompt(
-                search,
-                JD_REQUEST if jd == "missing" else JD_NO_TEXT,
-                "snapshot",
-                payload,
-                ALERT_TTL,
-            )
-            return
-        if saved:
-            return
         self._prompt(
-            search,
-            "No copy of the job ad was saved. Reply to this message with a PDF or "
-            "screenshot of it.",
-            "snapshot",
-            {"correlation_id": correlation_id},
-            ALERT_TTL,
+            search, JD_REQUEST if jd == "missing" else JD_NO_TEXT, "snapshot", payload, ALERT_TTL
         )
 
     def _read_config(self) -> dict[str, Any]:

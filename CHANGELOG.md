@@ -20,7 +20,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - A logged link is saved in its canonical form: lowercase scheme and host, no fragment, no tracking parameters (`utm_*`, `trk`, `refId`, `trackingId`, `gclid`, `fbclid`, `gh_src` and the like), and LinkedIn job links as `https://www.linkedin.com/jobs/view/<id>/`. Links already stored are left as they are and compared canonically. The watcher's links are unchanged.
 - LinkedIn is never fetched: `fetch.py` refuses `linkedin.com`, its subdomains and `lnkd.in` for every caller, on the first link and every redirect hop. A LinkedIn `/log` or `careerhunter log` needs the company and title, and the refusal says how to give them. SETUP suggests logging the company career-site link the posting leads to instead.
-- A `/log` with no job description asks for it instead of a PDF or screenshot of the ad. Applied from an alert still asks for the ad.
+- A `/log` with no job description, and every Applied from an alert, asks for the job description instead of a PDF or screenshot of the ad: the watcher keeps no description to attach. A reply with a file also becomes the ad copy when none was saved. A request for the ad sent before this version still takes a PDF or image.
 - The PDF reader moved from `resume.py` to `pdftext.py`, shared with job descriptions. Resume import behaves as before.
 - `search.db` moves to schema version 20 and the EI record to version 2. Back up and run `careerhunter migrate`. A sealed claim's file is not migrated, and is still read.
 

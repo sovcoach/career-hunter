@@ -388,3 +388,91 @@ def test_the_loop_uses_the_short_timeout_while_a_stitch_is_open(env: Env, keep_u
     )
     timeouts = [p["timeout"] for m, p in env.api.calls if m == "getUpdates"]
     assert timeouts == [botmod.POLL_TIMEOUT, botmod.STITCH_POLL_TIMEOUT]
+
+
+# --- Applied from an alert ---------------------------------------------------------------
+
+
+def pending_jd_requests(env: Env) -> list[str]:
+    """Correlation ids with an open, unused request for their JD."""
+    s = env.search()
+    try:
+        rows = s.execute(
+            "SELECT payload FROM bot_prompts WHERE used_at IS NULL AND kind = 'snapshot'"
+        ).fetchall()
+    finally:
+        s.close()
+    payloads = [json.loads(r[0]) for r in rows]
+    return [str(p["correlation_id"]) for p in payloads if p.get("jd") is True]
+
+
+def assert_no_jd_gap(env: Env) -> None:
+    """Every application is recorded with a JD or has a pending request for one."""
+    with_jd = {r["application_id"] for r in jd_rows(env)}
+    asked = set(pending_jd_requests(env))
+    for row in ei_apps(env):
+        assert row["jd_expected"] == 1
+        assert row["id"] in with_jd or row["correlation_id"] in asked
+
+
+def test_the_watcher_keeps_no_description_to_attach(env: Env) -> None:
+    test_bot.alerted(env)
+    s = env.search()
+    try:
+        columns = {r[1] for r in s.execute("PRAGMA table_info(postings)")}
+    finally:
+        s.close()
+    assert not {c for c in columns if "description" in c}
+
+
+def test_applied_with_a_saved_ad_asks_for_the_jd_and_takes_a_text_reply(env: Env) -> None:
+    test_bot.apply(env)
+    assert env.api.texts()[-2:] == [
+        "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved.",
+        botmod.JD_REQUEST,
+    ]
+    assert_no_jd_gap(env)
+    (app,) = ei_apps(env)
+    assert pending_jd_requests(env) == [app["correlation_id"]]
+    env.say(PART_1 + PART_2, reply_to=env.prompt_id())
+    assert env.api.texts()[-1] == "Job description saved."
+    (row,) = jd_rows(env)
+    assert (row["text"], row["jd_source"]) == (PART_1 + PART_2, "pasted")
+    assert pending_jd_requests(env) == []
+    assert_no_jd_gap(env)
+    (app,) = ei_apps(env)
+    assert app["snapshot_path"] != row["file_path"]  # the ad copy is kept
+    s, e = env.search(), env.ei()
+    assert e is not None
+    assert ledger.reconcile(s, {ACTIVE.label: e}) == []
+    assert s.execute("SELECT jd_sha256 FROM applications").fetchone()[0] == row["text_sha256"]
+    s.close()
+    e.close()
+
+
+def test_applied_without_an_ad_asks_for_the_jd_not_a_screenshot(env: Env) -> None:
+    test_bot.alerted(env, test_bot.SHELL_URL, "Sample Logistics", "Synthetic Clerk")
+    env.press("Applied")
+    env.press("Email")
+    env.press("Today")
+    assert env.api.texts()[-2:] == [
+        "Recorded: Sample Logistics — Synthetic Clerk (ref a1).",
+        botmod.JD_REQUEST,
+    ]
+    assert "screenshot" not in env.api.everything_sent()
+    assert_no_jd_gap(env)
+    data = b"<html><h1>Clerk</h1><p>Synthetic clerk duties.</p></html>"
+    env.say(reply_to=env.prompt_id(), **document(env, data))
+    assert env.api.texts()[-1] == "Job description saved."
+    (row,) = jd_rows(env)
+    assert (row["text"], row["jd_source"], row["file_type"]) == (
+        "Clerk\nSynthetic clerk duties.",
+        "file",
+        "html",
+    )
+    (app,) = ei_apps(env)
+    assert app["snapshot_path"] == row["file_path"]  # the JD file is the ad copy
+    s = env.search()
+    assert s.execute("SELECT snapshot_path FROM postings").fetchone()[0] == row["file_path"]
+    s.close()
+    assert_no_jd_gap(env)
