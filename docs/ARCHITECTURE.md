@@ -301,15 +301,15 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 
 ## Phase roadmap
 
-Only what is on `main` is listed. The latest release is v0.3.0; Phases 3 to 5 are on `main` and not yet tagged.
+Only what is on `main` is listed. The latest release is v0.4.0.
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1, Foundation (v0.1.0) | Storage guards, Keychain helper, schema and migrations, seed import, EI export, CI, docs | released |
 | 1.5, Data layer split (v0.2.0) | `search.db` and one EI record file per claim, a correlation ID, write order and reconciliation, claim config and sealing | released |
 | 2, Telegram bot (v0.3.0) | The bot (alerts with Applied/Skipped, `/log`, `/status`, `/activity`, `/recent`), job-ad snapshots, the launchd service, the fit-criteria schema (validation only), and repo hygiene | released |
-| 3, Watcher | `careerhunter watch` on Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards; exclusions, hard gates, location rules and the posting age; lanes; gap-tier scoring with a fit on a local model, grounded in an imported resume; local embedding cosines and `embed-eval`; one alert digest per run; run records, health and the weekly digest; `careerhunter log` and `report` | on `main` |
-| 4, Discovery | Discovery passes against a local SearXNG inside the watch agent, posting URLs fetched once through their ATS, and a board queue approved from the CLI or the bot | on `main` |
-| 5, Release | The MIT license (ADR-021), `careerhunter demo`, the model-id settings, the inert template watchlist, and SETUP for a release checkout and upgrades | on `main` |
+| 3, Watcher (v0.4.0) | `careerhunter watch` on Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards; exclusions, hard gates, location rules and the posting age; lanes; gap-tier scoring with a fit on a local model, grounded in an imported resume; local embedding cosines and `embed-eval`; one alert digest per run; run records, health and the weekly digest; `careerhunter log` and `report` | released |
+| 4, Discovery (v0.4.0) | Discovery passes against a local SearXNG inside the watch agent, posting URLs fetched once through their ATS, and a board queue approved from the CLI or the bot | released |
+| 5, Release (v0.4.0) | The MIT license (ADR-021), `careerhunter demo`, the model-id settings, the inert template watchlist, and SETUP for a release checkout and upgrades | released |
 
 Work lands as pull requests against `main`, and the operator tags a release with semver when it is cut. The repo went public once Phase 1 was verified, and `main` was protected straight after (ADR-012).
