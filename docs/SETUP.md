@@ -614,11 +614,13 @@ The bot restarts if it stops, retrying once a minute (for example, while the dat
 
 ```text
 telegram        OK  chat set
-bot service     OK  running (pid 4242)
+bot service     OK  running (pid 4242); checkout ~/Projects/career-hunter-release, data folder /Volumes/ExampleDrive/ExampleFolder
 bot heartbeat   OK  polled within the last 5 minutes
-watch service   OK  loaded
+watch service   OK  loaded; checkout ~/Projects/career-hunter-release, data folder /Volumes/ExampleDrive/ExampleFolder
 watch           --  no successful run yet
 ```
+
+Each service line names the checkout and the data folder the agent serves, as launchd reports them. launchd keeps one bot and one watch agent per user, not per data folder, so a `doctor` run against another data folder (a test volume, say) still describes those agents: the line says `not this CAREERHUNTER_DATA_DIR`, and an OK becomes a WARN.
 
 The bot log is `logs/bot.log` in your data folder. It records events only, never message text or the token. A finished watch writes `logs/watch.success`. Each line of a run goes to `logs/watch.log` as it happens, and the last line counts the boards. A crash leaves its traceback in that file only. A run looks like this:
 
@@ -849,6 +851,9 @@ If something goes wrong before step 6 finishes, nothing in the data folder has c
 | The bot replies `Config can't be read, so nothing was recorded. Run careerhunter doctor.` | `/log` needs `config.yaml` for the date and the claim check | Fix `config.yaml`, then send the link again |
 | `lanes -- not configured` | `search.lanes` isn't set, so lane checking is off | Nothing to fix if you meant it. Add lanes to label and order alerts |
 | `config.yaml BAD … needs an end date` | A claim that isn't active has no `end` | Add its end date, or check `active_claim` for a typo |
+| `org.careerhunter.bot is disabled in launchd. Run: launchctl enable gui/…/org.careerhunter.bot, then careerhunter service install` (or the watch label), from `service install` or on a `doctor` service line | launchd has a disabled override for that label. `service install` checks before it writes anything, and stops. The override is launchd's own, kept per user and per label: it outlasts `careerhunter service uninstall`, which only removes the plist, so installing again fails the same way until it is cleared. career-hunter never clears it for you | Run the command it prints, `launchctl enable gui/$(id -u)/<label>`, as yourself, then `uv run careerhunter service install` |
+| `launchctl bootstrap failed (5). Check launchctl print-disabled gui/… for <label>` | launchd refused to load the agent. Error 5 most often means the label is disabled | Run `launchctl print-disabled gui/$(id -u)`. If the label shows `disabled` or `true`, run `launchctl enable gui/$(id -u)/<label>`, then `uv run careerhunter service install`. It is a user agent: it never needs root |
+| `bot service WARN … not this CAREERHUNTER_DATA_DIR` (or `watch service`) | The agent loaded for your user serves another data folder than the one this `doctor` run checked | Nothing to fix while you are testing against another data folder. Otherwise run `uv run careerhunter service uninstall`, then `service install` from the release checkout with the right `CAREERHUNTER_DATA_DIR` |
 | `WARNING: FileVault is OFF` | The Mac's own disk isn't encrypted | Step 1 |
 | `uv: command not found` | Terminal hasn't picked up uv yet | Close and reopen Terminal, or re-run the Step 3 installer |
 
@@ -867,5 +872,7 @@ diskutil apfs addVolume "$(diskutil info -plist /Volumes/CHBase | plutil -extrac
 ```bash
 CAREERHUNTER_DATA_DIR=/Volumes/CHTest/ExampleFolder uv run careerhunter init
 ```
+
+`doctor` against the test volume still describes the services loaded for your user: their lines name the real data folder and say `not this CAREERHUNTER_DATA_DIR`. Don't install the services against the test volume.
 
 When you're done, eject `CHBase` and `CHTest` in Finder, then move `~/ch-test.sparseimage` to the Trash.

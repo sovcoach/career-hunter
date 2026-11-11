@@ -25,8 +25,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - LinkedIn is never fetched: `fetch.py` refuses `linkedin.com`, its subdomains and `lnkd.in` for every caller, on the first link and every redirect hop. A LinkedIn `/log` or `careerhunter log` needs the company and title, and the refusal says how to give them. SETUP suggests logging the company career-site link the posting leads to instead.
 - A `/log` with no job description, and every Applied from an alert, asks for the job description instead of a PDF or screenshot of the ad: the watcher keeps no description to attach. A reply with a file also becomes the ad copy when none was saved. A request for the ad sent before this version still takes a PDF or image.
 - The PDF reader moved from `resume.py` to `pdftext.py`, shared with job descriptions. Resume import behaves as before.
+- `doctor`'s `bot service` and `watch service` lines name the checkout and data folder each agent serves, from `launchctl print` for a loaded agent and from its plist otherwise. launchd labels are per user, so against another data folder (a test volume) they describe the live agents: the line then says `not this CAREERHUNTER_DATA_DIR`, and an OK becomes a WARN. A label launchd has disabled is BAD on its line, with the exact `launchctl enable` command, even when the agent isn't installed.
 - `search.db` moves to schema version 20 and the EI record to version 2. Back up and run `careerhunter migrate`. A sealed claim's file is not migrated, and is still read.
 - Search migration 0021 (schema version 21) lets a checked lane move, only through `lanes reassign`: it drops the set-once trigger, keeps `lane_checked` at 1 once set, and logs each move of a checked lane to a new `lane_changes` table. EI files are not changed. After `migrate`, run `careerhunter lanes reassign --dry-run`.
+
+### Fixed
+- A launchd label left disabled made `careerhunter service install` fail with launchctl's error 5 and its suggestion to run as root. `service install` now checks every label it would install before writing a plist, and stops with the exact command: `<label> is disabled in launchd. Run: launchctl enable gui/<uid>/<label>, then careerhunter service install`. It never enables a label itself, and `uninstall` still leaves the override alone. A failed bootstrap gets a fixed message, `launchctl bootstrap failed (<code>)`, without launchctl's text; code 5 adds a pointer to `launchctl print-disabled`. Nothing suggests root or sudo.
+- After retiring the old separate discovery agent, `service install` no longer reports success when installing the bot or watch agent failed for any reason other than both being installed already.
 
 ## [0.4.0] - 2026-11-10
 
