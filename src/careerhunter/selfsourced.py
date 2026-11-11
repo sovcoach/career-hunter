@@ -194,10 +194,12 @@ def record(
     today: dt.date,
     fetcher: Fetcher,
     jd: JobDescription | None = None,
+    notes: str | None = None,
 ) -> Logged:
     """Record the application, and the posting with it, in one ledger call.
 
     `jd` is a pasted or uploaded JD; without one, it is fetched when the host allows.
+    `notes` go to search.db only (the import's notes).
     """
     if method not in enums.METHODS:
         raise LogError("That method isn't recognized.")
@@ -216,7 +218,7 @@ def record(
     if jd is None and posting.url and fetchable:
         jd = jobdesc.fetched(posting.url, fetcher)
     saved = jobdesc.save(data_dir, jd, today) if jd is not None else None
-    app = Application(replace(posting, snapshot_path=path), dating, method)
+    app = Application(replace(posting, snapshot_path=path), dating, method, notes=notes)
     try:
         recorded = ledger.record_application(search, active, app, saved)
     except IdentityConflict:

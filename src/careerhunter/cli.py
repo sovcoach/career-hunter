@@ -1600,6 +1600,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
         _doctor_private_folder(report, "reports/", datadir.root / "reports")
     _doctor_private_folder(report, "snapshots/", datadir.snapshots)
     _doctor_private_folder(report, "logs/", datadir.logs)
+    _doctor_private_folder(report, "imports/", datadir.imports)
     _doctor_bot(report, datadir, config_doc, now)
     _doctor_watch(report, datadir, config_doc, now)
     _doctor_discover(report, datadir, config_doc, now)

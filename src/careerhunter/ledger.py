@@ -282,10 +282,12 @@ def attach_job_description(
     search: sqlite3.Connection,
     active: ActiveClaim | None,
     correlation_id: str,
-    jd: SavedJd,
+    jd: SavedJd | None,
     url: str | None = None,
 ) -> Attached:
     """Add a JD to an application recorded earlier, EI first (ADR-014).
+
+    `jd` is None for a URL-only attach (the import fills an empty link that way).
 
     With `url`, an empty URL is filled with its canonical form: an audited EI update,
     and `postings.url` when that is empty. A URL that another posting has, or that
@@ -328,27 +330,27 @@ def attach_job_description(
         if ref.url is None and _url_owner(search, new_url, ref.posting_id):
             raise AttachRefused("That link is already recorded for another posting.")
         url_set = ref.url is None or (ei_row is not None and ei_row["posting_url"] is None)
-    sha = jd.description.text_sha256
+    sha = jd.description.text_sha256 if jd is not None else None
     current = ei_store.current_job_description(to_ei.conn, correlation_id) if to_ei else None
     current_sha = current.text_sha256 if current else ref.jd_sha256
-    jd_added = jd.has_text and sha != current_sha
-    snapshot_set = ref.snapshot_path is None or (
-        ei_row is not None and ei_row["snapshot_path"] is None
+    jd_added = jd is not None and jd.has_text and sha != current_sha
+    snapshot_set = jd is not None and (
+        ref.snapshot_path is None or (ei_row is not None and ei_row["snapshot_path"] is None)
     )
     try:
         with ei_first(search, to_ei):
             if new_url is not None and ref.url is None:
                 search_store.set_posting_url(search, ref.posting_id, new_url)
-            if ref.snapshot_path is None:
+            if jd is not None and ref.snapshot_path is None:
                 search_store.set_posting_snapshot(search, ref.posting_id, jd.path)
-            if jd_added:
+            if jd is not None and jd_added:
                 search_store.set_application_jd(search, ref.application_id, sha, jd.path)
             if to_ei is not None and ei_row is not None:
                 if new_url is not None and ei_row["posting_url"] is None:
                     ei_store.set_posting_url(to_ei.conn, correlation_id, new_url)
-                if ei_row["snapshot_path"] is None:
+                if jd is not None and ei_row["snapshot_path"] is None:
                     ei_store.set_snapshot_path(to_ei.conn, correlation_id, jd.path)
-                if jd_added:
+                if jd is not None and jd_added:
                     ei_store.insert_job_description(
                         to_ei.conn, int(ei_row["id"]), ei_job_description(jd)
                     )
