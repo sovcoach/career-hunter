@@ -173,8 +173,8 @@ def insert_application(
 ) -> int:
     cur = conn.execute(
         "INSERT INTO applications (correlation_id, ei_claim, posting_id, date_applied, "
-        "date_precision, week_of, method, resume_file, reasoning, notes) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "date_precision, week_of, method, resume_file, reasoning, notes, jd_expected) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
         (
             correlation_id,
             ei_claim,
@@ -189,6 +189,16 @@ def insert_application(
         ),
     )
     return int(cur.lastrowid or 0)
+
+
+def set_application_jd(
+    conn: sqlite3.Connection, application_id: int, jd_sha256: str | None, jd_path: str | None
+) -> None:
+    """The application's current JD: its text hash and its snapshot file."""
+    conn.execute(
+        "UPDATE applications SET jd_sha256 = ?, jd_path = ? WHERE id = ?",
+        (jd_sha256, jd_path, application_id),
+    )
 
 
 def link_to_claim(conn: sqlite3.Connection, application_id: int, label: str) -> None:

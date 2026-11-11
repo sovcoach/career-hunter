@@ -161,7 +161,7 @@ created  $CAREERHUNTER_DATA_DIR/backups
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 19
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 20
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -356,8 +356,8 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 19
-ei_record_2026-27.db: created; schema version 1
+search.db: applied nothing; schema version 20
+ei_record_2026-27.db: created; schema version 2
 EI claim 2026-27 (from 2026-08-02)
 ```
 
@@ -375,7 +375,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 19
+search.db       OK  schema version 20
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -383,7 +383,7 @@ watch run       --  none recorded yet
 watch useful    --  no useful run recorded yet
 bot alerts      OK  not held
 bot refusals    OK  no posting given up
-claim 2026-27   OK  schema version 1
+claim 2026-27   OK  schema version 2
 claim 2026-27   OK  active, from 2026-08-02
 claim 2026-27   OK  0600
 reconcile       OK  search.db and 1 claim record agree
@@ -713,7 +713,7 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    `config.yaml` should say `OK`. If it lists problems, fix them and run it again. A 0.3.0 `search.db` is behind, so this line is expected, and `doctor` exits 1:
 
    ```text
-   search.db       BAD schema version 2, expected 19; run: careerhunter migrate
+   search.db       BAD schema version 2, expected 20; run: careerhunter migrate
    ```
 
 6. **Migrate**:
@@ -725,8 +725,8 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    Expected output (the claim will be yours):
 
    ```text
-   search.db: applied [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]; schema version 19
-   ei_record_2026-27.db: applied nothing; schema version 1
+   search.db: applied [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]; schema version 20
+   ei_record_2026-27.db: applied [2]; schema version 2
    EI claim 2026-27 (from 2026-08-02)
    ```
 
@@ -756,7 +756,7 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    Every line should be `OK` or `--`, and these show the upgrade took:
 
    ```text
-   search.db       OK  schema version 19
+   search.db       OK  schema version 20
    resume/         OK  2 files, all owner-only
    resume          OK  matches its import
    ```
@@ -785,7 +785,7 @@ If something goes wrong before step 6 finishes, nothing in the data folder has c
 | `… is before claim 2026-27 started` | A seed date falls outside your claim | Fix the date, or see `--route-out-of-claim-to-search` in Step 8 |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 19` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 20` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |

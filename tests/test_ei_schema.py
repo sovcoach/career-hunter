@@ -38,6 +38,18 @@ ALLOWED_COLUMNS = {
         "voided_at",
         "created_at",
     },
+    # EI migration 0002, widened on purpose (ADR-024).
+    "job_descriptions": {
+        "id",
+        "application_id",
+        "text",
+        "text_sha256",
+        "jd_source",
+        "file_path",
+        "file_sha256",
+        "file_type",
+        "recorded_at",
+    },
     "edits": {"id", "table_name", "row_id", "column_name", "old_value", "new_value", "edited_at"},
     "schema_migrations": {"version", "name", "checksum", "applied_at"},
     "db_identity": {"id", "track", "created_at"},
@@ -107,6 +119,34 @@ def _activity(conn: sqlite3.Connection, **cols: object) -> int:
         "INSERT INTO activities (date, date_precision, week_of, type, description) "
         "VALUES (?, ?, ?, 'course', ?)",
         (values["date"], values["date_precision"], values["week_of"], f"Course {next(_ids)}"),
+    )
+    return int(cur.lastrowid or 0)
+
+
+HASH = "ab" * 32
+
+
+def _jd(conn: sqlite3.Connection, application_id: int, **cols: object) -> int:
+    values = {
+        "text": "Synthetic duties.",
+        "text_sha256": HASH,
+        "jd_source": "pasted",
+        "file_path": "snapshots/2026/0011223344556677.txt",
+        "file_sha256": "cd" * 32,
+        "file_type": "txt",
+    } | cols
+    cur = conn.execute(
+        "INSERT INTO job_descriptions (application_id, text, text_sha256, jd_source, file_path, "
+        "file_sha256, file_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            application_id,
+            values["text"],
+            values["text_sha256"],
+            values["jd_source"],
+            values["file_path"],
+            values["file_sha256"],
+            values["file_type"],
+        ),
     )
     return int(cur.lastrowid or 0)
 
@@ -211,13 +251,23 @@ def test_statuses_and_methods_match_python(ei: sqlite3.Connection) -> None:
 
 
 @pytest.mark.parametrize(
-    "table", ["claim", "applications", "status_history", "activities", "edits", "schema_migrations"]
+    "table",
+    [
+        "claim",
+        "applications",
+        "status_history",
+        "activities",
+        "edits",
+        "schema_migrations",
+        "job_descriptions",
+    ],
 )
 def test_deletes_are_refused_everywhere(ei: sqlite3.Connection, table: str) -> None:
     a = _app(ei)
     ei.execute("INSERT INTO status_history (application_id, status) VALUES (?, 'applied')", (a,))
     _activity(ei)
     ei.execute("UPDATE applications SET resume_file = 'cv.pdf'")  # gives `edits` a row
+    _jd(ei, a)
     with pytest.raises(sqlite3.IntegrityError, match=r"disabled|permanent"):
         ei.execute(f"DELETE FROM {table}")  # noqa: S608 - table names are fixed above
 
@@ -299,6 +349,7 @@ def test_activity_dates_must_fall_in_the_claim(ei: sqlite3.Connection) -> None:
         lambda c: c.execute("UPDATE activities SET related_company = 'x'"),
         lambda c: c.execute("UPDATE claim SET end_date = '2027-01-01'"),
         lambda c: c.execute("UPDATE claim SET sealed_at = NULL"),
+        lambda c: _jd(c, int(c.execute("SELECT min(id) FROM applications").fetchone()[0])),
     ],
     ids=[
         "add application",
@@ -308,6 +359,7 @@ def test_activity_dates_must_fall_in_the_claim(ei: sqlite3.Connection) -> None:
         "edit activity",
         "move end",
         "unseal",
+        "add job description",
     ],
 )
 def test_a_sealed_record_refuses_every_write(ei: sqlite3.Connection, write: object) -> None:
@@ -331,3 +383,90 @@ def test_voided_rows_are_frozen(ei: sqlite3.Connection) -> None:
     )
     with pytest.raises(sqlite3.IntegrityError, match="frozen"):
         ei.execute("UPDATE applications SET voided = 0, void_reason = NULL, voided_at = NULL")
+
+
+# --- job descriptions (EI migration 0002) ------------------------------------------------
+
+
+def test_a_new_application_defaults_to_pre_feature_and_jd_expected_never_changes(
+    ei: sqlite3.Connection,
+) -> None:
+    a = _app(ei)
+    assert ei.execute("SELECT jd_expected FROM applications WHERE id = ?", (a,)).fetchone()[0] == 0
+    with pytest.raises(sqlite3.IntegrityError, match="jd_expected"):
+        ei.execute("UPDATE applications SET jd_expected = 1 WHERE id = ?", (a,))
+    ei.execute("UPDATE applications SET jd_expected = 0, resume_file = 'cv' WHERE id = ?", (a,))
+    with pytest.raises(sqlite3.IntegrityError):
+        ei.execute(
+            "INSERT INTO applications (correlation_id, employer, role, date_applied, "
+            "date_precision, method, jd_expected) VALUES (?, 'E', 'R', '2026-09-03', 'exact', "
+            "'email', 2)",
+            (_corr(),),
+        )
+
+
+@pytest.mark.parametrize(
+    "cols",
+    [
+        {"text": ""},
+        {"text_sha256": "AB" * 32},
+        {"text_sha256": "ab" * 31},
+        {"jd_source": "scraped"},
+        {"file_path": "/abs/path.txt"},
+        {"file_path": "elsewhere/x.txt"},
+        {"file_path": "snapshots/../x.txt"},
+        {"file_sha256": "zz" * 32},
+        {"file_type": "docx"},
+        {"file_path": None},  # the three file columns go together
+        {"file_path": None, "file_sha256": None},
+    ],
+)
+def test_job_description_checks(ei: sqlite3.Connection, cols: dict[str, object]) -> None:
+    a = _app(ei)
+    with pytest.raises(sqlite3.IntegrityError):
+        _jd(ei, a, **cols)
+
+
+def test_a_job_description_without_a_file_is_allowed(ei: sqlite3.Connection) -> None:
+    _jd(ei, _app(ei), file_path=None, file_sha256=None, file_type=None)
+
+
+def test_job_descriptions_are_append_only_and_unique_per_text(ei: sqlite3.Connection) -> None:
+    a = _app(ei)
+    _jd(ei, a)
+    with pytest.raises(sqlite3.IntegrityError):
+        _jd(ei, a)  # the same text twice
+    _jd(ei, a, text="Corrected.", text_sha256="ef" * 32)  # a corrected JD is a new row
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        ei.execute("UPDATE job_descriptions SET jd_source = 'file'")
+
+
+def test_a_voided_application_gets_no_job_description(ei: sqlite3.Connection) -> None:
+    a = _app(ei)
+    ei.execute(
+        "UPDATE applications SET voided = 1, void_reason = 'dup', voided_at = 'now' WHERE id = ?",
+        (a,),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="frozen"):
+        _jd(ei, a)
+
+
+def test_the_current_job_description_is_the_latest_row(ei: sqlite3.Connection) -> None:
+    from careerhunter import ei_store
+
+    a = _app(ei)
+    corr = str(
+        ei.execute("SELECT correlation_id FROM applications WHERE id = ?", (a,)).fetchone()[0]
+    )
+    assert ei_store.has_job_descriptions(ei)
+    assert ei_store.current_job_description(ei, corr) is None
+    first = ei_store.EiJobDescription("First.", "11" * 32, "pasted", None, None, None)
+    second = ei_store.EiJobDescription(
+        "Second.", "22" * 32, "file", "snapshots/2026/aa.pdf", "33" * 32, "pdf"
+    )
+    ei_store.insert_job_description(ei, a, first)
+    ei_store.insert_job_description(ei, a, second)
+    assert ei_store.current_job_description(ei, corr) == second
+    assert ei_store.current_job_descriptions(ei) == {corr: second}
+    assert "Second." not in repr(second)
+    assert ei_store.jd_expected(ei) == {corr: 0}

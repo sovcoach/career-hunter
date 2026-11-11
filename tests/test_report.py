@@ -139,6 +139,7 @@ def test_orphans_on_either_side_are_counted_and_left_unchanged(
                     method="email",
                     snapshot_path=None,
                     resume_file=None,
+                    jd_expected=1,
                 ),
             )
     before = _digest(ready)
