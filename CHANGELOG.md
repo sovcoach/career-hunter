@@ -7,6 +7,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-11
+
 ### Added
 - Each application keeps its job description (ADR-024). EI migration 0002 adds an append-only `job_descriptions` table (the text verbatim, its SHA-256, `jd_source` and its snapshot file) and `applications.jd_expected`; search migration 0020 adds `applications.jd_expected`, `jd_sha256` and `jd_path`. Applications recorded before them get `jd_expected` 0 and show as pre-feature; every application recorded from now on gets 1. A corrected JD is a new row, and the latest is current.
 - `/log <link> | method | date [| Company | Title]` takes the job description on the lines after it. Telegram splits a long paste into several messages, so plain text messages that follow within 4 seconds of each other are joined to it with a blank line between each (Telegram splits at blank lines and drops them), and the application is recorded once they stop. A pasted job description is stored as Telegram delivered it: Telegram turns tabs into spaces and trims trailing spaces, so a file is the way to keep the exact text. A PDF, HTML or text file captioned with the `/log` line is the job description too. Without one (and none on the page), the application is recorded and the reply asks for the job description as a reply. A text that arrives just after the window gets a reply saying to send the whole description as a `.txt` reply to the `Recorded` message. No reply repeats a job description, and the bot log counts only its messages.
@@ -24,6 +26,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A `/log` with no job description, and every Applied from an alert, asks for the job description instead of a PDF or screenshot of the ad: the watcher keeps no description to attach. A reply with a file also becomes the ad copy when none was saved. A request for the ad sent before this version still takes a PDF or image.
 - The PDF reader moved from `resume.py` to `pdftext.py`, shared with job descriptions. Resume import behaves as before.
 - `search.db` moves to schema version 20 and the EI record to version 2. Back up and run `careerhunter migrate`. A sealed claim's file is not migrated, and is still read.
+- `docs/SETUP.md` has "Upgrading from 0.4.0 to 0.5.0": the schema numbers and `doctor` lines to expect, and `init` to create `imports/` in an existing data folder. Its release checkout uses `v0.5.0`.
 
 ## [0.4.0] - 2026-11-10
 
@@ -215,7 +218,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/sovcoach/career-hunter/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sovcoach/career-hunter/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sovcoach/career-hunter/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sovcoach/career-hunter/compare/v0.1.0...v0.2.0

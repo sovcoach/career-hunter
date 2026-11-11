@@ -309,7 +309,7 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 
 ## Phase roadmap
 
-Only what is on `main` is listed. The latest release is v0.4.0.
+Only what is on `main` is listed. The latest release is v0.5.0.
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -319,5 +319,6 @@ Only what is on `main` is listed. The latest release is v0.4.0.
 | 3, Watcher (v0.4.0) | `careerhunter watch` on Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards; exclusions, hard gates, location rules and the posting age; lanes; gap-tier scoring with a fit on a local model, grounded in an imported resume; local embedding cosines and `embed-eval`; one alert digest per run; run records, health and the weekly digest; `careerhunter log` and `report` | released |
 | 4, Discovery (v0.4.0) | Discovery passes against a local SearXNG inside the watch agent, posting URLs fetched once through their ATS, and a board queue approved from the CLI or the bot | released |
 | 5, Release (v0.4.0) | The MIT license (ADR-021), `careerhunter demo`, the model-id settings, the inert template watchlist, and SETUP for a release checkout and upgrades | released |
+| Job descriptions and backfill import (v0.5.0) | Each application keeps its job description (ADR-024): canonical links, LinkedIn never fetched, a JD from a paste, a file or the page, in `/log`, `careerhunter log`, `doctor`, `report` and the export; one title and employer normalization; `careerhunter import` | released |
 
 Work lands as pull requests against `main`, and the operator tags a release with semver when it is cut. The repo went public once Phase 1 was verified, and `main` was protected straight after (ADR-012).
