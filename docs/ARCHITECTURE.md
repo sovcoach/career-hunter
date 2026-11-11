@@ -7,7 +7,7 @@
 
 Inside that folder, the data itself has two layers that never mix either. `search.db` holds everything career-hunter learns from: postings, fit ratings, skip reasons and the like. Each EI claim gets its own small record file, holding only what Service Canada may ask for. The two are linked by a random ID that means nothing on its own.
 
-A small "storage guard" runs before every command and checks that the data folder is somewhere safe. Secrets, such as the future Telegram bot token, sit in the macOS Keychain, separate from both halves.
+A small "storage guard" runs before every command and checks that the data folder is somewhere safe. Secrets, such as the Telegram bot token, sit in the macOS Keychain, separate from both halves.
 
 ---
 
@@ -15,7 +15,8 @@ A small "storage guard" runs before every command and checks that the data folde
 
 | Module | Responsibility |
 |---|---|
-| `cli.py` | `careerhunter` entry point. Runs the storage guard, then dispatches the command. Exit codes: 0 ok, 1 error, 2 refused by the guard. |
+| `cli.py` | `careerhunter` entry point. Runs the storage guard, then dispatches the command; `demo` alone is dispatched first, because it uses no data folder. Exit codes: 0 ok, 1 error, 2 refused by the guard. |
+| `demo.py` | `careerhunter demo`: an in-memory `search.db` and EI record, a synthetic config, fake boards and a fake local model, through the real `watch.run`, `bot.digest_texts` and `ledger.record_application`. Reads no data folder, writes no file, opens no socket. |
 | `storage_guard.py` | Fail-closed checks on `CAREERHUNTER_DATA_DIR` (see below). Also creates the data folder safely. |
 | `platform_checks.py` | `SystemProbe`: read-only wrappers around `diskutil info -plist`, `fdesetup status`, `git rev-parse` and `os.stat`. Tests swap in a fake. |
 | `secrets_store.py` | Keychain access through `keyring`. Allowlisted names only, plaintext backends refused, and values never printed. |
@@ -25,6 +26,7 @@ A small "storage guard" runs before every command and checks that the data folde
 | `migrations/search/`, `migrations/ei_record/` | Schema history, one track per kind of file. Each migration is applied once, and its checksum is recorded so edits are detected. The runner in `db.py` also creates `schema_migrations` and `db_identity`, and their four no-update and no-delete triggers. A fresh `search.db` therefore has 6 triggers (2 from its `0001_init.sql`), and a fresh EI record has 32 (28 from its `0001_init.sql`). |
 | `models.py` | Plain record values: `Posting`, `Application`, `Activity`, `Dating`. |
 | `claims.py` | The `ei` config section, the per-precision claim check, creating each claim's file, the refusal to write while an earlier claim is unsealed, and sealing. |
+| `records.py` | Voids a mistaken application or activity with a reason, never deleting it; the schema's audit triggers log the change. |
 | `ledger.py` | Writes decisions to both layers in a fixed order, builds the sanitized EI copy, and reconciles the two layers. |
 | `selfsourced.py` | A self-sourced application in one step, for `careerhunter log` and the bot's `/log`: reads the link once for the company and title, saves the job-ad copy, and writes the posting and the application through one `ledger.record_application` call, under one correlation ID. |
 | `report.py` | `careerhunter report`: the one code path that attaches a claim's EI record to `search.db`, both read-only, to join them on `correlation_id` into a private report (ADR-014 as amended). |
@@ -40,6 +42,10 @@ A small "storage guard" runs before every command and checks that the data folde
 | `runlog.py` | A run's log file in `logs/`: each line written as it happens, mode 0600, never through a symlink. |
 | `filters.py` | The decision to keep, skip or flag a posting: exclusions, hard gates, location rules, role filters and schedule limits. A skip reason is a string. No fetching, scoring or alerts. |
 | `lanes.py` | Matches a title to the best-priority lane in `search.lanes` (whole words, via `filters.has_phrase`), and orders and holds pending alerts by lane, fit and age. Never skips a posting and never reads `never_gated_families`. |
+| `embed.py` | One embedding of the resume and of a posting on the local model (`scoring.embedding_model`), through `loopback.py`, and the cosine stored beside the tier. A cosine never causes a skip (ADR-019). |
+| `embed_eval.py` | `careerhunter embed-eval`: ranks stored cosines against stored tiers into a private report under `evals/`. Calls no model. |
+| `discover.py` | A discovery pass on a local SearXNG through `loopback.py`: the query cursor and pacing, the backoff, posting URLs and board candidates from the results, and the approve and reject rules (ADR-020). Stores no title, snippet or body. |
+| `scout_prompt.py` | `careerhunter scout-prompt`: a prompt from the exclusions and the hard gates the watcher skips on. Prints only. |
 | `score.py` | Scores one kept posting on a local loopback model. The prompt is lanes, location rules, hard gates and `gap_tiers`. Returns gaps, model text and the tier name; the watcher stores them with the tier's `fit`. Leaves `fit_rating` null. Not `fetch.py`; it talks through `loopback.py` with a 120-second total. |
 | `htmltext.py` | A board's HTML job description as plain text, with the standard library only: unescaped once for Greenhouse, scripts and styles dropped, block tags as line breaks. Stores nothing. |
 | `watch.py` | One run of `careerhunter watch`: a discovery pass when due and the postings it found, then the boards, filter, posting age, then score, within a 600-second budget. One company's failure is isolated. Stores each posting's fit, lane and posted date, and records the run in `watch_runs`. Writes `search.db` only. Does not call Telegram. |
@@ -63,8 +69,13 @@ A small "storage guard" runs before every command and checks that the data folde
 ├── exports/                              ← EI reports, timestamped, never overwritten
 ├── snapshots/<YYYY>/                     ← copies of job ads (0600; ADR-017)
 ├── logs/                                 ← bot.log, bot.heartbeat, watch.log, discover.log, *.success (0600)
-└── backups/
+├── resume/current.txt                    ← the imported resume's text (folder 0700, file 0600; ADR-023)
+├── reports/                              ← `careerhunter report` output (0600), made on first use
+├── evals/                                ← `careerhunter embed-eval` reports (0600), made on first use
+└── backups/                              ← made by `init`; SETUP's dated upgrade backups go here
 ```
+
+`doctor` checks `exports/`, `snapshots/` and `logs/`, and `resume/` and `reports/` once they exist, and tightens anything others could read. It does not check `evals/` or `backups/`.
 
 - **Outside the repo:** a git mistake can't leak data that isn't there. See DECISIONS ADR-001.
 - **On an encrypted external volume:** the record is personal. The guard requires encrypted APFS and refuses anything else. See ADR-001 and ADR-002.

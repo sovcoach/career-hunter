@@ -195,7 +195,7 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | Where on-site, hybrid, and remote work is acceptable | `search.location_rules` |
 | How many missing requirements still count, and the fit each tier means | `fit_rubric.gap_tiers` (every tier needs `fit: low`, `medium` or `high`) |
 | The lowest fit at which a title outside every lane still alerts | `search.off_lane_min_fit` (default `high`) |
-| Your resume, for scoring and a similarity line (see "Import your resume") | `search.resume: resume/current.txt` |
+| Your resume, for scoring and a similarity score that `embed-eval` reads (see "Import your resume") | `search.resume: resume/current.txt` |
 | Languages, credentials, shifts, pay, seniority (in the title, or also the description), and a minimum salary | `hard_gates` |
 | A cap on weekend days | `schedule_limits` |
 | Which roles to keep at one company | that company's `role_filters` |
@@ -248,7 +248,7 @@ One `role_filters` block requires every family, work model, and place it lists. 
 
 ### Run the local models
 
-career-hunter talks to [LM Studio](https://lmstudio.ai) on this Mac only, at fixed addresses: `http://127.0.0.1:1234/v1/chat/completions` for scoring and `http://127.0.0.1:1234/v1/embeddings` for the similarity line. Neither address can be changed in `config.yaml`, and nothing is sent anywhere else. Port 1234 is LM Studio's default.
+career-hunter talks to [LM Studio](https://lmstudio.ai) on this Mac only, at fixed addresses: `http://127.0.0.1:1234/v1/chat/completions` for scoring and `http://127.0.0.1:1234/v1/embeddings` for the similarity score (a cosine stored beside each score, which `embed-eval` reads). Neither address can be changed in `config.yaml`, and nothing is sent anywhere else. Port 1234 is LM Studio's default.
 
 1. In LM Studio, download one **chat model** (an instruction-following model; it has to answer with JSON) and one **embedding model**.
 2. Start LM Studio's local server on port 1234 and load both models. The server must be running whenever the watch agent runs.
@@ -272,7 +272,7 @@ Each is text of 1 to 200 characters, with no control characters and no spaces at
 
 An embedding model is much smaller, usually under 1 GB. A larger chat model usually lists gaps more carefully and takes longer per posting. A watch run has 600 seconds, and postings it doesn't reach are scored on the next run. If LM Studio can't load a model, pick a smaller one.
 
-If the chat model doesn't answer, the watch log says `watch: scoring: model unreachable; N postings left for the next run`, nothing is alerted until it answers, and after `health.failure_runs` runs in a row the bot tells you. Changing `scoring.chat_model` does not re-score anything by itself. Changing `scoring.embedding_model` does not re-embed stored postings: their stored vectors are compared with the new resume vector as they are, so similarity lines mix the two models until those postings are gone. The similarity line never decides anything.
+If the chat model doesn't answer, the watch log says `watch: scoring: model unreachable; N postings left for the next run`, nothing is alerted until it answers, and after `health.failure_runs` runs in a row the bot tells you. Changing `scoring.chat_model` does not re-score anything by itself. Changing `scoring.embedding_model` does not re-embed stored postings: their stored vectors are compared with the new resume vector as they are, so stored cosines mix the two models until those postings are gone. A cosine never decides anything and is not sent.
 
 ### Import your resume
 

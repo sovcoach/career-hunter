@@ -6,11 +6,11 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 
 | # | Decision | Status |
 |---|---|---|
-| 001 | Data lives outside the repo, on an encrypted external volume | Accepted (Phase 1) |
+| 001 | Data lives outside the repo, on an encrypted external volume | Accepted (Phase 1); amended (#44) |
 | 002 | A mount guard verifies the data volume, not just the path | Accepted (Phase 1) |
 | 003 | Secrets live in the macOS Keychain | Accepted (Phase 1) |
 | 004 | SQLite is the record store | Accepted (Phase 1); amended by 014; amended (#51) |
-| 005 | The schema is designed around EI record-keeping | Accepted (Phase 1); amended by 014 |
+| 005 | The schema is designed around EI record-keeping | Accepted (Phase 1); amended by 014; amended (#34) |
 | 006 | gitleaks via the pinned upstream pre-commit hook, not brew | Accepted (Phase 1); amended (lockfile) |
 | 007 | A dedicated Telegram bot for notifications | Accepted (for Phase 2) |
 | 008 | An always-on Mac mini as the host | Accepted (Phase 1) |
@@ -18,21 +18,23 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 010 | Repo workflow conventions | Accepted (Phase 1); amended (local merges); amended (web merges) |
 | 011 | Claude Code permission rules as a guard-rail | Accepted (Phase 1); amended (local merges); amended (web merges) |
 | 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1); amended by 021; amended (local merges); amended (web merges) |
-| 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
-| 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
-| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39) |
+| 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1); amended (Phase 2) |
+| 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5); amended (#34) |
+| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39, #41, #34, #42, #43) |
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2); amended (#30) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
-| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023; amended (#42, #44) |
-| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30) |
+| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023; amended (#39, #42, #44) |
+| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30); amended (#40, #41); amended (#42) |
 | 021 | The public repo is MIT | Accepted (Phase 5) |
-| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32) |
-| 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37); amended (#43, #44) |
+| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32, #35, #36, #40, #41, #42) |
+| 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37); amended (#38, #43, #44) |
 
 ---
 
 ## ADR-001: Data lives outside the repo, on an encrypted external volume
+
+> **Amended: upgrade backups (#44).** `backups/` is no longer only reserved. SETUP's "Upgrading to a new release" backs up the whole data folder, by hand and with the services stopped, into one dated folder under `backups/`: SQLite's `.backup` for every database file, a copy that keeps permissions for everything else, then a check that the copy is owner-only. Nothing does this automatically, and `doctor` does not check `backups/`. Backups off the drive are still the operator's responsibility.
 
 **Context.**
 - The record holds personal details: where you applied, outcomes, notes, and eventually saved job ads.
@@ -503,6 +505,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A fixed offset doesn't follow any daylight-saving changes. Choosing between a name and an offset is left to the operator.
 
 ## ADR-019: Local embedding vectors live in search.db beside the LLM tier
+
+> **Amended by ADR-015's digest amendment (#39).** Alerts no longer carry `LLM: <tier>` or the `similarity:` line described below: a digest row has no tier name and no cosine, and since #34 a job ad sent with `/log` gets no alert of its own. The cosine is still stored beside the tier, and `embed-eval` reads it.
 
 > **Amended: the model id is config (#44).** The embedding request's model id is `scoring.embedding_model` (default `local-embedding`), and the scoring request's is `scoring.chat_model` (default `local-model`). Each is text of 1 to 200 characters with no control characters and no leading or trailing spaces; any other key under `scoring` is refused, so neither URL can be set. The URLs stay the loopback constants below. Stored vectors do not record the model that made them: after `scoring.embedding_model` changes, stored posting vectors are compared with the new resume vector as they are. A vector of another dimension is a `dim-mismatch` miss; one of the same dimension gives a cosine across two models. A cosine still decides nothing.
 

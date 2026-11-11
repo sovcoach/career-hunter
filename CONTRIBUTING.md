@@ -31,7 +31,9 @@ The first `make check` also builds gitleaks, which takes a minute or two.
 
 The data-path hook needs `CAREERHUNTER_DATA_DIR` set in the shell you commit from (the same value career-hunter uses). No path is built into the hook, so without it every commit is refused with a message saying so.
 
-Tests never need a real data folder or Keychain: the storage guard and Keychain are replaced with fakes. To try the CLI by hand without your real drive, create a throwaway encrypted disk image (see "Testing the CLI safely" in [docs/SETUP.md](docs/SETUP.md#testing-the-cli-safely)).
+Tests never need a real data folder or Keychain: the storage guard and Keychain are replaced with fakes, and no test may open a socket. `uv run careerhunter demo` runs the watch pipeline on synthetic data in memory, with no data folder at all. To try the other commands by hand without your real drive, create a throwaway encrypted disk image (see "Testing the CLI safely" in [docs/SETUP.md](docs/SETUP.md#testing-the-cli-safely)).
+
+**Never install the services from this checkout.** `uv sync` installs career-hunter in editable mode, and `careerhunter` applies any migration it finds on disk when it opens `search.db`, so a service running from a development checkout could apply an unreleased migration to real data. Run the services from a separate release checkout, as in "A separate checkout for the services" in [docs/SETUP.md](docs/SETUP.md).
 
 ## Workflow
 
@@ -43,7 +45,7 @@ Tests never need a real data folder or Keychain: the storage guard and Keychain 
 5. Open a **pull request** using the template. CI must pass: lint, types, tests with coverage of at least 85%, and gitleaks.
 6. **Merge on GitHub** with "Create a merge commit" once the pull request's CI checks pass (ADR-010). A local merge is optional; its steps are in [AGENTS.md](AGENTS.md#merging). No force pushes to `main`: any other push to `main` is refused by the pre-push guard.
    - **Manual override, for the operator only:** `CAREERHUNTER_ALLOW_PUSH_MAIN=1 git push origin main`. It's for a deliberate, by-hand fix or the optional local merge; never put it in a script or alias. AI assistants are denied any command that mentions the variable, and never merge (ADR-011).
-7. At the end of a phase: move `[Unreleased]` to a version and tag it (`vX.Y.0`).
+7. When the operator cuts a release: move `[Unreleased]` to that version in `CHANGELOG.md`, bump `pyproject.toml`, and tag it (`vX.Y.0`).
 
 ## Common commands
 
