@@ -600,7 +600,7 @@ def cmd_service(datadir: DataDir, args: argparse.Namespace) -> int:
             print(f"removed {retired}; discovery now runs inside the watch agent")
         try:
             installed = service.install(datadir.root, watch_interval_minutes=minutes)
-        except service.ServiceError:
+        except service.AlreadyInstalled:
             if retired is None:
                 raise
             installed = []  # the bot and watch agents were already there: migrated
@@ -720,14 +720,19 @@ def _doctor_bot(
         else:
             report.line("telegram", "OK", "chat set")
     current = service.status()
+    disabled = _disabled_note(service.LABEL, current)
     if not current.installed:
-        report.line("bot service", "--", "not installed (run: careerhunter service install)")
+        if disabled:
+            report.line("bot service", "BAD", f"not installed; {disabled}")
+        else:
+            report.line("bot service", "--", "not installed (run: careerhunter service install)")
         return
     if current.running:
-        report.line("bot service", "OK", f"running (pid {current.pid})")
+        level, text = "OK", f"running (pid {current.pid})"
     else:
         detail = f"installed but not running (last exit {current.last_exit or 'unknown'})"
-        report.line("bot service", "BAD", f"{detail}; see logs/bot.log")
+        level, text = "BAD", f"{detail}; see logs/bot.log"
+    _service_line(report, "bot service", level, text, service.LABEL, current, datadir, disabled)
     heartbeat = datadir.logs / "bot.heartbeat"
     try:
         beat = dt.datetime.fromisoformat(heartbeat.read_text().strip())
@@ -742,19 +747,75 @@ def _doctor_bot(
         report.line("bot heartbeat", "OK", "polled within the last 5 minutes")
 
 
+def _disabled_note(label: str, current: service.ServiceStatus) -> str | None:
+    """The exact enable command when launchd has disabled `label`, else None.
+
+    launchd keeps a disabled override per user, through `uninstall`, so this is checked
+    even when the agent isn't installed.
+    """
+    disabled = service.disabled_labels()
+    if not disabled or label not in disabled:
+        return None
+    if not current.installed:
+        then = ", then careerhunter service install"
+    elif not current.loaded:
+        then = ", then careerhunter service uninstall and careerhunter service install"
+    else:
+        then = ", or it won't load at the next login"
+    return f"{label} is disabled in launchd. Run: {service.enable_command(label)}{then}"
+
+
+def _service_line(
+    report: _Report,
+    name: str,
+    level: str,
+    text: str,
+    label: str,
+    current: service.ServiceStatus,
+    datadir: DataDir,
+    disabled: str | None,
+) -> None:
+    """One service line, naming the checkout and data folder the agent serves.
+
+    Labels are per user, so an agent may serve another checkout's data folder. When its
+    CAREERHUNTER_DATA_DIR is not this one, an OK line is a WARN.
+    """
+    if current.loaded and (current.program or current.data_dir):
+        program, data_dir = current.program, current.data_dir
+    else:
+        program, data_dir = service.plist_target(label)
+    checkout = service.checkout_of(program) if program else None
+    where = f"checkout {checkout}" if checkout else f"program {program or 'unknown'}"
+    text += f"; {where}, data folder {data_dir or 'unknown'}"
+    if data_dir is not None and os.path.realpath(data_dir) != os.path.realpath(datadir.root):
+        text += "; not this CAREERHUNTER_DATA_DIR"
+        if level == "OK":
+            level = "WARN"
+    if disabled:
+        level, text = "BAD", f"{text}; {disabled}"
+    report.line(name, level, text)
+
+
 def _doctor_watch(
     report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
 ) -> None:
     """Whether the watch agent is loaded, and how old the last finished run is."""
-    current = service.status(label=service.WATCH_LABEL)
+    label = service.WATCH_LABEL
+    current = service.status(label=label)
+    disabled = _disabled_note(label, current)
     if not current.installed:
-        report.line("watch service", "--", "not installed (run: careerhunter service install)")
-    elif not current.loaded:
-        report.line("watch service", "BAD", "installed but not loaded")
-    elif current.running and current.pid is not None:
-        report.line("watch service", "OK", f"running (pid {current.pid})")
+        if disabled:
+            report.line("watch service", "BAD", f"not installed; {disabled}")
+        else:
+            report.line("watch service", "--", "not installed (run: careerhunter service install)")
     else:
-        report.line("watch service", "OK", "loaded")
+        if not current.loaded:
+            level, text = "BAD", "installed but not loaded"
+        elif current.running and current.pid is not None:
+            level, text = "OK", f"running (pid {current.pid})"
+        else:
+            level, text = "OK", "loaded"
+        _service_line(report, "watch service", level, text, label, current, datadir, disabled)
     if current.installed:
         _doctor_watch_interval(report, config_doc)
     _doctor_watch_success(report, datadir, config_doc, now)
@@ -1349,6 +1410,73 @@ def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_lanes(datadir: DataDir, args: argparse.Namespace) -> int:
+    """`lanes reassign [--dry-run]`: recompute every checked posting's lane.
+
+    The current `search.lanes` and the current matcher decide. A dry run reads
+    search.db only, and needs it migrated already. Without `--dry-run` the same changes
+    are written in one transaction, and `lane_changes` logs each one. Postings released
+    from the off-lane hold alert at the bot's next poll, within `alerts.max_per_poll`;
+    one past the posting-age gate gets a `too_old` skip instead. Writes search.db only.
+    """
+    if args.lanes_action != "reassign":  # pragma: no cover - argparse limits the choices
+        return EXIT_ERROR
+    doc = _config_doc(datadir)
+    if doc is None:
+        _err("error: config.yaml is missing")
+        return EXIT_ERROR
+    if lanes.configured(doc) is None:
+        _err("error: config.yaml has no search.lanes, so there are no lanes to reassign")
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    today = config_today(doc)
+    if args.dry_run:
+        conn = db.connect_read_only(datadir.search_db_path)
+        try:
+            _require_current(conn, "search", "search.db")
+            planned = lanes.plan_reassign(conn, doc, today)
+        finally:
+            conn.close()
+        print("dry run: nothing is written.")
+    else:
+        conn = db.connect(datadir.search_db_path)
+        try:
+            db.migrate(conn, "search")
+            planned = lanes.reassign(conn, doc, today)
+        finally:
+            conn.close()
+    _print_reassignment(planned, dry_run=args.dry_run)
+    return EXIT_OK
+
+
+def _print_reassignment(planned: lanes.Reassignment, *, dry_run: bool) -> None:
+    for move in planned.moves:
+        old, new = move.old or "off-lane", move.new or "off-lane"
+        print(f"{move.posting_id:6} {move.title}: {old} -> {new}")
+    verb = "would change" if dry_run else "changed"
+    print(f"{len(planned.moves)} of {planned.checked} checked postings {verb} lane.")
+    to_lane = sum(1 for m in planned.moves if m.old is None)
+    to_off = sum(1 for m in planned.moves if m.new is None)
+    between = len(planned.moves) - to_lane - to_off
+    print(f"  from off-lane to a lane: {to_lane}; to off-lane: {to_off}; between lanes: {between}")
+    can = "would become" if dry_run else "became"
+    print(
+        f"{len(planned.released)} held off-lane postings {can} alertable, "
+        "within alerts.max_per_poll."
+    )
+    if planned.too_old:
+        skip = "would get" if dry_run else "got"
+        print(
+            f"{len(planned.too_old)} released postings are past the posting-age gate and "
+            f"{skip} a too_old skip instead."
+        )
+    if planned.newly_held:
+        held = "would be" if dry_run else "are now"
+        print(f"{planned.newly_held} alertable postings {held} held off-lane.")
+
+
 def cmd_scout_prompt(datadir: DataDir, args: argparse.Namespace) -> int:
     """Print a scout prompt from exclusions and hard gates. Writes nothing."""
     if not datadir.config_path.is_file():
@@ -1885,6 +2013,16 @@ def build_parser() -> argparse.ArgumentParser:
         "scout-prompt",
         help="print a scout prompt from exclusions and the hard gates the watcher skips on",
     )
+    p = sub.add_parser("lanes", help="manage the title lanes stored on postings")
+    lanes_sub = p.add_subparsers(dest="lanes_action", required=True)
+    p = lanes_sub.add_parser(
+        "reassign",
+        help="recompute every checked posting's lane against the current config; "
+        "writes search.db only",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="list each posting that would change; write nothing"
+    )
     p = sub.add_parser("resume", help="import a resume for scoring; the text stays local")
     resume_sub = p.add_subparsers(dest="resume_action", required=True)
     p = resume_sub.add_parser(
@@ -1919,6 +2057,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "watch": cmd_watch,
     "discover": cmd_discover,
     "scout-prompt": cmd_scout_prompt,
+    "lanes": cmd_lanes,
     "resume": cmd_resume,
     "embed-eval": cmd_embed_eval,
     "doctor": cmd_doctor,

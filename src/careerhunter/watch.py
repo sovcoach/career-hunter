@@ -76,10 +76,12 @@ scored, unalerted postings stored without one, by their stored tier name.
 Lanes (#33). With `search.lanes` set, a posting's title is checked against the lanes
 when it is stored, skipped ones included, and the best-priority lane that matches is
 stored with it, or none (off-lane). Every run then checks any posting not yet checked,
-from any source, so postings stored before lanes existed get theirs. Both writes are
-set once (`... WHERE lane_checked = 0`). A changed lane list does not move a posting
-already checked. An off-lane posting is still gated and scored like any other. Without
-`search.lanes`, nothing is checked and no posting is off-lane.
+from any source, so postings stored before lanes existed get theirs. Both writes touch
+only unchecked rows (`... WHERE lane_checked = 0`), so the watcher never moves a
+posting already checked: after a change to the lanes or the matcher, only `careerhunter
+lanes reassign` does, and search migration 0021 logs each move to `lane_changes`. An
+off-lane posting is still gated and scored like any other. Without `search.lanes`,
+nothing is checked and no posting is off-lane.
 
 Reposts (#34). A posting is never alerted when the operator already logged or skipped
 the same role: the same company row and the same `filters.title_key`, whatever its url,

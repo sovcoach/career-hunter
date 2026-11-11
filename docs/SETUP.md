@@ -162,7 +162,7 @@ created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 20
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 21
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -211,9 +211,11 @@ The templates use placeholder names such as Example Robotics, Example City, and 
 
 `search.target_titles`, `search.locations`, and `search.work_models` still validate so an older file loads. The watcher does not match them. Use lanes and location rules.
 
-Lanes label and order alerts; they never skip a posting. A title is matched against every title in every lane, as whole words, ignoring case, and the lane with the best (lowest) priority wins. Alerts go off-lane last, then best fit first, then non-fallback lanes before `fallback: true` ones, then by priority, then oldest. A title that matches no lane is still gated and scored, and alerts only at `search.off_lane_min_fit` or better, labelled `Off-lane`. A posting keeps the lane it was given when it was stored, even if you change the lanes later. Without `search.lanes`, lane checking is off and `doctor` says so: alerts go by fit, then oldest. Lanes are separate from `hard_gates.never_gated_families`.
+Lanes label and order alerts; they never skip a posting. A title is matched against every title in every lane, as whole words, ignoring case, and the lane with the best (lowest) priority wins. Alerts go off-lane last, then best fit first, then non-fallback lanes before `fallback: true` ones, then by priority, then oldest. A title that matches no lane is still gated and scored, and alerts only at `search.off_lane_min_fit` or better, labelled `Off-lane`. A title that matches no lane literally can still match by the normalized rule: a lane title that is two or more words and then `Specialist`, `Analyst` or `Associate` (one built-in group) matches a posting with the same words and any of those three, ignoring level words (Junior, Senior, Sr., I to IV, 1 to 4, Level N) and reading `Analyst, Client Experience` as `Client Experience Analyst`. So `IT Support Specialist` also matches `Senior IT Support Associate II` and `IT Support Associate - Night Shift`, but not `IT Support Associate Manager`, `IT Support Lead` or `Business Analyst, IT Support`. A one-word core such as `Data Analyst` only matches literally. A posting keeps the lane it was given when it was stored, even if you change the lanes later, until you run `careerhunter lanes reassign`. Without `search.lanes`, lane checking is off and `doctor` says so: alerts go by fit, then oldest. Lanes are separate from `hard_gates.never_gated_families`.
 
 Every alert carries a fit: `Fit: High`, `Medium` or `Low`, from the `fit` of the tier the posting was scored into. A posting the model hasn't scored yet, or scored into a tier name that is no longer in `gap_tiers`, is held and not alerted until it has a fit. `doctor` counts what is held.
+
+**After you change `search.lanes`, or upgrade to a release that matches titles differently,** run `uv run careerhunter lanes reassign --dry-run`. It lists each stored posting whose lane would change, with its id, title, and old and new lane (`off-lane` for none), then the counts and how many held off-lane postings would become alertable. It writes nothing. If the list looks right, run `uv run careerhunter lanes reassign` to apply exactly those moves; each is logged in `search.db`. Released postings alert at the bot's next poll, within `alerts.max_per_poll`, and one older than `search.max_posting_age_days` is skipped as `too_old` instead. Without `search.lanes` it refuses.
 
 **Upgrading from 0.3.0?** Follow "Upgrading to a new release" near the end of this guide. Postings that were already scored, and not yet alerted, get their fit from your config on the next watch run, by their tier name. With `search.lanes` set, that run also gives every stored posting its lane.
 
@@ -357,7 +359,7 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 20
+search.db: applied nothing; schema version 21
 ei_record_2026-27.db: created; schema version 2
 EI claim 2026-27 (from 2026-08-02)
 ```
@@ -376,7 +378,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 20
+search.db       OK  schema version 21
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -612,11 +614,13 @@ The bot restarts if it stops, retrying once a minute (for example, while the dat
 
 ```text
 telegram        OK  chat set
-bot service     OK  running (pid 4242)
+bot service     OK  running (pid 4242); checkout ~/Projects/career-hunter-release, data folder /Volumes/ExampleDrive/ExampleFolder
 bot heartbeat   OK  polled within the last 5 minutes
-watch service   OK  loaded
+watch service   OK  loaded; checkout ~/Projects/career-hunter-release, data folder /Volumes/ExampleDrive/ExampleFolder
 watch           --  no successful run yet
 ```
+
+Each service line names the checkout and the data folder the agent serves, as launchd reports them. launchd keeps one bot and one watch agent per user, not per data folder, so a `doctor` run against another data folder (a test volume, say) still describes those agents: the line says `not this CAREERHUNTER_DATA_DIR`, and an OK becomes a WARN.
 
 The bot log is `logs/bot.log` in your data folder. It records events only, never message text or the token. A finished watch writes `logs/watch.success`. Each line of a run goes to `logs/watch.log` as it happens, and the last line counts the boards. A crash leaves its traceback in that file only. A run looks like this:
 
@@ -831,7 +835,7 @@ If something goes wrong before step 6 finishes, nothing in the data folder has c
 | `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 20` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 21` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |
@@ -847,6 +851,9 @@ If something goes wrong before step 6 finishes, nothing in the data folder has c
 | The bot replies `Config can't be read, so nothing was recorded. Run careerhunter doctor.` | `/log` needs `config.yaml` for the date and the claim check | Fix `config.yaml`, then send the link again |
 | `lanes -- not configured` | `search.lanes` isn't set, so lane checking is off | Nothing to fix if you meant it. Add lanes to label and order alerts |
 | `config.yaml BAD … needs an end date` | A claim that isn't active has no `end` | Add its end date, or check `active_claim` for a typo |
+| `org.careerhunter.bot is disabled in launchd. Run: launchctl enable gui/…/org.careerhunter.bot, then careerhunter service install` (or the watch label), from `service install` or on a `doctor` service line | launchd has a disabled override for that label. `service install` checks before it writes anything, and stops. The override is launchd's own, kept per user and per label: it outlasts `careerhunter service uninstall`, which only removes the plist, so installing again fails the same way until it is cleared. career-hunter never clears it for you | Run the command it prints, `launchctl enable gui/$(id -u)/<label>`, as yourself, then `uv run careerhunter service install` |
+| `launchctl bootstrap failed (5). Check launchctl print-disabled gui/… for <label>` | launchd refused to load the agent. Error 5 most often means the label is disabled | Run `launchctl print-disabled gui/$(id -u)`. If the label shows `disabled` or `true`, run `launchctl enable gui/$(id -u)/<label>`, then `uv run careerhunter service install`. It is a user agent: it never needs root |
+| `bot service WARN … not this CAREERHUNTER_DATA_DIR` (or `watch service`) | The agent loaded for your user serves another data folder than the one this `doctor` run checked | Nothing to fix while you are testing against another data folder. Otherwise run `uv run careerhunter service uninstall`, then `service install` from the release checkout with the right `CAREERHUNTER_DATA_DIR` |
 | `WARNING: FileVault is OFF` | The Mac's own disk isn't encrypted | Step 1 |
 | `uv: command not found` | Terminal hasn't picked up uv yet | Close and reopen Terminal, or re-run the Step 3 installer |
 
@@ -865,5 +872,7 @@ diskutil apfs addVolume "$(diskutil info -plist /Volumes/CHBase | plutil -extrac
 ```bash
 CAREERHUNTER_DATA_DIR=/Volumes/CHTest/ExampleFolder uv run careerhunter init
 ```
+
+`doctor` against the test volume still describes the services loaded for your user: their lines name the real data folder and say `not this CAREERHUNTER_DATA_DIR`. Don't install the services against the test volume.
 
 When you're done, eject `CHBase` and `CHTest` in Finder, then move `~/ch-test.sparseimage` to the Trash.

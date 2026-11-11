@@ -66,6 +66,56 @@ def test_the_best_priority_wins_when_titles_in_several_lanes_match() -> None:
     assert lanes.match("Site Lead", d) == Lane("narrow", 1, False)
 
 
+SUPPORT = Lane("it_support", 1, False)
+CLIENT = Lane("client_experience", 2, False)
+
+
+def normalized_doc() -> dict[str, Any]:
+    return doc(
+        {
+            "name": "it_support",
+            "priority": 1,
+            "titles": [["IT Support Specialist", "IT Support Analyst"]],
+        },
+        {"name": "client_experience", "priority": 2, "titles": ["Client Experience Analyst"]},
+        {"name": "data", "priority": 3, "titles": ["Data Analyst"]},
+    )
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("IT Support Associate", SUPPORT),
+        ("Analyst, Client Experience", CLIENT),
+        ("Senior Analyst, Client Experience", CLIENT),
+        ("Senior IT Support Associate II", SUPPORT),
+        ("IT Support Associate - Night Shift", SUPPORT),
+        ("IT Support Manager", None),
+        ("IT Support Associate Manager", None),
+        ("Data Associate", None),  # the lane "Data Analyst" has a one-word core
+        ("Business Analyst, IT Support", None),
+        ("Analyst, Client Experience Operations", None),
+        ("Senior Analyst, Client Experience Operations", None),
+        ("Associate Director, IT Support", None),
+        ("Client Experience Director", None),
+        ("IT Support Lead", None),
+    ],
+)
+def test_normalized_titles_match_when_no_lane_matches_literally(
+    title: str, expected: Lane | None
+) -> None:
+    assert lanes.match(title, normalized_doc()) == expected
+
+
+def test_a_literal_match_wins_over_a_better_priority_normalized_one() -> None:
+    d = doc(
+        {"name": "it_support", "priority": 1, "titles": ["IT Support Specialist"]},
+        {"name": "associates", "priority": 2, "titles": ["Support Associate"]},
+    )
+    assert lanes.match("IT Support Associate", d) == Lane("associates", 2, False)
+    assert lanes.match("IT Support Analyst", d) == Lane("it_support", 1, False)
+
+
 def test_configured_lists_lanes_by_priority_and_none_without_any() -> None:
     d = doc(
         {"name": "second", "priority": 5, "titles": ["B"]},

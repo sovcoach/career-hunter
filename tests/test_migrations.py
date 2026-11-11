@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 21)), "ei_record": [1, 2]}[track]
+    expected = {"search": list(range(1, 22)), "ei_record": [1, 2]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1017,7 +1017,7 @@ def test_search_0020_marks_every_existing_application_pre_feature(tmp_path: Path
             "method) VALUES (?, ?, '2026-10-30', 'exact', 'email')",
             ("a" * 32, posting),
         )
-        assert db.migrate(conn, "search") == [20]
+        assert db.migrate(conn, "search") == [20, 21]
         row = conn.execute("SELECT jd_expected, jd_sha256, jd_path FROM applications").fetchone()
         assert tuple(row) == (0, None, None)
         with pytest.raises(sqlite3.IntegrityError, match="jd_expected"):
@@ -1037,7 +1037,39 @@ def test_search_0020_marks_every_existing_application_pre_feature(tmp_path: Path
         conn.close()
 
 
+def test_search_0021_lets_a_checked_lane_move_and_logs_it(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:20])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'manual')"
+        ).lastrowid
+        checked, unchecked = (
+            conn.execute(
+                "INSERT INTO postings (company_id, title, first_seen, source) "
+                "VALUES (?, ?, '2026-10-30', 'manual')",
+                (company, title),
+            ).lastrowid
+            for title in ("Clerk", "Courier")
+        )
+        conn.execute("UPDATE postings SET lane = 'ops', lane_checked = 1 WHERE id = ?", (checked,))
+        with pytest.raises(sqlite3.IntegrityError, match="set once"):
+            conn.execute("UPDATE postings SET lane = 'support' WHERE id = ?", (checked,))
+        assert db.migrate(conn, "search") == [21]
+        rows = conn.execute("SELECT id, lane, lane_checked FROM postings ORDER BY id")
+        assert [tuple(r) for r in rows] == [(checked, "ops", 1), (unchecked, None, 0)]
+        conn.execute("UPDATE postings SET lane = 'support' WHERE id = ?", (checked,))
+        changes = conn.execute("SELECT posting_id, old_lane, new_lane FROM lane_changes")
+        assert [tuple(r) for r in changes] == [(checked, "ops", "support")]
+        with pytest.raises(sqlite3.IntegrityError, match="lane_checked stays 1"):
+            conn.execute(
+                "UPDATE postings SET lane = NULL, lane_checked = 0 WHERE id = ?", (checked,)
+            )
+    finally:
+        conn.close()
+
+
 def test_trigger_counts_on_a_fresh_file(fresh: sqlite3.Connection, track: str) -> None:
     """The counts ARCHITECTURE states for a fresh file."""
     found = fresh.execute("SELECT count(*) FROM sqlite_master WHERE type = 'trigger'").fetchone()
-    assert found[0] == {"search": 8, "ei_record": 37}[track]
+    assert found[0] == {"search": 9, "ei_record": 37}[track]
