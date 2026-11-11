@@ -600,7 +600,7 @@ def cmd_service(datadir: DataDir, args: argparse.Namespace) -> int:
             print(f"removed {retired}; discovery now runs inside the watch agent")
         try:
             installed = service.install(datadir.root, watch_interval_minutes=minutes)
-        except service.ServiceError:
+        except service.AlreadyInstalled:
             if retired is None:
                 raise
             installed = []  # the bot and watch agents were already there: migrated

@@ -172,14 +172,63 @@ class ServiceError(Exception):
     """A launchd step failed. The message is user-facing."""
 
 
+class AlreadyInstalled(ServiceError):
+    """Both agents' plists exist already, so there is nothing to install."""
+
+
+_DISABLED_LINE = re.compile(r'^\s*"([^"]+)"\s*=>\s*(disabled|enabled|true|false)\s*$', re.MULTILINE)
+
+
+def disabled_labels(runner: Runner | None = None) -> set[str] | None:
+    """The labels launchd has disabled in this user's domain, or None when it can't say.
+
+    Reads `launchctl print-disabled gui/<uid>`, in either of its forms:
+    `"label" => disabled|enabled` or `"label" => true|false`, where true is disabled.
+    A disabled label outlasts `uninstall`: only `launchctl enable` clears it.
+    """
+    runner = runner or run_launchctl
+    code, out = runner(["print-disabled", _domain()])
+    if code != 0:
+        return None
+    return {
+        match.group(1)
+        for match in _DISABLED_LINE.finditer(out)
+        if match.group(2) in ("disabled", "true")
+    }
+
+
+def enable_command(label: str) -> str:
+    """The exact command that clears launchd's disabled override for `label`."""
+    return f"launchctl enable {_domain()}/{label}"
+
+
+def _refuse_disabled(labels: list[str], runner: Runner) -> None:
+    """Stop before anything is written when launchd has disabled a label to install."""
+    disabled = disabled_labels(runner) or set()
+    found = [label for label in labels if label in disabled]
+    if not found:
+        return
+    names = " and ".join(found)
+    verb = "is" if len(found) == 1 else "are"
+    commands = "; ".join(enable_command(label) for label in found)
+    raise ServiceError(
+        f"{names} {verb} disabled in launchd. Run: {commands}, then careerhunter service install"
+    )
+
+
 def _install_one(path: Path, body: bytes, runner: Runner) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(body)
     os.chmod(path, 0o644)  # launchd requires the plist not be group- or world-writable
-    code, out = runner(["bootstrap", _domain(), str(path)])
+    code, _out = runner(["bootstrap", _domain(), str(path)])
     if code != 0:
         path.unlink()
-        raise ServiceError(f"launchctl bootstrap failed ({code}): {out.strip()[:200]}")
+        # launchctl's own text is not passed on: it can suggest running as root, which
+        # never helps a user agent.
+        message = f"launchctl bootstrap failed ({code})"
+        if code == 5:
+            message += f". Check launchctl print-disabled {_domain()} for {path.stem}"
+        raise ServiceError(message)
 
 
 def install(
@@ -190,7 +239,11 @@ def install(
     home: Path | None = None,
     watch_interval_minutes: int = DEFAULT_WATCH_INTERVAL_MINUTES,
 ) -> list[Path]:
-    """Install whichever of the bot and watch agents is missing."""
+    """Install whichever of the bot and watch agents is missing.
+
+    A label launchd has disabled stops the install before any plist is written, with
+    the exact `launchctl enable` command. It is never enabled here.
+    """
     runner = runner or run_launchctl
     binary = program_path or program()
     # Build every body before writing so a bad interval leaves nothing new behind.
@@ -201,7 +254,8 @@ def install(
     missing = [(path, body) for path, body in planned if not path.exists()]
     if not missing:
         names = " and ".join(path.name for path, _body in planned)
-        raise ServiceError(f"{names} already exist; run: careerhunter service uninstall")
+        raise AlreadyInstalled(f"{names} already exist; run: careerhunter service uninstall")
+    _refuse_disabled([path.stem for path, _body in missing], runner)
     made: list[Path] = []
     for path, body in missing:
         _install_one(path, body, runner)
