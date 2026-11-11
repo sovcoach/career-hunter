@@ -15,6 +15,7 @@ import pytest
 from careerhunter import cli, db
 from careerhunter.jobdesc import sha256
 from tests.conftest import ACTIVE, EARLIER, FakeProbe, set_claims
+from tests.test_jobdesc import make_pdf
 
 JD = "About the role\nSYNTHETIC-JD-TEXT Example Robotics is looking for an analyst."
 LINKEDIN = "https://www.linkedin.com/jobs/view/4000000001/?refId=abc123&trk=public_jobs_topcard"
@@ -321,3 +322,20 @@ def test_a_search_only_attach_says_so(
         assert conn.execute("SELECT ei_claim FROM applications").fetchall() == [(None,)]
     finally:
         conn.close()
+
+
+def test_the_example_file_is_a_valid_import(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    example = Path(__file__).resolve().parents[1] / "import.example.json"
+    (ready / "imports" / "backfill.json").write_text(example.read_text(encoding="utf-8"))
+    folder = ready / "imports" / "job-descriptions"
+    folder.mkdir()
+    (folder / "synthetic-widgets-data-analyst.pdf").write_bytes(
+        make_pdf(["Synthetic duties for a data analyst."])
+    )
+    assert run(probe, ready / "imports" / "backfill.json", "--dry-run") == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert f"link {LINKEDIN_CANONICAL}" in out
+    assert "Synthetic Widgets / Data Analyst, the week of 2026-09-14" in out
+    assert out.splitlines()[-1] == "3 create"

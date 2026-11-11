@@ -158,6 +158,7 @@ created  $CAREERHUNTER_DATA_DIR/exports
 created  $CAREERHUNTER_DATA_DIR/snapshots
 created  $CAREERHUNTER_DATA_DIR/logs
 created  $CAREERHUNTER_DATA_DIR/backups
+created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
@@ -449,6 +450,37 @@ uv run careerhunter log https://jobs.example.com/ads/7 --method company_site --d
 Keep the job description with it: `--jd-file path/to/ad.pdf` takes a PDF, HTML or text file, and `--jd-stdin` reads pasted text from standard input (use one or the other). Without either, the job description is fetched from the page when it carries one. The output says `Job description saved.` or `No job description was saved.`; a missing one shows up in `doctor`. An encrypted PDF is refused, and a scanned PDF with no text is kept as the copy of the ad but doesn't count as the job description.
 
 **LinkedIn links are never fetched**, so `--company` and `--title` are required with one. Better still, open the posting, follow it to the company's own career site, and log that page's link instead: its job description can be fetched. Pasting the description is the fallback, and so is a LinkedIn Easy Apply posting with no career-site page. If you already logged an application to the same role at the same company (a repost counts: the title is compared without its requisition code), it is still recorded, and one more line names the earlier date, for example `You logged an application to this role on 2026-10-27.` Without a readable `config.yaml`, nothing is fetched or recorded. The bot's `/log` does the same from Telegram.
+
+### Backfilling applications and their job descriptions
+
+`seed` brings in your history once. `careerhunter import` is for adding job descriptions, and applications you haven't recorded yet, later on: it matches each entry to what is already recorded, and never changes an application's date.
+
+1. **Prepare the file.** Copy `import.example.json` from the repo into the `imports/` folder in your data folder (`init` creates it, owner-only), for example as `imports/backfill.json`, and replace the example entries with yours. The file must sit under `imports/`: a file anywhere else, even elsewhere in the data folder, is refused. Each entry needs `employer`, `role`, `date`, `date_precision` (`day`, or `week` when you only know the week; any day of that week works, and it's stored as its Monday) and `method`. `location`, `work_model`, `url`, `notes` (kept in `search.db` only, and only for a new application) and one of `jd_text` (the description, pasted) or `jd_file` (a PDF, HTML or text file, named relative to the JSON file and also under `imports/`) are optional. Links are saved in their canonical form, so a LinkedIn link with tracking parameters becomes `https://www.linkedin.com/jobs/view/<id>/`. Nothing is fetched.
+2. **Dry run.** It opens both databases read-only and writes nothing, not even a file:
+
+   ```bash
+   uv run careerhunter import "$CAREERHUNTER_DATA_DIR/imports/backfill.json" --dry-run
+   ```
+
+   Each entry gets one line: its number, its class, and what it would write to `search.db` and to the EI record. A job description shows only as its SHA-256 and its length; its text is never printed. The classes:
+
+   | Class | Means |
+   |---|---|
+   | `CREATE` | Nothing matches: a new application, recorded the way `/log` records one |
+   | `ATTACH` | One recorded application has the same employer (ignoring case, a leading "The" and suffixes such as Inc or Ltd) and the same title (with `Analyst, Client Experience` read as `Client Experience Analyst`), or several do and one has the same date. It gets the job description, and the link if it has none |
+   | `UNCHANGED` | It already has this job description and link. A second run shows every entry this way |
+   | `AMBIGUOUS` | More than one application could be meant, a title only nearly matches (`Senior … Specialist` for `… Analyst`), or two entries point at one application. The candidates are listed under it as `candidate app N (…)` |
+   | `CONFLICT` | The application already has a different link or a different job description. Nothing is changed |
+   | `REFUSED` | A field is wrong, the date is in the future or outside the active claim, or the application's claim record can't change |
+
+3. **Resolve ambiguous entries.** Add `"resolve": N` to an entry, with the `app N` number of the application it belongs to, or `"resolve": "new"` to record it as a new application. Run the dry run again until the result is what you want.
+4. **Apply.** The same command without `--dry-run` prints the same lines and does exactly what they say:
+
+   ```bash
+   uv run careerhunter import "$CAREERHUNTER_DATA_DIR/imports/backfill.json"
+   ```
+
+   It exits 0 when every entry is done or unchanged, and 1 when anything is left ambiguous, in conflict or refused (the rest are still applied). An entry dated before your claim is refused; `--route-out-of-claim-to-search` records it in `search.db` only instead, as with `seed`. It refuses to run at all (exit 2) while an earlier claim's record is unsealed, or for a file outside `imports/`.
 
 ### A report across both files
 
@@ -795,6 +827,8 @@ If something goes wrong before step 6 finishes, nothing in the data folder has c
 | `… is readable by other users … chmod 700` | Folder permissions are too open | Run the `chmod` command it prints |
 | `seed file has N problem(s)` | Something in `seed.yaml` needs fixing | Each line names the entry and field. Fix them and re-run |
 | `… is before claim 2026-27 started` | A seed date falls outside your claim | Fix the date, or see `--route-out-of-claim-to-search` in Step 8 |
+| `REFUSING TO IMPORT: the import file must be under imports/ in the data folder` | `careerhunter import` reads only from `imports/` | Move the file (and its `jd_file`s) into `imports/` and run it again |
+| `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
 | `search.db BAD schema version 2, expected 20` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
