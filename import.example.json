@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "applications": [
+    {
+      "employer": "Example Robotics Inc.",
+      "role": "Analyst, Client Experience",
+      "location": "Example City",
+      "work_model": "hybrid",
+      "date": "2026-09-15",
+      "date_precision": "day",
+      "method": "linkedin_easy_apply",
+      "url": "https://www.linkedin.com/jobs/view/4000000001/?refId=abc123&trk=public_jobs_topcard",
+      "jd_text": "About the role\nExample Robotics is looking for a Client Experience Analyst to ...",
+      "notes": "Found through a former colleague."
+    },
+    {
+      "employer": "Synthetic Widgets",
+      "role": "Data Analyst",
+      "date": "2026-09-17",
+      "date_precision": "week",
+      "method": "company_site",
+      "url": "https://careers.example.com/jobs/77",
+      "jd_file": "job-descriptions/synthetic-widgets-data-analyst.pdf"
+    },
+    {
+      "employer": "Placeholder Foods",
+      "role": "Project Coordinator",
+      "date": "2026-09-22",
+      "date_precision": "day",
+      "method": "email",
+      "url": null,
+      "resolve": "new"
+    }
+  ]
+}

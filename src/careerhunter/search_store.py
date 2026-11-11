@@ -244,6 +244,71 @@ def jd_references(conn: sqlite3.Connection) -> dict[str, JdReference]:
     return {str(r["correlation_id"]): _jd_reference(r) for r in conn.execute(_JD_REFERENCES)}
 
 
+@dataclass(frozen=True)
+class StoredApplication:
+    """One application in search.db with its posting and company, for the import."""
+
+    application_id: int
+    correlation_id: str
+    ei_claim: str | None
+    posting_id: int
+    company: str
+    title: str
+    location: str
+    url: str | None
+    snapshot_path: str | None
+    dating: Dating
+    jd_sha256: str | None
+
+
+_STORED_APPLICATIONS = (
+    "SELECT a.id, a.correlation_id, a.ei_claim, a.posting_id, c.name, p.title, p.location, "
+    "p.url, p.snapshot_path, a.date_precision, a.date_applied, a.week_of, a.jd_sha256 "
+    "FROM applications a JOIN postings p ON p.id = a.posting_id "
+    "JOIN companies c ON c.id = p.company_id"
+)
+
+
+def _stored_application(row: sqlite3.Row) -> StoredApplication:
+    return StoredApplication(
+        application_id=int(row["id"]),
+        correlation_id=str(row["correlation_id"]),
+        ei_claim=row["ei_claim"],
+        posting_id=int(row["posting_id"]),
+        company=str(row["name"]),
+        title=str(row["title"]),
+        location=str(row["location"] or ""),
+        url=row["url"],
+        snapshot_path=row["snapshot_path"],
+        dating=Dating(str(row["date_precision"]), row["date_applied"], row["week_of"]),
+        jd_sha256=row["jd_sha256"],
+    )
+
+
+def stored_applications(conn: sqlite3.Connection) -> list[StoredApplication]:
+    """Every application, oldest first."""
+    return [_stored_application(r) for r in conn.execute(_STORED_APPLICATIONS + " ORDER BY a.id")]
+
+
+def stored_application(conn: sqlite3.Connection, application_id: int) -> StoredApplication | None:
+    row = conn.execute(_STORED_APPLICATIONS + " WHERE a.id = ?", (application_id,)).fetchone()
+    return _stored_application(row) if row else None
+
+
+def company_id(conn: sqlite3.Connection, name: str) -> int | None:
+    """The id of the company with exactly this name, or None. Writes nothing."""
+    row = conn.execute("SELECT id FROM companies WHERE name = ?", (name,)).fetchone()
+    return int(row["id"]) if row else None
+
+
+def posting_company(conn: sqlite3.Connection, posting_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT c.name FROM postings p JOIN companies c ON c.id = p.company_id WHERE p.id = ?",
+        (posting_id,),
+    ).fetchone()
+    return str(row["name"]) if row else None
+
+
 def jd_counts(conn: sqlite3.Connection) -> tuple[int, int]:
     """Applications with no JD: (expected one, from before JDs were kept)."""
     row = conn.execute(

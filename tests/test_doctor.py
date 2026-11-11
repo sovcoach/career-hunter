@@ -339,6 +339,21 @@ def test_loose_exports_and_snapshots_are_fixed(
     assert "snapshots/      OK  1 file, all owner-only" in out
 
 
+def test_init_creates_imports_and_doctor_keeps_it_owner_only(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    imports = ready / "imports"
+    assert imports.is_dir() and imports.stat().st_mode & 0o777 == 0o700
+    code, out = doctor(probe, capsys)
+    assert "imports/        OK  0 files, all owner-only" in out
+    (imports / "backfill.json").write_text("{}")
+    os.chmod(imports / "backfill.json", 0o644)
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_OK
+    assert "imports/        FIXED backfill.json (0o644) -> owner-only" in out
+    assert (imports / "backfill.json").stat().st_mode & 0o777 == 0o600
+
+
 def _datadir(root: Path) -> claims.DataDir:
     return claims.DataDir(root=root, mount_point=root.parent)
 

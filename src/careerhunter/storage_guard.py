@@ -25,7 +25,7 @@ from pathlib import Path
 from careerhunter.platform_checks import SystemProbe
 
 ENV_VAR = "CAREERHUNTER_DATA_DIR"
-SUBDIRS = ("exports", "snapshots", "logs", "backups")
+SUBDIRS = ("exports", "snapshots", "logs", "backups", "imports")
 BOOT_PATHS = (Path("/"), Path("/System/Volumes/Data"))
 EI_RECORD_PREFIX = "ei_record_"
 # The shape of a claim label. It becomes part of a file name, so nothing else is allowed
@@ -82,6 +82,11 @@ class DataDir:
     @property
     def logs(self) -> Path:
         return self.root / "logs"
+
+    @property
+    def imports(self) -> Path:
+        """Where `careerhunter import` reads its JSON file and JD files from, and only there."""
+        return self.root / "imports"
 
 
 def repo_root() -> Path | None:

@@ -36,6 +36,8 @@ A small "storage guard" runs before every command and checks that the data folde
 | `ei_store.py` | Reads and writes on one EI record file. It imports no search code and opens nothing itself. |
 | `search_store.py` | Reads and writes on `search.db`, including the posting identity rules. |
 | `seed.py` | Validates `seed.yaml`, runs the claim check, then imports each record into its layer. Idempotent by natural keys. |
+| `backfill.py` | `careerhunter import`: reads a version 1 JSON file from `imports/` only (symlinks followed, its `jd_file`s too), validates it by hand, and gives each entry one class (create, attach, unchanged, ambiguous, conflict, refused) by `titles.py` matching against `search.db`. `plan` reads only, for `--dry-run`; `apply` writes exactly the plan, a new application through `selfsourced.record` with a fetcher that refuses everything, a JD or an empty link through `ledger.attach_job_description`. No SQL of its own. |
+| `titles.py` | One normalization for titles and employers: `canonical` (`filters.title_key` with one comma inversion, `Analyst, Client Experience` as `client experience analyst`), `employer_key` (no leading "The", no Inc, Ltd, LLC, Corp, Co …) and `equivalent` (titles that differ only by level words at either end, or by specialist, analyst, associate). |
 | `export.py` | Builds one claim's EI record for a date range as CSV and PDF, from that claim's file alone, with a JD reference per application, and writes the JDs and their original files into a private folder beside them. |
 | `bot.py` | The Telegram bot: the chat allowlist, commands, buttons and replies, writing through the ledger; fail-closed startup and the polling loop. On each successful poll it sends one alert digest per watch run, capped by `alerts.max_per_poll`, in lane order; one failure and one recovery message per component outage (#42); and, at `alerts.weekly_digest` in `schedule.timezone`, the weekly counts by lane (#43). It sends none of these while it can't read `config.yaml`. |
 | `telegram.py` | A minimal Bot API client (standard library plus `truststore`) whose errors never carry the token. Its errors say which kind of failure it was: no answer, HTTP 429, refused, or a reply that isn't the Bot API's JSON. |
@@ -69,6 +71,7 @@ A small "storage guard" runs before every command and checks that the data folde
 ├── config.yaml                           ← your search settings and EI claims (from config.example.yaml)
 ├── exclusions.yaml                       ← companies/keywords to skip
 ├── seed.yaml                             ← one-off import of past history
+├── imports/                              ← `careerhunter import` files and their JD files, read from here only (0700)
 ├── exports/                              ← EI reports, timestamped, never overwritten; each with a <stem>-job-descriptions/ folder (0700) when it has JDs
 ├── snapshots/<YYYY>/                     ← copies of job ads and job descriptions (0600; ADR-017, ADR-024)
 ├── logs/                                 ← bot.log, bot.heartbeat, watch.log, discover.log, *.success (0600)
@@ -78,7 +81,7 @@ A small "storage guard" runs before every command and checks that the data folde
 └── backups/                              ← made by `init`; SETUP's dated upgrade backups go here
 ```
 
-`doctor` checks `exports/`, `snapshots/` and `logs/`, and `resume/` and `reports/` once they exist, and tightens anything others could read. It does not check `evals/` or `backups/`.
+`doctor` checks `exports/`, `snapshots/`, `logs/` and `imports/`, and `resume/` and `reports/` once they exist, and tightens anything others could read. It does not check `evals/` or `backups/`.
 
 - **Outside the repo:** a git mistake can't leak data that isn't there. See DECISIONS ADR-001.
 - **On an encrypted external volume:** the record is personal. The guard requires encrypted APFS and refuses anything else. See ADR-001 and ADR-002.
