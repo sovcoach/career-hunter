@@ -21,8 +21,8 @@ Your records stay on your machine and are never stored in this code repository. 
 | `careerhunter init` | Creates your private data folder on the encrypted drive, copies in starter config files, and creates the databases |
 | `careerhunter migrate` | Brings `search.db` and the active claim's record up to this version's schema, creating the claim's file if it is new. Run it with the services stopped |
 | `careerhunter seed` | Imports your existing applications and activities from a simple YAML file, each into the right place. Re-running is safe: nothing is duplicated |
-| `careerhunter log <link> --method … --date …` | Records a job you found and applied to yourself in one step: the posting and the application go into both files under one ID, with a copy of the ad when the page gives one. `--company` and `--title` fill in what the page doesn't show |
-| `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
+| `careerhunter log <link> --method … --date …` | Records a job you found and applied to yourself in one step: the posting and the application go into both files under one ID, with a copy of the ad when the page gives one, and its job description from `--jd-file`, `--jd-stdin` or the page. `--company` and `--title` fill in what the page doesn't show, and are required for a LinkedIn link, which is never fetched |
+| `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets, with each application's job description by reference, and a folder of the job descriptions themselves |
 | `careerhunter report --claim …` | Joins one claim's EI record to `search.db`, both read-only, into a private report under `reports/`: each application's EI facts beside its lane, fit and source, with counts by lane. Prints only the report's relative path |
 | `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
 | `careerhunter secret set/verify` | Stores a secret (the Telegram bot token) in the macOS Keychain without ever showing it |

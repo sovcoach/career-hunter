@@ -444,7 +444,11 @@ When you apply to a job you found yourself, record the posting and the applicati
 uv run careerhunter log https://jobs.example.com/ads/7 --method company_site --date 2026-10-20
 ```
 
-`--method` is one of `company_site`, `linkedin_easy_apply`, `email`, `referral`, `agency`, `recruiter_inbound` or `other` (plain words such as `Company site` work too). `--date` is `YYYY-MM-DD`, `today` or `yesterday`, and must fall within the active claim. The page is fetched once for the company, title and location; if it doesn't show them, add `--company "Example Robotics" --title "Synthetic Analyst"`. A copy of the ad is saved when the page gives one. If you already logged an application to the same role at the same company (a repost counts: the title is compared without its requisition code), it is still recorded, and one more line names the earlier date, for example `You logged an application to this role on 2026-10-27.` Without a readable `config.yaml`, nothing is fetched or recorded. The bot's `/log` does the same from Telegram.
+`--method` is one of `company_site`, `linkedin_easy_apply`, `email`, `referral`, `agency`, `recruiter_inbound` or `other` (plain words such as `Company site` work too). `--date` is `YYYY-MM-DD`, `today` or `yesterday`, and must fall within the active claim. The link is saved without tracking parameters. The page is fetched for the company, title and location; if it doesn't show them, add `--company "Example Robotics" --title "Synthetic Analyst"`. A copy of the ad is saved when the page gives one.
+
+Keep the job description with it: `--jd-file path/to/ad.pdf` takes a PDF, HTML or text file, and `--jd-stdin` reads pasted text from standard input (use one or the other). Without either, the job description is fetched from the page when it carries one. The output says `Job description saved.` or `No job description was saved.`; a missing one shows up in `doctor`. An encrypted PDF is refused, and a scanned PDF with no text is kept as the copy of the ad but doesn't count as the job description.
+
+**LinkedIn links are never fetched**, so `--company` and `--title` are required with one. Better still, open the posting, follow it to the company's own career site, and log that page's link instead: its job description can be fetched. Pasting the description is the fallback, and so is a LinkedIn Easy Apply posting with no career-site page. If you already logged an application to the same role at the same company (a repost counts: the title is compared without its requisition code), it is still recorded, and one more line names the earlier date, for example `You logged an application to this role on 2026-10-27.` Without a readable `config.yaml`, nothing is fetched or recorded. The bot's `/log` does the same from Telegram.
 
 ### A report across both files
 
@@ -471,7 +475,13 @@ wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-27_2026-09-01_2026-09-30_<time>_app
 wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-27_2026-09-01_2026-09-30_<time>_activities.csv
 ```
 
-The report is built from that claim's record file alone. Nothing from `search.db` can appear in it. The PDF is the readable report. The CSV files open in Numbers or Excel. Applications and activities without a known date appear in a separate **Date unknown** section of every report, so nothing is left out.
+With job descriptions in that period, one more line names their folder:
+
+```text
+wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-27_2026-09-01_2026-09-30_<time>-job-descriptions/ (2 job descriptions)
+```
+
+The report is built from that claim's record file alone. Nothing from `search.db` can appear in it. The PDF is the readable report. The CSV files open in Numbers or Excel. Each application shows its job description by reference: `JD 1a2b3c4d (pasted)` (the first characters of its fingerprint, and where it came from), `JD missing`, or `JD missing (pre-feature)` for one recorded before career-hunter kept job descriptions. The folder holds one `.txt` per application with a job description (a short header, then the text exactly as recorded) and a copy of its original file, all owner-only. Applications and activities without a known date appear in a separate **Date unknown** section of every report, so nothing is left out.
 
 ## When a claim ends
 
@@ -505,7 +515,7 @@ Sealing never happens on its own, and the claim you are on can't be sealed. If `
 
 The bot lets you record applications, statuses and activities from your phone. It only ever talks to your own private chat with it, and it has no open ports: it calls Telegram, never the other way round.
 
-**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal. Watcher postings come as one digest per watch run, each row with company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link. A job you record with `/log` is answered with its company, title and a short reference. Status words and short references like `a7` go too. It never sends your notes, the names of the gaps it found (only how many), the numeric fit rating or EI record details. `alerts.max_per_poll` (default 10) caps how many postings go per poll; the rest follow on the next poll. What you type (activity descriptions, skip reasons) and any job-ad files you send do go to Telegram, so don't type anything sensitive. See ADR-015 in docs/DECISIONS.md.
+**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal. Watcher postings come as one digest per watch run, each row with company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link. A job you record with `/log` is answered with its company, title and a short reference. Status words and short references like `a7` go too. It never sends your notes, the names of the gaps it found (only how many), the numeric fit rating or EI record details. `alerts.max_per_poll` (default 10) caps how many postings go per poll; the rest follow on the next poll. What you type (activity descriptions, skip reasons, job descriptions you paste) and any job-ad or job-description files you send do go to Telegram, so don't type anything sensitive. The bot never sends a job description back. See ADR-015 in docs/DECISIONS.md.
 
 ### 10a. Create the bot and store its token
 
@@ -616,7 +626,9 @@ health:
 
 | Send | What happens |
 |---|---|
-| `/log <link> \| method \| date` | Records a job you found and applied to yourself, in one message: the posting and the application, with a copy of the ad when the page gives one. The method is a word such as `email` or `Company site`; the date is `YYYY-MM-DD`, `today` or `yesterday`. Send just `/log <link>` to be asked for the method and the date with buttons. If the page doesn't show the company and title, add them: `/log <link> \| email \| today \| Company \| Title`. |
+| `/log <link> \| method \| date` | Records a job you found and applied to yourself, in one message: the posting and the application, with a copy of the ad when the page gives one. The method is a word such as `email` or `Company site`; the date is `YYYY-MM-DD`, `today` or `yesterday`. Send just `/log <link>` to be asked for the method and the date with buttons. If the page doesn't show the company and title, add them: `/log <link> \| email \| today \| Company \| Title`. A LinkedIn link is never fetched, so it always needs them. |
+| `/log …` with the job description | Paste the job description on the lines after the `/log` line, in the same message. Telegram splits a long paste into several messages; the bot joins every plain text message that arrives within 4 seconds of the one before, and records the application once they stop. Or send the job description as a PDF, HTML or text file with the `/log` line as its caption. The reply ends `Job description saved.` and never repeats the text. |
+| A reply with the job description | When no job description was saved, the bot asks for it: reply to that message with the text, or with a PDF, HTML or text file. If a long paste wasn't joined in full, the bot says so: reply to the `Recorded` message with the whole description as a `.txt` file, which replaces the one saved. |
 | **Applied** | The bot asks how you applied, then when: **Today**, **Yesterday**, **This week**, **Last week** or **Other date** (reply with YYYY-MM-DD). It saves a copy of the job ad. If it can't, it asks you to reply with a PDF or screenshot of the ad. |
 | **Skipped** | Asks why, then records the skip. Skips never go into the EI record. |
 | `/status a7 interview_scheduled` | Updates an application. References like `a7` come from `/recent` and last 7 days. Send just `/status` to choose with buttons. |

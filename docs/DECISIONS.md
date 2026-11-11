@@ -10,7 +10,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 002 | A mount guard verifies the data volume, not just the path | Accepted (Phase 1) |
 | 003 | Secrets live in the macOS Keychain | Accepted (Phase 1) |
 | 004 | SQLite is the record store | Accepted (Phase 1); amended by 014; amended (#51) |
-| 005 | The schema is designed around EI record-keeping | Accepted (Phase 1); amended by 014; amended (#34) |
+| 005 | The schema is designed around EI record-keeping | Accepted (Phase 1); amended by 014; amended (#34); amended by 024 |
 | 006 | gitleaks via the pinned upstream pre-commit hook, not brew | Accepted (Phase 1); amended (lockfile) |
 | 007 | A dedicated Telegram bot for notifications | Accepted (for Phase 2) |
 | 008 | An always-on Mac mini as the host | Accepted (Phase 1) |
@@ -19,16 +19,17 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 011 | Claude Code permission rules as a guard-rail | Accepted (Phase 1); amended (local merges); amended (web merges) |
 | 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1); amended by 021; amended (local merges); amended (web merges) |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1); amended (Phase 2) |
-| 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5); amended (#34) |
-| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39, #41, #34, #42, #43) |
+| 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5); amended (#34); amended by 024 |
+| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39, #41, #34, #42, #43); amended by 024 |
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2); amended (#30) |
-| 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
+| 017 | A snapshot of every job ad applied to | Accepted (Phase 2); amended by 024 |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
 | 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023; amended (#39, #42, #44) |
 | 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30); amended (#40, #41); amended (#42) |
 | 021 | The public repo is MIT | Accepted (Phase 5) |
 | 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32, #35, #36, #40, #41, #42) |
 | 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37); amended (#38, #43, #44) |
+| 024 | Each application keeps its job description | Accepted (0.5.0) |
 
 ---
 
@@ -119,6 +120,8 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 - Enum values are duplicated in `enums.py` for friendly validation. The database stays the source of truth.
 
 ## ADR-005: The schema is designed around EI record-keeping
+
+> **Amended by [ADR-024](#adr-024-each-application-keeps-its-job-description).** The job description is part of the record: EI migration 0002 adds an append-only `job_descriptions` table (the text verbatim, its hash, its source and its file) and `applications.jd_expected`, which tells a missing JD from one recorded before JDs were kept.
 
 > **Amended by [ADR-014](#adr-014-two-data-layers-searchdb-and-one-ei-record-file-per-claim) (Phase 1.5).** This record now lives in one file per EI claim, without the learning fields: fit ratings, gaps, notes and skips moved to `search.db`. Companies and postings, and so the posting identity rules, are in `search.db` too. Retention, voiding, the audit log and honest dates are unchanged in the EI files.
 
@@ -326,6 +329,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-014: Two data layers: `search.db`, and one EI record file per claim
 
+> **Amended by [ADR-024](#adr-024-each-application-keeps-its-job-description).** New fields: EI `applications.jd_expected` and `job_descriptions`; `search.db` `applications.jd_expected`, `jd_sha256` and `jd_path`. A JD goes to both layers in the fixed order, EI first, and `reconcile` also compares `jd_expected`, the current JD's hash and the canonical link. The sentinel test plants the new `search.db` fields too.
+
 > **Amended: one read-only report attaches (#34).** `careerhunter report --claim <label>` is the one code path that joins the two layers. It opens `search.db` read-only (`mode=ro`), attaches that claim's file read-only (`mode=ro`) as `ei`, and sets `query_only`, so neither file can be written through it. It joins on the random `correlation_id` only; there are still no cross-database foreign keys. The report is a private file, `reports/report-<claim>-<utc>.txt` (0600, folder 0700), never overwritten, and the terminal prints only its relative path. It lists each application's EI employer, role, date, method and latest EI status beside its lane, fit word and source in `search.db`, with counts by lane; orphans on either side are counted and left to `doctor` to name. Voided EI rows are counted and left out. No other code path attaches: `ei_store` still opens nothing, export still reads only the claim's file, and `doctor` still queries each file on its own. A test fails if `ATTACH` appears in any other source file. Writes are unchanged: they still go through the ledger's fixed order, not an attached transaction. `doctor` now names an application found on one side only (or linked to a claim with no file) as an `orphan`, in either direction, and still repairs nothing. The sentinel test now plants a value in every `search.db` field added since v0.3.0 and by Batch E (the cosine and both vectors, the resume hash, `schedule`, `alerted_at`, discovery rows, the lane, the fit and tier, key requirements, the run, posting age and board identity, operator skips, refusals and health), runs every path that writes an EI file (Applied, a status, `/log` and `careerhunter log`, an uploaded job ad, an activity), and scans the EI file and its WAL byte for byte; none may appear. An AST test fails if `watch`, `score`, `embed`, `discover`, or any careerhunter module they reach through imports (so any new watcher module), imports `ei_store` or names it outside a docstring.
 
 **Context.**
@@ -383,6 +388,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - There are more files to back up: `search.db` plus one file per claim.
 
 ## ADR-015: Telegram is a cloud service: bot messages are kept minimal
+
+> **Amended by [ADR-024](#adr-024-each-application-keeps-its-job-description).** A job description goes through Telegram one way: pasted after the `/log` line (a long paste is stitched from the messages Telegram split it into), sent as a file captioned with the `/log` line, or sent as a reply when the bot asks for it. It is never sent back. Replies say only `Job description saved.` or ask for it, and the bot log counts the messages a JD was made of, never their text. A LinkedIn link is never fetched, so `/log` refuses one without `| Company | Title`.
 
 > **Amended by [ADR-019](#adr-019-local-embedding-vectors-live-in-searchdb-beside-the-llm-tier) (Phase 3.5).** A watcher alert also includes the tier name and, when a cosine is stored, that cosine. It still does not send notes, fit ratings, gaps, the model text, vectors, skip reasons, or the claim.
 
@@ -461,6 +468,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A message from a stranger still reaches Telegram, and costs one poll. It is dropped before any parsing beyond the allowlist check.
 
 ## ADR-017: A snapshot of every job ad applied to
+
+> **Amended by [ADR-024](#adr-024-each-application-keeps-its-job-description).** A JD file can be the snapshot: when an application has no job-ad copy, its JD's file (a paste as `.txt`, a PDF, HTML or text file as sent) fills `snapshot_path` in both layers, so a LinkedIn application has one too. A `/log` with no JD asks for the JD instead of a PDF or screenshot; Applied from an alert still asks for the ad.
 
 **Context.**
 - ADR-005 planned job-ad copies for the EI record, and the schema has had `snapshot_path` since Phase 1.
@@ -709,3 +718,31 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - Re-scores wait while never-scored postings outnumber what one run can score.
 - A posting that keeps failing to parse is retried in first-come order, so a backlog of postings stored before its last attempt goes first (#38).
 - A re-score from the stored fields has no description, so it can differ from one made with it.
+
+## ADR-024: Each application keeps its job description
+
+**Context.**
+- A job ad is taken down once the role is filled. An EI review can come years later and ask what the job was, and the job-ad snapshot (ADR-017) is often a JavaScript shell, an ATS's JSON, or missing.
+- LinkedIn is where many postings are found, and its pages are not fetched (below), so a LinkedIn application had no copy of the ad at all.
+- A JD pasted into Telegram arrives split into several messages when it is long.
+
+**Decision.**
+- **The JD is part of the record (amends ADR-005).** EI migration 0002 adds `job_descriptions`: each JD verbatim, the SHA-256 of that exact text, its source (`jd_source`: `pasted`, `file` or `fetched`) and its snapshot file. The table follows the record's rules: no deletes, no updates (a corrected JD is a new row, and the latest row is the current one), nothing added once the claim is sealed or to a voided application. The column is `jd_source`, not `source`, because the EI schema keeps no column of that name (the search layer's `source` says where a posting was found). The migration only adds, so a voided row doesn't stop it, and a sealed claim's file, which is never migrated, still reads as having no JDs.
+- **`jd_expected` tells a missing JD from an old one.** Both layers get `applications.jd_expected`. Rows from before the migrations get 0, every application recorded since gets 1, and a trigger refuses any change. A row with no JD and `jd_expected = 1` is missing one; with 0 it is pre-feature.
+- **Both layers, in the fixed order (amends ADR-014).** The JD's snapshot file is saved first, like the job-ad copy. Then `ledger.record_application` writes the EI `job_descriptions` row and `search.db`'s `jd_sha256` and `jd_path` (search migration 0020), EI first. `search.db` keeps no second copy of the text: the file has it, so an application in `search.db` only still keeps its JD. `ledger.attach_job_description` adds one later, EI first, and may fill an empty link with its canonical form, as an audited EI update; it refuses an application whose claim is not active, is sealed, or is voided, and a link another posting has. `reconcile` also compares `jd_expected`, the current JD's hash and the canonical link.
+- **Where a JD comes from.** A paste is kept verbatim: UTF-8, no NUL, at most 100,000 characters. A file's type comes from its bytes: a PDF through `pdftext.py` (the resume's PDF reader, with its caps; an encrypted one is refused and nothing is saved), HTML through `htmltext.py`, or strict UTF-8 text, at most 20 MB. A PDF that opens but has no text, such as a scan, is kept as the job ad, but it is not a JD. Without a paste or a file, the JD is fetched: the page's JSON-LD `JobPosting.description`, or the ATS's public JSON. A pasted JD wins over a fetched one.
+- **A JD file can be the snapshot (amends ADR-017).** Every JD is saved as a snapshot file (a paste or a fetched text as `.txt`, a file in its own type), owner-only. When an application has no job-ad snapshot, its JD file becomes one, in both layers.
+- **Canonical links, and hosts never fetched.** A logged link is stored in its canonical form (`urls.canonical`: lowercase scheme and host, no fragment, no tracking parameters, LinkedIn job links as `https://www.linkedin.com/jobs/view/<id>/`), and links already stored are compared canonically, never rewritten. `fetch.py` refuses LinkedIn (`linkedin.com`, its subdomains, and `lnkd.in`) for every caller, on the first URL and every redirect hop, before any lookup. A LinkedIn `/log` therefore needs the company and title.
+- **Through Telegram one way (amends ADR-015).** A JD can come in through Telegram: after the `/log` line, as later messages stitched within 4 seconds of each other, or as a file captioned with the `/log` line. It is never sent back: no reply quotes it, and the bot log records only how many messages it was made of. With no JD, the application is still recorded and flagged, and the reply asks for the JD as a reply.
+- **Shown everywhere by reference.** `doctor` warns with the count of applications missing a JD. The report and the export name each application's JD as `JD <first 8 of sha256> (<source>)`, `JD missing` or `JD missing (pre-feature)`, and the export writes the JDs themselves into a private folder beside the CSV and PDF.
+
+**Alternatives.**
+- Fetching LinkedIn with a signed-in session. Rejected: it would put the operator's login on the Mac for the fetcher to use, and its pages would still be a JavaScript shell.
+- A copy of the text in `search.db`. Rejected: the snapshot file already holds it, and `search.db` is read far more widely.
+- A longer message size or a single `.txt` upload only. Rejected: pasting is what the operator does on a phone. The `.txt` reply stays as the fallback when stitching fails.
+- Updating the current JD in place. Rejected: the record is append-only, so a correction is a new row.
+
+**Trade-offs.**
+- Stitching relies on Telegram sending the parts of a split paste within 4 seconds, and joins them exactly as sent. A message typed within that window is taken as part of the JD. If Telegram drops whitespace at a split, the JD differs from the paste; that is checked by hand with the real client.
+- Applications recorded before 0.5.0, and those recorded from an alert's Applied button, have no JD until one is attached.
+- A scanned PDF gives no text, so its application stays flagged until the JD is sent as text.
