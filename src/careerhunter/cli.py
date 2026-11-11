@@ -32,6 +32,7 @@ from careerhunter import (
     bot,
     claims,
     db,
+    demo,
     discover,
     embed,
     embed_eval,
@@ -789,7 +790,7 @@ def _doctor_earlier_claim(
 
 
 def cmd_watch(datadir: DataDir, args: argparse.Namespace) -> int:
-    """Fetch Greenhouse, Lever and Ashby boards once, then exit.
+    """Fetch every watched board once, after a discovery pass when one is due, then exit.
 
     Every line goes to logs/watch.log as it happens, then to stderr. Only the run log,
     config.yaml, or search.db failing stops the run with exit 1.
@@ -1606,17 +1607,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p = sub.add_parser(
         "service",
-        help="run the bot, the watch, and optional discovery as launchd services on this Mac",
+        help="install, remove or show the bot and watch LaunchAgents; discovery runs in watch",
     )
     p.add_argument("service_action", choices=("install", "uninstall", "status"))
     sub.add_parser(
         "watch",
-        help="fetch Greenhouse, Lever and Ashby boards on the watchlist, "
-        "and approved discovery boards, once and exit",
+        help="fetch the watchlist's and approved discovery boards once, after a discovery "
+        "pass when one is due, then exit",
     )
     discover_parser = sub.add_parser(
         "discover",
-        help="queue companies from a local SearXNG; pages are not fetched",
+        help="run one discovery pass on a local SearXNG, or list, approve or reject boards",
     )
     discover_parser.add_argument(
         "discover_action",
@@ -1648,6 +1649,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="rank stored cosines against LLM tiers; the report stays in the data folder",
     )
     sub.add_parser("doctor", help="check the setup and report what is missing")
+    sub.add_parser(
+        "demo",
+        help="run the pipeline on synthetic data in memory; reads and writes no files",
+    )
     return parser
 
 
@@ -1679,6 +1684,9 @@ def main(
 ) -> int:
     """Run one command. `clock` is the time doctor measures ages against (tests fix it)."""
     args = build_parser().parse_args(argv)
+    if args.command == "demo":
+        # No data folder is read or written, so there is nothing for the guard to check.
+        return demo.run()
     probe = probe or SystemProbe()
     try:
         datadir = storage_guard.check(require_exists=args.command != "init", probe=probe)

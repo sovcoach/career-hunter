@@ -15,7 +15,7 @@ import yaml
 
 from careerhunter import ats, cli, db, discover, loopback, search_store
 from careerhunter.platform_checks import SystemProbe
-from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
+from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply, use_example_watchlist
 from tests.test_score import BROKEN, broken_connection
 
 SNIPPET = "DO-NOT-LEAK-SNIPPET"
@@ -77,6 +77,7 @@ def _enable(root: Path, *, hosts: list[str] | None = None) -> None:
 @pytest.fixture
 def inited(data_env: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]) -> Path:
     assert cli.main(["init"], probe=probe) == 0
+    use_example_watchlist(data_env / "config.yaml")
     capsys.readouterr()
     return data_env
 

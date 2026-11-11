@@ -11,6 +11,7 @@ It takes about 20 minutes, plus however long your drive takes to encrypt.
 - A Mac running a recent macOS. The steps were tested on macOS 26.
 - An **external drive** that will hold your data, formatted as **APFS**. This guide calls it `ExampleDrive`; use your own drive's name wherever you see that.
 - Your Mac's admin password (for installing developer tools).
+- [LM Studio](https://lmstudio.ai), with one chat model and one embedding model downloaded (see "Run the local models" in Step 7). It is required: career-hunter scores postings only with a model running on this Mac, and a posting that hasn't been scored is never alerted. Memory decides which models fit; Step 7 has a guide.
 
 ## Step 1: Turn on FileVault for the Mac itself
 
@@ -99,6 +100,30 @@ Expected output ends with:
 pre-commit installed at .git/hooks/pre-commit
 ```
 
+### A separate checkout for the services
+
+The background services (Step 10c) must run from a **release checkout**: a second folder that holds one release tag and nothing else. `uv sync` installs career-hunter so that it runs whatever source is in its folder, and `careerhunter` applies any new database migration it finds there the next time it opens `search.db`. If the services ran from the folder above and you checked out an unreleased branch there, a running service could apply that branch's migration to your real `search.db`; once applied, a migration can't be changed, and every restart (a crash, a reboot) would run whatever branch was checked out.
+
+Make the release checkout next to the first one. This guide uses the tag `v0.4.0`; use the latest release tag:
+
+```bash
+cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.4.0
+```
+
+```bash
+cd ~/Projects/career-hunter-release && uv sync --locked
+```
+
+**Every `uv run careerhunter` command in the rest of this guide runs from `~/Projects/career-hunter-release`.** Keep `~/Projects/career-hunter` for reading the code or developing, and never install the services from it.
+
+To see what career-hunter does before setting anything up, run the demo. It uses made-up companies and postings in memory, with fake job boards and a fake model: it needs no data folder, writes no file and connects to nothing.
+
+```bash
+cd ~/Projects/career-hunter-release && uv run careerhunter demo
+```
+
+It prints a watch run, the Telegram digest it would send, and the EI record of one application.
+
 ## Step 5: Tell career-hunter where your data lives
 
 This adds one line to your shell settings so every new Terminal window knows where the data folder is. Change `ExampleDrive` if your drive has another name.
@@ -122,7 +147,7 @@ Expected output:
 ## Step 6: Create your data folder
 
 ```bash
-cd ~/Projects/career-hunter && uv run careerhunter init
+cd ~/Projects/career-hunter-release && uv run careerhunter init
 ```
 
 Expected output. Your real output shows the full folder path where this guide writes `$CAREERHUNTER_DATA_DIR`:
@@ -136,7 +161,7 @@ created  $CAREERHUNTER_DATA_DIR/backups
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 1
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 19
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -156,7 +181,7 @@ open "$CAREERHUNTER_DATA_DIR"
 
 Edit these with TextEdit, or any plain-text editor:
 
-- **`config.yaml`**: your target job titles, locations, work models, salary floor, fit rubric, schedule, the companies you want to watch, and your EI claim (see below).
+- **`config.yaml`**: your target job titles, locations, work models, salary floor, fit rubric, schedule, the companies you want to watch, the local models, and your EI claim (see below). The watchlist starts empty, so `careerhunter watch` fetches nothing until you add your own companies; the examples are a commented block under `watchlist:`.
 - **`exclusions.yaml`**: companies and keywords to skip.
 - **`seed.yaml`**: the applications and activities you've *already* done. Delete the example entries and add your own. The comments at the top explain each field. If you only remember roughly when you applied, use `date_precision: week` with `week_of`. If you don't remember at all, use `date_precision: unknown`. Don't guess an exact date. Include the job ad's `url` (or `requisition_id`) whenever you have it: it's how career-hunter tells a re-posted role apart from the original.
 
@@ -170,7 +195,7 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | Where on-site, hybrid, and remote work is acceptable | `search.location_rules` |
 | How many missing requirements still count, and the fit each tier means | `fit_rubric.gap_tiers` (every tier needs `fit: low`, `medium` or `high`) |
 | The lowest fit at which a title outside every lane still alerts | `search.off_lane_min_fit` (default `high`) |
-| Your resume, for scoring and a similarity line (see "Import your resume") | `search.resume: resume/current.txt` |
+| Your resume, for scoring and a similarity score that `embed-eval` reads (see "Import your resume") | `search.resume: resume/current.txt` |
 | Languages, credentials, shifts, pay, seniority (in the title, or also the description), and a minimum salary | `hard_gates` |
 | A cap on weekend days | `schedule_limits` |
 | Which roles to keep at one company | that company's `role_filters` |
@@ -178,6 +203,8 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | How many of your recent Applied, Skipped and status decisions the scorer sees as examples (only the local model sees them; 0 for none) | `learning.labelled_examples` (default 5) |
 | When `doctor` warns about runs that did nothing useful, and when the bot says a part stopped working | `health.unproductive_runs`, `health.failure_runs` (default 3 each) |
 | Companies, title keywords, description keywords, and one role | `exclusions.yaml` |
+| The boards to watch | `watchlist` (empty until you add companies) |
+| Which models LM Studio runs for scoring and embeddings | `scoring.chat_model`, `scoring.embedding_model` (see "Run the local models") |
 
 The templates use placeholder names such as Example Robotics, Example City, and Example Staffing Mill.
 
@@ -187,14 +214,7 @@ Lanes label and order alerts; they never skip a posting. A title is matched agai
 
 Every alert carries a fit: `Fit: High`, `Medium` or `Low`, from the `fit` of the tier the posting was scored into. A posting the model hasn't scored yet, or scored into a tier name that is no longer in `gap_tiers`, is held and not alerted until it has a fit. `doctor` counts what is held.
 
-**Upgrading to fit tiers and lanes?** Do these in order:
-
-1. Add a `fit` to every tier in `fit_rubric.gap_tiers` in your `config.yaml`. Without one, the config is refused when it is loaded, and the services can't start.
-2. Stop the services: `uv run careerhunter service uninstall`.
-3. Run `uv run careerhunter migrate`. It brings `search.db` to schema 11 (fit and runs in 9, lanes in 10, key requirements and each score's run in 11).
-4. Start the services again: `uv run careerhunter service install`.
-
-Postings that were already scored, and not yet alerted, get their fit from your config on the next watch run, by their tier name. With `search.lanes` set, that run also gives every stored posting its lane.
+**Upgrading from 0.3.0?** Follow "Upgrading to a new release" near the end of this guide. Postings that were already scored, and not yet alerted, get their fit from your config on the next watch run, by their tier name. With `search.lanes` set, that run also gives every stored posting its lane.
 
 `fit_rubric.weights` and `fit_rubric.thresholds` are not applied. Scoring uses `gap_tiers` and leaves the numeric rating empty.
 
@@ -225,6 +245,34 @@ Each should answer JSON with a list of postings (`content`, `result` or `jobPost
 `hard_gates.seniority_words`, `title_exceptions` and `never_gated_families` match whole words of the title, ignoring case: "Lead" matches "Team Lead" and "(Lead)", but not "Leader". List a plural on its own if it should count. `hard_gates.seniority_in_description: true` also checks the description for seniority words; it is false by default, so a junior title whose description mentions senior colleagues is kept. A key under `hard_gates` that career-hunter does not know, such as a misspelled option, is refused when the config is loaded.
 
 One `role_filters` block requires every family, work model, and place it lists. Its `work_models` check uses remote when it is inferred from the location; with no work model and no "remote", the work model is unknown and passes. It cannot say "remote, or else Example City." Treating that as an AND would hide roles that should stay. There is no field for that or-rule yet.
+
+### Run the local models
+
+career-hunter talks to [LM Studio](https://lmstudio.ai) on this Mac only, at fixed addresses: `http://127.0.0.1:1234/v1/chat/completions` for scoring and `http://127.0.0.1:1234/v1/embeddings` for the similarity score (a cosine stored beside each score, which `embed-eval` reads). Neither address can be changed in `config.yaml`, and nothing is sent anywhere else. Port 1234 is LM Studio's default.
+
+1. In LM Studio, download one **chat model** (an instruction-following model; it has to answer with JSON) and one **embedding model**.
+2. Start LM Studio's local server on port 1234 and load both models. The server must be running whenever the watch agent runs.
+3. Put each model's identifier in `config.yaml`. Use the identifier LM Studio shows for the loaded model, in its Developer tab or with `lms ps` in Terminal:
+
+```yaml
+scoring:
+  chat_model: example-chat-model
+  embedding_model: example-embedding-model
+```
+
+Each is text of 1 to 200 characters, with no control characters and no spaces at either end. Left out or `null`, career-hunter asks for `local-model` and `local-embedding`. `scoring` takes no other key: a `url` is refused.
+
+**Choosing models for your Mac's memory.** On a Mac with Apple silicon, the models share memory with everything else. A model's size on disk is roughly the memory it needs once loaded, plus some for the prompt. Leave at least a third of the memory for macOS and your other apps. As a guide, for chat models stored at 4-bit quantization:
+
+| Memory | Chat model size to look for |
+|---|---|
+| 16 GB | about 7 to 8 billion parameters (around 5 GB) |
+| 24 to 32 GB | up to about 14 billion parameters (around 9 GB) |
+| 64 GB or more | up to about 32 billion parameters (around 20 GB) |
+
+An embedding model is much smaller, usually under 1 GB. A larger chat model usually lists gaps more carefully and takes longer per posting. A watch run has 600 seconds, and postings it doesn't reach are scored on the next run. If LM Studio can't load a model, pick a smaller one.
+
+If the chat model doesn't answer, the watch log says `watch: scoring: model unreachable; N postings left for the next run`, nothing is alerted until it answers, and after `health.failure_runs` runs in a row the bot tells you. Changing `scoring.chat_model` does not re-score anything by itself. Changing `scoring.embedding_model` does not re-embed stored postings: their stored vectors are compared with the new resume vector as they are, so stored cosines mix the two models until those postings are gone. A cosine never decides anything and is not sent.
 
 ### Import your resume
 
@@ -308,7 +356,7 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 1
+search.db: applied nothing; schema version 19
 ei_record_2026-27.db: created; schema version 1
 EI claim 2026-27 (from 2026-08-02)
 ```
@@ -326,16 +374,33 @@ data dir        OK  $CAREERHUNTER_DATA_DIR (volume /Volumes/ExampleDrive, encryp
 config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
-search.db       OK  schema version 1
+timezone        OK  UTC
+search.db       OK  schema version 19
 search.db       OK  0600
+resume          --  not imported (optional: careerhunter resume import)
+lanes           OK  2 lanes; off-lane postings alert at high fit or better
+watch run       --  none recorded yet
+watch useful    --  no useful run recorded yet
+bot alerts      OK  not held
+bot refusals    OK  no posting given up
 claim 2026-27   OK  schema version 1
 claim 2026-27   OK  active, from 2026-08-02
 claim 2026-27   OK  0600
 reconcile       OK  search.db and 1 claim record agree
+exports/        OK  0 files, all owner-only
+snapshots/      OK  0 files, all owner-only
+logs/           OK  0 files, all owner-only
+telegram        --  telegram.chat_id not set (see: careerhunter bot discover)
+bot service     --  not installed (run: careerhunter service install)
+watch service   --  not installed (run: careerhunter service install)
+watch           --  no successful run yet
+discovery       --  off
+git push        OK  push.default is current
+git push        OK  pre-push guard installed
 secret          telegram_bot_token: missing
 ```
 
-`telegram_bot_token: missing` is expected until Phase 2.
+The `--` lines and `telegram_bot_token: missing` are expected until you finish Step 10.
 
 ## Step 8: Import your history
 
@@ -343,19 +408,20 @@ secret          telegram_bot_token: missing
 uv run careerhunter seed
 ```
 
-Expected output (your numbers will differ):
+Expected output with the template's example entries (your numbers will differ):
 
 ```text
 EI claim 2026-27 (from 2026-08-02)
 search.db
-  companies            4 inserted     0 already present
-  postings             4 inserted     0 already present
-  applications         4 inserted     0 already present
-  decision_history     4 inserted     0 already present
+  companies            3 inserted     0 already present
+  postings             3 inserted     0 already present
+  applications         3 inserted     0 already present
+  decision_history     3 inserted     0 already present
 ei_record_2026-27.db
-  applications         4 inserted     0 already present
-  status_history       4 inserted     0 already present
-  activities           3 inserted     0 already present
+  applications         3 inserted     0 already present
+  status_history       3 inserted     0 already present
+  activities           2 inserted     0 already present
+warning: applications[2] (Placeholder Foods / Project Coordinator): date unknown: recorded under claim 2026-27 and listed under "Date unknown" in exports
 ```
 
 Each application goes into both files: your EI record gets what Service Canada may ask for, and `search.db` gets the rest, including your notes. Activities go into the EI record only.
@@ -399,7 +465,7 @@ uv run careerhunter export --claim 2026-27 --from 2026-09-01 --to 2026-09-30
 Expected output:
 
 ```text
-EI claim 2026-27: 3 applications, 3 activities
+EI claim 2026-27: 3 applications, 2 activities
 wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-27_2026-09-01_2026-09-30_<time>.pdf
 wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-27_2026-09-01_2026-09-30_<time>_applications.csv
 wrote $CAREERHUNTER_DATA_DIR/exports/ei_2026-27_2026-09-01_2026-09-30_<time>_activities.csv
@@ -487,8 +553,10 @@ Only that chat can use the bot. Messages from anyone else get no reply at all.
 
 ### 10c. Run it as a service
 
+Install the services from the release checkout (see "A separate checkout for the services" in Step 4), so the LaunchAgents run that checkout's `careerhunter`:
+
 ```bash
-uv run careerhunter service install
+cd ~/Projects/career-hunter-release && uv run careerhunter service install
 ```
 
 Expected output:
@@ -570,6 +638,139 @@ The bot also tells you when something stops working. After `health.failure_runs`
 
 ---
 
+## Upgrading to a new release
+
+Upgrade the release checkout only, one release tag at a time, in this order. The commands below upgrade 0.3.0 to 0.4.0; for a later release, read its entry in `CHANGELOG.md` first and use its tag. If your services were installed from `~/Projects/career-hunter` (as 0.3.0's guide did), steps 1 and 3 move them to the release checkout.
+
+1. **Stop the services**, so nothing opens the databases while you work:
+
+   ```bash
+   cd ~/Projects/career-hunter && uv run careerhunter service uninstall
+   ```
+
+   It prints `uninstalled`, or `not installed` if nothing was running.
+
+2. **Back up the whole data folder** into one dated folder under `backups/`. Each database file (`search.db` and every `ei_record_<label>.db`) is copied with SQLite's own backup command, which makes a consistent copy. Everything else (config, `resume/`, `exports/`, `snapshots/`, `reports/` and the rest) is copied as it is, keeping its permissions. Run these one at a time, in the same Terminal window (the first one sets `B`, which the others use):
+
+   ```bash
+   cd "$CAREERHUNTER_DATA_DIR" && B="backups/$(date -u +%Y-%m-%dT%H%M%SZ)" && mkdir -m 700 "$B" && echo "$B"
+   ```
+
+   ```bash
+   for f in *.db; do sqlite3 "$f" ".backup '$B/$f'" && chmod 600 "$B/$f"; done
+   ```
+
+   ```bash
+   rsync -a --exclude '/backups/' --exclude '/*.db' --exclude '/*.db-wal' --exclude '/*.db-shm' ./ "$B/"
+   ```
+
+   Then check the copy. Each database prints `ok`, and the last command prints nothing when every file and folder in the copy is owner-only:
+
+   ```bash
+   for f in "$B"/*.db; do echo "$f: $(sqlite3 "$f" 'PRAGMA integrity_check')"; done
+   ```
+
+   ```bash
+   find "$B" -perm +077 -print
+   ```
+
+   If `find` lists anything, run `chmod -R go-rwx "$B"` and check again. `doctor` does not check `backups/`, so this is the check. The copies stay on the encrypted drive; copy that dated folder somewhere else as well if you want a backup that survives losing the drive. A sealed claim's copy is 0600, not 0400: it is a copy, and the original stays sealed.
+
+3. **Move the release checkout to the new tag**, or make it if you don't have one yet:
+
+   ```bash
+   cd ~/Projects/career-hunter && git fetch --tags
+   ```
+
+   ```bash
+   cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.4.0
+   ```
+
+   If `~/Projects/career-hunter-release` already exists, move it instead with `cd ~/Projects/career-hunter-release && git checkout v0.4.0`. Then, either way:
+
+   ```bash
+   cd ~/Projects/career-hunter-release && uv sync --locked
+   ```
+
+4. **Add a fit to every gap tier.** In `config.yaml`, every tier under `fit_rubric.gap_tiers.tiers` needs `fit: low`, `medium` or `high`. Without one the config is refused when it is loaded: `watch`, the bot and the other commands that need it stop, and `doctor` shows the problem:
+
+   ```yaml
+   fit_rubric:
+     gap_tiers:
+       tiers:
+         - {name: strong, max_gaps: 1, fit: high}
+         - {name: possible, max_gaps: 2, fit: medium}
+   ```
+
+   While you're there, set `scoring.chat_model` and `scoring.embedding_model` (see "Run the local models").
+
+5. **Run `doctor` before migrating**:
+
+   ```bash
+   cd ~/Projects/career-hunter-release && uv run careerhunter doctor
+   ```
+
+   `config.yaml` should say `OK`. If it lists problems, fix them and run it again. A 0.3.0 `search.db` is behind, so this line is expected, and `doctor` exits 1:
+
+   ```text
+   search.db       BAD schema version 2, expected 19; run: careerhunter migrate
+   ```
+
+6. **Migrate**:
+
+   ```bash
+   cd ~/Projects/career-hunter-release && uv run careerhunter migrate
+   ```
+
+   Expected output (the claim will be yours):
+
+   ```text
+   search.db: applied [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]; schema version 19
+   ei_record_2026-27.db: applied nothing; schema version 1
+   EI claim 2026-27 (from 2026-08-02)
+   ```
+
+   All of them apply in one transaction: if one fails, nothing is applied, and the backup from step 2 is untouched either way.
+
+7. **Import your resume, then point the config at it.** Do this after step 6: `resume import` applies any pending migration itself, and migrating in step 6 keeps that change between the two `doctor` runs, right after the backup.
+
+   ```bash
+   cd ~/Projects/career-hunter-release && uv run careerhunter resume import path/to/your-resume.pdf
+   ```
+
+   It prints the number of characters and the setting to add, for example:
+
+   ```text
+   imported resume: 2,481 characters
+   set search.resume: resume/current.txt in config.yaml to use it
+   ```
+
+   Then set `search.resume: resume/current.txt` in `config.yaml` (see "Import your resume").
+
+8. **Run `doctor` again**:
+
+   ```bash
+   cd ~/Projects/career-hunter-release && uv run careerhunter doctor
+   ```
+
+   Every line should be `OK` or `--`, and these show the upgrade took:
+
+   ```text
+   search.db       OK  schema version 19
+   resume/         OK  2 files, all owner-only
+   resume          OK  matches its import
+   ```
+
+9. **Install the services from the release checkout**:
+
+   ```bash
+   cd ~/Projects/career-hunter-release && uv run careerhunter service install
+   ```
+
+   The output is the two `installed …` lines in Step 10c. Run `doctor` once more to see the services running.
+
+If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
+
 ## Troubleshooting
 
 | You see | What it means | Fix |
@@ -584,7 +785,7 @@ The bot also tells you when something stops working. After `health.failure_runs`
 | `… is before claim 2026-27 started` | A seed date falls outside your claim | Fix the date, or see `--route-out-of-claim-to-search` in Step 8 |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 8, expected 10` | The code was updated and `search.db` hasn't caught up | Stop the services with `uv run careerhunter service uninstall`, run `uv run careerhunter migrate`, then `uv run careerhunter service install` |
+| `search.db BAD schema version 2, expected 19` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |

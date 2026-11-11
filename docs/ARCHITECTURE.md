@@ -7,7 +7,7 @@
 
 Inside that folder, the data itself has two layers that never mix either. `search.db` holds everything career-hunter learns from: postings, fit ratings, skip reasons and the like. Each EI claim gets its own small record file, holding only what Service Canada may ask for. The two are linked by a random ID that means nothing on its own.
 
-A small "storage guard" runs before every command and checks that the data folder is somewhere safe. Secrets, such as the future Telegram bot token, sit in the macOS Keychain, separate from both halves.
+A small "storage guard" runs before every command and checks that the data folder is somewhere safe. Secrets, such as the Telegram bot token, sit in the macOS Keychain, separate from both halves.
 
 ---
 
@@ -15,7 +15,8 @@ A small "storage guard" runs before every command and checks that the data folde
 
 | Module | Responsibility |
 |---|---|
-| `cli.py` | `careerhunter` entry point. Runs the storage guard, then dispatches the command. Exit codes: 0 ok, 1 error, 2 refused by the guard. |
+| `cli.py` | `careerhunter` entry point. Runs the storage guard, then dispatches the command; `demo` alone is dispatched first, because it uses no data folder. Exit codes: 0 ok, 1 error, 2 refused by the guard. |
+| `demo.py` | `careerhunter demo`: an in-memory `search.db` and EI record, a synthetic config, fake boards and a fake local model, through the real `watch.run`, `bot.digest_texts` and `ledger.record_application`. Reads no data folder, writes no file, opens no socket. |
 | `storage_guard.py` | Fail-closed checks on `CAREERHUNTER_DATA_DIR` (see below). Also creates the data folder safely. |
 | `platform_checks.py` | `SystemProbe`: read-only wrappers around `diskutil info -plist`, `fdesetup status`, `git rev-parse` and `os.stat`. Tests swap in a fake. |
 | `secrets_store.py` | Keychain access through `keyring`. Allowlisted names only, plaintext backends refused, and values never printed. |
@@ -25,6 +26,7 @@ A small "storage guard" runs before every command and checks that the data folde
 | `migrations/search/`, `migrations/ei_record/` | Schema history, one track per kind of file. Each migration is applied once, and its checksum is recorded so edits are detected. The runner in `db.py` also creates `schema_migrations` and `db_identity`, and their four no-update and no-delete triggers. A fresh `search.db` therefore has 6 triggers (2 from its `0001_init.sql`), and a fresh EI record has 32 (28 from its `0001_init.sql`). |
 | `models.py` | Plain record values: `Posting`, `Application`, `Activity`, `Dating`. |
 | `claims.py` | The `ei` config section, the per-precision claim check, creating each claim's file, the refusal to write while an earlier claim is unsealed, and sealing. |
+| `records.py` | Voids a mistaken application or activity with a reason, never deleting it; the schema's audit triggers log the change. |
 | `ledger.py` | Writes decisions to both layers in a fixed order, builds the sanitized EI copy, and reconciles the two layers. |
 | `selfsourced.py` | A self-sourced application in one step, for `careerhunter log` and the bot's `/log`: reads the link once for the company and title, saves the job-ad copy, and writes the posting and the application through one `ledger.record_application` call, under one correlation ID. |
 | `report.py` | `careerhunter report`: the one code path that attaches a claim's EI record to `search.db`, both read-only, to join them on `correlation_id` into a private report (ADR-014 as amended). |
@@ -40,6 +42,10 @@ A small "storage guard" runs before every command and checks that the data folde
 | `runlog.py` | A run's log file in `logs/`: each line written as it happens, mode 0600, never through a symlink. |
 | `filters.py` | The decision to keep, skip or flag a posting: exclusions, hard gates, location rules, role filters and schedule limits. A skip reason is a string. No fetching, scoring or alerts. |
 | `lanes.py` | Matches a title to the best-priority lane in `search.lanes` (whole words, via `filters.has_phrase`), and orders and holds pending alerts by lane, fit and age. Never skips a posting and never reads `never_gated_families`. |
+| `embed.py` | One embedding of the resume and of a posting on the local model (`scoring.embedding_model`), through `loopback.py`, and the cosine stored beside the tier. A cosine never causes a skip (ADR-019). |
+| `embed_eval.py` | `careerhunter embed-eval`: ranks stored cosines against stored tiers into a private report under `evals/`. Calls no model. |
+| `discover.py` | A discovery pass on a local SearXNG through `loopback.py`: the query cursor and pacing, the backoff, posting URLs and board candidates from the results, and the approve and reject rules (ADR-020). Stores no title, snippet or body. |
+| `scout_prompt.py` | `careerhunter scout-prompt`: a prompt from the exclusions and the hard gates the watcher skips on. Prints only. |
 | `score.py` | Scores one kept posting on a local loopback model. The prompt is lanes, location rules, hard gates and `gap_tiers`. Returns gaps, model text and the tier name; the watcher stores them with the tier's `fit`. Leaves `fit_rating` null. Not `fetch.py`; it talks through `loopback.py` with a 120-second total. |
 | `htmltext.py` | A board's HTML job description as plain text, with the standard library only: unescaped once for Greenhouse, scripts and styles dropped, block tags as line breaks. Stores nothing. |
 | `watch.py` | One run of `careerhunter watch`: a discovery pass when due and the postings it found, then the boards, filter, posting age, then score, within a 600-second budget. One company's failure is isolated. Stores each posting's fit, lane and posted date, and records the run in `watch_runs`. Writes `search.db` only. Does not call Telegram. |
@@ -63,8 +69,13 @@ A small "storage guard" runs before every command and checks that the data folde
 ├── exports/                              ← EI reports, timestamped, never overwritten
 ├── snapshots/<YYYY>/                     ← copies of job ads (0600; ADR-017)
 ├── logs/                                 ← bot.log, bot.heartbeat, watch.log, discover.log, *.success (0600)
-└── backups/
+├── resume/current.txt                    ← the imported resume's text (folder 0700, file 0600; ADR-023)
+├── reports/                              ← `careerhunter report` output (0600), made on first use
+├── evals/                                ← `careerhunter embed-eval` reports (0600), made on first use
+└── backups/                              ← made by `init`; SETUP's dated upgrade backups go here
 ```
+
+`doctor` checks `exports/`, `snapshots/` and `logs/`, and `resume/` and `reports/` once they exist, and tightens anything others could read. It does not check `evals/` or `backups/`.
 
 - **Outside the repo:** a git mistake can't leak data that isn't there. See DECISIONS ADR-001.
 - **On an encrypted external volume:** the record is personal. The guard requires encrypted APFS and refuses anything else. See ADR-001 and ADR-002.
@@ -208,9 +219,9 @@ With no work model from the board (Greenhouse), a location with the whole word "
 
 One `role_filters` block is AND only. It cannot express "this work model, or else that place." `work_models` checks the board's work model, or remote when it is inferred; an unknown work model does not fail it.
 
-Scoring posts to `http://127.0.0.1:1234/v1/chat/completions` and nowhere else. The request carries the posting and, when one is imported and in use, the resume text. The model returns gaps. The program applies `gap_tiers` and writes `gaps`, `llm_output`, `scout_metadata` (`{"tier": "<name>"}`), `fit` (that tier's `fit` from config) and `scored_resume_sha256`, in one UPDATE. While a resume is in use, `llm_output` is canonical JSON of the parsed gaps, never the reply, and a reply that copies 40 characters of the resume into a gap, or has a gap over 120 characters, is treated as one that does not parse (ADR-023). `fit_rating` stays null. A later run scores those still-unscored rows after it has fetched the boards. A configured resume that cannot be used holds all scoring for the run. The watch run does not call Telegram and does not open an EI record.
+Scoring posts to `http://127.0.0.1:1234/v1/chat/completions` and nowhere else, naming the model `scoring.chat_model` (default `local-model`). The request carries the posting and, when one is imported and in use, the resume text. The model returns gaps. The program applies `gap_tiers` and writes `gaps`, `llm_output`, `scout_metadata` (`{"tier": "<name>"}`), `fit` (that tier's `fit` from config) and `scored_resume_sha256`, in one UPDATE. While a resume is in use, `llm_output` is canonical JSON of the parsed gaps, never the reply, and a reply that copies 40 characters of the resume into a gap, or has a gap over 120 characters, is treated as one that does not parse (ADR-023). `fit_rating` stays null. A later run scores those still-unscored rows after it has fetched the boards. A configured resume that cannot be used holds all scoring for the run. The watch run does not call Telegram and does not open an EI record.
 
-On that same pass, when `search.resume` is `resume/current.txt` and that file matches its import, the watcher also asks `http://127.0.0.1:1234/v1/embeddings` for one vector of the resume and one vector of the posting (company, title, location, work model, and the description when the board sent one). The client is loopback only, follows no redirects, and is not `fetch.py`. The model id is `local-embedding`. Search migration 0004 stores the float32 BLOBs in `resume_embedding` and `posting_embeddings`, and the cosine in `postings.embedding_score`. The resume text and the posting text are not stored. A resume that is not imported, missing, or changed since its import (`no-resume`), a down server (`unreachable`), a reply that is not a usable vector (`bad-reply`), or a different dimension (`dim-mismatch`) leaves that cosine null and adds one log line, `embedding miss posting <id>: <reason>`. The run still exits 0. The client has a 60-second total and its own 1 MB cap. A transport failure (refused, out of time, or too large) means nothing more is sent to the embedding server this run; a reply that arrives but is not a vector is a miss for that posting only. A cosine never causes a skip. When the resume bytes change, stored posting vectors are compared again locally and the model is not asked to embed those postings again. `fit_rubric.embedding_weight` is not read. The EI schema stays at version 1.
+On that same pass, when `search.resume` is `resume/current.txt` and that file matches its import, the watcher also asks `http://127.0.0.1:1234/v1/embeddings` for one vector of the resume and one vector of the posting (company, title, location, work model, and the description when the board sent one). The client is loopback only, follows no redirects, and is not `fetch.py`. The model id is `scoring.embedding_model` (default `local-embedding`); stored vectors do not record it, so after a change they are compared as they are (ADR-019). Search migration 0004 stores the float32 BLOBs in `resume_embedding` and `posting_embeddings`, and the cosine in `postings.embedding_score`. The resume text and the posting text are not stored. A resume that is not imported, missing, or changed since its import (`no-resume`), a down server (`unreachable`), a reply that is not a usable vector (`bad-reply`), or a different dimension (`dim-mismatch`) leaves that cosine null and adds one log line, `embedding miss posting <id>: <reason>`. The run still exits 0. The client has a 60-second total and its own 1 MB cap. A transport failure (refused, out of time, or too large) means nothing more is sent to the embedding server this run; a reply that arrives but is not a vector is a miss for that posting only. A cosine never causes a skip. When the resume bytes change, stored posting vectors are compared again locally and the model is not asked to embed those postings again. `fit_rubric.embedding_weight` is not read. The EI schema stays at version 1.
 
 The scoring request also carries up to `learning.labelled_examples` (default 5) of the operator's most recently labelled postings, as title, lane, gap count and label (an application's latest status, or `skipped` for a Skipped tap), read once per run; the posting being scored is left out. They reach the loopback request only (ADR-023 as amended for #43). Rules and thresholds never change by themselves, and cosines stay out of the decision (ADR-019).
 
@@ -290,13 +301,15 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 
 ## Phase roadmap
 
+Only what is on `main` is listed. The latest release is v0.3.0; Phases 3 to 5 are on `main` and not yet tagged.
+
 | Phase | Scope | Status |
 |---|---|---|
-| 1, Foundation (v0.1.0) | Storage guards, Keychain helper, schema and migrations, seed import, EI export, CI, docs | done |
-| 1.5, Data layer split (v0.2.0) | `search.db` and one EI record file per claim, a correlation ID, write order and reconciliation, claim config and sealing | done |
-| 2, Telegram bot (v0.3.0) | The bot (alerts with Applied/Skipped, `/log`, `/status`, `/activity`, `/recent`), job-ad snapshots, the launchd service, the fit-criteria schema (validation only), and repo hygiene | **this release** |
-| 3, Watcher | Fetch watchlisted companies' ATS boards; job-ad snapshots for the EI record; fit rating against the config rubric; skips with reasons | planned |
-| 4, Discovery | Find new companies and postings beyond the watchlist | planned |
-| 5, Release | License, polish | planned |
+| 1, Foundation (v0.1.0) | Storage guards, Keychain helper, schema and migrations, seed import, EI export, CI, docs | released |
+| 1.5, Data layer split (v0.2.0) | `search.db` and one EI record file per claim, a correlation ID, write order and reconciliation, claim config and sealing | released |
+| 2, Telegram bot (v0.3.0) | The bot (alerts with Applied/Skipped, `/log`, `/status`, `/activity`, `/recent`), job-ad snapshots, the launchd service, the fit-criteria schema (validation only), and repo hygiene | released |
+| 3, Watcher | `careerhunter watch` on Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards; exclusions, hard gates, location rules and the posting age; lanes; gap-tier scoring with a fit on a local model, grounded in an imported resume; local embedding cosines and `embed-eval`; one alert digest per run; run records, health and the weekly digest; `careerhunter log` and `report` | on `main` |
+| 4, Discovery | Discovery passes against a local SearXNG inside the watch agent, posting URLs fetched once through their ATS, and a board queue approved from the CLI or the bot | on `main` |
+| 5, Release | The MIT license (ADR-021), `careerhunter demo`, the model-id settings, the inert template watchlist, and SETUP for a release checkout and upgrades | on `main` |
 
-Each phase lands as a pull request against `main` with its own milestone, and gets a semver tag when merged. The repo goes public once Phase 1 is verified, and `main` is protected straight after (ADR-012).
+Work lands as pull requests against `main`, and the operator tags a release with semver when it is cut. The repo went public once Phase 1 was verified, and `main` was protected straight after (ADR-012).

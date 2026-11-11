@@ -6,32 +6,35 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 
 | # | Decision | Status |
 |---|---|---|
-| 001 | Data lives outside the repo, on an encrypted external volume | Accepted (Phase 1) |
+| 001 | Data lives outside the repo, on an encrypted external volume | Accepted (Phase 1); amended (#44) |
 | 002 | A mount guard verifies the data volume, not just the path | Accepted (Phase 1) |
 | 003 | Secrets live in the macOS Keychain | Accepted (Phase 1) |
 | 004 | SQLite is the record store | Accepted (Phase 1); amended by 014; amended (#51) |
-| 005 | The schema is designed around EI record-keeping | Accepted (Phase 1); amended by 014 |
+| 005 | The schema is designed around EI record-keeping | Accepted (Phase 1); amended by 014; amended (#34) |
 | 006 | gitleaks via the pinned upstream pre-commit hook, not brew | Accepted (Phase 1); amended (lockfile) |
 | 007 | A dedicated Telegram bot for notifications | Accepted (for Phase 2) |
 | 008 | An always-on Mac mini as the host | Accepted (Phase 1) |
 | 009 | Guards fail closed, with no override flag | Accepted (Phase 1) |
 | 010 | Repo workflow conventions | Accepted (Phase 1); amended (local merges); amended (web merges) |
 | 011 | Claude Code permission rules as a guard-rail | Accepted (Phase 1); amended (local merges); amended (web merges) |
-| 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1); amended (local merges); amended (web merges) |
-| 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1) |
-| 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5) |
-| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39) |
+| 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1); amended by 021; amended (local merges); amended (web merges) |
+| 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1); amended (Phase 2) |
+| 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5); amended (#34) |
+| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39, #41, #34, #42, #43) |
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2); amended (#30) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2) |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
-| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023 |
-| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30) |
-| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32) |
-| 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37) |
+| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023; amended (#39, #42, #44) |
+| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30); amended (#40, #41); amended (#42) |
+| 021 | The public repo is MIT | Accepted (Phase 5) |
+| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32, #35, #36, #40, #41, #42) |
+| 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37); amended (#38, #43, #44) |
 
 ---
 
 ## ADR-001: Data lives outside the repo, on an encrypted external volume
+
+> **Amended: upgrade backups (#44).** `backups/` is no longer only reserved. SETUP's "Upgrading to a new release" backs up the whole data folder, by hand and with the services stopped, into one dated folder under `backups/`: SQLite's `.backup` for every database file, a copy that keeps permissions for everything else, then a check that the copy is owner-only. Nothing does this automatically, and `doctor` does not check `backups/`. Backups off the drive are still the operator's responsibility.
 
 **Context.**
 - The record holds personal details: where you applied, outcomes, notes, and eventually saved job ads.
@@ -265,6 +268,8 @@ Ask rules only work while Claude Code's auto mode is off, so anything that must 
 
 ## ADR-012: The repo goes public after Phase 1 verification; `main` is protected then
 
+> **Amended by [ADR-021](#adr-021-the-public-repo-is-mit) (Phase 5).** The reuse grant is the MIT License. The trade-off below records the all-rights-reserved state that applied until that grant.
+
 > **Amended: web merges allowed (#44).** Supersedes the local-merge note below. Web merges are allowed for operator convenience. Pull requests merge on GitHub with "Create a merge commit". The branch protection settings are unchanged. Administrator bypass is again an exception: it is used only for an optional local merge or a by-hand fix, where GitHub reports "Bypassed rule violations" for the pull request and status check rules. Force pushes to `main` are never part of the flow.
 
 > **Amended: local merges (#44).** The branch protection settings are unchanged: a pull request and the `Lint, types, tests` and `gitleaks (full history)` checks are required, and administrators may bypass. That bypass is now the normal merge path, not only an exception for a by-hand fix. The operator pushes a local merge commit (ADR-010) to `main`, and GitHub reports "Bypassed rule violations" for the pull request and status check rules. That is expected only on that push, after the pull request's own checks have passed. Force pushes to `main` are still never part of the flow.
@@ -289,7 +294,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 **Trade-offs.**
 - There is a short window where `main` is unprotected. It is covered by the per-push approval rule in ADR-011 and by making step 4 the very next action.
 - Being public means every commit is visible forever. That is why the history must be clean before going public, and why the gitleaks scan covers all history, not only new commits.
-- Until a license is added in Phase 5, the code is visible but **all rights reserved**: others can read it, but have no grant to reuse it.
+- Until a license is added in Phase 5, the code is visible but **all rights reserved**: others can read it, but have no grant to reuse it. Phase 5 adds that grant: see ADR-021.
 
 ## ADR-013: No exemptions in the data-path hook, not even for its own tests
 
@@ -501,6 +506,10 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-019: Local embedding vectors live in search.db beside the LLM tier
 
+> **Amended by ADR-015's digest amendment (#39).** Alerts no longer carry `LLM: <tier>` or the `similarity:` line described below: a digest row has no tier name and no cosine, and since #34 a job ad sent with `/log` gets no alert of its own. The cosine is still stored beside the tier, and `embed-eval` reads it.
+
+> **Amended: the model id is config (#44).** The embedding request's model id is `scoring.embedding_model` (default `local-embedding`), and the scoring request's is `scoring.chat_model` (default `local-model`). Each is text of 1 to 200 characters with no control characters and no leading or trailing spaces; any other key under `scoring` is refused, so neither URL can be set. The URLs stay the loopback constants below. Stored vectors do not record the model that made them: after `scoring.embedding_model` changes, stored posting vectors are compared with the new resume vector as they are. A vector of another dimension is a `dim-mismatch` miss; one of the same dimension gives a cosine across two models. A cosine still decides nothing.
+
 > **Amended: a bad reply has its own reason (#42).** An embedding miss is now `unreachable` only when the server could not be used (refused, out of time, or a reply over the cap); a reply that arrived but is not a usable vector (another status, a body of the wrong shape, an empty, zero or non-finite vector) is the new reason `bad-reply`. Only `unreachable` stops embedding for the rest of the run, as before. The log line is still `embedding miss posting <id>: <reason>` and nothing else. Scoring already told the two apart (ADR-023): a `ScoreError` is a down model, a reply that does not parse leaves the posting as it was.
 
 > **Amended: loopback deadlines (#30).** The scoring, embedding and SearXNG clients share one exchange with a total deadline: 120 seconds for scoring, 60 for embedding and 30 for discovery. The lookup, the connect, the reply headers and the body all count against it, and a watchdog shuts the socket down when it passes.
@@ -518,7 +527,7 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 **Decision.**
 - **Float32 vectors are BLOBs in ordinary tables in `search.db`.** Search migration 0004 adds `resume_embedding` (one row: SHA-256 of the resume bytes, dimension, vector, timestamp) and `posting_embeddings` (one row per posting: dimension, vector, timestamp). `postings.embedding_score` holds the cosine, from -1 to 1, or null. The resume text and the posting text are not stored. The EI files stay on schema 1. `fit_rating` stays null.
 - **No native extension.** `search.db` stays mode 0600 and opens with the standard library.
-- **The embedding client is loopback only.** It posts to `http://127.0.0.1:1234/v1/embeddings` on the local LM Studio server, with the model id `local-embedding`. No redirects, and it is not `fetch.py`.
+- **The embedding client is loopback only.** It posts to `http://127.0.0.1:1234/v1/embeddings` on the local LM Studio server, with the model id `local-embedding` (now `scoring.embedding_model`; see the amendment above). No redirects, and it is not `fetch.py`.
 - **The cosine is stored beside the LLM tier and never replaces it.** The existing skip rules stay as they are. A cosine does not cause a skip. The alert keeps company, title, and link, and adds `LLM: <tier>`. When a cosine is present, one more line is `similarity: 0.82`.
 - **A miss fails closed for that posting only.** If the resume file is missing, the embedding server is down, or a vector has the wrong dimension, that posting's cosine stays null. The watch log gets `embedding miss posting <id>: <reason>` and nothing else: no resume text, no posting text, and no vector. The run continues and still exits 0. The alert then has the LLM line only.
 - **The description is still not a column.** The first score pass embeds the in-memory text: company, title, location, work model, and the description when the board sent one. A later pass has only the stored fields. The vector is the only kept trace of that description. When the resume bytes change, stored posting vectors are compared again locally, without calling the model.
@@ -590,6 +599,25 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A daily run still sends at most 12 site-restricted queries. A shorter interval, down to 60 minutes, sends that set more often.
 - A discovery message leaves the suggested name and the URL on Telegram's servers. The snippet and the query do not.
 
+## ADR-021: The public repo is MIT
+
+**Context.**
+- ADR-012 made the repo public after Phase 1 and left reuse ungranted until Phase 5.
+- Until this decision, a reader could look at the code and had no permission to use it.
+
+**Decision.**
+- The grant is the MIT License, in `LICENSE`, copyright 2026 Daniel.
+- `pyproject.toml` names that license. The README points at `LICENSE`.
+- Source files do not carry their own copyright headers. The one `LICENSE` file is the grant.
+
+**Alternatives.**
+- Apache-2.0. Rejected: this project does not need a patent grant.
+- Staying all rights reserved. Rejected: ADR-012 already set Phase 5 as the point a reuse grant is added.
+
+**Trade-offs.**
+- MIT allows reuse, including in closed-source copies, as long as the notice is kept.
+- The grant covers the code in this repository. The data folder stays outside the repo (ADR-001).
+
 ## ADR-022: A watch run isolates failures, logs as it goes, and has a time budget
 
 > **Amended for health (#42).** A finished run now also records whether it did useful work (`watch_runs.useful`, search migration 0018): at least one board fetched and parsed and, when postings were waiting to be scored, the scorer answered at least once (a reply that does not parse counts: the model answered). A model that is down, a scorer held for its resume, or scoring the budget never reached, with postings waiting, makes the run not useful; so does a run that fetched no board. In the same transaction the run records each component it reached in `component_health`: the boards failed when none was fetched and at least one failed, and worked when one was fetched; the local model failed when it stopped answering (`ScoreError`), and worked when it answered. A component the run never reached is left as it was, never counted as working. Each record also stores the postings held for scoring at that moment. A discovery pass that ran records itself the same way: a miss or a stop adds one to `discovery_state.unproductive` and one failed run of SearXNG, with the kind (`unreachable`, `bad-reply` or `throttled`); a pass with a usable reply to every query stamps `useful_at`, clears the count and records SearXNG as working. A pass that was off, inside its backoff or skipped as busy changes neither. The `watch.success` and `discover.success` stamps stay the "ran" stamps.
@@ -631,6 +659,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - The log files grow without limit. There is no rotation yet. *Amended for health (#42):* when a run opens `logs/watch.log` or `logs/discover.log` and it has reached 5 MB, the standard library's `RotatingFileHandler` rolls it over first, keeping five older files (`watch.log.1` to `watch.log.5`) in `logs/`. Every rotated file is set to 0600 again and the new one is created 0600, so a umask never loosens one; a symlink is never rolled over. A log can pass 5 MB by one run's lines. A rotation that fails stops the run, like a log that can't be opened.
 
 ## ADR-023: Scoring is grounded in an imported resume, and re-scored when it changes
+
+> **Amended: the model id is config (#44).** The scoring request names the model `scoring.chat_model` (default `local-model`); see ADR-019. The URL is unchanged. Changing the model does not re-score anything by itself.
 
 > **Amended for the learning loop (#43).** The scoring request may now carry `labelled_examples`: up to `learning.labelled_examples` (0 to 20, default 5; 0 sends none) of the postings the operator labelled most recently, each as its title, lane (`off-lane`, or null when not checked), gap count and label. A label comes only from the operator: an application, labelled with its latest status (`applied` or later, from the bot, the CLI or `seed`), or a skip chosen with the Skipped button (`skipped`, `skips.by_operator`). The system never predicts a label, and a watcher skip is not one. The examples are read once per watch run, the posting being scored (same company and title) is left out, and the company, gap names, notes, skip reasons and cosines are never sent. They go to the loopback model's request only: no column, log line or Telegram message carries them, and `llm_output` stays as before (canonical gaps while a resume is in use). Rules and thresholds (`gap_tiers`, gates, lanes, `off_lane_min_fit`) never change automatically. Embeddings stay out of the scoring decision until `embed-eval` shows they predict the operator's labels: ADR-019 stands.
 

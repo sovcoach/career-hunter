@@ -31,6 +31,7 @@ from careerhunter.models import Application, Dating, Posting
 from careerhunter.secrets_store import SecretError
 from careerhunter.storage_guard import DataDir
 from tests.conftest import ACTIVE, EARLIER, set_claims
+from tests.fakes import use_example_watchlist
 
 ROOT = Path(__file__).parents[1]
 CHAT = 424242
@@ -247,6 +248,7 @@ def env(datadir: DataDir) -> Env:
     for name in ("logs", "snapshots"):
         (datadir.root / name).mkdir(mode=0o700)
     shutil.copyfile(ROOT / "config.example.yaml", datadir.config_path)
+    use_example_watchlist(datadir.config_path)
     set_claims(datadir.root, ACTIVE.label, ACTIVE)
     write_config(datadir)
     api, web, clock = FakeTelegram(), FakeWeb({AD_URL: AD, SHELL_URL: SHELL}), Clock()

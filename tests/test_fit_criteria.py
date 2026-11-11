@@ -21,6 +21,7 @@ from careerhunter.config import (
     validate_config,
     validate_exclusions,
 )
+from tests.fakes import template_watchlist
 
 ROOT = Path(__file__).parents[1]
 TEMPLATE = yaml.safe_load((ROOT / "config.example.yaml").read_text())
@@ -43,8 +44,9 @@ def test_the_template_uses_every_new_field_and_is_valid() -> None:
     assert "gap_tiers" in d["fit_rubric"]
     assert {"seniority_words", "title_exceptions", "shift_patterns"} <= set(d["hard_gates"])
     assert "schedule_limits" in d
-    assert any("role_filters" in w for w in d["watchlist"])
-    assert any(w.get("agency") for w in d["watchlist"])
+    assert d["watchlist"] == []  # inert until edited; see test_template_watchlist
+    assert any("role_filters" in w for w in template_watchlist())
+    assert any(w.get("agency") for w in template_watchlist())
     assert validate_exclusions(EXCLUSIONS) == []
 
 
@@ -231,6 +233,7 @@ def _set(path: str, value: Any) -> Any:
 )
 def test_problems_are_reported(mutate: Any, message: str) -> None:
     d = doc()
+    d["watchlist"] = template_watchlist()  # the commented examples, uncommented
     if "title_exceptions needs" in message:
         d["hard_gates"]["title_exceptions"] = ["Example Manager"]
     mutate(d)

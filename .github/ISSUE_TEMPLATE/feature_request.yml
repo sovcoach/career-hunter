@@ -26,7 +26,7 @@ body:
       options:
         - Not sure
         - Phase 1 - Foundation
-        - Phase 2 - Notifications
+        - Phase 2 - Telegram bot
         - Phase 3 - Watcher
         - Phase 4 - Discovery
         - Phase 5 - Release

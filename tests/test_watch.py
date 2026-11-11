@@ -18,6 +18,7 @@ from careerhunter.models import Posting
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.score import Score
 from careerhunter.storage_guard import DataDir
+from tests.fakes import use_example_watchlist
 
 DAY = "2026-11-01"
 
@@ -923,6 +924,7 @@ def test_an_empty_watchlist_does_nothing(search: sqlite3.Connection, datadir: Da
 @pytest.fixture
 def inited(data_env: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]) -> Path:
     assert cli.main(["init"], probe=probe) == 0
+    use_example_watchlist(data_env / "config.yaml")
     capsys.readouterr()
     return data_env
 

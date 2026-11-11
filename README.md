@@ -2,9 +2,9 @@
 
 **In plain language:** career-hunter is a private, self-hosted job-search assistant that runs on your own Mac. It keeps a careful record of every job you apply to and every other job-search activity, such as networking, job fairs, agency registrations and courses. When you need to show your job search, for example when Service Canada asks for it during an Employment Insurance (EI) claim, it produces a clean report as a PDF and a spreadsheet. It can also watch boards you name, score the postings it keeps, and message you on Telegram.
 
-Your information never leaves your machine and is never stored in this code repository. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
+Your records stay on your machine and are never stored in this code repository. What does leave is listed in [SECURITY.md](SECURITY.md) and ADR-015: the short messages the bot sends you through Telegram, the requests to the job boards you watch, and, if you turn on discovery, the search queries your local SearXNG sends on. The data lives on an encrypted external drive, and secrets live in the macOS Keychain.
 
-> **Status:** Phase 2 (Telegram bot), version 0.3.0. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards, filters them, and scores the ones it keeps with a local model. The bot sends one alert digest per watch run.
+> **Status:** the latest release is 0.3.0 (Phase 2, the Telegram bot); Phases 3 to 5 are on `main` for the next release. Tracking, import and export work, with one EI record per claim kept apart from everything else, and a private Telegram bot records applications, statuses and activities from your phone. `careerhunter watch` records new postings from Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards, filters them, and scores the ones it keeps with a local model in LM Studio. The bot sends one alert digest per watch run. `careerhunter demo` shows all of that on made-up data without a data folder.
 
 ---
 
@@ -19,15 +19,18 @@ Your information never leaves your machine and is never stored in this code repo
 | Command | What it does |
 |---|---|
 | `careerhunter init` | Creates your private data folder on the encrypted drive, copies in starter config files, and creates the databases |
+| `careerhunter migrate` | Brings `search.db` and the active claim's record up to this version's schema, creating the claim's file if it is new. Run it with the services stopped |
 | `careerhunter seed` | Imports your existing applications and activities from a simple YAML file, each into the right place. Re-running is safe: nothing is duplicated |
 | `careerhunter log <link> --method … --date …` | Records a job you found and applied to yourself in one step: the posting and the application go into both files under one ID, with a copy of the ad when the page gives one. `--company` and `--title` fill in what the page doesn't show |
 | `careerhunter export --claim … --from … --to …` | Writes one EI claim's job-search record for a date range as a PDF plus two CSV spreadsheets |
 | `careerhunter report --claim …` | Joins one claim's EI record to `search.db`, both read-only, into a private report under `reports/`: each application's EI facts beside its lane, fit and source, with counts by lane. Prints only the report's relative path |
 | `careerhunter claim seal …` | Permanently closes a finished claim's record and makes it read-only |
-| `careerhunter secret set/verify` | Stores a secret (e.g. the future Telegram bot token) in the macOS Keychain without ever showing it |
-| `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits. Discovery runs inside the watch agent; install removes the separate discovery agent of earlier versions |
+| `careerhunter secret set/verify` | Stores a secret (the Telegram bot token) in the macOS Keychain without ever showing it |
+| `careerhunter bot run` / `service install` | Runs the Telegram bot, and installs it plus a watch LaunchAgent that runs on the configured interval and exits. Install them from a release checkout (see SETUP). `service uninstall` and `service status` remove and show them. Discovery runs inside the watch agent; install removes the separate discovery agent of earlier versions |
 | `careerhunter doctor` | Checks the setup and tells you what's missing |
+| `careerhunter demo` | Runs a watch, prints the digest the bot would send and records one application, all on made-up data in memory, with fake job boards and a fake model. Needs no data folder, writes nothing and connects to nothing |
 | `careerhunter watch` | Fetches the Greenhouse, Lever, Ashby, SmartRecruiters, BambooHR and Workday boards named on the watchlist, and approved discovery boards, once, after a discovery pass when one is due. It records new postings in `search.db`, skips or flags them from the config, and scores the ones it keeps with a local model. It does not call Telegram. The watch LaunchAgent runs this command on a schedule. The bot sends one alert digest per watch run |
+| `careerhunter resume import <file>` | Reads a PDF or DOCX resume on this Mac and stores its text in the data folder for scoring; prints only the character count |
 | `careerhunter scout-prompt` | Prints a scout prompt from exclusions and the hard gates the watcher skips on. Writes nothing |
 | `careerhunter embed-eval` | Ranks stored cosines against LLM tiers. Writes a private report under `evals/` and prints only that relative path |
 | `careerhunter discover` | Runs one discovery pass against a local SearXNG by hand; the watch agent runs one each `discovery.interval_minutes`. A posting URL it finds is alerted through the watch run's digest; a board is queued in `search.db` once one board-API request confirms it. `approve` and `reject` update that queue only. The bot can approve or reject a pending row from the allowlisted chat. That message is the suggested name and the URL. An approved board is fetched on the next `careerhunter watch` |
@@ -86,6 +89,6 @@ Secrets go in the **macOS Keychain** through the Python `keyring` library. They 
 
 ## Tech
 
-Python 3.12+ managed with [uv](https://docs.astral.sh/uv/), SQLite, PyYAML, keyring and ReportLab. Quality checks: ruff, mypy (strict), pytest with coverage, gitleaks, pre-commit, and GitHub Actions.
+Python 3.12+ managed with [uv](https://docs.astral.sh/uv/), SQLite, PyYAML, keyring, ReportLab, pypdf and truststore. Scoring and embeddings run on [LM Studio](https://lmstudio.ai) on the same Mac, and discovery on an optional local SearXNG. Quality checks: ruff, mypy (strict), pytest with coverage, gitleaks, pre-commit, and GitHub Actions.
 
-A license will be added in Phase 5.
+The code is released under the MIT License. See [LICENSE](LICENSE).

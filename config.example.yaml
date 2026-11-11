@@ -4,24 +4,25 @@
 #   $CAREERHUNTER_DATA_DIR/config.yaml
 # (`careerhunter init` copies this template there). Never put personal values here.
 #
-# Phase 1 validates this file (`careerhunter doctor`). Later phases use it to decide
-# which postings to surface and when to notify you.
+# `careerhunter doctor` checks this file. `careerhunter watch` and the bot read it to
+# decide which boards to fetch and which postings to skip, score and alert.
 
 search:
-  # Job titles you are targeting. Matched loosely against posting titles.
+  # target_titles, locations and work_models still validate so an older file loads.
+  # Nothing matches them: use lanes and location_rules below. target_titles may be
+  # left out when lanes are set.
   target_titles:
     - Operations Coordinator
     - Customer Success Specialist
     - Project Coordinator
-  # Places you would work from or commute to.
   locations:
     - Example City
     - Remote (Canada)
-  # Which work models you are open to: onsite, hybrid, remote.
   work_models: [remote, hybrid, onsite]
-  # Optional (validated now, used for scoring from Phase 3): target titles grouped into
-  # lanes by priority. A title may be a list of variants that count as one title. A
-  # fallback lane ranks below an equally good fit in any other lane.
+  # Optional: target titles grouped into lanes by priority. A title may be a list of
+  # variants that count as one title, matched as whole words in any case. Lanes label
+  # and order alerts and never skip a posting. A fallback lane ranks below an equally
+  # good fit in any other lane. Without lanes, alerts go by fit, then oldest.
   lanes:
     - name: operations
       priority: 1
@@ -36,11 +37,12 @@ search:
   # Optional: the lowest fit (low, medium or high) at which a posting whose title
   # matches no lane still alerts, labelled Off-lane and sent last. Default high.
   off_lane_min_fit: high
+  # Optional. Postings older than this many days (by the board's posted date, or
+  # the day first seen when the board gives none) are skipped as too_old. 1 to 365,
+  # default 7.
+  max_posting_age_days: 7
   # Optional: where each work model is acceptable. With no work model from the board,
   # a location saying "remote" counts as remote and anything else as on-site.
-  # Optional. Postings older than this many days (by the board's posted date, or
-  # the day first seen when the board gives none) are skipped as too_old. 1 to 365.
-  max_posting_age_days: 7
   location_rules:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here
     remote: [Canada]                    # fully remote only within these regions
@@ -53,9 +55,10 @@ search:
 # Hard gates: a posting failing any of these is skipped, with the reason recorded.
 hard_gates:
   min_salary: null             # yearly CAD; skipped when the top of the stated range is below it; null turns it off
-  max_commute_km: 40
-  exclude_work_models: []      # e.g. [onsite]
-  # Optional gates; a posting that trips one is skipped with that reason (Phase 3).
+  max_commute_km: 40           # validated; not applied
+  exclude_work_models: []      # validated; not applied (use location_rules)
+  # Optional gates; a posting that trips one is skipped with that reason. A key that
+  # is not one of these is refused.
   required_languages: []       # skip postings that require any of these languages
   credentials: []              # licences, clearances or designations you can't get
   shift_patterns: [overnight]  # e.g. rotating, overnight, 24/7
@@ -65,18 +68,19 @@ hard_gates:
   title_exceptions: []         # titles allowed despite containing a seniority word
   never_gated_families: []     # title families gated only when explicitly senior
 
-# How postings are scored (0-10). Weights are relative; Phase 3 uses them.
+# How postings are scored: the local model lists the requirements a posting asks for
+# that you are missing, and gap_tiers turns the count into a tier and a fit.
 fit_rubric:
+  # weights and thresholds still validate so an older file loads, and are not applied.
+  # With gap_tiers set they can be left out.
   weights:
     title_match: 3
     skills_match: 3
     location_match: 2
     seniority_match: 2
   thresholds:
-    strong: 8                  # notify right away
-    worth_a_look: 5            # include in the daily digest
-  # Optional: rate by the number of missing requirements instead of weights. With
-  # gap_tiers set, weights and thresholds can be left out.
+    strong: 8
+    worth_a_look: 5
   gap_tiers:
     tiers:                     # best first, by the most gaps the tier allows
       # fit is required on every tier: low, medium or high. Alerts show it, and a
@@ -92,6 +96,14 @@ fit_rubric:
   # Optional number from 0 to 1. The watcher does not use it for skips, alerts, or
   # what it stores. embed-eval ranks a blend with it when it is set. Null leaves it unset.
   embedding_weight: null
+
+# Optional: the model identifiers sent to LM Studio on this Mac (see docs/SETUP.md,
+# "Run the local models"). Use the identifier LM Studio shows for each loaded model.
+# Text of 1 to 200 characters; unset or null sends local-model and local-embedding.
+# The server addresses are fixed loopback URLs and are not set here.
+scoring:
+  chat_model: null             # e.g. example-chat-model
+  embedding_model: null        # e.g. example-embedding-model
 
 schedule:
   # A zone name (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); UTC if unset.
@@ -113,26 +125,32 @@ schedule_limits:
 # kept here and not fetched. ats_type is one of:
 # greenhouse, lever, ashby, workday, successfactors, icims, taleo, smartrecruiters,
 # jobvite, bamboohr, other
-watchlist:
-  - name: Example Robotics
-    ats_type: greenhouse
-    ats_slug: examplerobotics
-    careers_url: https://example.com/careers
-  - name: Sample Logistics
-    ats_type: lever
-    ats_slug: samplelogistics
-    careers_url: https://example.org/jobs
-    role_filters:              # optional: only these roles at this company
-      role_families: [support, operations]
-      work_models: [remote, hybrid]
-  # A Workday board, for example:
-  # - name: Example Freight
-  #   ats_type: workday
-  #   ats_slug: examplefreight   # the tenant
-  #   ats_host: wd5
-  #   ats_site: External
-  - name: Example Staffing
-    agency: true               # optional: a staffing agency, labelled as such
+#
+# The list starts empty, so `careerhunter watch` fetches nothing until you add your
+# own boards. To start from the examples, replace `watchlist: []` with the block
+# below, remove the leading "# " from each of its lines, and put in real companies.
+# The Workday entry stays commented until you also remove its second "# ".
+watchlist: []
+# watchlist:
+#   - name: Example Robotics
+#     ats_type: greenhouse
+#     ats_slug: examplerobotics
+#     careers_url: https://example.com/careers
+#   - name: Sample Logistics
+#     ats_type: lever
+#     ats_slug: samplelogistics
+#     careers_url: https://example.org/jobs
+#     role_filters:              # optional: only these roles at this company
+#       role_families: [support, operations]
+#       work_models: [remote, hybrid]
+#   # A Workday board, for example:
+#   # - name: Example Freight
+#   #   ats_type: workday
+#   #   ats_slug: examplefreight   # the tenant
+#   #   ats_host: wd5
+#   #   ats_site: External
+#   - name: Example Staffing
+#     agency: true               # optional: a staffing agency, labelled as such
 
 # Optional discovery settings (ADR-020). A null URL leaves discovery off.
 # A set URL is plain http to 127.0.0.1, localhost, or ::1, with no userinfo.
@@ -162,7 +180,7 @@ ei:
   #     start: 2026-08-02      # the start date Service Canada gave you
   #     end: 2027-07-31        # optional while the claim is active
 
-# Telegram (Phase 2). The bot only ever talks to this one private chat. Find the id
+# Telegram. The bot only ever talks to this one private chat. Find the id
 # with `careerhunter bot discover` (see docs/SETUP.md).
 telegram:
   chat_id: null                # e.g. 123456789

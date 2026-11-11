@@ -320,6 +320,20 @@ class ActiveClaim:
     messages: list[str] = field(default_factory=list)
 
 
+def init_record(conn: sqlite3.Connection, claim: Claim) -> None:
+    """Migrate a new, empty EI record and store the claim it belongs to."""
+    db.migrate(conn, "ei_record")
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO claim (id, label, start_date, end_date) VALUES (1, ?, ?, ?)",
+            (
+                claim.label,
+                claim.start.isoformat(),
+                claim.end.isoformat() if claim.end else None,
+            ),
+        )
+
+
 def _create_file(path: Path, claim: Claim) -> None:
     tmp = path.with_name(path.name + ".tmp")
     for leftover in [*db.db_files(tmp), tmp.with_name(tmp.name + "-journal")]:
@@ -328,16 +342,7 @@ def _create_file(path: Path, claim: Claim) -> None:
             leftover.unlink()
     conn = db.connect(tmp, wal=False)
     try:
-        db.migrate(conn, "ei_record")
-        with db.transaction(conn):
-            conn.execute(
-                "INSERT INTO claim (id, label, start_date, end_date) VALUES (1, ?, ?, ?)",
-                (
-                    claim.label,
-                    claim.start.isoformat(),
-                    claim.end.isoformat() if claim.end else None,
-                ),
-            )
+        init_record(conn, claim)
     finally:
         conn.close()
     os.link(tmp, path)  # fails if the record file appeared meanwhile; never overwrites
