@@ -7,6 +7,20 @@ words, ignoring case, by `filters.has_phrase`: the same folding as every other t
 match here. When titles in several lanes match, the lane with the best (lowest)
 priority wins. Priorities are unique (config validation), so there is never a tie.
 
+Only when no lane matches literally, the normalized rule is tried, by
+`titles.loose_match`, and again the best priority wins. A variant that is a core of two
+or more words and a role word (specialist, analyst, associate, one built-in group)
+matches a posting with that core and any role word of the group, ignoring level words
+(junior, senior, I to IV, "level N", ...) and after comma inversion ("Analyst, Client
+Experience" is "Client Experience Analyst"). The role word must end the title or come
+before a separator (comma, dash, bracket), so "IT Support Associate Manager" is not an
+"IT Support Specialist". A one-word core ("Data Analyst") only matches literally.
+
+A stored lane moves only through `careerhunter lanes reassign` (`plan_reassign`,
+`reassign`): it recomputes every checked posting's lane against the current config and
+matcher, and search migration 0021 logs each move to `lane_changes`. The watcher only
+fills in postings not yet checked.
+
 Lanes only label and order postings. They never skip one and never exempt one from a
 hard gate: `hard_gates.never_gated_families` is a separate list, and neither reads the
 other. A config without `search.lanes` has no lanes, and lane checking is off.
@@ -23,14 +37,18 @@ Python, so it does not depend on how a SQLite version orders nulls.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+import datetime as dt
+import sqlite3
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, replace
 from typing import Any
 
-from careerhunter.config import off_lane_min_fit
+from careerhunter import db, search_store
+from careerhunter.config import max_posting_age_days, off_lane_min_fit
 from careerhunter.enums import FIT_LEVELS
-from careerhunter.filters import has_phrase
+from careerhunter.filters import has_phrase, too_old
 from careerhunter.search_store import PendingAlert
+from careerhunter.titles import loose_match
 
 
 @dataclass(frozen=True)
@@ -63,11 +81,16 @@ def match(title: str, doc: Mapping[str, Any] | None) -> Lane | None:
     raw = search.get("lanes") if isinstance(search, Mapping) else None
     if not isinstance(raw, list):
         return None
+    return _best(title, raw, has_phrase) or _best(title, raw, loose_match)
+
+
+def _best(title: str, raw: list[Any], test: Callable[[str, str], bool]) -> Lane | None:
+    """The best-priority lane with a variant that `test` matches, or None."""
     best: Lane | None = None
     for lane in raw:
         if not isinstance(lane, Mapping):
             continue
-        if any(has_phrase(title, variant) for variant in _variants(lane.get("titles"))):
+        if any(test(title, variant) for variant in _variants(lane.get("titles"))):
             found = Lane(lane["name"], lane["priority"], bool(lane.get("fallback", False)))
             if best is None or found.priority < best.priority:
                 best = found
@@ -120,6 +143,78 @@ def alert_order(pending: list[PendingAlert], doc: Mapping[str, Any]) -> list[Ord
         key = (0, -rank, fallback, priority, alert.first_seen, alert.posting_id)
         keyed.append((key, Ordered(alert.posting_id, f"Lane: {alert.lane}")))
     return [ordered for _, ordered in sorted(keyed, key=lambda pair: pair[0])]
+
+
+@dataclass(frozen=True)
+class LaneMove:
+    """A checked posting whose lane changes. None is off-lane."""
+
+    posting_id: int
+    title: str
+    old: str | None
+    new: str | None
+
+
+@dataclass(frozen=True)
+class Reassignment:
+    """What `lanes reassign` changes, or would change on a dry run."""
+
+    checked: int  # postings already checked against the lanes
+    moves: tuple[LaneMove, ...]
+    released: tuple[int, ...]  # held off-lane, and alertable once moved
+    too_old: tuple[int, ...]  # released from the hold but past the posting-age gate
+    newly_held: int  # alertable now, held off-lane once moved
+
+
+def plan_reassign(conn: sqlite3.Connection, doc: Mapping[str, Any], today: dt.date) -> Reassignment:
+    """Every checked posting's lane against the current config and matcher. Reads only.
+
+    A posting the move releases from the off-lane hold alerts as usual, through the
+    bot's `alert_order` and `alerts.max_per_poll`. One past `search.max_posting_age_days`
+    (its posted date, or first_seen) is listed in `too_old` instead: the age gate runs
+    only on unscored postings, so `reassign` applies it here rather than let it pass.
+    """
+    rows = search_store.checked_lane_titles(conn)
+    moves = []
+    for row in rows:
+        found = match(row.title, doc)
+        new = None if found is None else found.name
+        if new != row.lane:
+            moves.append(LaneMove(row.posting_id, row.title, row.lane, new))
+    moved = {move.posting_id: move.new for move in moves}
+    pending = search_store.pending_alerts(conn)
+    after = [
+        replace(alert, lane=moved[alert.posting_id]) if alert.posting_id in moved else alert
+        for alert in pending
+    ]
+    before_ids = {item.posting_id for item in alert_order(pending, doc)}
+    after_ids = {item.posting_id for item in alert_order(after, doc)}
+    posted = {row.posting_id: row.posted for row in rows}
+    max_age = max_posting_age_days(doc)
+    released: list[int] = []
+    aged: list[int] = []
+    for posting_id in sorted(after_ids - before_ids):
+        day = dt.date.fromisoformat(posted[posting_id][:10])
+        (aged if too_old(day, None, today, max_age) else released).append(posting_id)
+    return Reassignment(
+        checked=len(rows),
+        moves=tuple(moves),
+        released=tuple(released),
+        too_old=tuple(aged),
+        newly_held=len(before_ids - after_ids),
+    )
+
+
+def reassign(conn: sqlite3.Connection, doc: Mapping[str, Any], today: dt.date) -> Reassignment:
+    """Apply `plan_reassign` in one transaction. `lane_changes` logs each move, and a
+    released posting past the age gate gets a `too_old` skip, as the watcher gives."""
+    with db.transaction(conn):
+        planned = plan_reassign(conn, doc, today)
+        for move in planned.moves:
+            search_store.move_posting_lane(conn, move.posting_id, move.old, move.new)
+        for posting_id in planned.too_old:
+            search_store.insert_skip(conn, posting_id, today.isoformat(), "too_old")
+    return planned
 
 
 def _fit_rank(fit: str) -> int:

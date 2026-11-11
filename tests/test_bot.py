@@ -1790,7 +1790,7 @@ def test_without_lanes_alerts_go_by_fit_with_no_lane_line(env: Env, keep_umask: 
 def test_a_posting_not_yet_lane_checked_waits_for_the_watcher(env: Env, keep_umask: None) -> None:
     posting = _insert(env, "Example Org", "Fresh", "https://jobs.example.com/ads/1")
     conn = db.connect(env.datadir.search_db_path)
-    conn.execute("DROP TRIGGER posting_lane_set_once")  # rewind the row to unchecked
+    conn.execute("DROP TRIGGER posting_lane_checked_stays")  # rewind the row to unchecked
     conn.execute("UPDATE postings SET lane = NULL, lane_checked = 0 WHERE id = ?", (posting,))
     conn.close()
     assert _poll(env) == 0

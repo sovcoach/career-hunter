@@ -611,6 +611,45 @@ def set_posting_lane(conn: sqlite3.Connection, posting_id: int, lane: str | None
     return cur.rowcount == 1
 
 
+@dataclass(frozen=True)
+class CheckedLane:
+    """A posting already checked against the lanes, for `lanes reassign`."""
+
+    posting_id: int
+    title: str
+    lane: str | None  # None: off-lane
+    posted: str  # the posted date, or first_seen when the board gave none
+
+
+def checked_lane_titles(conn: sqlite3.Connection) -> list[CheckedLane]:
+    """Every posting already checked against the lanes, oldest first."""
+    rows = conn.execute(
+        "SELECT id, title, lane, coalesce(posted_date, first_seen) AS posted "
+        "FROM postings WHERE lane_checked = 1 ORDER BY id"
+    )
+    return [
+        CheckedLane(
+            posting_id=int(row["id"]),
+            title=str(row["title"]),
+            lane=None if row["lane"] is None else str(row["lane"]),
+            posted=str(row["posted"]),
+        )
+        for row in rows
+    ]
+
+
+def move_posting_lane(
+    conn: sqlite3.Connection, posting_id: int, old: str | None, new: str | None
+) -> bool:
+    """Move a checked posting from lane `old` to `new` (None: off-lane). False when the
+    posting is not checked or no longer has `old`. A trigger logs it to `lane_changes`."""
+    cur = conn.execute(
+        "UPDATE postings SET lane = ? WHERE id = ? AND lane_checked = 1 AND lane IS ?",
+        (new, posting_id, old),
+    )
+    return cur.rowcount == 1
+
+
 def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
     """Every posting whose title has not been checked against the lanes, oldest first."""
     rows = conn.execute("SELECT id, title FROM postings WHERE lane_checked = 0 ORDER BY id")

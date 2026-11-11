@@ -435,7 +435,7 @@ def test_new_posting_columns_are_checked(
         search.execute(f"UPDATE postings SET {column} = ? WHERE id = ?", (value, p))  # noqa: S608
 
 
-# --- 0010: the lane, set once ---------------------------------------------------------------
+# --- 0010 and 0021: the lane, checked once, moved only with a logged change ---------------------
 
 
 def _lane(search: sqlite3.Connection, posting: int) -> tuple[object, object]:
@@ -448,23 +448,52 @@ def test_a_new_posting_is_unchecked_with_no_lane(search: sqlite3.Connection) -> 
     assert _lane(search, _posting(search, _company(search))) == (None, 0)
 
 
-@pytest.mark.parametrize(("lane", "other"), [("operations", "support"), (None, "support")])
-def test_a_lane_is_set_once_and_not_changed(
-    search: sqlite3.Connection, lane: str | None, other: str
-) -> None:
+def _changes(search: sqlite3.Connection) -> list[tuple[object, object, object]]:
+    rows = search.execute("SELECT posting_id, old_lane, new_lane FROM lane_changes ORDER BY id")
+    return [tuple(row) for row in rows]
+
+
+def test_the_old_set_once_trigger_is_gone(search: sqlite3.Connection) -> None:
+    names = {
+        row[0] for row in search.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+    }
+    assert "posting_lane_set_once" not in names
+    assert {"posting_lane_checked_stays", "posting_lane_change_logged"} <= names
+
+
+@pytest.mark.parametrize("lane", ["operations", None])
+def test_a_checked_lane_stays_checked(search: sqlite3.Connection, lane: str | None) -> None:
     p = _posting(search, _company(search))
     search.execute("UPDATE postings SET lane = ?, lane_checked = 1 WHERE id = ?", (lane, p))
-    assert _lane(search, p) == (lane, 1)
     # Writing the same values again is allowed: the fill-in is safe to repeat.
     search.execute("UPDATE postings SET lane = ?, lane_checked = 1 WHERE id = ?", (lane, p))
-    for sql, params in (
-        ("UPDATE postings SET lane = ? WHERE id = ?", (other, p)),
-        ("UPDATE postings SET lane_checked = 0, lane = NULL WHERE id = ?", (p,)),
-    ):
-        with pytest.raises(sqlite3.IntegrityError, match="set once"):
-            search.execute(sql, params)
+    with pytest.raises(sqlite3.IntegrityError, match="lane_checked stays 1"):
+        search.execute("UPDATE postings SET lane_checked = 0, lane = NULL WHERE id = ?", (p,))
     search.execute("UPDATE postings SET title = 'Renamed' WHERE id = ?", (p,))
     assert _lane(search, p) == (lane, 1)
+    assert _changes(search) == []
+
+
+def test_every_move_of_a_checked_lane_is_logged(search: sqlite3.Connection) -> None:
+    p = _posting(search, _company(search))
+    search.execute("UPDATE postings SET lane = 'operations', lane_checked = 1 WHERE id = ?", (p,))
+    assert _changes(search) == []  # the first check is not a change
+    search.execute("UPDATE postings SET lane = 'support' WHERE id = ?", (p,))
+    search.execute("UPDATE postings SET lane = NULL WHERE id = ?", (p,))
+    search.execute("UPDATE postings SET lane = NULL WHERE id = ?", (p,))  # no change
+    search.execute("UPDATE postings SET lane = 'operations' WHERE id = ?", (p,))
+    assert _changes(search) == [
+        (p, "operations", "support"),
+        (p, "support", None),
+        (p, None, "operations"),
+    ]
+    stamp = search.execute("SELECT changed_at FROM lane_changes LIMIT 1").fetchone()[0]
+    assert len(stamp) == 20 and stamp.endswith("Z")
+
+
+def test_a_lane_change_names_a_real_posting(search: sqlite3.Connection) -> None:
+    with pytest.raises(sqlite3.IntegrityError):
+        search.execute("INSERT INTO lane_changes (posting_id, new_lane) VALUES (9999, 'x')")
 
 
 @pytest.mark.parametrize(
