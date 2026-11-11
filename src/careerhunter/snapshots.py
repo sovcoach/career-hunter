@@ -134,6 +134,15 @@ def posting_info(html: bytes) -> PostingInfo:
     return PostingInfo(title=_text(page.title))
 
 
+def posting_description(html: bytes) -> str | None:
+    """The first JSON-LD `JobPosting.description` on the page, as it is (often HTML)."""
+    for job in _job_postings(_parse(html).json_ld):
+        value = job.get("description")
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
 def is_readable(html: bytes) -> bool:
     page = _parse(html)
     if _job_postings(page.json_ld):

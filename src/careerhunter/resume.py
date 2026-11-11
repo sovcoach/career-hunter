@@ -2,8 +2,9 @@
 
 The format is decided from the bytes, never from the file name:
 
-- PDF: the file starts with `%PDF-`. It is read with pypdf. An encrypted PDF is
-  refused before any page is touched, and so is one with more than MAX_PAGES pages.
+- PDF: the file starts with `%PDF-`. It is read with pypdf, through `pdftext.py`. An
+  encrypted PDF is refused before any page is touched, and so is one with more than
+  MAX_PAGES pages.
   Text is taken page by page, and the first page that takes the total over MAX_CHARS
   is refused.
 - DOCX: a zip that contains both `[Content_Types].xml` and `word/document.xml`. It is
@@ -37,14 +38,11 @@ import datetime as dt
 import fcntl
 import hashlib
 import io
-import logging
 import os
 import re
 import secrets
 import sqlite3
 import stat
-import struct
-import warnings
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
@@ -54,10 +52,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import pypdf
-import pypdf.errors
-
-from careerhunter import db
+from careerhunter import db, pdftext
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_DOCUMENT_XML = 5 * 1024 * 1024
@@ -76,7 +71,6 @@ CONFIG_VALUE = f"{RESUME_DIR}/{CURRENT}"
 # 50,000 characters are at most four bytes each in UTF-8.
 MAX_TEXT_BYTES = MAX_CHARS * 4
 
-_PDF_MAGIC = b"%PDF-"
 _ZIP_MAGIC = b"PK\x03\x04"
 _DOCX_PARTS = ("[Content_Types].xml", "word/document.xml")
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -110,22 +104,6 @@ _MESSAGES = {
     "loose": "the resume file is readable by others; run careerhunter doctor",
     "mismatch": "the resume file does not match its import; run careerhunter resume import",
 }
-
-# pypdf parses untrusted bytes and can fail in many ways besides its own errors. Only
-# the pypdf calls themselves are wrapped with this, never code of ours.
-_PDF_FAILURES = (
-    pypdf.errors.PyPdfError,
-    ValueError,
-    KeyError,
-    TypeError,
-    IndexError,
-    AttributeError,
-    RecursionError,
-    ZeroDivisionError,
-    OverflowError,
-    struct.error,
-    zlib.error,
-)
 
 
 class ResumeError(Exception):
@@ -171,7 +149,7 @@ def extract_text(data: bytes) -> str:
     """The text of a PDF or DOCX file, decided from its bytes."""
     if len(data) > MAX_FILE_BYTES:
         raise ResumeError("too_large")
-    if data.startswith(_PDF_MAGIC):
+    if data.startswith(pdftext.MAGIC):
         text = _pdf_text(data)
     elif data.startswith(_ZIP_MAGIC):
         text = _docx_text(data)
@@ -183,53 +161,19 @@ def extract_text(data: bytes) -> str:
     return text
 
 
-@contextmanager
-def _quiet_pypdf() -> Iterator[None]:
-    """pypdf's log records and warnings can quote the file; none of them leave here."""
-    # pypdf logs through child loggers (pypdf._reader and others) that take their level
-    # from this one, so a level above CRITICAL silences them all, and nothing they log
-    # is passed up to the handlers of the CLI or the bot.
-    logger = logging.getLogger("pypdf")
-    level, propagate = logger.level, logger.propagate
-    logger.setLevel(logging.CRITICAL + 1)
-    logger.propagate = False
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            yield
-    finally:
-        logger.setLevel(level)
-        logger.propagate = propagate
+_PDF_REASONS = {
+    "unreadable": "pdf_unreadable",
+    "encrypted": "encrypted",
+    "too_many_pages": "too_many_pages",
+    "too_long": "too_long",
+}
 
 
 def _pdf_text(data: bytes) -> str:
-    with _quiet_pypdf():
-        try:
-            reader = pypdf.PdfReader(io.BytesIO(data))
-            encrypted = reader.is_encrypted
-        except _PDF_FAILURES:
-            raise ResumeError("pdf_unreadable") from None
-        if encrypted:
-            raise ResumeError("encrypted")
-        try:
-            pages = reader.pages
-            count = len(pages)
-        except _PDF_FAILURES:
-            raise ResumeError("pdf_unreadable") from None
-        if count > MAX_PAGES:
-            raise ResumeError("too_many_pages")
-        parts: list[str] = []
-        total = 0
-        for index in range(count):
-            try:
-                page_text = pages[index].extract_text()
-            except _PDF_FAILURES:
-                raise ResumeError("pdf_unreadable") from None
-            total += len(page_text) + 1  # the newline between pages counts too
-            if total > MAX_CHARS:
-                raise ResumeError("too_long")
-            parts.append(page_text)
-    return "\n".join(parts)
+    try:
+        return pdftext.pdf_text(data, max_chars=MAX_CHARS, max_pages=MAX_PAGES)
+    except pdftext.PdfTextError as exc:
+        raise ResumeError(_PDF_REASONS[exc.reason]) from None
 
 
 def _docx_xml(data: bytes) -> bytes:
