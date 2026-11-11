@@ -201,6 +201,62 @@ def set_application_jd(
     )
 
 
+@dataclass(frozen=True)
+class JdReference:
+    """An application's JD fields in search.db, with its posting's URL and snapshot."""
+
+    application_id: int
+    posting_id: int
+    ei_claim: str | None
+    jd_expected: int
+    jd_sha256: str | None
+    jd_path: str | None
+    url: str | None
+    snapshot_path: str | None
+
+
+_JD_REFERENCES = (
+    "SELECT a.correlation_id, a.id, a.posting_id, a.ei_claim, a.jd_expected, a.jd_sha256, "
+    "a.jd_path, p.url, p.snapshot_path FROM applications a JOIN postings p ON p.id = a.posting_id"
+)
+
+
+def _jd_reference(row: sqlite3.Row) -> JdReference:
+    return JdReference(
+        application_id=int(row["id"]),
+        posting_id=int(row["posting_id"]),
+        ei_claim=row["ei_claim"],
+        jd_expected=int(row["jd_expected"]),
+        jd_sha256=row["jd_sha256"],
+        jd_path=row["jd_path"],
+        url=row["url"],
+        snapshot_path=row["snapshot_path"],
+    )
+
+
+def jd_reference(conn: sqlite3.Connection, correlation_id: str) -> JdReference | None:
+    row = conn.execute(_JD_REFERENCES + " WHERE a.correlation_id = ?", (correlation_id,)).fetchone()
+    return _jd_reference(row) if row else None
+
+
+def jd_references(conn: sqlite3.Connection) -> dict[str, JdReference]:
+    """Every application's JD fields, keyed by correlation id."""
+    return {str(r["correlation_id"]): _jd_reference(r) for r in conn.execute(_JD_REFERENCES)}
+
+
+def posting_urls(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+    """Every stored posting URL, as stored, with its posting id."""
+    return [
+        (int(r["id"]), str(r["url"]))
+        for r in conn.execute("SELECT id, url FROM postings WHERE url IS NOT NULL")
+    ]
+
+
+def set_posting_url(conn: sqlite3.Connection, posting_id: int, url: str) -> None:
+    """Fill a posting's empty URL. A posting that has one keeps it."""
+    conn.execute("UPDATE postings SET url = ? WHERE id = ? AND url IS NULL", (url, posting_id))
+
+
 def link_to_claim(conn: sqlite3.Connection, application_id: int, label: str) -> None:
     conn.execute("UPDATE applications SET ei_claim = ? WHERE id = ?", (label, application_id))
 
@@ -966,6 +1022,14 @@ def posting_by_id(conn: sqlite3.Connection, posting_id: int) -> Posting | None:
 
 def set_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -> None:
     conn.execute("UPDATE postings SET snapshot_path = ? WHERE id = ?", (path, posting_id))
+
+
+def fill_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -> None:
+    """Set the posting's snapshot only when it has none."""
+    conn.execute(
+        "UPDATE postings SET snapshot_path = ? WHERE id = ? AND snapshot_path IS NULL",
+        (path, posting_id),
+    )
 
 
 def _blob(value: object) -> bytes | None:

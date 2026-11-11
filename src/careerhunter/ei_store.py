@@ -83,6 +83,32 @@ def application_id(conn: sqlite3.Connection, correlation_id: str) -> int | None:
     return int(row["id"]) if row else None
 
 
+def application_fields(conn: sqlite3.Connection, correlation_id: str) -> sqlite3.Row | None:
+    """id, posting_url, snapshot_path and voided of one application, or None."""
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT id, posting_url, snapshot_path, voided FROM applications WHERE correlation_id = ?",
+        (correlation_id,),
+    ).fetchone()
+    return row
+
+
+def set_posting_url(conn: sqlite3.Connection, correlation_id: str, url: str) -> None:
+    """Fill an empty posting URL. An audited update (the edits trigger records it)."""
+    conn.execute(
+        "UPDATE applications SET posting_url = ? WHERE correlation_id = ? AND posting_url IS NULL",
+        (url, correlation_id),
+    )
+
+
+def set_snapshot_path(conn: sqlite3.Connection, correlation_id: str, path: str) -> None:
+    """Fill an empty snapshot path. An audited update."""
+    conn.execute(
+        "UPDATE applications SET snapshot_path = ? WHERE correlation_id = ? "
+        "AND snapshot_path IS NULL",
+        (path, correlation_id),
+    )
+
+
 def add_status(
     conn: sqlite3.Connection, application_id: int, status: str, status_date: str | None
 ) -> None:
@@ -201,4 +227,12 @@ def jd_expected(conn: sqlite3.Connection) -> dict[str, int]:
     return {
         str(r["correlation_id"]): int(r["jd_expected"])
         for r in conn.execute("SELECT correlation_id, jd_expected FROM applications")
+    }
+
+
+def posting_urls(conn: sqlite3.Connection) -> dict[str, str | None]:
+    """Every application's posting URL, as stored, keyed by correlation id."""
+    return {
+        str(r["correlation_id"]): r["posting_url"]
+        for r in conn.execute("SELECT correlation_id, posting_url FROM applications")
     }
