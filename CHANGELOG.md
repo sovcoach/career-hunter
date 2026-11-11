@@ -7,6 +7,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-10
+
 ### Added
 - The project is MIT licensed (ADR-021). See `LICENSE`.
 - `docs/SETUP.md` covers what 0.4.0 needs: LM Studio is required, with a guide to choosing chat and embedding models for the Mac's memory; the services are installed from a separate release checkout (`git worktree add ../career-hunter-release v0.4.0`, then `uv sync --locked`), never from a development one; and "Upgrading to a new release" gives the order: stop the services, back up the whole data folder (SQLite `.backup` for every database file, a copy keeping permissions for the rest, then an owner-only check), move the release checkout, add a fit to every gap tier, `doctor`, `migrate`, `resume import` then `search.resume: resume/current.txt`, `doctor`, and install the services again. Its expected outputs are taken from runs of this version on synthetic data (#44).
@@ -195,7 +197,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sovcoach/career-hunter/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sovcoach/career-hunter/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sovcoach/career-hunter/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sovcoach/career-hunter/releases/tag/v0.1.0
