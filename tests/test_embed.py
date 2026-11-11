@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import http.client
 import json
+import re
 import sqlite3
 import struct
 from pathlib import Path
@@ -486,7 +487,9 @@ def test_embedding_tables_hold_vectors_not_text(search: sqlite3.Connection) -> N
     assert posting_embed_cols == ["posting_id", "dim", "vector", "embedded_at"]
     assert "embedding_score" in posting_cols
     assert "description" not in posting_cols
-    assert [item.version for item in db.load_migrations("ei_record")] == [1]
+    # No EI migration holds an embedding, a vector or a score.
+    for item in db.load_migrations("ei_record"):
+        assert not re.search(r"embed|vector|cosine|score", item.sql, re.IGNORECASE), item.name
     company_id, _ = search_store.upsert_company(search, "Example Org", source="watcher")
     posting_id = search_store.create_posting(
         search,

@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 20)), "ei_record": [1]}[track]
+    expected = {"search": list(range(1, 21)), "ei_record": [1, 2]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -952,3 +952,92 @@ def test_0019_clears_only_workday_keys_in_the_old_path_form(tmp_path: Path) -> N
         assert rows == {"Old": None, "New": keys["New"], "Other": keys["Other"]}
     finally:
         conn.close()
+
+
+def _ei_at_0001(path: Path) -> sqlite3.Connection:
+    conn = db.connect(path)
+    db.migrate(conn, "ei_record", db.load_migrations("ei_record")[:1])
+    conn.execute("INSERT INTO claim (id, label, start_date) VALUES (1, '2026-27', '2026-09-01')")
+    for i, voided in ((1, 0), (2, 1)):
+        conn.execute(
+            "INSERT INTO applications (correlation_id, employer, role, date_applied, "
+            "date_precision, method) VALUES (?, 'Example Robotics', ?, '2026-09-02', 'exact', "
+            "'email')",
+            (f"{i:032x}", f"Analyst {i}"),
+        )
+        if voided:
+            conn.execute(
+                "UPDATE applications SET voided = 1, void_reason = 'duplicate', "
+                "voided_at = '2026-09-03T00:00:00Z' WHERE id = ?",
+                (i,),
+            )
+    return conn
+
+
+def test_ei_0002_marks_every_existing_row_pre_feature_past_a_voided_one(tmp_path: Path) -> None:
+    conn = _ei_at_0001(tmp_path / "ei.db")
+    try:
+        edits = conn.execute("SELECT count(*) FROM edits").fetchone()[0]
+        assert db.migrate(conn, "ei_record") == [2]
+        rows = conn.execute("SELECT jd_expected FROM applications ORDER BY id").fetchall()
+        assert [r[0] for r in rows] == [0, 0]
+        assert conn.execute("SELECT count(*) FROM edits").fetchone()[0] == edits  # no UPDATE
+        assert conn.execute("SELECT count(*) FROM job_descriptions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_ei_store_reads_a_file_still_at_0001(tmp_path: Path) -> None:
+    from careerhunter import ei_store
+
+    conn = _ei_at_0001(tmp_path / "ei.db")
+    try:
+        assert not ei_store.has_job_descriptions(conn)
+        assert ei_store.current_job_description(conn, f"{1:032x}") is None
+        assert ei_store.current_job_descriptions(conn) == {}
+        assert ei_store.jd_expected(conn) == {f"{1:032x}": 0, f"{2:032x}": 0}
+    finally:
+        conn.close()
+
+
+def test_search_0020_marks_every_existing_application_pre_feature(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", db.load_migrations("search")[:19])
+        company = conn.execute(
+            "INSERT INTO companies (name, source) VALUES ('Example Widgets', 'manual')"
+        ).lastrowid
+        posting = conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (?, 'Clerk', '2026-10-30', 'manual')",
+            (company,),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO applications (correlation_id, posting_id, date_applied, date_precision, "
+            "method) VALUES (?, ?, '2026-10-30', 'exact', 'email')",
+            ("a" * 32, posting),
+        )
+        assert db.migrate(conn, "search") == [20]
+        row = conn.execute("SELECT jd_expected, jd_sha256, jd_path FROM applications").fetchone()
+        assert tuple(row) == (0, None, None)
+        with pytest.raises(sqlite3.IntegrityError, match="jd_expected"):
+            conn.execute("UPDATE applications SET jd_expected = 1")
+        for sql in (
+            "UPDATE applications SET jd_sha256 = 'AB'",
+            "UPDATE applications SET jd_path = '/abs/x.txt'",
+            "UPDATE applications SET jd_path = 'snapshots/../x.txt'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(sql)
+        conn.execute(
+            "UPDATE applications SET jd_sha256 = ?, jd_path = 'snapshots/2026/ab.txt'",
+            ("ab" * 32,),
+        )
+    finally:
+        conn.close()
+
+
+def test_trigger_counts_on_a_fresh_file(fresh: sqlite3.Connection, track: str) -> None:
+    """The counts ARCHITECTURE states for a fresh file."""
+    found = fresh.execute("SELECT count(*) FROM sqlite_master WHERE type = 'trigger'").fetchone()
+    assert found[0] == {"search": 8, "ei_record": 37}[track]

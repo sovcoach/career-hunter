@@ -36,6 +36,7 @@ from careerhunter import (
     discover,
     embed,
     embed_eval,
+    jobdesc,
     lanes,
     resume,
     search_store,
@@ -255,6 +256,11 @@ def cmd_export(datadir: DataDir, args: argparse.Namespace) -> int:
     )
     for path in (result.pdf, result.applications_csv, result.activities_csv):
         print(f"wrote {path}")
+    if result.job_descriptions is not None:
+        print(
+            f"wrote {result.job_descriptions}/ "
+            f"({plural(result.jd_count, 'job description', 'job descriptions')})"
+        )
     return EXIT_OK
 
 
@@ -276,13 +282,17 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
     try:
         method = selfsourced.parse_method(args.method)
         dating = selfsourced.parse_day(args.date, today)
+        jd = _jd_argument(args)
         posting = selfsourced.describe(
             args.url, fetch_page, today, company=args.company, title=args.title
         )
         with _writable(datadir) as w:
             logged = selfsourced.record(
-                datadir.root, w.search, w.active, posting, method, dating, today, fetch_page
+                datadir.root, w.search, w.active, posting, method, dating, today, fetch_page, jd
             )
+    except jobdesc.JobDescError as exc:
+        _err(f"error: {exc} Nothing was recorded.")
+        return EXIT_ERROR
     except selfsourced.NamesMissing as exc:
         _err(f"error: {exc} Add --company and --title.")
         return EXIT_ERROR
@@ -292,9 +302,29 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
     where = f"EI claim {logged.ei_claim}" if logged.ei_claim else "search.db only, no active claim"
     print(f"Recorded: {logged.company} — {logged.title} ({where}).")
     print("Job ad saved." if logged.snapshot_saved else "No copy of the job ad was saved.")
+    if logged.jd_saved:
+        print("Job description saved.")
+    elif logged.jd_file_without_text:
+        print("The JD file was kept as the job ad, but it has no text: no job description saved.")
+    else:
+        print("No job description was saved.")
     if logged.earlier:
         print(logged.earlier)
     return EXIT_OK
+
+
+def _jd_argument(args: argparse.Namespace) -> jobdesc.JobDescription | None:
+    """The JD from --jd-file or --jd-stdin, read and checked before anything is written."""
+    if args.jd_stdin:
+        return jobdesc.from_paste_bytes(sys.stdin.buffer.read(jobdesc.MAX_FILE_BYTES + 1))
+    if args.jd_file is None:
+        return None
+    try:
+        with open(args.jd_file, "rb") as fh:
+            data = fh.read(jobdesc.MAX_FILE_BYTES + 1)
+    except OSError:
+        raise ValueError("the --jd-file file could not be read") from None
+    return jobdesc.from_file(data)
 
 
 def fetch_page(url: str) -> Fetched:
@@ -1366,6 +1396,32 @@ def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
         report.line("bot refusals", "OK", "no posting given up")
 
 
+def _doctor_job_descriptions(report: _Report, search: sqlite3.Connection) -> None:
+    """Applications with no job description (ADR-024)."""
+    missing, pre_feature = search_store.jd_counts(search)
+    older = (
+        f"; {plural(pre_feature, 'application', 'applications')} from before JDs were kept"
+        if pre_feature
+        else ""
+    )
+    if missing:
+        report.line(
+            "job descriptions",
+            "WARN",
+            f"{plural(missing, 'application has', 'applications have')} no job description"
+            f" (reply to the bot's request with it){older}",
+        )
+    elif pre_feature:
+        report.line(
+            "job descriptions",
+            "--",
+            f"{plural(pre_feature, 'application', 'applications')} from before JDs were "
+            "kept, with no JD",
+        )
+    else:
+        report.line("job descriptions", "OK", "every application has one")
+
+
 def _doctor_resume(
     report: _Report,
     datadir: DataDir,
@@ -1500,6 +1556,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
         _doctor_components(report, search, config_doc)
         _doctor_alert_hold(report, search)
         _doctor_refusals(report, search)
+        _doctor_job_descriptions(report, search)
 
     records: dict[str, sqlite3.Connection] = {}
     unreadable = search is None and datadir.search_db_path.exists()
@@ -1587,6 +1644,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--date", required=True, help="YYYY-MM-DD, today or yesterday")
     p.add_argument("--company", help="the employer, when the page doesn't say (with --title)")
     p.add_argument("--title", help="the role, when the page doesn't say (with --company)")
+    jd = p.add_mutually_exclusive_group()
+    jd.add_argument(
+        "--jd-file", metavar="PATH", help="the job description, as a PDF, HTML or text file"
+    )
+    jd.add_argument(
+        "--jd-stdin", action="store_true", help="read the job description, as text, from stdin"
+    )
     p = sub.add_parser(
         "report",
         help="join one claim's EI record to search.db, read-only, into a private report",

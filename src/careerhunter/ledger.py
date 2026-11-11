@@ -20,6 +20,12 @@ SQLite can't commit atomically across two WAL databases, so the order is fixed:
 If step 3 fails, the EI record still stands and PartialWriteError says so; `doctor`
 reports the gap. `reconcile()` compares the two layers in both directions.
 
+A job description (ADR-024) goes the same way. Its snapshot file is saved before the
+call, like the ADR-017 job-ad copy; the EI record gets its `job_descriptions` row, and
+search.db the text's hash and the file's path. Every application recorded from now on
+has `jd_expected = 1` in both layers, with or without a JD. A JD file also becomes the
+job-ad snapshot when there is none yet.
+
 A skip is a search-only decision: it never opens an EI file. A discovery
 decision is search-only too: it approves or rejects one queued company and
 does not open an EI file.
@@ -31,12 +37,13 @@ import secrets
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from careerhunter import discover, ei_store, enums, search_store
+from careerhunter import discover, ei_store, enums, search_store, urls
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating, read_file_claim
 from careerhunter.db import transaction
-from careerhunter.ei_store import EiApplication
+from careerhunter.ei_store import EiApplication, EiJobDescription
+from careerhunter.jobdesc import SavedJd
 from careerhunter.models import Activity, Application, Dating, Posting
 
 
@@ -63,6 +70,7 @@ def sanitize(app: Application, correlation_id: str) -> EiApplication:
         method=app.method,
         snapshot_path=app.posting.snapshot_path,
         resume_file=app.resume_file,
+        jd_expected=1,
     )
 
 
@@ -99,25 +107,58 @@ class Recorded:
     warning: str = ""
 
 
+def ei_job_description(jd: SavedJd) -> EiJobDescription:
+    """The EI record's copy of a saved JD. Every field is named on purpose."""
+    description = jd.description
+    sha = description.text_sha256
+    if sha is None:
+        raise ValueError("a JD with no text has no job_descriptions row")
+    return EiJobDescription(
+        text=description.text,
+        text_sha256=sha,
+        source=description.source,
+        file_path=jd.path,
+        file_sha256=description.file_sha256,
+        file_type=description.file_type,
+    )
+
+
 def record_application(
-    search: sqlite3.Connection, active: ActiveClaim | None, app: Application
+    search: sqlite3.Connection,
+    active: ActiveClaim | None,
+    app: Application,
+    jd: SavedJd | None = None,
 ) -> Recorded:
-    """Record an application in both layers (search.db only when no claim is active)."""
+    """Record an application in both layers (search.db only when no claim is active).
+
+    `jd` is a JD whose file is already saved. Its text, when it has any, is recorded in
+    both layers; its file becomes the job-ad snapshot when the posting has none.
+    """
     warning = ""
     if active is not None:
         verdict, warning = check_dating(active.claim, app.dating)
         if verdict is Verdict.REFUSE:
             raise ClaimError(warning)
+    if jd is not None and app.posting.snapshot_path is None:
+        app = replace(app, posting=replace(app.posting, snapshot_path=jd.path))
     label = active.claim.label if active else None
     correlation_id = new_correlation_id()
     status_date = app.dating.sort_date
     with ei_first(search, active):
-        _, posting_id, _, _ = search_store.find_or_create_posting(search, app.posting, app.dating)
+        _, posting_id, _, created = search_store.find_or_create_posting(
+            search, app.posting, app.dating
+        )
+        if jd is not None and not created:
+            search_store.fill_posting_snapshot(search, posting_id, jd.path)
         app_id = search_store.insert_application(search, posting_id, app, correlation_id, label)
         search_store.add_decision(search, app_id, "applied", status_date)
+        if jd is not None and jd.has_text:
+            search_store.set_application_jd(search, app_id, jd.description.text_sha256, jd.path)
         if active is not None:
             ei_id = ei_store.insert_application(active.conn, sanitize(app, correlation_id))
             ei_store.add_status(active.conn, ei_id, "applied", status_date)
+            if jd is not None and jd.has_text:
+                ei_store.insert_job_description(active.conn, ei_id, ei_job_description(jd))
     return Recorded(correlation_id, label, warning)
 
 
@@ -217,6 +258,107 @@ def attach_snapshot(
     return to_ei is not None
 
 
+class AttachRefused(Exception):
+    """A later attach was refused, and nothing was written. The message is user-facing."""
+
+
+@dataclass(frozen=True)
+class Attached:
+    to_ei: bool  # the EI record got it too
+    jd_added: bool  # a new current JD (False when it was the current one already)
+    url_set: bool
+    snapshot_set: bool
+
+
+def _url_owner(search: sqlite3.Connection, url: str, posting_id: int) -> bool:
+    """True when another posting already has this URL, compared canonically."""
+    return any(
+        other != posting_id and urls.canonical(stored) == url
+        for other, stored in search_store.posting_urls(search)
+    )
+
+
+def attach_job_description(
+    search: sqlite3.Connection,
+    active: ActiveClaim | None,
+    correlation_id: str,
+    jd: SavedJd,
+    url: str | None = None,
+) -> Attached:
+    """Add a JD to an application recorded earlier, EI first (ADR-014).
+
+    With `url`, an empty URL is filled with its canonical form: an audited EI update,
+    and `postings.url` when that is empty. A URL that another posting has, or that
+    differs from the one recorded, is refused. The JD file becomes the job-ad snapshot
+    when the application has none. An application recorded under a claim that is not
+    the active one, or whose claim is sealed, is refused: its record can't change.
+    """
+    ref = search_store.jd_reference(search, correlation_id)
+    if ref is None:
+        raise ValueError(f"no application with correlation id {correlation_id}")
+    to_ei: ActiveClaim | None = None
+    if ref.ei_claim is not None:
+        if active is None or active.claim.label != ref.ei_claim:
+            raise AttachRefused(
+                f"That application is in the record for claim {ref.ei_claim}, which is not "
+                "the active claim, so its record can't change."
+            )
+        file_claim = read_file_claim(active.conn)
+        if file_claim is not None and file_claim.sealed_at is not None:
+            raise AttachRefused(
+                f"The record for claim {ref.ei_claim} is sealed, so it can't change."
+            )
+        to_ei = active
+    ei_row = None
+    if to_ei is not None:
+        ei_row = ei_store.application_fields(to_ei.conn, correlation_id)
+        if ei_row is None:
+            raise ClaimError(
+                f"application {correlation_id} is missing from the EI record for claim "
+                f"{to_ei.claim.label}; run `careerhunter doctor`"
+            )
+        if int(ei_row["voided"]):
+            raise AttachRefused("That application was voided, so it can't change.")
+    new_url = urls.canonical(url) if url else None
+    url_set = False
+    if new_url is not None:
+        recorded = [u for u in (ref.url, ei_row["posting_url"] if ei_row else None) if u]
+        if any(urls.canonical(u) != new_url for u in recorded):
+            raise AttachRefused("That application already has a different link.")
+        if ref.url is None and _url_owner(search, new_url, ref.posting_id):
+            raise AttachRefused("That link is already recorded for another posting.")
+        url_set = ref.url is None or (ei_row is not None and ei_row["posting_url"] is None)
+    sha = jd.description.text_sha256
+    current = ei_store.current_job_description(to_ei.conn, correlation_id) if to_ei else None
+    current_sha = current.text_sha256 if current else ref.jd_sha256
+    jd_added = jd.has_text and sha != current_sha
+    snapshot_set = ref.snapshot_path is None or (
+        ei_row is not None and ei_row["snapshot_path"] is None
+    )
+    try:
+        with ei_first(search, to_ei):
+            if new_url is not None and ref.url is None:
+                search_store.set_posting_url(search, ref.posting_id, new_url)
+            if ref.snapshot_path is None:
+                search_store.set_posting_snapshot(search, ref.posting_id, jd.path)
+            if jd_added:
+                search_store.set_application_jd(search, ref.application_id, sha, jd.path)
+            if to_ei is not None and ei_row is not None:
+                if new_url is not None and ei_row["posting_url"] is None:
+                    ei_store.set_posting_url(to_ei.conn, correlation_id, new_url)
+                if ei_row["snapshot_path"] is None:
+                    ei_store.set_snapshot_path(to_ei.conn, correlation_id, jd.path)
+                if jd_added:
+                    ei_store.insert_job_description(
+                        to_ei.conn, int(ei_row["id"]), ei_job_description(jd)
+                    )
+    except sqlite3.IntegrityError:
+        raise AttachRefused(
+            "That job description is already recorded for this application."
+        ) from None
+    return Attached(to_ei is not None, jd_added, url_set, snapshot_set)
+
+
 # --- Reconciliation -------------------------------------------------------------------
 
 
@@ -240,11 +382,15 @@ def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]
     gaps: list[Gap] = []
     links = search_store.claim_links(search)
     decisions = search_store.decision_sequences(search)
+    references = search_store.jd_references(search)
     for label, conn in sorted(records.items()):
         where = f"the EI record for claim {label}"
         file_claim = read_file_claim(conn)
         sealed = file_claim is not None and file_claim.sealed_at is not None
         statuses = ei_store.status_sequences(conn)
+        expected = ei_store.jd_expected(conn)
+        current = ei_store.current_job_descriptions(conn)
+        ei_urls = ei_store.posting_urls(conn)
         for corr in sorted(statuses):
             if corr not in links:
                 gaps.append(Gap(corr, f"in {where} but missing from search.db", "orphan"))
@@ -260,6 +406,7 @@ def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]
                 gaps.append(
                     Gap(corr, f"status history differs between claim {label} and search.db")
                 )
+            gaps.extend(_jd_gaps(corr, label, expected, current, ei_urls, references))
         for corr, claim_label in sorted(links.items()):
             if claim_label == label and corr not in statuses:
                 gaps.append(Gap(corr, f"in search.db but missing from {where}", "orphan"))
@@ -272,4 +419,28 @@ def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]
                     "orphan",
                 )
             )
+    return gaps
+
+
+def _jd_gaps(
+    corr: str,
+    label: str,
+    expected: dict[str, int],
+    current: dict[str, EiJobDescription],
+    ei_urls: dict[str, str | None],
+    references: dict[str, search_store.JdReference],
+) -> list[Gap]:
+    """jd_expected, the current JD's hash and the canonical URL, compared (ADR-024)."""
+    ref = references[corr]
+    gaps: list[Gap] = []
+    if expected.get(corr, 0) != ref.jd_expected:
+        gaps.append(Gap(corr, f"jd_expected differs between claim {label} and search.db"))
+    ei_sha = current[corr].text_sha256 if corr in current else None
+    if ei_sha != ref.jd_sha256:
+        gaps.append(Gap(corr, f"the current JD differs between claim {label} and search.db"))
+    ei_url, search_url = ei_urls.get(corr), ref.url
+    if (urls.canonical(ei_url) if ei_url else None) != (
+        urls.canonical(search_url) if search_url else None
+    ):
+        gaps.append(Gap(corr, f"the posting link differs between claim {label} and search.db"))
     return gaps

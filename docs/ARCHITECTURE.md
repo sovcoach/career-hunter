@@ -22,21 +22,24 @@ A small "storage guard" runs before every command and checks that the data folde
 | `secrets_store.py` | Keychain access through `keyring`. Allowlisted names only, plaintext backends refused, and values never printed. |
 | `config.py` | Validates `config.yaml` and `exclusions.yaml` and reports every problem at once. |
 | `db.py` | SQLite connections (WAL, `busy_timeout=5000`, foreign keys on; or read-only), the migration runner with one track per kind of file, and a transaction helper. A run of pending migrations is one `BEGIN IMMEDIATE` transaction, statement by statement, with no write lock when nothing is pending (ADR-004, #51). |
-| `resume.py` | Reads a PDF (pypdf) or DOCX (standard library) resume locally, with fixed errors and caps; imports its text to `resume/current.txt` with only the SHA-256 in `search.db`; and `load`, the only way scoring and embeddings read it (ADR-023). |
-| `migrations/search/`, `migrations/ei_record/` | Schema history, one track per kind of file. Each migration is applied once, and its checksum is recorded so edits are detected. The runner in `db.py` also creates `schema_migrations` and `db_identity`, and their four no-update and no-delete triggers. A fresh `search.db` therefore has 6 triggers (2 from its `0001_init.sql`), and a fresh EI record has 32 (28 from its `0001_init.sql`). |
+| `pdftext.py` | The text of a PDF with pypdf, under caps the caller sets: an encrypted PDF is refused before any page is read, failures are fixed reasons, and nothing pypdf logs leaves it. Shared by `resume.py` and `jobdesc.py`. |
+| `resume.py` | Reads a PDF (through `pdftext.py`) or DOCX (standard library) resume locally, with fixed errors and caps; imports its text to `resume/current.txt` with only the SHA-256 in `search.db`; and `load`, the only way scoring and embeddings read it (ADR-023). |
+| `migrations/search/`, `migrations/ei_record/` | Schema history, one track per kind of file. Each migration is applied once, and its checksum is recorded so edits are detected. The runner in `db.py` also creates `schema_migrations` and `db_identity`, and their four no-update and no-delete triggers. A fresh `search.db` therefore has 8 triggers (2 from its `0001_init.sql`, 1 from 0010 and 1 from 0020), and a fresh EI record has 37 (28 from its `0001_init.sql` and 5 from 0002). |
 | `models.py` | Plain record values: `Posting`, `Application`, `Activity`, `Dating`. |
 | `claims.py` | The `ei` config section, the per-precision claim check, creating each claim's file, the refusal to write while an earlier claim is unsealed, and sealing. |
 | `records.py` | Voids a mistaken application or activity with a reason, never deleting it; the schema's audit triggers log the change. |
-| `ledger.py` | Writes decisions to both layers in a fixed order, builds the sanitized EI copy, and reconciles the two layers. |
-| `selfsourced.py` | A self-sourced application in one step, for `careerhunter log` and the bot's `/log`: reads the link once for the company and title, saves the job-ad copy, and writes the posting and the application through one `ledger.record_application` call, under one correlation ID. |
-| `report.py` | `careerhunter report`: the one code path that attaches a claim's EI record to `search.db`, both read-only, to join them on `correlation_id` into a private report (ADR-014 as amended). |
+| `ledger.py` | Writes decisions to both layers in a fixed order, builds the sanitized EI copy, records and later attaches job descriptions, and reconciles the two layers, `jd_expected`, the current JD and the canonical link included. |
+| `selfsourced.py` | A self-sourced application in one step, for `careerhunter log` and the bot's `/log`: stores the link in its canonical form and matches a stored one canonically, reads the page for the company and title (never a LinkedIn page, which then needs both given), saves the job-ad copy and the JD's file, fetching the JD when none was given, and writes the posting, the application and the JD through one `ledger.record_application` call, under one correlation ID (ADR-024). |
+| `urls.py` | `canonical(url)`: a posting link without tracking parameters or fragment, LinkedIn job links as `https://www.linkedin.com/jobs/view/<id>/`, idempotent. `no_fetch(url)`: LinkedIn (`linkedin.com`, its subdomains, `lnkd.in`), which `fetch.py` refuses for every caller. |
+| `jobdesc.py` | A job description from a paste (verbatim), a PDF, HTML or text file (its type judged from its bytes), or an allowed fetch (JSON-LD or the ATS's JSON); its text hash; and its owner-only snapshot file (ADR-024). |
+| `report.py` | `careerhunter report`: the one code path that attaches a claim's EI record to `search.db`, both read-only, to join them on `correlation_id` into a private report (ADR-014 as amended). Each row shows the canonical link and a JD reference. |
 | `ei_store.py` | Reads and writes on one EI record file. It imports no search code and opens nothing itself. |
 | `search_store.py` | Reads and writes on `search.db`, including the posting identity rules. |
 | `seed.py` | Validates `seed.yaml`, runs the claim check, then imports each record into its layer. Idempotent by natural keys. |
-| `export.py` | Builds one claim's EI record for a date range as CSV and PDF, from that claim's file alone. |
+| `export.py` | Builds one claim's EI record for a date range as CSV and PDF, from that claim's file alone, with a JD reference per application, and writes the JDs and their original files into a private folder beside them. |
 | `bot.py` | The Telegram bot: the chat allowlist, commands, buttons and replies, writing through the ledger; fail-closed startup and the polling loop. On each successful poll it sends one alert digest per watch run, capped by `alerts.max_per_poll`, in lane order; one failure and one recovery message per component outage (#42); and, at `alerts.weekly_digest` in `schedule.timezone`, the weekly counts by lane (#43). It sends none of these while it can't read `config.yaml`. |
 | `telegram.py` | A minimal Bot API client (standard library plus `truststore`) whose errors never carry the token. Its errors say which kind of failure it was: no answer, HTTP 429, refused, or a reply that isn't the Bot API's JSON. |
-| `fetch.py` | Fetches a link safely: public addresses only, pinned to the checked address on every redirect hop. One 60-second deadline covers the lookup, every hop and the body, and the body is capped. Keeps a `Retry-After` header when the server sends one. A board-API GET asks for `application/json` (`accept=JSON`); that is a hint only, and the caller's JSON parse is the gate. `post_json` sends one JSON POST the same way (for Workday's job list) and does not follow a redirect. |
+| `fetch.py` | Fetches a link safely: public addresses only, pinned to the checked address on every redirect hop, and never a LinkedIn host (`urls.no_fetch`), on the first URL or any hop. One 60-second deadline covers the lookup, every hop and the body, and the body is capped. Keeps a `Retry-After` header when the server sends one. A board-API GET asks for `application/json` (`accept=JSON`); that is a hint only, and the caller's JSON parse is the gate. `post_json` sends one JSON POST the same way (for Workday's job list) and does not follow a redirect. |
 | `deadline.py` | A total time limit on a monotonic clock, a body read in chunks that honors it and a size cap, and the per-connection watchdog that shuts a socket down when time runs out. |
 | `loopback.py` | One HTTP exchange with a server on this Mac, used by scoring, embedding and discovery: loopback addresses only, no redirects, a total deadline and a size cap. Not `fetch.py`. |
 | `runlog.py` | A run's log file in `logs/`: each line written as it happens, mode 0600, never through a symlink. |
@@ -50,7 +53,7 @@ A small "storage guard" runs before every command and checks that the data folde
 | `htmltext.py` | A board's HTML job description as plain text, with the standard library only: unescaped once for Greenhouse, scripts and styles dropped, block tags as line breaks. Stores nothing. |
 | `watch.py` | One run of `careerhunter watch`: a discovery pass when due and the postings it found, then the boards, filter, posting age, then score, within a 600-second budget. One company's failure is isolated. Stores each posting's fit, lane and posted date, and records the run in `watch_runs`. Writes `search.db` only. Does not call Telegram. |
 | `ats.py` | The requests for one board and its jobs parsed from the replies: Greenhouse, Lever and Ashby lists; SmartRecruiters, BambooHR and Workday lists, then one detail per new posting; one posting by itself; and one request to confirm a discovered board. One byte budget per board. `Client.post_json` sends only to a subdomain of `myworkdayjobs.com` over https and refuses any other host before it is looked up, on top of the fetcher's address pinning. Field names checked against public docs or live public boards. |
-| `snapshots.py` | Job-ad snapshots: the page, an ATS's public JSON, or a PDF or screenshot sent to the bot. |
+| `snapshots.py` | Job-ad snapshots: the page or an ATS's public JSON. A JD's file is saved here too, and becomes the snapshot when there is none (ADR-024); a PDF or screenshot is still taken in reply to a request for the ad sent before 0.5.0. |
 | `service.py` | User LaunchAgents: the bot, kept running; `org.careerhunter.watch`, which runs `careerhunter watch` once per `schedule.watcher_interval_minutes` and exits; discovery runs inside that watch agent. Install retires `org.careerhunter.discover` from earlier versions. |
 | `scripts/check_no_datadir_paths.py` | Pre-commit hook that blocks staged content pointing into the data folder. |
 | `scripts/pre_push_guard.py` | Pre-push hook that refuses any push updating or deleting `main` (ADR-011). |
@@ -66,8 +69,8 @@ A small "storage guard" runs before every command and checks that the data folde
 ├── config.yaml                           ← your search settings and EI claims (from config.example.yaml)
 ├── exclusions.yaml                       ← companies/keywords to skip
 ├── seed.yaml                             ← one-off import of past history
-├── exports/                              ← EI reports, timestamped, never overwritten
-├── snapshots/<YYYY>/                     ← copies of job ads (0600; ADR-017)
+├── exports/                              ← EI reports, timestamped, never overwritten; each with a <stem>-job-descriptions/ folder (0700) when it has JDs
+├── snapshots/<YYYY>/                     ← copies of job ads and job descriptions (0600; ADR-017, ADR-024)
 ├── logs/                                 ← bot.log, bot.heartbeat, watch.log, discover.log, *.success (0600)
 ├── resume/current.txt                    ← the imported resume's text (folder 0700, file 0600; ADR-023)
 ├── reports/                              ← `careerhunter report` output (0600), made on first use
@@ -117,6 +120,7 @@ companies 1──* postings 1──* applications 1──* decision_history
 - `postings.key_requirements` and `postings.score_run_id` (search migration 0011): up to three short requirements the model took from the posting (a JSON array, or null), and the `watch_runs` row of the run that last gave the posting its score or fit. The digest sends the first and groups by the second.
 - `companies.ats_host` and `companies.ats_site` (search migration 0012): a Workday board's wdN host and site, null for every other ATS. The same migration rebuilds `discovery_candidates` so a queued board can be any of the six ATS types the watcher reads, carry Workday's host and site, and have the status `gone`; nothing references that table, so the rebuild needs no foreign-key pragma.
 - `postings.posted_date` (search migration 0013): the posted date the board gave, in UTC, or null.
+- `applications.jd_expected`, `jd_sha256` and `jd_path` (search migration 0020): whether a JD was expected (0 for applications from before it, fixed by a trigger), the current JD's text hash, and its snapshot file. The text itself is only in that file and in the EI record (ADR-024).
 - `postings.ats_key` (search migration 0015, unique when set): `<ats_type>:<board>:<posting id>`, the posting's identity on its board, set when the watcher stores or meets it. Discovery checks it before fetching a posting, so a Greenhouse posting whose `absolute_url` is on the company's own domain is still known. The watcher matches a stored posting on it before the URL, and a posting whose key is stored gets no detail request. A Workday key is `workday:<tenant>:<host>:<site>:<id>`, where `<id>` is the trailing `_<id>` of the `externalPath`, as it is: on a live public board that is the tail of `jobPostingInfo.jobPostingId` and begins with `jobReqId` (`JREQ205219-7` for `JREQ205219`), so two postings of one requisition stay apart and a retitled or moved posting keeps its key (not verified across a real retitle). A path without that tail keys on the whole path. Search migration 0019 clears Workday keys stored in the older whole-path form; the watcher sets the new one when it next meets the posting by its URL.
 - `skips.by_operator` (search migration 0016) is 1 for a skip the operator chose with the bot's Skipped button and 0 for one the watcher wrote. Only an operator skip suppresses a repost (`already_handled`). Skips stored before 0016 keep 0, because their reason text can't tell the two apart; `reason` stays free text.
 - `alert_refusals` (search migration 0017): one row per posting Telegram refused when it was sent alone, with the count, the last refusal and, after three, when the bot gave it up. The row goes once Telegram accepts the posting. Transport failures, bad replies and HTTP 429 are not counted.
@@ -133,10 +137,11 @@ companies 1──* postings 1──* applications 1──* decision_history
 ```
 claim (one row: label, start, end, sealed_at)
 applications 1──* status_history          activities
+applications 1──* job_descriptions        (EI migration 0002; append-only)
 edits        (audit log of every permitted UPDATE, written by triggers)
 ```
 
-- **Only EI fields:** employer, role, location, work model, posting URL, date and precision, method, the snapshot and resume references, and the void columns. There is no fit, gap, LLM, skip, scout or notes column anywhere, and tests hold the schema to an exact allowlist.
+- **Only EI fields:** employer, role, location, work model, posting URL, date and precision, method, the snapshot and resume references, `jd_expected`, the void columns, and each job description (its text, hash, `jd_source` and file). There is no fit, gap, LLM, skip, scout or notes column anywhere, and tests hold the schema to an exact allowlist.
 - **Dates:** ISO text. Applications and activities carry a `date_precision`:
   - `exact`: a real date;
   - `week`: `week_of`, always a Monday;
@@ -148,7 +153,7 @@ edits        (audit log of every permitted UPDATE, written by triggers)
   - in an EI record: an application as employer + role + location + posting URL + date, and an activity as type + description + date or week.
 - **Retention and corrections** (EI records):
   - Every table has a `BEFORE DELETE` trigger that aborts, and nothing cascades.
-  - `status_history` and `edits` are append-only. Status changes are new rows, and the current status is the latest row.
+  - `status_history`, `job_descriptions` and `edits` are append-only. Status changes are new rows, and the current status is the latest row; so is the current JD. `jd_expected` never changes.
   - Mistaken applications and activities are **voided**: they need a reason, stay in the file, are left out of exports, and are frozen afterwards.
   - Every permitted UPDATE is written column-by-column to `edits` by triggers, so nothing can change without a trail.
   - `id`, `correlation_id` and `created_at` never change. The claim's label and start never change.

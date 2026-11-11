@@ -10,8 +10,12 @@ The two layers are linked only by the random `correlation_id`; there are no fore
 keys across files. The report is a private file, `reports/report-<claim>-<utc>.txt`,
 mode 0600, in the data folder, never overwritten; the terminal prints only its path
 relative to the data folder. It holds the EI facts of each application (employer, role,
-date, method, the latest EI status) beside the search side's lane, fit word and source,
-and counts by lane. Orphans on either side are counted, not listed: `doctor` names them.
+date, method, the latest EI status, the canonical link and a JD reference, ADR-024)
+beside the search side's lane, fit word and source, and counts by lane. The JD
+reference is the EI record's current JD, `JD <first 8 of sha256> (<source>)`, or `JD
+missing`, or `JD missing (pre-feature)`; a claim file still at EI migration 0001 has
+no JDs, and every row of it is pre-feature. Orphans on either side are counted, not
+listed: `doctor` names them.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from careerhunter import db
+from careerhunter import db, ei_store, urls
 
 FOLDER = "reports"
 
@@ -41,6 +45,8 @@ class Row:
     lane: str
     fit: str
     source: str
+    link: str = "no link"
+    jd: str = "JD missing (pre-feature)"
 
 
 @dataclass(frozen=True)
@@ -67,7 +73,8 @@ def connect(search_path: Path, ei_path: Path) -> sqlite3.Connection:
 
 
 _ROWS = """
-SELECT e.employer, e.role, e.date_precision, e.date_applied, e.week_of, e.method, e.voided,
+SELECT e.correlation_id, e.employer, e.role, e.date_precision, e.date_applied, e.week_of,
+       e.method, e.voided, e.posting_url, p.url,
        (SELECT h.status FROM ei.status_history h WHERE h.application_id = e.id
         ORDER BY h.id DESC LIMIT 1) AS ei_status,
        p.lane, p.lane_checked, p.fit, p.source
@@ -87,10 +94,36 @@ WHERE a.ei_claim = ?
 """
 
 
+_CURRENT_JDS = """
+SELECT a.correlation_id, j.text_sha256, j.jd_source
+FROM ei.job_descriptions j JOIN ei.applications a ON a.id = j.application_id
+WHERE j.id = (SELECT max(id) FROM ei.job_descriptions WHERE application_id = j.application_id)
+"""
+
+
+def _ei_jds(conn: sqlite3.Connection) -> tuple[dict[str, int], dict[str, tuple[str, str]]]:
+    """jd_expected and the current JD (hash, source) per correlation id, in `ei`."""
+    columns = {r["name"] for r in conn.execute("PRAGMA ei.table_info(applications)")}
+    expected: dict[str, int] = {}
+    if "jd_expected" in columns:
+        expected = {
+            str(r[0]): int(r[1])
+            for r in conn.execute("SELECT correlation_id, jd_expected FROM ei.applications")
+        }
+    has_table = conn.execute(
+        "SELECT 1 FROM ei.sqlite_master WHERE type = 'table' AND name = 'job_descriptions'"
+    ).fetchone()
+    current: dict[str, tuple[str, str]] = {}
+    if has_table:
+        current = {str(r[0]): (str(r[1]), str(r[2])) for r in conn.execute(_CURRENT_JDS)}
+    return expected, current
+
+
 def build(conn: sqlite3.Connection, claim: str) -> Report:
     """Read the joined rows and the orphan counts. Voided EI rows are counted, not shown."""
     rows: list[Row] = []
     voided = 0
+    expected, current = _ei_jds(conn)
     for r in conn.execute(_ROWS):
         if r["voided"]:
             voided += 1
@@ -105,6 +138,8 @@ def build(conn: sqlite3.Connection, claim: str) -> Report:
                 lane=_lane(r["lane"], r["lane_checked"]),
                 fit=str(r["fit"]).capitalize() if r["fit"] else "not scored",
                 source=str(r["source"]),
+                link=_link(r["posting_url"] or r["url"]),
+                jd=_jd(str(r["correlation_id"]), expected, current),
             )
         )
     only_ei = int(conn.execute(_ONLY_EI).fetchone()[0])
@@ -141,7 +176,8 @@ def render(report: Report, now: dt.datetime) -> str:
     for row in report.rows:
         lines.append(
             f"  {row.when}  {row.employer} — {row.role}  | {row.method} | EI status: "
-            f"{row.ei_status} | lane: {row.lane} | fit: {row.fit} | source: {row.source}"
+            f"{row.ei_status} | lane: {row.lane} | fit: {row.fit} | source: {row.source} | "
+            f"{row.jd} | {row.link}"
         )
     if not report.rows:
         lines.append("  none")
@@ -168,6 +204,15 @@ def _when(precision: object, day: object, week: object) -> str:
     if precision == "week" and week:
         return f"week of {week}"
     return "date unknown"
+
+
+def _link(url: object) -> str:
+    return urls.canonical(str(url)) if url else "no link"
+
+
+def _jd(corr: str, expected: dict[str, int], current: dict[str, tuple[str, str]]) -> str:
+    sha, source = current.get(corr, (None, None))
+    return ei_store.jd_reference(sha, source, expected.get(corr, 0))
 
 
 def _lane(lane: object, checked: object) -> str:

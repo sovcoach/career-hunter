@@ -19,11 +19,12 @@ import pytest
 from careerhunter import db, search_store, selfsourced
 from careerhunter.models import Dating
 from tests import test_bot
-from tests.test_bot import AD_URL, PDF, Env, ei_apps
+from tests.test_bot import AD_URL, Env, ei_apps
 
 env = test_bot.env  # the bot fixture, shared with test_bot
 
 STORED_URL = "https://jobs.example.com/ads/stored"
+JD_FILE = b"Synthetic planner duties at Example Robotics.\n"
 DAY = "2026-10-21"
 
 TEXT = {
@@ -46,6 +47,8 @@ TEXT = {
     "health_at": "2031-02-03T04:05:09Z",
     "useful_at": "2031-02-03T04:05:10Z",
     "run_started": "2031-02-03T04:05:11Z",
+    "jd_sha256": "a5" * 32,
+    "jd_path": "snapshots/2031/sentinel-jd-e4.txt",
 }
 COSINE = 0.7311073133
 VECTOR = struct.pack("<4f", 0.11, 0.22, 0.33, 0.44)
@@ -133,6 +136,18 @@ def _stored(env: Env, url: str, title: str, *, first: bool = True) -> int:
         conn.close()
 
 
+def _plant_jd(env: Env) -> None:
+    """search migration 0020's JD fields. EI keeps its own JD rows; these never go there."""
+    conn = db.connect(env.datadir.search_db_path)
+    try:
+        conn.execute(
+            "UPDATE applications SET jd_sha256 = ?, jd_path = ?",
+            (TEXT["jd_sha256"], TEXT["jd_path"]),
+        )
+    finally:
+        conn.close()
+
+
 def _ei_bytes(env: Env) -> bytes:
     path = env.datadir.ei_record_path(test_bot.ACTIVE.label)
     return b"".join(part.read_bytes() for part in db.db_files(path) if part.exists())
@@ -150,11 +165,12 @@ def test_no_learning_field_reaches_an_ei_file(
     env.web.routes[STORED_URL] = test_bot.SHELL
     # Applied from an alert: the stored posting, with every field planted.
     env.bot._finish_apply(posting_id, "email", Dating("exact", day=DAY))
+    _plant_jd(env)  # search.db's JD reference fields, on every application so far
     env.say("/status a1 screening")
-    # /log in one step on a link already stored, then the upload it asks for.
+    # /log in one step on a link already stored, then the JD file it asks for.
     env.say(f"/log {STORED_URL} | referral | {DAY} | Example Robotics | Synthetic Planner")
-    env.api.files["documents/f1.bin"] = PDF
-    env.say(reply_to=env.prompt_id(), document={"file_id": "f1", "file_size": len(PDF)})
+    env.api.files["documents/f1.bin"] = JD_FILE
+    env.say(reply_to=env.prompt_id(), document={"file_id": "f1", "file_size": len(JD_FILE)})
     env.say("/activity networking 2026-10-22 Synthetic meetup")
     # careerhunter log goes through the same selfsourced.record.
     with env.bot._writable(env.bot._config()) as (search, active):
@@ -177,7 +193,8 @@ def test_no_learning_field_reaches_an_ei_file(
         statuses = [r[0] for r in ei.execute("SELECT status FROM status_history ORDER BY id")]
         assert statuses == ["applied", "screening", "applied", "applied"]
         assert ei.execute("SELECT count(*) FROM activities").fetchone()[0] == 1
-        assert ei.execute("SELECT count(*) FROM edits").fetchone()[0] == 1  # the upload
+        assert ei.execute("SELECT count(*) FROM edits").fetchone()[0] == 1  # the JD file
+        assert ei.execute("SELECT count(*) FROM job_descriptions").fetchone()[0] == 1
     finally:
         ei.close()
     found = _ei_bytes(env)
@@ -223,6 +240,8 @@ def test_the_ei_schema_has_no_learning_column(env: Env) -> None:
         "gaps",
         "llm_output",
         "notes",
+        "jd_sha256",
+        "jd_path",
     ):
         assert learning not in columns
     for table in (

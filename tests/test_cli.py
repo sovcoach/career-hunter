@@ -78,7 +78,7 @@ def test_full_flow(inited: Path, probe: FakeProbe, capsys: pytest.CaptureFixture
     set_claims(inited, ACTIVE.label, ACTIVE)
     assert run(["migrate"], probe) == 0
     out = capsys.readouterr().out
-    assert "ei_record_2026-27.db: created; schema version 1" in out
+    assert "ei_record_2026-27.db: created; schema version 2" in out
     assert (inited / "ei_record_2026-27.db").stat().st_mode & 0o777 == 0o600
 
     shutil.copyfile(FIXTURES / "seed_synthetic.yaml", inited / "seed.yaml")

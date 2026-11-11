@@ -7,8 +7,10 @@ Capturing a page, best source first:
 2. **The ATS's public JSON**, for pages that are only a JavaScript shell. Workday's
    `/wday/cxs/...` endpoint, and the documented Greenhouse, Lever and Ashby APIs, return
    the posting's description. It is saved as a small HTML page that embeds the JSON.
-3. Otherwise, **nothing**: the bot then asks for a PDF or screenshot of the ad, which
-   is checked to really be a PDF, PNG or JPEG and saved the same way.
+3. Otherwise, **nothing**: the bot asks for the job description instead, and a JD file
+   sent in reply becomes the snapshot (ADR-024). A request for a PDF or screenshot of
+   the ad sent by an earlier version still takes one, checked to really be a PDF, PNG
+   or JPEG and saved the same way.
 
 Files go in snapshots/<YYYY>/<random>.<ext> under the data directory, created owner-only
 (0600, folders 0700) and never overwritten. Paths are stored relative to the data
@@ -132,6 +134,15 @@ def posting_info(html: bytes) -> PostingInfo:
             location = ", ".join(b for b in bits if b) or None
         return PostingInfo(_text(job.get("title")), company, location)
     return PostingInfo(title=_text(page.title))
+
+
+def posting_description(html: bytes) -> str | None:
+    """The first JSON-LD `JobPosting.description` on the page, as it is (often HTML)."""
+    for job in _job_postings(_parse(html).json_ld):
+        value = job.get("description")
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
 def is_readable(html: bytes) -> bool:

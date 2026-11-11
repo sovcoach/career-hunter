@@ -7,6 +7,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Each application keeps its job description (ADR-024). EI migration 0002 adds an append-only `job_descriptions` table (the text verbatim, its SHA-256, `jd_source` and its snapshot file) and `applications.jd_expected`; search migration 0020 adds `applications.jd_expected`, `jd_sha256` and `jd_path`. Applications recorded before them get `jd_expected` 0 and show as pre-feature; every application recorded from now on gets 1. A corrected JD is a new row, and the latest is current.
+- `/log <link> | method | date [| Company | Title]` takes the job description on the lines after it. Telegram splits a long paste into several messages, so plain text messages that follow within 4 seconds of each other are joined to it with a blank line between each (Telegram splits at blank lines and drops them), and the application is recorded once they stop. A pasted job description is stored as Telegram delivered it: Telegram turns tabs into spaces and trims trailing spaces, so a file is the way to keep the exact text. A PDF, HTML or text file captioned with the `/log` line is the job description too. Without one (and none on the page), the application is recorded and the reply asks for the job description as a reply. A text that arrives just after the window gets a reply saying to send the whole description as a `.txt` reply to the `Recorded` message. No reply repeats a job description, and the bot log counts only its messages.
+- `careerhunter log` takes `--jd-file PATH` (PDF, HTML or text) or `--jd-stdin`, not both. Without either, `/log` and `careerhunter log` fetch the job description from the page's JSON-LD or the ATS's public JSON.
+- An encrypted PDF is refused, and nothing is saved. A PDF with no text, such as a scan, is kept as the job-ad copy, and the application stays flagged until the job description is sent as text.
+- A job description's file becomes the job-ad snapshot when there is none, so LinkedIn applications get one (ADR-017 as amended).
+- `doctor` has a `job descriptions` line: WARN with the count of applications missing one, `--` with the count from before job descriptions were kept.
+- `careerhunter report` shows each application's canonical link and its job description by reference: `JD <first 8 of sha256> (<source>)`, `JD missing` or `JD missing (pre-feature)`. The export's CSV and PDF get the same column, and the export writes a `<stem>-job-descriptions/` folder (0700) with one `.txt` per application (a header, then the verbatim text) and a copy of each original file (0600). Both still read a claim file at EI schema 1.
+- `reconcile` (and so `doctor`) also compares `jd_expected`, the current job description's hash and the canonical link between the two layers.
+
+### Changed
+- A logged link is saved in its canonical form: lowercase scheme and host, no fragment, no tracking parameters (`utm_*`, `trk`, `refId`, `trackingId`, `gclid`, `fbclid`, `gh_src` and the like), and LinkedIn job links as `https://www.linkedin.com/jobs/view/<id>/`. Links already stored are left as they are and compared canonically. The watcher's links are unchanged.
+- LinkedIn is never fetched: `fetch.py` refuses `linkedin.com`, its subdomains and `lnkd.in` for every caller, on the first link and every redirect hop. A LinkedIn `/log` or `careerhunter log` needs the company and title, and the refusal says how to give them. SETUP suggests logging the company career-site link the posting leads to instead.
+- A `/log` with no job description, and every Applied from an alert, asks for the job description instead of a PDF or screenshot of the ad: the watcher keeps no description to attach. A reply with a file also becomes the ad copy when none was saved. A request for the ad sent before this version still takes a PDF or image.
+- The PDF reader moved from `resume.py` to `pdftext.py`, shared with job descriptions. Resume import behaves as before.
+- `search.db` moves to schema version 20 and the EI record to version 2. Back up and run `careerhunter migrate`. A sealed claim's file is not migrated, and is still read.
+
 ## [0.4.0] - 2026-11-10
 
 ### Added

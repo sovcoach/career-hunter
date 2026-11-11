@@ -8,7 +8,7 @@ an Activity built by the caller, carrying only the fields the EI record holds.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import astuple, dataclass, fields
+from dataclasses import astuple, dataclass, field, fields
 
 from careerhunter.models import Activity, Dating
 
@@ -29,6 +29,20 @@ class EiApplication:
     method: str
     snapshot_path: str | None
     resume_file: str | None
+    jd_expected: int  # 1 for every application recorded since EI migration 0002
+
+
+@dataclass(frozen=True)
+class EiJobDescription:
+    """One job description as the EI record stores it: the text verbatim, its hash,
+    its source, and its snapshot file (relative to the data folder)."""
+
+    text: str = field(repr=False)
+    text_sha256: str
+    source: str
+    file_path: str | None
+    file_sha256: str | None
+    file_type: str | None
 
 
 EI_APPLICATION_FIELDS = tuple(f.name for f in fields(EiApplication))
@@ -69,6 +83,32 @@ def application_id(conn: sqlite3.Connection, correlation_id: str) -> int | None:
     return int(row["id"]) if row else None
 
 
+def application_fields(conn: sqlite3.Connection, correlation_id: str) -> sqlite3.Row | None:
+    """id, posting_url, snapshot_path and voided of one application, or None."""
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT id, posting_url, snapshot_path, voided FROM applications WHERE correlation_id = ?",
+        (correlation_id,),
+    ).fetchone()
+    return row
+
+
+def set_posting_url(conn: sqlite3.Connection, correlation_id: str, url: str) -> None:
+    """Fill an empty posting URL. An audited update (the edits trigger records it)."""
+    conn.execute(
+        "UPDATE applications SET posting_url = ? WHERE correlation_id = ? AND posting_url IS NULL",
+        (url, correlation_id),
+    )
+
+
+def set_snapshot_path(conn: sqlite3.Connection, correlation_id: str, path: str) -> None:
+    """Fill an empty snapshot path. An audited update."""
+    conn.execute(
+        "UPDATE applications SET snapshot_path = ? WHERE correlation_id = ? "
+        "AND snapshot_path IS NULL",
+        (path, correlation_id),
+    )
+
+
 def add_status(
     conn: sqlite3.Connection, application_id: int, status: str, status_date: str | None
 ) -> None:
@@ -106,3 +146,105 @@ def status_sequences(conn: sqlite3.Connection) -> dict[str, list[tuple[str, str 
     ):
         sequences[r["correlation_id"]].append((r["status"], r["status_date"]))
     return sequences
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def has_job_descriptions(conn: sqlite3.Connection) -> bool:
+    """False for a file still at EI migration 0001 (a sealed claim's, say)."""
+    return _has_table(conn, "job_descriptions")
+
+
+def insert_job_description(
+    conn: sqlite3.Connection, application_id: int, jd: EiJobDescription
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO job_descriptions (application_id, text, text_sha256, jd_source, file_path, "
+        "file_sha256, file_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            application_id,
+            jd.text,
+            jd.text_sha256,
+            jd.source,
+            jd.file_path,
+            jd.file_sha256,
+            jd.file_type,
+        ),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def _jd(row: sqlite3.Row) -> EiJobDescription:
+    return EiJobDescription(
+        text=str(row["text"]),
+        text_sha256=str(row["text_sha256"]),
+        source=str(row["jd_source"]),
+        file_path=row["file_path"],
+        file_sha256=row["file_sha256"],
+        file_type=row["file_type"],
+    )
+
+
+_CURRENT_JDS = (
+    "SELECT a.correlation_id, j.text, j.text_sha256, j.jd_source, j.file_path, j.file_sha256, "
+    "j.file_type FROM job_descriptions j JOIN applications a ON a.id = j.application_id "
+    "WHERE j.id = (SELECT max(id) FROM job_descriptions WHERE application_id = j.application_id)"
+)
+
+
+def current_job_description(
+    conn: sqlite3.Connection, correlation_id: str
+) -> EiJobDescription | None:
+    """The application's current JD (its latest row), or None. A 0001 file has none."""
+    if not has_job_descriptions(conn):
+        return None
+    row = conn.execute(_CURRENT_JDS + " AND a.correlation_id = ?", (correlation_id,)).fetchone()
+    return _jd(row) if row else None
+
+
+def current_job_descriptions(conn: sqlite3.Connection) -> dict[str, EiJobDescription]:
+    """Every application's current JD, keyed by correlation id. A 0001 file has none."""
+    if not has_job_descriptions(conn):
+        return {}
+    return {str(r["correlation_id"]): _jd(r) for r in conn.execute(_CURRENT_JDS)}
+
+
+def jd_expected(conn: sqlite3.Connection) -> dict[str, int]:
+    """Every application's jd_expected, keyed by correlation id; 0 on a 0001 file."""
+    has_column = any(
+        r["name"] == "jd_expected" for r in conn.execute("PRAGMA table_info(applications)")
+    )
+    if not has_column:
+        return {
+            str(r["correlation_id"]): 0
+            for r in conn.execute("SELECT correlation_id FROM applications")
+        }
+    return {
+        str(r["correlation_id"]): int(r["jd_expected"])
+        for r in conn.execute("SELECT correlation_id, jd_expected FROM applications")
+    }
+
+
+def posting_urls(conn: sqlite3.Connection) -> dict[str, str | None]:
+    """Every application's posting URL, as stored, keyed by correlation id."""
+    return {
+        str(r["correlation_id"]): r["posting_url"]
+        for r in conn.execute("SELECT correlation_id, posting_url FROM applications")
+    }
+
+
+def jd_reference(text_sha256: str | None, source: str | None, jd_expected: int) -> str:
+    """How a report or an export names an application's JD (ADR-024).
+
+    Any JD shows its reference, `JD <first 8 of sha256> (<source>)`, even before the
+    feature. With none, `JD missing`, or `JD missing (pre-feature)` for an application
+    recorded before a JD was expected.
+    """
+    if text_sha256:
+        return f"JD {text_sha256[:8]} ({source})"
+    return "JD missing" if jd_expected else "JD missing (pre-feature)"

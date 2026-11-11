@@ -1024,3 +1024,56 @@ def test_a_request_body_over_its_cap_is_refused_without_a_lookup() -> None:
             connector=FakeWeb({}).connector,
         )
     assert resolve.calls == []
+
+
+def _no_lookup(host: str, port: int, timeout: float) -> list[str]:
+    raise AssertionError("a never-fetched host must be refused before any lookup")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://linkedin.com/jobs/view/4000000001/",
+        "https://www.linkedin.com/jobs/view/4000000001/",
+        "https://ca.linkedin.com/jobs/view/4000000001/",
+        "http://WWW.LINKEDIN.COM./jobs",
+        "https://lnkd.in/abcdef",
+    ],
+)
+def test_linkedin_is_refused_before_any_lookup_or_socket(url: str) -> None:
+    web = FakeWeb({})
+    with pytest.raises(f.FetchRefused, match="LinkedIn"):
+        f.fetch(url, resolver=_no_lookup, connector=web.connector)
+    assert web.dialled == []
+
+
+def test_a_post_to_linkedin_is_refused_before_any_lookup() -> None:
+    web = FakeWeb({})
+    with pytest.raises(f.FetchRefused, match="LinkedIn"):
+        f.post_json(
+            "https://www.linkedin.com/x", {"a": 1}, resolver=_no_lookup, connector=web.connector
+        )
+    assert web.dialled == []
+
+
+@pytest.mark.parametrize(
+    "location", ["https://www.linkedin.com/jobs/view/4000000001/", "https://lnkd.in/abc"]
+)
+def test_a_redirect_to_linkedin_is_refused(location: str) -> None:
+    web = FakeWeb({"https://jobs.example.com/a": FakeResponse(302, {"Location": location})})
+    resolve = resolver({"jobs.example.com": [PUBLIC]})
+    with pytest.raises(f.FetchRefused, match="LinkedIn"):
+        f.fetch("https://jobs.example.com/a", resolver=resolve, connector=web.connector)
+    assert resolve.calls == ["jobs.example.com"]
+    assert len(web.dialled) == 1
+
+
+def test_a_host_that_only_contains_the_name_is_fetched() -> None:
+    web = FakeWeb({"https://notlinkedin.com/ad": FakeResponse()})
+    got = f.fetch(
+        "https://notlinkedin.com/ad",
+        resolver=resolver({"notlinkedin.com": [PUBLIC]}),
+        connector=web.connector,
+    )
+    assert got.status == 200
+    assert web.dialled == [("https", "notlinkedin.com", PUBLIC, 443)]
