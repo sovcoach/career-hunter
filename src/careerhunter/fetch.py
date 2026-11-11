@@ -3,7 +3,8 @@
 A URL sent to the bot is fetched from the Mac mini, which sits on a private network. So
 before each request (the first and every redirect hop):
 
-1. the URL must be http or https, with no user name or password in it;
+1. the URL must be http or https, with no user name or password in it, and its host
+   must not be one that is never fetched (`urls.no_fetch`: LinkedIn, for every caller);
 2. the host is resolved once, and every address it resolves to must be public (not
    loopback, private, link-local, carrier-grade NAT, multicast, reserved or
    unspecified; an IPv4 address mapped into IPv6 is checked as IPv4);
@@ -56,6 +57,7 @@ from careerhunter.deadline import (
     read_capped,
 )
 from careerhunter.deadline import start_timer as _timer
+from careerhunter.urls import no_fetch_host
 
 MAX_BYTES = 5 * 1024 * 1024
 MAX_POST_BYTES = 64 * 1024  # the request body of one POST
@@ -238,6 +240,8 @@ def _target(
     host = parts.hostname
     if not host:
         raise FetchRefused("the link has no host")
+    if no_fetch_host(host):
+        raise FetchRefused("LinkedIn pages are never fetched")
     try:
         port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError as exc:
