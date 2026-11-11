@@ -29,6 +29,7 @@ import yaml
 from careerhunter import (
     __version__,
     ats,
+    backfill,
     bot,
     claims,
     db,
@@ -70,6 +71,7 @@ from careerhunter.fetch import JSON, Fetched, post_json
 from careerhunter.fetch import fetch as fetch_url
 from careerhunter.filters import PostingText
 from careerhunter.ledger import PartialWriteError, reconcile
+from careerhunter.models import Dating
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.runlog import RunLog, RunLogError
 from careerhunter.score import Score, score_posting
@@ -235,6 +237,171 @@ def cmd_seed(datadir: DataDir, args: argparse.Namespace) -> int:
     for entry in result.search_only:
         print(f"search.db only: {entry}")
     return EXIT_OK
+
+
+def cmd_import(datadir: DataDir, args: argparse.Namespace) -> int:
+    """Backfill earlier applications and their JDs from a JSON file under imports/.
+
+    One line per entry: its number, its class, and what it writes in each layer (a JD
+    as its hash and length only; its text is never printed). `--dry-run` writes
+    nothing at all. Exit 0 when every entry is done or unchanged, 1 when any is
+    ambiguous, in conflict or refused (after the rest are applied), and 2 when a guard
+    refuses: the file is not under imports/, or an earlier claim's record is unsealed.
+    """
+    doc = _config_doc(datadir)
+    settings = settings_from_config(doc) if doc else ClaimSettings()
+    today = config_today(doc)
+    try:
+        parsed = backfill.load(datadir, args.file, today)
+    except backfill.ImportPathError as exc:
+        _err(f"REFUSING TO IMPORT: {exc}")
+        return EXIT_GUARD
+    except backfill.ImportFileError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    blockers = claims.write_blockers(datadir, settings)
+    if blockers:
+        _err("REFUSING TO IMPORT until these are fixed:")
+        for problem in blockers:
+            _err(f"  - {problem}")
+        return EXIT_GUARD
+    route = args.route_out_of_claim
+    if args.dry_run:
+        with _read_only_record(datadir, settings) as (search, record):
+            planned = backfill.plan(search, record, parsed, route_out_of_claim=route)
+        print(f"dry run: nothing is written. {_describe_claim(record.claim)}")
+        _print_plan(planned)
+        return _import_exit([item.kind for item in planned])
+    with _writable(datadir) as w:
+        record = (
+            backfill.Record(w.active.claim, w.active.conn) if w.active else backfill.Record(None)
+        )
+        planned = backfill.plan(w.search, record, parsed, route_out_of_claim=route)
+        print(_describe_claim(record.claim))
+        _print_plan(planned)
+        outcomes = backfill.apply(datadir.root, w.search, w.active, planned, today)
+    for item, outcome in zip(planned, outcomes, strict=True):
+        if outcome.kind != item.kind:
+            print(f"{outcome.number:3} {outcome.kind.upper():9} not written: {outcome.detail}")
+    return _import_exit([outcome.kind for outcome in outcomes])
+
+
+def _describe_claim(claim: claims.Claim | None) -> str:
+    if claim is None:
+        return "No active EI claim: applications go to search.db only."
+    return f"EI claim {claim.label} ({claim.period})."
+
+
+@contextmanager
+def _read_only_record(
+    datadir: DataDir, settings: ClaimSettings
+) -> Iterator[tuple[sqlite3.Connection, backfill.Record]]:
+    """search.db and the active claim's record, read-only, for a dry run. Both must be
+    migrated already: a dry run never applies a migration or creates a file."""
+    if not datadir.search_db_path.is_file():
+        raise ValueError("search.db doesn't exist yet; run: careerhunter init")
+    search = db.connect_read_only(datadir.search_db_path)
+    ei: sqlite3.Connection | None = None
+    try:
+        _require_current(search, "search", "search.db")
+        claim = settings.active
+        if claim is not None and datadir.ei_record_path(claim.label).is_file():
+            ei = db.connect_read_only(datadir.ei_record_path(claim.label))
+            _require_current(ei, "ei_record", f"the record for claim {claim.label}")
+            file_claim = claims.read_file_claim(ei)
+            if file_claim is not None and file_claim.sealed_at is not None:
+                raise ClaimError(
+                    f"claim {claim.label} was sealed on {file_claim.sealed_at}, so it can't be "
+                    "the active claim. Start a new claim in config.yaml"
+                )
+        yield search, backfill.Record(claim, ei)
+    finally:
+        if ei is not None:
+            ei.close()
+        search.close()
+
+
+def _require_current(conn: sqlite3.Connection, track: str, name: str) -> None:
+    if db.schema_version(conn) != db.latest_version(track):
+        raise ValueError(f"{name} needs a migration first; run: careerhunter migrate")
+
+
+def _import_exit(kinds: list[str]) -> int:
+    return EXIT_OK if all(kind in backfill.DONE for kind in kinds) else EXIT_ERROR
+
+
+def _dating_text(dating: Dating) -> str:
+    if dating.precision == "week":
+        return f"the week of {dating.week_of}"
+    return str(dating.day)
+
+
+def _jd_text(jd: jobdesc.JobDescription | None) -> str:
+    if jd is None:
+        return "no JD (flagged as missing)"
+    if not jd.has_text:
+        return "a JD file with no text, kept as the job-ad copy only"
+    return f"JD sha256 {jd.text_sha256} ({len(jd.text):,} characters)"
+
+
+def _app_text(app: search_store.StoredApplication) -> str:
+    return (
+        f"app {app.application_id} ({_dating_text(app.dating)}, {app.company} / {app.title}"
+        f"{', ' + app.url if app.url else ''})"
+    )
+
+
+def _plan_line(item: backfill.Planned) -> list[str]:
+    head = f"{item.number:3} {item.kind.upper():9}"
+    entry = item.entry
+    why = "; ".join(item.reasons)
+    if entry is None:
+        return [f"{head} {item.label}: {why}"]
+    named = f"{entry.employer} / {entry.role}, {_dating_text(entry.dating)}"
+    if item.kind == backfill.CREATE:
+        fields = f"{named}, {entry.method}, link {entry.url or 'none'}"
+        notes = f", notes ({len(entry.notes):,} characters)" if entry.notes else ""
+        ei = (
+            f"EI: the same without notes, {_jd_text(entry.jd)}"
+            if item.to_ei
+            else "EI: nothing (search.db only)"
+        )
+        lines = [f"{head} search.db: {fields}{notes}, {_jd_text(entry.jd)}; {ei}"]
+        if item.warning:
+            lines.append(f"{'':14}note: {item.warning}")
+        return lines
+    target = item.target
+    if item.kind == backfill.ATTACHING and target is not None:
+        parts = []
+        if item.set_url:
+            parts.append(f"link {entry.url}")
+        if item.add_jd or item.set_snapshot:
+            parts.append(_jd_text(entry.jd))
+        where = f"search.db and EI claim {target.ei_claim}" if target.ei_claim else "search.db"
+        return [f"{head} {_app_text(target)} gets, in {where}: {', '.join(parts)}"]
+    if target is not None and item.kind in (backfill.UNCHANGED, backfill.CONFLICT):
+        return [f"{head} {named} -> {_app_text(target)}{': ' + why if why else ''}"]
+    lines = [f"{head} {named}: {why}"]
+    lines.extend(f"{'':14}candidate {_app_text(app)}" for app in item.candidates)
+    return lines
+
+
+def _print_plan(planned: list[backfill.Planned]) -> None:
+    for item in planned:
+        for line in _plan_line(item):
+            print(line)
+    counts: dict[str, int] = {}
+    for item in planned:
+        counts[item.kind] = counts.get(item.kind, 0) + 1
+    order = (
+        backfill.CREATE,
+        backfill.ATTACHING,
+        backfill.UNCHANGED,
+        backfill.AMBIGUOUS,
+        backfill.CONFLICT,
+        backfill.REFUSED,
+    )
+    print(", ".join(f"{counts[k]} {k}" for k in order if k in counts))
 
 
 def cmd_export(datadir: DataDir, args: argparse.Namespace) -> int:
@@ -1633,6 +1800,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="record applications dated outside the active claim in search.db only, "
         "instead of refusing the import",
     )
+    p = sub.add_parser(
+        "import",
+        help="backfill earlier applications and their job descriptions from a JSON file "
+        "under imports/ in the data directory",
+    )
+    p.add_argument("file", type=Path, help="the JSON file, under imports/ in the data directory")
+    p.add_argument(
+        "--dry-run", action="store_true", help="say what each entry would do; write nothing"
+    )
+    p.add_argument(
+        "--route-out-of-claim-to-search",
+        dest="route_out_of_claim",
+        action="store_true",
+        help="record applications dated outside the active claim in search.db only, "
+        "instead of refusing them",
+    )
     p = sub.add_parser("export", help="write one claim's EI record (CSV + PDF) for a date range")
     p.add_argument("--claim", required=True, metavar="LABEL", help="the claim, e.g. 2026-27")
     p.add_argument("--from", dest="date_from", type=_date, required=True, metavar="YYYY-MM-DD")
@@ -1725,6 +1908,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "init": cmd_init,
     "migrate": cmd_migrate,
     "seed": cmd_seed,
+    "import": cmd_import,
     "export": cmd_export,
     "log": cmd_log,
     "report": cmd_report,
