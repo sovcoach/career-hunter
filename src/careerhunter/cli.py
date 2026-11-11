@@ -256,6 +256,11 @@ def cmd_export(datadir: DataDir, args: argparse.Namespace) -> int:
     )
     for path in (result.pdf, result.applications_csv, result.activities_csv):
         print(f"wrote {path}")
+    if result.job_descriptions is not None:
+        print(
+            f"wrote {result.job_descriptions}/ "
+            f"({plural(result.jd_count, 'job description', 'job descriptions')})"
+        )
     return EXIT_OK
 
 
@@ -1391,6 +1396,32 @@ def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
         report.line("bot refusals", "OK", "no posting given up")
 
 
+def _doctor_job_descriptions(report: _Report, search: sqlite3.Connection) -> None:
+    """Applications with no job description (ADR-024)."""
+    missing, pre_feature = search_store.jd_counts(search)
+    older = (
+        f"; {plural(pre_feature, 'application', 'applications')} from before JDs were kept"
+        if pre_feature
+        else ""
+    )
+    if missing:
+        report.line(
+            "job descriptions",
+            "WARN",
+            f"{plural(missing, 'application has', 'applications have')} no job description"
+            f" (reply to the bot's request with it){older}",
+        )
+    elif pre_feature:
+        report.line(
+            "job descriptions",
+            "--",
+            f"{plural(pre_feature, 'application', 'applications')} from before JDs were "
+            "kept, with no JD",
+        )
+    else:
+        report.line("job descriptions", "OK", "every application has one")
+
+
 def _doctor_resume(
     report: _Report,
     datadir: DataDir,
@@ -1525,6 +1556,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
         _doctor_components(report, search, config_doc)
         _doctor_alert_hold(report, search)
         _doctor_refusals(report, search)
+        _doctor_job_descriptions(report, search)
 
     records: dict[str, sqlite3.Connection] = {}
     unreadable = search is None and datadir.search_db_path.exists()

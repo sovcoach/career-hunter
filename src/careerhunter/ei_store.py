@@ -236,3 +236,15 @@ def posting_urls(conn: sqlite3.Connection) -> dict[str, str | None]:
         str(r["correlation_id"]): r["posting_url"]
         for r in conn.execute("SELECT correlation_id, posting_url FROM applications")
     }
+
+
+def jd_reference(text_sha256: str | None, source: str | None, jd_expected: int) -> str:
+    """How a report or an export names an application's JD (ADR-024).
+
+    Any JD shows its reference, `JD <first 8 of sha256> (<source>)`, even before the
+    feature. With none, `JD missing`, or `JD missing (pre-feature)` for an application
+    recorded before a JD was expected.
+    """
+    if text_sha256:
+        return f"JD {text_sha256[:8]} ({source})"
+    return "JD missing" if jd_expected else "JD missing (pre-feature)"

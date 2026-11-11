@@ -244,6 +244,15 @@ def jd_references(conn: sqlite3.Connection) -> dict[str, JdReference]:
     return {str(r["correlation_id"]): _jd_reference(r) for r in conn.execute(_JD_REFERENCES)}
 
 
+def jd_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Applications with no JD: (expected one, from before JDs were kept)."""
+    row = conn.execute(
+        "SELECT coalesce(sum(jd_expected = 1), 0), coalesce(sum(jd_expected = 0), 0) "
+        "FROM applications WHERE jd_sha256 IS NULL"
+    ).fetchone()
+    return int(row[0]), int(row[1])
+
+
 def posting_urls(conn: sqlite3.Connection) -> list[tuple[int, str]]:
     """Every stored posting URL, as stored, with its posting id."""
     return [
