@@ -23,6 +23,11 @@ search:
   # variants that count as one title, matched as whole words in any case. Lanes label
   # and order alerts and never skip a posting. A fallback lane ranks below an equally
   # good fit in any other lane. Without lanes, alerts go by fit, then oldest.
+  # When no lane matches literally, a title of two or more words then Specialist,
+  # Analyst or Associate also matches the same words with any of those three,
+  # ignoring level words (Junior, Senior, II, Level 2 ...) and reading
+  # "Analyst, Client Experience" as "Client Experience Analyst". After changing
+  # lanes, run: careerhunter lanes reassign --dry-run
   lanes:
     - name: operations
       priority: 1
