@@ -143,6 +143,44 @@ class ServiceStatus:
     running: bool = False
     pid: int | None = None
     last_exit: str | None = None
+    # What the loaded agent runs, as launchd reports it: its program and its
+    # CAREERHUNTER_DATA_DIR. Labels are per user, not per data folder, so these say
+    # which checkout and data folder the agent serves.
+    program: str | None = None
+    data_dir: str | None = None
+
+
+_ENVIRONMENT = re.compile(r"^\s*environment = \{\n(.*?)^\s*\}", re.MULTILINE | re.DOTALL)
+_DATA_DIR_LINE = re.compile(r"^\s*CAREERHUNTER_DATA_DIR => (.+?)\s*$", re.MULTILINE)
+
+
+def _print_data_dir(out: str) -> str | None:
+    """CAREERHUNTER_DATA_DIR from the job's own `environment` block of `launchctl print`,
+    not its `inherited environment` or `default environment`."""
+    block = _ENVIRONMENT.search(out)
+    found = _DATA_DIR_LINE.search(block.group(1)) if block else None
+    return found.group(1) if found else None
+
+
+def plist_target(label: str, home: Path | None = None) -> tuple[str | None, str | None]:
+    """The program and CAREERHUNTER_DATA_DIR an installed plist names; None if unknown."""
+    try:
+        doc = plistlib.loads(agent_plist_path(label, home).read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None, None
+    args = doc.get("ProgramArguments") if isinstance(doc, dict) else None
+    env = doc.get("EnvironmentVariables") if isinstance(doc, dict) else None
+    program = args[0] if isinstance(args, list) and args and isinstance(args[0], str) else None
+    data_dir = env.get("CAREERHUNTER_DATA_DIR") if isinstance(env, dict) else None
+    return program, data_dir if isinstance(data_dir, str) else None
+
+
+def checkout_of(program: str) -> Path | None:
+    """The checkout a `<checkout>/.venv/bin/careerhunter` program runs from, or None."""
+    path = Path(program)
+    if path.parent.name == "bin" and path.parent.parent.name == ".venv":
+        return path.parent.parent.parent
+    return None
 
 
 def status(
@@ -159,12 +197,15 @@ def status(
         return ServiceStatus(installed=True)
     pid = re.search(r"^\s*pid = (\d+)", out, re.MULTILINE)
     exit_code = re.search(r"^\s*last exit code = (.+)$", out, re.MULTILINE)
+    program_line = re.search(r"^\s*program = (.+?)\s*$", out, re.MULTILINE)
     return ServiceStatus(
         installed=True,
         loaded=True,
         running=bool(re.search(r"^\s*state = running", out, re.MULTILINE)),
         pid=int(pid.group(1)) if pid else None,
         last_exit=exit_code.group(1).strip() if exit_code else None,
+        program=program_line.group(1) if program_line else None,
+        data_dir=_print_data_dir(out),
     )
 
 

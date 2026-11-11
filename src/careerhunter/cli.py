@@ -720,14 +720,19 @@ def _doctor_bot(
         else:
             report.line("telegram", "OK", "chat set")
     current = service.status()
+    disabled = _disabled_note(service.LABEL, current)
     if not current.installed:
-        report.line("bot service", "--", "not installed (run: careerhunter service install)")
+        if disabled:
+            report.line("bot service", "BAD", f"not installed; {disabled}")
+        else:
+            report.line("bot service", "--", "not installed (run: careerhunter service install)")
         return
     if current.running:
-        report.line("bot service", "OK", f"running (pid {current.pid})")
+        level, text = "OK", f"running (pid {current.pid})"
     else:
         detail = f"installed but not running (last exit {current.last_exit or 'unknown'})"
-        report.line("bot service", "BAD", f"{detail}; see logs/bot.log")
+        level, text = "BAD", f"{detail}; see logs/bot.log"
+    _service_line(report, "bot service", level, text, service.LABEL, current, datadir, disabled)
     heartbeat = datadir.logs / "bot.heartbeat"
     try:
         beat = dt.datetime.fromisoformat(heartbeat.read_text().strip())
@@ -742,19 +747,75 @@ def _doctor_bot(
         report.line("bot heartbeat", "OK", "polled within the last 5 minutes")
 
 
+def _disabled_note(label: str, current: service.ServiceStatus) -> str | None:
+    """The exact enable command when launchd has disabled `label`, else None.
+
+    launchd keeps a disabled override per user, through `uninstall`, so this is checked
+    even when the agent isn't installed.
+    """
+    disabled = service.disabled_labels()
+    if not disabled or label not in disabled:
+        return None
+    if not current.installed:
+        then = ", then careerhunter service install"
+    elif not current.loaded:
+        then = ", then careerhunter service uninstall and careerhunter service install"
+    else:
+        then = ", or it won't load at the next login"
+    return f"{label} is disabled in launchd. Run: {service.enable_command(label)}{then}"
+
+
+def _service_line(
+    report: _Report,
+    name: str,
+    level: str,
+    text: str,
+    label: str,
+    current: service.ServiceStatus,
+    datadir: DataDir,
+    disabled: str | None,
+) -> None:
+    """One service line, naming the checkout and data folder the agent serves.
+
+    Labels are per user, so an agent may serve another checkout's data folder. When its
+    CAREERHUNTER_DATA_DIR is not this one, an OK line is a WARN.
+    """
+    if current.loaded and (current.program or current.data_dir):
+        program, data_dir = current.program, current.data_dir
+    else:
+        program, data_dir = service.plist_target(label)
+    checkout = service.checkout_of(program) if program else None
+    where = f"checkout {checkout}" if checkout else f"program {program or 'unknown'}"
+    text += f"; {where}, data folder {data_dir or 'unknown'}"
+    if data_dir is not None and os.path.realpath(data_dir) != os.path.realpath(datadir.root):
+        text += "; not this CAREERHUNTER_DATA_DIR"
+        if level == "OK":
+            level = "WARN"
+    if disabled:
+        level, text = "BAD", f"{text}; {disabled}"
+    report.line(name, level, text)
+
+
 def _doctor_watch(
     report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None, now: dt.datetime
 ) -> None:
     """Whether the watch agent is loaded, and how old the last finished run is."""
-    current = service.status(label=service.WATCH_LABEL)
+    label = service.WATCH_LABEL
+    current = service.status(label=label)
+    disabled = _disabled_note(label, current)
     if not current.installed:
-        report.line("watch service", "--", "not installed (run: careerhunter service install)")
-    elif not current.loaded:
-        report.line("watch service", "BAD", "installed but not loaded")
-    elif current.running and current.pid is not None:
-        report.line("watch service", "OK", f"running (pid {current.pid})")
+        if disabled:
+            report.line("watch service", "BAD", f"not installed; {disabled}")
+        else:
+            report.line("watch service", "--", "not installed (run: careerhunter service install)")
     else:
-        report.line("watch service", "OK", "loaded")
+        if not current.loaded:
+            level, text = "BAD", "installed but not loaded"
+        elif current.running and current.pid is not None:
+            level, text = "OK", f"running (pid {current.pid})"
+        else:
+            level, text = "OK", "loaded"
+        _service_line(report, "watch service", level, text, label, current, datadir, disabled)
     if current.installed:
         _doctor_watch_interval(report, config_doc)
     _doctor_watch_success(report, datadir, config_doc, now)

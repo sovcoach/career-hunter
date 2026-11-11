@@ -284,7 +284,14 @@ def test_a_disabled_label_is_not_mistaken_for_an_installed_agent(
 
 
 _ROOT_OR_SUDO = re.compile(r"\b(root|sudo)\b", re.IGNORECASE)
-_CLI_SERVICE_CODE = ("cmd_service", "_print_service", "_doctor_bot", "_doctor_watch")
+_CLI_SERVICE_CODE = (
+    "cmd_service",
+    "_print_service",
+    "_doctor_bot",
+    "_doctor_watch",
+    "_disabled_note",
+    "_service_line",
+)
 
 
 def _string_literals(tree: ast.AST) -> list[str]:
@@ -701,3 +708,163 @@ def test_doctor_flags_an_unreadable_discovery_stamp(
     code, out = doctor(probe, capsys)
     assert code == cli.EXIT_ERROR
     assert "discovery       BAD last success stamp is unreadable" in out
+
+
+# --- doctor: which agent the service lines describe -------------------------------------
+
+CHECKOUT = "/Users/example/ExampleFolder/career-hunter"
+OTHER_DATA = "/Volumes/ExampleDrive/ExampleFolder"
+
+
+def loaded(label: str, data_dir: str, program: str = f"{CHECKOUT}/.venv/bin/careerhunter") -> str:
+    """`launchctl print` for a running agent, in launchd's layout, trimmed."""
+    return f"""gui/501/{label} = {{
+\tstate = running
+
+\tprogram = {program}
+\targuments = {{
+\t\t{program}
+\t}}
+
+\tinherited environment = {{
+\t\tCAREERHUNTER_DATA_DIR => /opt/example/inherited
+\t}}
+
+\tdefault environment = {{
+\t\tPATH => /usr/bin:/bin
+\t}}
+
+\tenvironment = {{
+\t\tOSLogRateLimit => 64
+\t\tCAREERHUNTER_DATA_DIR => {data_dir}
+\t\tXPC_SERVICE_NAME => {label}
+\t}}
+
+\tpid = 4242
+\tlast exit code = (never exited)
+}}"""
+
+
+def agents(bot: tuple[int, str], watch: tuple[int, str], disabled: str = "") -> Any:
+    def run(args: list[str]) -> tuple[int, str]:
+        if args[0] == "print-disabled":
+            return 0, disabled
+        if args[0] == "print":
+            return watch if args[-1].endswith(service.WATCH_LABEL) else bot
+        return 0, ""
+
+    return run
+
+
+def test_status_reads_the_agent_s_program_and_data_folder() -> None:
+    service.install(Path(OTHER_DATA), program_path=Path("/x"), runner=fake_launchctl())
+    found = service.status(fake_launchctl(loaded(service.LABEL, OTHER_DATA)))
+    assert found.program == f"{CHECKOUT}/.venv/bin/careerhunter"
+    assert found.data_dir == OTHER_DATA  # the job's own environment, not the inherited one
+    assert service.checkout_of(found.program) == Path(CHECKOUT)
+    assert service.checkout_of("/opt/bin/careerhunter") is None
+    assert service.plist_target(service.LABEL) == ("/x", OTHER_DATA)
+    assert service.plist_target(service.WATCH_LABEL) == ("/x", OTHER_DATA)
+    service.plist_path().write_bytes(b"not a plist")
+    assert service.plist_target(service.LABEL) == (None, None)
+
+
+def test_doctor_names_the_checkout_and_data_folder_each_agent_serves(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service.install(ready, program_path=Path("/x"), runner=fake_launchctl())
+    run = agents(
+        (0, loaded(service.LABEL, str(ready))), (0, loaded(service.WATCH_LABEL, str(ready)))
+    )
+    monkeypatch.setattr(service, "run_launchctl", run)
+    _code, out = doctor(probe, capsys)
+    for name in ("bot service    ", "watch service  "):
+        assert f"{name} OK  running (pid 4242); checkout {CHECKOUT}, data folder {ready}\n" in out
+
+
+def test_doctor_warns_when_an_agent_serves_another_data_folder(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A scratch data folder: the agents loaded for the user serve the live one.
+    service.install(ready, program_path=Path("/x"), runner=fake_launchctl())
+    run = agents(
+        (0, loaded(service.LABEL, OTHER_DATA)), (0, loaded(service.WATCH_LABEL, str(ready)))
+    )
+    monkeypatch.setattr(service, "run_launchctl", run)
+    _code, out = doctor(probe, capsys)
+    assert (
+        f"bot service     WARN running (pid 4242); checkout {CHECKOUT}, data folder "
+        f"{OTHER_DATA}; not this CAREERHUNTER_DATA_DIR\n"
+    ) in out
+    assert (
+        f"watch service   OK  running (pid 4242); checkout {CHECKOUT}, data folder {ready}\n" in out
+    )
+
+
+def test_doctor_reads_an_unloaded_agent_s_plist(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service.install(
+        Path(OTHER_DATA), program_path=Path("/opt/bin/careerhunter"), runner=fake_launchctl()
+    )
+    monkeypatch.setattr(service, "run_launchctl", agents((113, ""), (113, "")))
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert (
+        "watch service   BAD installed but not loaded; program /opt/bin/careerhunter, "
+        f"data folder {OTHER_DATA}; not this CAREERHUNTER_DATA_DIR\n"
+    ) in out
+
+
+@pytest.mark.parametrize("form", [NAMED_FORM, BOOL_FORM])
+def test_doctor_flags_a_disabled_label_even_when_not_installed(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    form: str,
+) -> None:
+    on, off = ("disabled", "enabled") if form is NAMED_FORM else ("true", "false")
+    listing = form.replace("{bot}", on).replace("{watch}", off)
+    monkeypatch.setattr(service, "run_launchctl", agents((113, ""), (113, ""), listing))
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert (
+        "bot service     BAD not installed; org.careerhunter.bot is disabled in launchd. "
+        f"Run: launchctl enable {DOMAIN}/org.careerhunter.bot, then careerhunter service install\n"
+    ) in out
+    assert "watch service   --  not installed (run: careerhunter service install)" in out
+
+
+def test_doctor_flags_a_disabled_label_on_an_installed_agent(
+    ready: Path,
+    probe: FakeProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service.install(ready, program_path=Path("/x"), runner=fake_launchctl())
+    listing = NAMED_FORM.replace("{bot}", "disabled").replace("{watch}", "disabled")
+    run = agents((0, loaded(service.LABEL, str(ready))), (113, ""), listing)
+    monkeypatch.setattr(service, "run_launchctl", run)
+    code, out = doctor(probe, capsys)
+    assert code == cli.EXIT_ERROR
+    assert (
+        f"bot service     BAD running (pid 4242); checkout {CHECKOUT}, data folder {ready}; "
+        f"org.careerhunter.bot is disabled in launchd. Run: launchctl enable "
+        f"{DOMAIN}/org.careerhunter.bot, or it won't load at the next login\n"
+    ) in out
+    assert (
+        f"watch service   BAD installed but not loaded; program /x, data folder {ready}; "
+        f"org.careerhunter.watch is disabled in launchd. Run: launchctl enable "
+        f"{DOMAIN}/org.careerhunter.watch, then careerhunter service uninstall and "
+        "careerhunter service install\n"
+    ) in out
