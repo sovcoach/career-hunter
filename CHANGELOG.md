@@ -7,6 +7,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-11
+
 ### Added
 - Each application keeps its job description (ADR-024). EI migration 0002 adds an append-only `job_descriptions` table (the text verbatim, its SHA-256, `jd_source` and its snapshot file) and `applications.jd_expected`; search migration 0020 adds `applications.jd_expected`, `jd_sha256` and `jd_path`. Applications recorded before them get `jd_expected` 0 and show as pre-feature; every application recorded from now on gets 1. A corrected JD is a new row, and the latest is current.
 - `/log <link> | method | date [| Company | Title]` takes the job description on the lines after it. Telegram splits a long paste into several messages, so plain text messages that follow within 4 seconds of each other are joined to it with a blank line between each (Telegram splits at blank lines and drops them), and the application is recorded once they stop. A pasted job description is stored as Telegram delivered it: Telegram turns tabs into spaces and trims trailing spaces, so a file is the way to keep the exact text. A PDF, HTML or text file captioned with the `/log` line is the job description too. Without one (and none on the page), the application is recorded and the reply asks for the job description as a reply. A text that arrives just after the window gets a reply saying to send the whole description as a `.txt` reply to the `Recorded` message. No reply repeats a job description, and the bot log counts only its messages.
@@ -26,8 +28,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A `/log` with no job description, and every Applied from an alert, asks for the job description instead of a PDF or screenshot of the ad: the watcher keeps no description to attach. A reply with a file also becomes the ad copy when none was saved. A request for the ad sent before this version still takes a PDF or image.
 - The PDF reader moved from `resume.py` to `pdftext.py`, shared with job descriptions. Resume import behaves as before.
 - `doctor`'s `bot service` and `watch service` lines name the checkout and data folder each agent serves, from `launchctl print` for a loaded agent and from its plist otherwise. launchd labels are per user, so against another data folder (a test volume) they describe the live agents: the line then says `not this CAREERHUNTER_DATA_DIR`, and an OK becomes a WARN. A label launchd has disabled is BAD on its line, with the exact `launchctl enable` command, even when the agent isn't installed.
-- `search.db` moves to schema version 20 and the EI record to version 2. Back up and run `careerhunter migrate`. A sealed claim's file is not migrated, and is still read.
-- Search migration 0021 (schema version 21) lets a checked lane move, only through `lanes reassign`: it drops the set-once trigger, keeps `lane_checked` at 1 once set, and logs each move of a checked lane to a new `lane_changes` table. EI files are not changed. After `migrate`, run `careerhunter lanes reassign --dry-run`.
+- Search migration 0021 lets a checked lane move, only through `lanes reassign`: it drops the set-once trigger, keeps `lane_checked` at 1 once set, and logs each move of a checked lane to a new `lane_changes` table.
+- `search.db` moves from schema version 19 (0.4.0) to 21, through search migrations 0020 and 0021, and the EI record from version 1 to 2, through EI migration 0002. Stop the services, back up the data folder, run `careerhunter migrate`, then `careerhunter lanes reassign --dry-run`: see "Upgrading from 0.4.0 to 0.5.0" in `docs/SETUP.md`. A sealed claim's file is not migrated, and is still read.
+- `docs/SETUP.md` has "Upgrading from 0.4.0 to 0.5.0": the schema numbers and `doctor` lines to expect, `init` to create `imports/` in an existing data folder, the `lanes reassign --dry-run` step, and where to look when a launchd label is disabled. Its release checkout uses `v0.5.0`.
 
 ### Fixed
 - A launchd label left disabled made `careerhunter service install` fail with launchctl's error 5 and its suggestion to run as root. `service install` now checks every label it would install before writing a plist, and stops with the exact command: `<label> is disabled in launchd. Run: launchctl enable gui/<uid>/<label>, then careerhunter service install`. It never enables a label itself, and `uninstall` still leaves the override alone. A failed bootstrap gets a fixed message, `launchctl bootstrap failed (<code>)`, without launchctl's text; code 5 adds a pointer to `launchctl print-disabled`. Nothing suggests root or sudo.
@@ -223,7 +226,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/sovcoach/career-hunter/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sovcoach/career-hunter/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sovcoach/career-hunter/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sovcoach/career-hunter/compare/v0.1.0...v0.2.0

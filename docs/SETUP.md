@@ -104,10 +104,10 @@ pre-commit installed at .git/hooks/pre-commit
 
 The background services (Step 10c) must run from a **release checkout**: a second folder that holds one release tag and nothing else. `uv sync` installs career-hunter so that it runs whatever source is in its folder, and `careerhunter` applies any new database migration it finds there the next time it opens `search.db`. If the services ran from the folder above and you checked out an unreleased branch there, a running service could apply that branch's migration to your real `search.db`; once applied, a migration can't be changed, and every restart (a crash, a reboot) would run whatever branch was checked out.
 
-Make the release checkout next to the first one. This guide uses the tag `v0.4.0`; use the latest release tag:
+Make the release checkout next to the first one. This guide uses the tag `v0.5.0`; use the latest release tag:
 
 ```bash
-cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.4.0
+cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.5.0
 ```
 
 ```bash
@@ -818,6 +818,53 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    The output is the two `installed …` lines in Step 10c. Run `doctor` once more to see the services running.
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
+
+## Upgrading from 0.4.0 to 0.5.0
+
+Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 4:** nothing to add. A 0.4.0 `config.yaml` is valid as it is.
+- **Step 5:** `doctor` exits 1 with this line, because `search.db` is two migrations behind:
+
+  ```text
+  search.db       BAD schema version 19, expected 21; run: careerhunter migrate
+  ```
+
+  The active claim's record is one behind, at schema version 1.
+- **Step 6:** `migrate` applies two migrations to `search.db` and one to the claim's record. The claim will be yours:
+
+  ```text
+  search.db: applied [20, 21]; schema version 21
+  ei_record_2026-27.db: applied [2]; schema version 2
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+  Applications recorded before this release have no job description until one is attached (see "Backfilling applications and their job descriptions"). A sealed claim's record is not migrated, and is still read.
+- **Step 7:** skip it. The resume was imported for 0.4.0.
+- **`imports/`:** `careerhunter import` reads only files under `imports/` in the data folder, and `migrate` doesn't create that folder. After step 6, run `init`. It creates `imports/` (0700), keeps every file that already exists, and changes nothing else:
+
+  ```bash
+  cd ~/Projects/career-hunter-release && uv run careerhunter init
+  ```
+
+- **Step 8:** these lines show the upgrade took. The count is yours, and `imports/` counts the files you put there:
+
+  ```text
+  search.db       OK  schema version 21
+  claim 2026-27   OK  schema version 2
+  imports/        OK  0 files, all owner-only
+  job descriptions --  14 applications from before JDs were kept, with no JD
+  ```
+
+  `job descriptions` turns to `WARN` while an application recorded on 0.5.0 is waiting for its job description.
+- **Step 9:** if `service install` stops with `<label> is disabled in launchd`, or with `launchctl bootstrap failed (5)`, launchd has a disabled override for that label, and `uninstall` leaves it in place. See the two launchd rows in "Troubleshooting". It is never fixed with root or sudo.
+- **After step 9:** 0.5.0 matches titles to lanes differently, and postings stored before it keep the lane they were given. See which would move, without changing anything:
+
+  ```bash
+  cd ~/Projects/career-hunter-release && uv run careerhunter lanes reassign --dry-run
+  ```
+
+  It lists each move and the counts, and writes nothing. If the list looks right, run it without `--dry-run` to apply exactly those moves (see "After you change `search.lanes`" in Step 7). Without `search.lanes` it refuses, and there is nothing to move.
 
 ## Troubleshooting
 

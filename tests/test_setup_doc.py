@@ -74,7 +74,7 @@ def test_lm_studio_is_required_and_the_addresses_are_the_constants() -> None:
 
 
 def test_services_are_installed_from_the_release_checkout() -> None:
-    assert "git worktree add ../career-hunter-release v0.4.0" in SETUP
+    assert "git worktree add ../career-hunter-release v0.5.0" in SETUP
     assert "cd ~/Projects/career-hunter-release && uv sync --locked" in SETUP
     install = [line for line in SETUP.splitlines() if "careerhunter service install" in line]
     commands = [line for line in install if line.startswith(("cd ", "   cd "))]
