@@ -244,7 +244,7 @@ def test_unchecked_lanes_and_low_off_lane_rows_stay_held(env: Env, keep_umask: N
     _post(env, "Off Low", lane=None, fit="low")
     unchecked = _post(env, "Unchecked")
     conn = db.connect(env.datadir.search_db_path)
-    conn.execute("DROP TRIGGER posting_lane_set_once")
+    conn.execute("DROP TRIGGER posting_lane_checked_stays")
     conn.execute("UPDATE postings SET lane = NULL, lane_checked = 0 WHERE id = ?", (unchecked,))
     conn.close()
     assert _poll(env) == 0
