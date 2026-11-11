@@ -7,6 +7,15 @@ words, ignoring case, by `filters.has_phrase`: the same folding as every other t
 match here. When titles in several lanes match, the lane with the best (lowest)
 priority wins. Priorities are unique (config validation), so there is never a tie.
 
+Only when no lane matches literally, the normalized rule is tried, by
+`titles.loose_match`, and again the best priority wins. A variant that is a core of two
+or more words and a role word (specialist, analyst, associate, one built-in group)
+matches a posting with that core and any role word of the group, ignoring level words
+(junior, senior, I to IV, "level N", ...) and after comma inversion ("Analyst, Client
+Experience" is "Client Experience Analyst"). The role word must end the title or come
+before a separator (comma, dash, bracket), so "IT Support Associate Manager" is not an
+"IT Support Specialist". A one-word core ("Data Analyst") only matches literally.
+
 Lanes only label and order postings. They never skip one and never exempt one from a
 hard gate: `hard_gates.never_gated_families` is a separate list, and neither reads the
 other. A config without `search.lanes` has no lanes, and lane checking is off.
@@ -23,7 +32,7 @@ Python, so it does not depend on how a SQLite version orders nulls.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +40,7 @@ from careerhunter.config import off_lane_min_fit
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import has_phrase
 from careerhunter.search_store import PendingAlert
+from careerhunter.titles import loose_match
 
 
 @dataclass(frozen=True)
@@ -63,11 +73,16 @@ def match(title: str, doc: Mapping[str, Any] | None) -> Lane | None:
     raw = search.get("lanes") if isinstance(search, Mapping) else None
     if not isinstance(raw, list):
         return None
+    return _best(title, raw, has_phrase) or _best(title, raw, loose_match)
+
+
+def _best(title: str, raw: list[Any], test: Callable[[str, str], bool]) -> Lane | None:
+    """The best-priority lane with a variant that `test` matches, or None."""
     best: Lane | None = None
     for lane in raw:
         if not isinstance(lane, Mapping):
             continue
-        if any(has_phrase(title, variant) for variant in _variants(lane.get("titles"))):
+        if any(test(title, variant) for variant in _variants(lane.get("titles"))):
             found = Lane(lane["name"], lane["priority"], bool(lane.get("fallback", False)))
             if best is None or found.priority < best.priority:
                 best = found
