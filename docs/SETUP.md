@@ -857,6 +857,14 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
   ```
 
   `job descriptions` turns to `WARN` while an application recorded on 0.5.0 is waiting for its job description.
+- **Step 9:** if `service install` stops with `<label> is disabled in launchd`, or with `launchctl bootstrap failed (5)`, launchd has a disabled override for that label, and `uninstall` leaves it in place. See the two launchd rows in "Troubleshooting". It is never fixed with root or sudo.
+- **After step 9:** 0.5.0 matches titles to lanes differently, and postings stored before it keep the lane they were given. See which would move, without changing anything:
+
+  ```bash
+  cd ~/Projects/career-hunter-release && uv run careerhunter lanes reassign --dry-run
+  ```
+
+  It lists each move and the counts, and writes nothing. If the list looks right, run it without `--dry-run` to apply exactly those moves (see "After you change `search.lanes`" in Step 7). Without `search.lanes` it refuses, and there is nothing to move.
 
 ## Troubleshooting
 
