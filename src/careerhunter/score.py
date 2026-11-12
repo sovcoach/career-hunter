@@ -126,10 +126,22 @@ def require_loopback(url: str) -> tuple[str, int, str]:
     return host, parts.port or 80, path
 
 
+def model_headers(token: str | None) -> dict[str, str]:
+    """The JSON headers for a call to the local model, with `Authorization: Bearer` when
+    `token` (the Keychain's `lm_studio_token`) is set. Never log the result."""
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def default_transport(
-    url: str, payload: bytes, *, budget: Deadline | None = None
+    url: str, payload: bytes, *, budget: Deadline | None = None, token: str | None = None
 ) -> tuple[int, bytes]:
-    """POST once, within TOTAL. A redirect status is returned as-is and is not followed."""
+    """POST once, within TOTAL. A redirect status is returned as-is and is not followed.
+
+    `token` is sent as a Bearer header when set; it is never logged or put in an error.
+    """
     host, port, path = require_loopback(url)
     try:
         return loopback.exchange(
@@ -138,7 +150,7 @@ def default_transport(
             port,
             path,
             body=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=model_headers(token),
             total=TOTAL,
             per_op=TIMEOUT,
             max_bytes=MAX_OUTPUT,

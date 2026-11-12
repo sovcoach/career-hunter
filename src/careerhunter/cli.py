@@ -1087,6 +1087,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
 
     # One budget for the whole run, shared by every client the run calls.
     budget = Deadline(watch.RUN_BUDGET)
+    token = _model_token(log.note)
 
     def on_crash(who: str, exc: Exception) -> None:
         log.note(_with_traceback(f"watch: {who}", exc))
@@ -1114,7 +1115,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             return score_posting(
                 posting,
                 doc,
-                transport=partial(score_transport, budget=budget),
+                transport=partial(score_transport, budget=budget, token=token),
                 resume=loaded,
                 examples=examples,
             )
@@ -1129,7 +1130,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             exclusions=exclusions,
             scorer=scorer,
             data_dir=datadir.root,
-            embed_transport=partial(embed.default_transport, budget=budget),
+            embed_transport=partial(embed.default_transport, budget=budget, token=token),
             on_crash=on_crash,
             emit=log.append,
             budget=budget,
@@ -1145,6 +1146,16 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
         conn.close()
     _record_watch_success(datadir)
     return EXIT_OK
+
+
+def _model_token(note: Callable[[str], None]) -> str | None:
+    """LM Studio's API token from the Keychain, or None. The value is never printed: a
+    Keychain that can't be read is one fixed log line, and the call goes without it."""
+    try:
+        return secrets_store.get_secret("lm_studio_token")
+    except secrets_store.SecretError:
+        note("watch: lm_studio_token could not be read from the Keychain; calls go without it")
+        return None
 
 
 BUSY = "discover: another pass started less than 150 seconds ago; skipped"

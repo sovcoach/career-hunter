@@ -30,7 +30,7 @@ from careerhunter import db, loopback, resume, search_store
 from careerhunter.config import DEFAULT_EMBEDDING_MODEL, embedding_model
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
-from careerhunter.score import ScoreError, Transport, require_loopback
+from careerhunter.score import ScoreError, Transport, model_headers, require_loopback
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/embeddings"
 MODEL_NAME = DEFAULT_EMBEDDING_MODEL  # what is sent when scoring.embedding_model is unset
@@ -81,9 +81,12 @@ def posting_text(posting: PostingText) -> str:
 
 
 def default_transport(
-    url: str, payload: bytes, *, budget: Deadline | None = None
+    url: str, payload: bytes, *, budget: Deadline | None = None, token: str | None = None
 ) -> tuple[int, bytes]:
-    """POST once, within TOTAL. A redirect status is returned as-is and is not followed."""
+    """POST once, within TOTAL. A redirect status is returned as-is and is not followed.
+
+    `token` is sent as a Bearer header when set; it is never logged or put in an error.
+    """
     host, port, path = require_loopback(url)
     try:
         return loopback.exchange(
@@ -92,7 +95,7 @@ def default_transport(
             port,
             path,
             body=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=model_headers(token),
             total=TOTAL,
             per_op=TIMEOUT,
             max_bytes=MAX_REPLY,
