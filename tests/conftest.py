@@ -249,6 +249,17 @@ def memory_keyring() -> Iterator[InMemoryKeyring]:
     keyring.set_keyring(previous)
 
 
+@pytest.fixture(autouse=True)
+def healthy_lm_studio(monkeypatch: pytest.MonkeyPatch) -> None:
+    """doctor sees a healthy LM Studio unless a test says otherwise. The real check
+    (`cli.lm_studio_status`) is tested on its own, against a fake server, in
+    test_lm_studio_auth; without this, every doctor test with a scoring config would
+    need a token and a server."""
+    from careerhunter import cli
+
+    monkeypatch.setattr(cli, "lm_studio_status", lambda: ("OK", "answers with the API token"))
+
+
 class RealNetworkBlocked(RuntimeError):
     """A test tried to use the network. Not an OSError, so no client takes it for a
     network failure; a client that catches every exception (the bounded resolver's

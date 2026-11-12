@@ -74,7 +74,8 @@ from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.models import Dating
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.runlog import RunLog, RunLogError
-from careerhunter.score import Score, score_posting
+from careerhunter.score import UNAUTHORIZED as SCORE_UNAUTHORIZED
+from careerhunter.score import Score, ScoreError, probe_models, score_posting
 from careerhunter.score import default_transport as score_transport
 from careerhunter.scout_prompt import render
 from careerhunter.seed import SeedError, Tally, import_seed
@@ -1675,6 +1676,48 @@ def _doctor_components(
         )
 
 
+def _model_in_use(config_doc: dict[str, Any]) -> bool:
+    """Whether a watch run calls LM Studio: scoring needs fit_rubric.gap_tiers, and
+    embeddings need a resume in config."""
+    rubric = config_doc.get("fit_rubric")
+    tiers = rubric.get("gap_tiers") if isinstance(rubric, dict) else None
+    return isinstance(tiers, dict) or resume.configured(config_doc)
+
+
+_LM_KEY_HINT = "run: careerhunter secret set lm_studio_token"
+
+
+def lm_studio_status() -> tuple[str, str]:
+    """(status, detail) for LM Studio's server, asked for its model list with the API
+    token. A refused token (401 or 403) is `unauthorized`, never `unreachable`. The
+    token is never printed. Tests replace this with a healthy fake (conftest)."""
+    try:
+        token = secrets_store.get_secret("lm_studio_token")
+    except secrets_store.SecretError:
+        return "BAD", "lm_studio_token could not be read from the Keychain"
+    if not token:
+        return "BAD", f"lm_studio_token is missing; {_LM_KEY_HINT}"
+    try:
+        status = probe_models(token)
+    except ScoreError:
+        return "BAD", "unreachable at 127.0.0.1:1234; start LM Studio's server"
+    if status in SCORE_UNAUTHORIZED:
+        return "BAD", f"unauthorized: LM Studio refused the API token; {_LM_KEY_HINT}"
+    if status == 200:
+        return "OK", "answers with the API token"
+    return "BAD", f"answered HTTP {int(status)} to a model list request"
+
+
+def _doctor_lm_studio(report: _Report, config_doc: dict[str, Any] | None) -> None:
+    """The LM Studio line, when a watch run would call it."""
+    if config_doc is None:
+        return
+    if not _model_in_use(config_doc):
+        report.line("LM Studio", "--", "not used (no fit_rubric.gap_tiers and no resume)")
+        return
+    report.line("LM Studio", *lm_studio_status())
+
+
 def _doctor_alert_hold(report: _Report, search: sqlite3.Connection) -> None:
     """Whether the bot is holding watcher alerts because it couldn't read config.yaml."""
     since = search_store.alerts_held_since(search)
@@ -1860,6 +1903,8 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
         _doctor_watch_runs(report, search, now)
         _doctor_usefulness(report, search, config_doc, now)
         _doctor_components(report, search, config_doc)
+    _doctor_lm_studio(report, config_doc)
+    if search is not None:
         _doctor_alert_hold(report, search)
         _doctor_refusals(report, search)
         _doctor_job_descriptions(report, search)

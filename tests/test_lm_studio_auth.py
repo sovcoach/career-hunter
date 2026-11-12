@@ -217,3 +217,93 @@ def test_migration_0022_keeps_every_health_row(tmp_path: Path) -> None:
         )
     finally:
         conn.close()
+
+
+# --- doctor asks LM Studio for its model list, with the token -----------------------------
+
+REAL_STATUS = cli.lm_studio_status  # conftest replaces it with a healthy fake per test
+
+
+def _server(monkeypatch: pytest.MonkeyPatch, reply: Reply) -> FakeServer:
+    server = FakeServer(reply)
+    monkeypatch.setattr(loopback, "LoopbackConnection", server)
+    return server
+
+
+def test_doctor_status_is_ok_when_the_token_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets_store.set_secret("lm_studio_token", TOKEN)
+    server = _server(monkeypatch, Reply(200, b'{"data":[]}'))
+    assert REAL_STATUS() == ("OK", "answers with the API token")
+    ((method, path, body, headers),) = server.requests
+    assert (method, path, body) == ("GET", "/v1/models", None)
+    assert headers["Authorization"] == f"Bearer {TOKEN}" and "Content-Type" not in headers
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_doctor_status_names_a_refused_token_unauthorized(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    secrets_store.set_secret("lm_studio_token", TOKEN)
+    _server(monkeypatch, Reply(status, b"{}"))
+    level, detail = REAL_STATUS()
+    assert level == "BAD"
+    assert detail.startswith("unauthorized: LM Studio refused the API token")
+    assert "careerhunter secret set lm_studio_token" in detail
+    assert "unreachable" not in detail and TOKEN not in detail
+
+
+def test_doctor_status_names_a_server_that_does_not_answer_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets_store.set_secret("lm_studio_token", TOKEN)
+    _server(monkeypatch, Reply(error=ConnectionRefusedError("synthetic"), error_at="request"))
+    assert REAL_STATUS() == ("BAD", "unreachable at 127.0.0.1:1234; start LM Studio's server")
+
+
+def test_doctor_status_names_another_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets_store.set_secret("lm_studio_token", TOKEN)
+    _server(monkeypatch, Reply(500, b"{}"))
+    assert REAL_STATUS() == ("BAD", "answered HTTP 500 to a model list request")
+
+
+def test_doctor_status_without_a_token_asks_for_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _server(monkeypatch, Reply(200, b"{}"))
+    assert REAL_STATUS() == (
+        "BAD",
+        "lm_studio_token is missing; run: careerhunter secret set lm_studio_token",
+    )
+    assert server.requests == []
+
+
+def test_doctor_status_with_an_unreadable_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(name: str) -> str | None:
+        raise secrets_store.SecretError("synthetic: no Keychain")
+
+    monkeypatch.setattr(cli.secrets_store, "get_secret", broken)
+    assert REAL_STATUS() == ("BAD", "lm_studio_token could not be read from the Keychain")
+
+
+def test_doctor_fails_on_a_refused_token_and_never_prints_it(
+    inited: Path,
+    probe: SystemProbe,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets_store.set_secret("lm_studio_token", TOKEN)
+    monkeypatch.setattr(cli, "lm_studio_status", REAL_STATUS)
+    _server(monkeypatch, Reply(401, b"{}"))
+    assert cli.main(["doctor"], probe=probe) == cli.EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "LM Studio       BAD unauthorized: LM Studio refused the API token" in out
+    assert TOKEN not in out
+
+
+def test_doctor_skips_lm_studio_when_nothing_calls_it(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "lm_studio_status", REAL_STATUS)
+    cli._doctor_lm_studio(cli._Report(), {"fit_rubric": {"weights": {}}})
+    cli._doctor_lm_studio(cli._Report(), None)  # an invalid config.yaml: no line
+    assert capsys.readouterr().out == (
+        "LM Studio       --  not used (no fit_rubric.gap_tiers and no resume)\n"
+    )

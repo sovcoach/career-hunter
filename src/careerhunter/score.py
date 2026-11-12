@@ -167,6 +167,37 @@ def default_transport(
         raise ScoreError("the local model could not be reached") from exc
 
 
+MODELS_URL = "http://127.0.0.1:1234/v1/models"
+PROBE_SECONDS = 5.0  # doctor's check: a list of models, which loads none
+PROBE_MAX = 1_048_576
+
+
+def probe_models(token: str | None, *, url: str = MODELS_URL) -> int:
+    """The HTTP status of one `GET /v1/models` with the token, for doctor.
+
+    It asks for the list of models, so no model is loaded. Raises ScoreError when the
+    server can't be reached within PROBE_SECONDS. The body is not read beyond the cap
+    and is not returned.
+    """
+    host, port, path = require_loopback(url)
+    headers = {k: v for k, v in model_headers(token).items() if k != "Content-Type"}
+    try:
+        status, _body = loopback.exchange(
+            "GET",
+            host,
+            port,
+            path,
+            body=None,
+            headers=headers,
+            total=PROBE_SECONDS,
+            per_op=PROBE_SECONDS,
+            max_bytes=PROBE_MAX,
+        )
+    except loopback.LoopbackError as exc:
+        raise ScoreError("the local model could not be reached") from exc
+    return status
+
+
 def score_posting(
     posting: PostingText,
     config: Mapping[str, Any],
