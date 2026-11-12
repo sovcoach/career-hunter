@@ -1241,64 +1241,99 @@ def test_the_backoff_is_capped_at_seven_days() -> None:
     assert discover.backoff_for(99, 60) == dt.timedelta(days=7)
 
 
-@pytest.mark.parametrize(
-    "reply",
-    [
-        pytest.param((429, b""), id="http-429"),
-        pytest.param(
-            (
-                200,
-                json.dumps(
-                    {
-                        "results": [{"url": _GOOD}],
-                        "unresponsive_engines": [["example engine", "CAPTCHA"]],
-                    }
-                ).encode(),
-            ),
-            id="captcha",
-        ),
-        pytest.param(
-            (
-                200,
-                json.dumps(
-                    {
-                        "results": [],
-                        "unresponsive_engines": [["example engine", "too many requests"]],
-                    }
-                ).encode(),
-            ),
-            id="too-many-requests",
-        ),
-        pytest.param(
-            (
-                200,
-                json.dumps(
-                    {
-                        "results": [],
-                        "unresponsive_engines": [["example engine", "Suspended: CAPTCHA"]],
-                    }
-                ).encode(),
-            ),
-            id="suspended-captcha",
-        ),
-    ],
-)
-def test_a_429_or_a_captcha_stops_the_pass_and_starts_the_backoff(
-    tmp_path: Path, reply: tuple[int, bytes]
+def _engines(results: list[dict[str, str]], *pairs: tuple[str, str]) -> bytes:
+    return json.dumps(
+        {"results": results, "unresponsive_engines": [list(pair) for pair in pairs]}
+    ).encode()
+
+
+def _suspended(conn: sqlite3.Connection) -> tuple[object, ...]:
+    row = conn.execute("SELECT suspended_engines, suspended_at FROM discovery_state")
+    return tuple(row.fetchone())
+
+
+def test_a_429_from_searxng_stops_the_pass_and_starts_the_backoff(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    talk = _Talk(b"", status=429, fail_at=1)
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk)
+    assert outcome == discover.Outcome(discover.THROTTLED, ())
+    assert len(talk.calls) == 1  # stopped at once
+    assert _rows(conn) == 0
+    assert _state(conn)[:2] == (0, 1)
+    conn.close()
+
+
+@pytest.mark.parametrize("error", ["CAPTCHA", "too many requests", "Suspended: CAPTCHA"])
+def test_one_throttled_engine_does_not_stop_a_pass_that_gets_results(
+    tmp_path: Path, error: str
 ) -> None:
     conn = _search_db(tmp_path)
+    talk = _Talk(_engines([{"url": _GOOD}], ("Example Engine", error)))
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk, confirm=_exists)
+    assert outcome.notice is None
+    assert len(talk.calls) == 3  # every query was asked
+    assert "discovery: engines throttled or suspended: example engine" in outcome.notes
+    assert _rows(conn) == 1
+    assert _state(conn) == (3, 0, None)  # the cursor moved, no backoff
+    assert _suspended(conn)[0] == '["example engine"]'
+    conn.close()
+
+
+def test_a_blocked_query_is_passed_over_while_others_answer(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    replies = [
+        _engines([], ("example engine", "Suspended: too many requests")),  # blocked
+        _engines([{"url": _GOOD}], ("example engine", "Suspended: too many requests")),
+        _engines([]),  # answered, with nothing found
+    ]
     calls: list[str] = []
 
     def talk(url: str) -> tuple[int, bytes]:
         calls.append(url)
-        return reply
+        return 200, replies[len(calls) - 1]
 
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk, confirm=_exists)
+    assert outcome.notice is None and len(calls) == 3
+    assert _rows(conn) == 1 and _state(conn)[1:] == (0, None)
+
+
+@pytest.mark.parametrize("error", ["CAPTCHA", "too many requests", "Suspended: access denied"])
+def test_when_every_engine_is_throttled_the_pass_stops_and_backs_off(
+    tmp_path: Path, error: str
+) -> None:
+    conn = _search_db(tmp_path)
+    talk = _Talk(_engines([], ("engine one", error), ("engine two", error)))
     outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk)
-    assert outcome == discover.Outcome(discover.THROTTLED, ())
-    assert len(calls) == 1  # stopped at once
+    assert outcome.notice == discover.THROTTLED
+    assert outcome.notes == ("discovery: engines throttled or suspended: engine one, engine two",)
+    assert len(talk.calls) == discover.BLOCKED_IN_A_ROW  # stopped early
     assert _rows(conn) == 0
     assert _state(conn)[:2] == (0, 1)
+    assert _suspended(conn)[0] == '["engine one", "engine two"]'
+    (health,) = [h for h in search_store.component_health(conn) if h.component == "searxng"]
+    assert health.last_failure == "throttled"
     conn.close()
+
+
+def test_a_pass_with_no_throttled_engine_clears_the_record(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    discover.run(
+        conn,
+        _ETIQUETTE,
+        today="2026-11-02",
+        transport=_Talk(_engines([], ("engine one", "CAPTCHA"))),
+    )
+    assert _suspended(conn)[0] is not None
+    conn.execute("UPDATE discovery_state SET failures = 0, backoff_until = NULL")
+    discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=_empty())
+    assert _suspended(conn) == (None, None)
+
+
+def test_an_engine_name_that_is_not_plain_text_is_unnamed(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    talk = _Talk(_engines([{"url": _GOOD}], ("<b>engine</b>", "CAPTCHA")))
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk)
+    assert "discovery: engines throttled or suspended: unnamed" in outcome.notes
 
 
 def test_another_engine_error_is_not_a_stop(tmp_path: Path) -> None:
@@ -1359,3 +1394,13 @@ def test_the_pauses_of_a_pass_must_fit_its_share_of_the_watch_run() -> None:
     assert any("must be at most 120 seconds" in p for p in validate_config(doc))
     doc = {"discovery": {"queries_per_run": 24, "query_delay_seconds": 5}}
     assert not any("discovery" in p for p in validate_config(doc))
+
+
+def test_the_engine_record_must_be_a_json_array(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    for bad in ("not json", '{"a": 1}'):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE discovery_state SET suspended_engines = ?", (bad,))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE discovery_state SET suspended_at = 'yesterday'")
+    conn.close()
