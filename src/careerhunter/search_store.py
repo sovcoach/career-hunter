@@ -270,11 +270,13 @@ class StoredApplication:
     snapshot_path: str | None
     dating: Dating
     jd_sha256: str | None
+    jd_unavailable: str | None = None  # why the JD is unavailable, when it was marked
 
 
 _STORED_APPLICATIONS = (
     "SELECT a.id, a.correlation_id, a.ei_claim, a.posting_id, c.name, p.title, p.location, "
-    "p.url, p.snapshot_path, a.date_precision, a.date_applied, a.week_of, a.jd_sha256 "
+    "p.url, p.snapshot_path, a.date_precision, a.date_applied, a.week_of, a.jd_sha256, "
+    "a.jd_unavailable_reason "
     "FROM applications a JOIN postings p ON p.id = a.posting_id "
     "JOIN companies c ON c.id = p.company_id"
 )
@@ -293,6 +295,7 @@ def _stored_application(row: sqlite3.Row) -> StoredApplication:
         snapshot_path=row["snapshot_path"],
         dating=Dating(str(row["date_precision"]), row["date_applied"], row["week_of"]),
         jd_sha256=row["jd_sha256"],
+        jd_unavailable=row["jd_unavailable_reason"],
     )
 
 

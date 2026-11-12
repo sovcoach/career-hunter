@@ -338,4 +338,5 @@ def test_the_example_file_is_a_valid_import(
     out = capsys.readouterr().out
     assert f"link {LINKEDIN_CANONICAL}" in out
     assert "Synthetic Widgets / Data Analyst, the week of 2026-09-14" in out
-    assert out.splitlines()[-1] == "3 create"
+    assert "JD unavailable (posting removed before capture)" in out
+    assert out.splitlines()[-1] == "4 create"

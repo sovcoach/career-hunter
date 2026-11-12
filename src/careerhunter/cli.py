@@ -365,12 +365,13 @@ def _plan_line(item: backfill.Planned) -> list[str]:
     if item.kind == backfill.CREATE:
         fields = f"{named}, {entry.method}, link {entry.url or 'none'}"
         notes = f", notes ({len(entry.notes):,} characters)" if entry.notes else ""
-        ei = (
-            f"EI: the same without notes, {_jd_text(entry.jd)}"
-            if item.to_ei
-            else "EI: nothing (search.db only)"
+        jd = (
+            f"JD unavailable ({entry.jd_unavailable})"
+            if entry.jd_unavailable is not None
+            else _jd_text(entry.jd)
         )
-        lines = [f"{head} search.db: {fields}{notes}, {_jd_text(entry.jd)}; {ei}"]
+        ei = f"EI: the same without notes, {jd}" if item.to_ei else "EI: nothing (search.db only)"
+        lines = [f"{head} search.db: {fields}{notes}, {jd}; {ei}"]
         if item.warning:
             lines.append(f"{'':14}note: {item.warning}")
         return lines
@@ -381,6 +382,8 @@ def _plan_line(item: backfill.Planned) -> list[str]:
             parts.append(f"link {entry.url}")
         if item.add_jd or item.set_snapshot:
             parts.append(_jd_text(entry.jd))
+        if item.mark_unavailable:
+            parts.append(f"JD unavailable ({entry.jd_unavailable})")
         where = f"search.db and EI claim {target.ei_claim}" if target.ei_claim else "search.db"
         return [f"{head} {_app_text(target)} gets, in {where}: {', '.join(parts)}"]
     if target is not None and item.kind in (backfill.UNCHANGED, backfill.CONFLICT):

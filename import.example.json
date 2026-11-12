@@ -30,6 +30,15 @@
       "method": "email",
       "url": null,
       "resolve": "new"
+    },
+    {
+      "employer": "Sample Logistics",
+      "role": "Operations Coordinator",
+      "date": "2026-09-24",
+      "date_precision": "day",
+      "method": "company_site",
+      "url": "https://jobs.example.org/postings/1234",
+      "jd_unavailable": "posting removed before capture"
     }
   ]
 }
