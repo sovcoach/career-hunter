@@ -39,12 +39,14 @@ from careerhunter import (
     embed_eval,
     jobdesc,
     lanes,
+    ledger,
     resume,
     search_store,
     secrets_store,
     selfsourced,
     service,
     storage_guard,
+    urls,
     watch,
 )
 from careerhunter import report as claim_report
@@ -479,6 +481,68 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
         print("No job description was saved.")
     if logged.earlier:
         print(logged.earlier)
+    return EXIT_OK
+
+
+def _selected_applications(
+    search: sqlite3.Connection, args: argparse.Namespace
+) -> list[search_store.StoredApplication]:
+    """The applications `jd unavailable` names: by the posting's link, compared
+    canonically, or by company, title and date (the day applied, or the week's Monday
+    for a week-dated one), compared without regard to case."""
+    found = search_store.stored_applications(search)
+    if args.url is not None:
+        wanted = urls.canonical(args.url)
+        return [a for a in found if a.url is not None and urls.canonical(a.url) == wanted]
+    day = args.date.isoformat()
+    return [
+        a
+        for a in found
+        if a.company.casefold() == args.company.strip().casefold()
+        and a.title.casefold() == args.title.strip().casefold()
+        and day in (a.dating.day, a.dating.week_of)
+    ]
+
+
+def cmd_jd(datadir: DataDir, args: argparse.Namespace) -> int:
+    """`jd unavailable`: mark an application's JD unavailable, with why (ADR-024)."""
+    picked_by_names = (args.company, args.title, args.date)
+    if args.url is None and None in picked_by_names:
+        _err("error: give --url, or all of --company, --title and --date")
+        return EXIT_ERROR
+    if args.url is not None and any(v is not None for v in picked_by_names):
+        _err("error: give --url, or --company, --title and --date, not both")
+        return EXIT_ERROR
+    try:
+        explanation = jobdesc.unavailable_explanation(args.reason)
+    except jobdesc.JobDescError as exc:
+        _err(f"error: {exc} Nothing was recorded.")
+        return EXIT_ERROR
+    with _writable(datadir) as w:
+        matches = _selected_applications(w.search, args)
+        if not matches:
+            _err("error: no application matches; nothing was recorded")
+            return EXIT_ERROR
+        if len(matches) > 1:
+            _err(
+                f"error: {len(matches)} applications match; give --url, or a narrower "
+                "--company, --title and --date. Nothing was recorded."
+            )
+            return EXIT_ERROR
+        (target,) = matches
+        try:
+            added = ledger.mark_jd_unavailable(
+                w.search, w.active, target.correlation_id, explanation
+            )
+        except ledger.AttachRefused as exc:
+            _err(f"error: {exc} Nothing was recorded.")
+            return EXIT_ERROR
+    where = f"EI claim {target.ei_claim}" if target.ei_claim else "search.db only"
+    name = f"{target.company} — {target.title}"
+    if added:
+        print(f"Marked: {name} ({where}): job description unavailable ({explanation}).")
+    else:
+        print(f"Already marked: {name} ({where}): {explanation}. Nothing changed.")
     return EXIT_OK
 
 
@@ -2035,6 +2099,20 @@ def build_parser() -> argparse.ArgumentParser:
     jd.add_argument(
         "--jd-stdin", action="store_true", help="read the job description, as text, from stdin"
     )
+    p = sub.add_parser("jd", help="job descriptions that can't be kept")
+    jd_sub = p.add_subparsers(dest="jd_action", required=True)
+    p = jd_sub.add_parser(
+        "unavailable",
+        help="mark an application's job description unavailable, with why; a JD attached "
+        "later still counts",
+    )
+    p.add_argument("--reason", required=True, help='why, e.g. "posting removed before capture"')
+    p.add_argument("--url", help="the application's job ad link")
+    p.add_argument("--company", help="the employer, with --title and --date")
+    p.add_argument("--title", help="the role, with --company and --date")
+    p.add_argument(
+        "--date", type=_date, metavar="YYYY-MM-DD", help="the day applied, or its week's Monday"
+    )
     p = sub.add_parser(
         "report",
         help="join one claim's EI record to search.db, read-only, into a private report",
@@ -2121,6 +2199,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "import": cmd_import,
     "export": cmd_export,
     "log": cmd_log,
+    "jd": cmd_jd,
     "report": cmd_report,
     "claim": cmd_claim,
     "secret": cmd_secret,
