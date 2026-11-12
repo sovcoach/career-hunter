@@ -14,8 +14,9 @@ BLOCKED_IN_A_ROW blocked queries in a row, and fails only when no query was answ
 The engines throttled in a pass that ran are kept in `discovery_state` (search
 migration 0025) and named in a line. A stopped pass and a miss both write no queue row,
 leave the cursor where it was, and count as a failed pass: the next pass waits
-`discovery.interval_minutes` times 2 to the number of failed passes in a row, at most
-BACKOFF_CAP, and a pass that succeeds clears the count.
+`discovery.interval_minutes`, doubled for each failed pass in a row after the first,
+at most BACKOFF_CAP. A pass that succeeds clears the count, and so does
+`careerhunter discover clear-backoff` (`clear_backoff`).
 
 Approve and reject update this queue, and a board approval can fill a company row.
 They do not rewrite config files or open an EI record. The bot may call them.
@@ -59,7 +60,7 @@ MISS = "discovery miss: unreachable"
 BAD_REPLY = "discovery miss: bad-reply"
 OFF = "discovery off"
 THROTTLED = "discovery stopped: rate limited or asked for a CAPTCHA"
-BACKOFF_CAP = dt.timedelta(days=7)
+BACKOFF_CAP = dt.timedelta(hours=24)
 # The share of the watch run's budget one discovery pass may use, in seconds. Config
 # keeps queries_per_run times query_delay_seconds well inside it (config.py).
 PASS_SECONDS = 150.0
@@ -637,9 +638,35 @@ def _backoff_until(conn: sqlite3.Connection) -> str | None:
 
 
 def backoff_for(failures: int, interval_minutes: int) -> dt.timedelta:
-    """The wait after `failures` failed passes in a row: the interval doubled each time."""
-    wait: dt.timedelta = dt.timedelta(minutes=interval_minutes) * (2 ** min(failures, 16))
+    """The wait after `failures` failed passes in a row: one interval after the first,
+    doubled for each one after it, at most BACKOFF_CAP."""
+    doublings = min(max(failures - 1, 0), 16)
+    wait: dt.timedelta = dt.timedelta(minutes=interval_minutes) * (2**doublings)
     return wait if wait < BACKOFF_CAP else BACKOFF_CAP
+
+
+@dataclass(frozen=True)
+class Backoff:
+    """Discovery's backoff, read now: failed passes in a row and when the next may start."""
+
+    failures: int
+    until: str | None
+
+
+def backoff(conn: sqlite3.Connection) -> Backoff:
+    row = conn.execute(
+        "SELECT failures, backoff_until FROM discovery_state WHERE id = 1"
+    ).fetchone()
+    return Backoff(0, None) if row is None else Backoff(int(row[0]), row[1])
+
+
+def clear_backoff(conn: sqlite3.Connection) -> Backoff:
+    """End the backoff now, so the next due pass runs. Returns what it was. The cursor,
+    the unproductive count and SearXNG's health are left as they are."""
+    with db.transaction(conn):
+        before = backoff(conn)
+        conn.execute("UPDATE discovery_state SET failures = 0, backoff_until = NULL WHERE id = 1")
+    return before
 
 
 # The component failure kind for each line that ends a pass (#42).

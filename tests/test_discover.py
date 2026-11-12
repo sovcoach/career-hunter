@@ -1220,25 +1220,91 @@ def test_failed_passes_back_off_exponentially_and_a_success_clears_it(tmp_path: 
     down = _Talk(b"", status=0, fail_at=1)
     run = {"today": "2026-11-02", "now": clock}
     assert discover.run(conn, _ETIQUETTE, transport=down, **run).notice == discover.MISS
-    assert _state(conn) == (0, 1, "2026-11-02T11:00:00Z")  # 60 minutes times 2
-    clock.advance(minutes=119)
+    assert _state(conn) == (0, 1, "2026-11-02T10:00:00Z")  # one interval, 60 minutes
+    clock.advance(minutes=59)
     waiting = _empty()
     outcome = discover.run(conn, _ETIQUETTE, transport=waiting, **run)
-    assert outcome == discover.Outcome("discovery backing off until 2026-11-02T11:00:00Z", ())
+    assert outcome == discover.Outcome("discovery backing off until 2026-11-02T10:00:00Z", ())
     assert waiting.calls == []
     clock.advance(minutes=1)
     assert discover.run(conn, _ETIQUETTE, transport=down, **run).notice == discover.MISS
-    assert _state(conn) == (0, 2, "2026-11-02T15:00:00Z")  # 60 times 4, from 11:00
-    clock.advance(hours=4)
+    assert _state(conn) == (0, 2, "2026-11-02T12:00:00Z")  # 60 times 2, from 10:00
+    clock.advance(hours=2)
     assert discover.run(conn, _ETIQUETTE, transport=_empty(), **run).notice is None
     assert _state(conn) == (3, 0, None)
     conn.close()
 
 
-def test_the_backoff_is_capped_at_seven_days() -> None:
-    assert discover.backoff_for(1, 60) == dt.timedelta(hours=2)
-    assert discover.backoff_for(3, 1440) == dt.timedelta(days=7)
-    assert discover.backoff_for(99, 60) == dt.timedelta(days=7)
+def test_the_backoff_doubles_from_one_interval_and_is_capped_at_a_day() -> None:
+    assert dt.timedelta(hours=24) == discover.BACKOFF_CAP
+    assert discover.backoff_for(1, 60) == dt.timedelta(hours=1)
+    assert discover.backoff_for(2, 60) == dt.timedelta(hours=2)
+    assert discover.backoff_for(5, 60) == dt.timedelta(hours=16)
+    assert discover.backoff_for(6, 60) == dt.timedelta(hours=24)
+    assert discover.backoff_for(99, 60) == dt.timedelta(hours=24)
+    # With the default daily interval, a failed pass waits for the next normal one.
+    assert discover.backoff_for(1, 1440) == discover.backoff_for(3, 1440) == dt.timedelta(days=1)
+
+
+def test_clear_backoff_ends_it_and_keeps_the_rest(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    clock = _Clock()
+    down = _Talk(b"", status=0, fail_at=1)
+    discover.run(conn, _ETIQUETTE, transport=down, today="2026-11-02", now=clock)
+    before = discover.clear_backoff(conn)
+    assert before == discover.Backoff(1, "2026-11-02T10:00:00Z")
+    assert _state(conn) == (0, 0, None)
+    unproductive = conn.execute("SELECT unproductive FROM discovery_state").fetchone()[0]
+    assert unproductive == 1  # not cleared: it counts passes that ran
+    assert discover.clear_backoff(conn) == discover.Backoff(0, None)
+    assert (
+        discover.run(conn, _ETIQUETTE, transport=_empty(), today="2026-11-02", now=clock).notice
+        is None
+    )
+    conn.close()
+
+
+def test_the_cli_clears_the_backoff(
+    inited: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    conn = db.connect(inited / "search.db")
+    try:
+        conn.execute(
+            "UPDATE discovery_state SET failures = 3, backoff_until = '2026-11-03T09:00:00Z'"
+        )
+    finally:
+        conn.close()
+    assert cli.main(["discover", "clear-backoff"], probe=probe) == 0
+    assert capsys.readouterr().out == (
+        "discovery: backoff cleared (it was until 2026-11-03T09:00:00Z, after 3 failed "
+        "passes in a row); the next pass runs when it is due\n"
+    )
+    assert cli.main(["discover", "clear-backoff"], probe=probe) == 0
+    assert capsys.readouterr().out == "discovery: no backoff to clear\n"
+    assert cli.main(["discover", "clear-backoff", "3"], probe=probe) == 1
+
+
+def test_doctor_names_the_backoff_and_the_command_that_ends_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    conn = _search_db(tmp_path)
+    now = dt.datetime(2026, 11, 2, 9, 30, tzinfo=dt.UTC)
+    talk = _Talk(_engines([], ("engine one", "CAPTCHA")))
+    discover.run(conn, _ETIQUETTE, transport=talk, today="2026-11-02", now=_Clock())
+    cli._doctor_discovery_backoff(cli._Report(), conn, _ETIQUETTE, now)
+    assert capsys.readouterr().out == (
+        "discovery       WARN backing off until 2026-11-02T10:00:00Z after 1 failed pass in a "
+        "row; engines throttled: engine one; to retry sooner, run: careerhunter discover "
+        "clear-backoff\n"
+    )
+    later = dt.datetime(2026, 11, 2, 10, 30, tzinfo=dt.UTC)  # past it: no warning
+    cli._doctor_discovery_backoff(cli._Report(), conn, _ETIQUETTE, later)
+    assert capsys.readouterr().out == (
+        "discovery       --  engines throttled in the last pass: engine one\n"
+    )
+    cli._doctor_discovery_backoff(cli._Report(), conn, {"discovery": {"searxng_url": None}}, now)
+    assert capsys.readouterr().out == ""  # discovery off
+    conn.close()
 
 
 def _engines(results: list[dict[str, str]], *pairs: tuple[str, str]) -> bytes:

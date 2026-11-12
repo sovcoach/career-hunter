@@ -1315,6 +1315,8 @@ def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
     elif candidate_id is not None:
         _err(f"error: discover {action} takes no candidate id")
         return EXIT_ERROR
+    if action == "clear-backoff":
+        return _discover_clear_backoff(datadir)
     if action != "run":
         return _discover_by_hand(datadir, action, candidate_id)
     try:
@@ -1400,6 +1402,28 @@ def _discover_by_hand(datadir: DataDir, action: str, candidate_id: int | None) -
         conn.close()
     for row in rows:
         print(discover.format_row(row))
+    return EXIT_OK
+
+
+def _discover_clear_backoff(datadir: DataDir) -> int:
+    """End discovery's backoff, so the next due pass runs. Writes search.db only."""
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    conn = db.connect(datadir.search_db_path)
+    try:
+        db.migrate(conn, "search")
+        before = discover.clear_backoff(conn)
+    finally:
+        conn.close()
+    if before.until is None:
+        print("discovery: no backoff to clear")
+    else:
+        print(
+            f"discovery: backoff cleared (it was until {before.until}, after "
+            f"{plural(before.failures, 'failed pass', 'failed passes')} in a row); "
+            "the next pass runs when it is due"
+        )
     return EXIT_OK
 
 
@@ -1753,6 +1777,31 @@ def _doctor_usefulness(
         report.line("discovery useful", "--", when)
 
 
+DISCOVERY_CLEAR_HINT = "to retry sooner, run: careerhunter discover clear-backoff"
+
+
+def _doctor_discovery_backoff(
+    report: _Report, search: sqlite3.Connection, config_doc: dict[str, Any] | None, now: dt.datetime
+) -> None:
+    """Discovery inside its backoff is a warning with the command that ends it; the
+    engines SearXNG reported as throttled in the last pass are named."""
+    if not discovery_enabled(config_doc):
+        return
+    state = discover.backoff(search)
+    engines, _when = discover.suspended_engines(search)
+    named = f"; engines throttled: {', '.join(engines)}" if engines else ""
+    if state.until is not None and state.until > now.strftime("%Y-%m-%dT%H:%M:%SZ"):
+        report.line(
+            "discovery",
+            "WARN",
+            f"backing off until {state.until} after "
+            f"{plural(state.failures, 'failed pass', 'failed passes')} in a row{named}; "
+            f"{DISCOVERY_CLEAR_HINT}",
+        )
+    elif engines:
+        report.line("discovery", "--", f"engines throttled in the last pass: {', '.join(engines)}")
+
+
 def _doctor_components(
     report: _Report, search: sqlite3.Connection, config_doc: dict[str, Any] | None
 ) -> None:
@@ -2023,6 +2072,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
     if search is not None:
         _doctor_watch_runs(report, search, now)
         _doctor_usefulness(report, search, config_doc, now)
+        _doctor_discovery_backoff(report, search, config_doc, now)
         _doctor_components(report, search, config_doc)
     _doctor_lm_studio(report, config_doc)
     if search is not None:
@@ -2189,10 +2239,11 @@ def build_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument(
         "discover_action",
         nargs="?",
-        choices=("run", "list", "approve", "reject"),
+        choices=("run", "list", "approve", "reject", "clear-backoff"),
         default="run",
         help="run: search and queue new rows; list: print pending rows; "
-        "approve or reject: decide one pending row",
+        "approve or reject: decide one pending row; clear-backoff: end the backoff after "
+        "failed passes",
     )
     discover_parser.add_argument(
         "candidate_id",
