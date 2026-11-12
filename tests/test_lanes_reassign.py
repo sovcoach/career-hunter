@@ -100,17 +100,20 @@ def test_reassign_applies_the_plan_and_logs_each_move(search: sqlite3.Connection
     unchecked = posting(search, "IT Support Associate", None, checked=False)
     planned = lanes.reassign(search, config(), TODAY)
     assert len(planned.moves) == 2
+    assert planned.first_checks == (
+        LaneMove(unchecked, "IT Support Associate", None, "it_support"),
+    )
     assert lanes_of(search) == {
         loose: ("client_experience", 1),
         dropped: (None, 1),
-        unchecked: (None, 0),  # the watcher fills in unchecked rows, not reassign
+        unchecked: ("it_support", 1),  # checked now, as the watcher's fill-in would
     }
-    assert changes(search) == [
+    assert changes(search) == [  # a first check is not a move, and is not logged
         (loose, None, "client_experience"),
         (dropped, "operations", None),
     ]
     again = lanes.reassign(search, config(), TODAY)
-    assert again.moves == ()
+    assert again.moves == () and again.first_checks == ()
     assert len(changes(search)) == 2
 
 
@@ -209,7 +212,7 @@ def test_the_dry_run_lists_the_moves_and_writes_nothing(
     assert f"{p:6} IT Support Associate: off-lane -> it_support" in out
     assert "1 of 1 checked postings would change lane." in out
     assert "from off-lane to a lane: 1; to off-lane: 0; between lanes: 0" in out
-    assert "1 held off-lane postings would become alertable" in out
+    assert "1 held postings would become alertable" in out
     assert (ready / "search.db").read_bytes() == before
 
 
@@ -222,7 +225,7 @@ def test_the_run_applies_the_same_moves(
     out = capsys.readouterr().out
     assert f"{p:6} IT Support Associate: off-lane -> it_support" in out
     assert "1 of 1 checked postings changed lane." in out
-    assert "1 held off-lane postings became alertable" in out
+    assert "1 held postings became alertable" in out
     conn = db.connect_read_only(ready / "search.db")
     try:
         assert changes(conn) == [(p, None, "it_support")]
@@ -264,3 +267,54 @@ def test_it_needs_a_config_and_a_search_db(
     (ready / "config.yaml").unlink()
     assert cli.main(["lanes", "reassign"], probe=probe) == 1
     assert "config.yaml is missing" in capsys.readouterr().err
+
+
+# --- postings not checked yet -------------------------------------------------------------
+
+
+def test_the_dry_run_lists_unchecked_postings_and_writes_nothing(
+    search: sqlite3.Connection,
+) -> None:
+    laned = posting(search, "Operations Coordinator", None, checked=False)
+    off = posting(search, "Synthetic Juggler", None, checked=False)
+    planned = lanes.plan_reassign(search, config(), TODAY)
+    assert planned.first_checks == (
+        LaneMove(laned, "Operations Coordinator", None, "operations"),
+        LaneMove(off, "Synthetic Juggler", None, None),
+    )
+    assert lanes_of(search) == {laned: (None, 0), off: (None, 0)}
+
+
+def test_an_unchecked_posting_held_for_its_lane_is_released_once_checked(
+    search: sqlite3.Connection,
+) -> None:
+    # An unchecked posting is held; checked into a lane, it may alert.
+    unchecked = posting(search, "Operations Coordinator", None, fit="medium", checked=False)
+    planned = lanes.plan_reassign(search, config(), TODAY)
+    assert planned.released == (unchecked,)
+
+
+def test_the_cli_lists_unchecked_postings_dry_run_first(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    set_lanes(ready, LANES)
+    conn = db.connect(ready / "search.db")
+    try:
+        p = posting(conn, "Operations Coordinator", None, checked=False)
+    finally:
+        conn.close()
+    before = (ready / "search.db").read_bytes()
+    assert cli.main(["lanes", "reassign", "--dry-run"], probe=probe) == 0
+    out = capsys.readouterr().out
+    assert f"{p:6} Operations Coordinator: not checked -> operations" in out
+    assert "1 postings not checked yet would be checked: 1 to a lane, 0 off-lane." in out
+    assert (ready / "search.db").read_bytes() == before
+    assert cli.main(["lanes", "reassign"], probe=probe) == 0
+    assert "1 postings not checked yet were checked: 1 to a lane, 0 off-lane." in (
+        capsys.readouterr().out
+    )
+    conn = db.connect_read_only(ready / "search.db")
+    try:
+        assert lanes_of(conn) == {p: ("operations", 1)}
+    finally:
+        conn.close()

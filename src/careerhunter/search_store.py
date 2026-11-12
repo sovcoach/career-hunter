@@ -678,6 +678,21 @@ def move_posting_lane(
     return cur.rowcount == 1
 
 
+def unchecked_lanes(conn: sqlite3.Connection) -> list[CheckedLane]:
+    """Every posting not yet checked against the lanes, oldest first, for `lanes
+    reassign`. Each has no lane yet."""
+    rows = conn.execute(
+        "SELECT id, title, coalesce(posted_date, first_seen) AS posted "
+        "FROM postings WHERE lane_checked = 0 ORDER BY id"
+    )
+    return [
+        CheckedLane(
+            posting_id=int(r["id"]), title=str(r["title"]), lane=None, posted=str(r["posted"])
+        )
+        for r in rows
+    ]
+
+
 def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
     """Every posting whose title has not been checked against the lanes, oldest first."""
     rows = conn.execute("SELECT id, title FROM postings WHERE lane_checked = 0 ORDER BY id")

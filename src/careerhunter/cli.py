@@ -1505,7 +1505,8 @@ def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
 
 
 def cmd_lanes(datadir: DataDir, args: argparse.Namespace) -> int:
-    """`lanes reassign [--dry-run]`: recompute every checked posting's lane.
+    """`lanes reassign [--dry-run]`: recompute every checked posting's lane, and check
+    every posting not checked yet.
 
     The current `search.lanes` and the current matcher decide. A dry run reads
     search.db only, and needs it migrated already. Without `--dry-run` the same changes
@@ -1549,17 +1550,23 @@ def _print_reassignment(planned: lanes.Reassignment, *, dry_run: bool) -> None:
     for move in planned.moves:
         old, new = move.old or "off-lane", move.new or "off-lane"
         print(f"{move.posting_id:6} {move.title}: {old} -> {new}")
+    for move in planned.first_checks:
+        print(f"{move.posting_id:6} {move.title}: not checked -> {move.new or 'off-lane'}")
     verb = "would change" if dry_run else "changed"
     print(f"{len(planned.moves)} of {planned.checked} checked postings {verb} lane.")
     to_lane = sum(1 for m in planned.moves if m.old is None)
     to_off = sum(1 for m in planned.moves if m.new is None)
     between = len(planned.moves) - to_lane - to_off
     print(f"  from off-lane to a lane: {to_lane}; to off-lane: {to_off}; between lanes: {between}")
+    if planned.first_checks:
+        laned = sum(1 for m in planned.first_checks if m.new is not None)
+        checks = "would be checked" if dry_run else "were checked"
+        print(
+            f"{len(planned.first_checks)} postings not checked yet {checks}: "
+            f"{laned} to a lane, {len(planned.first_checks) - laned} off-lane."
+        )
     can = "would become" if dry_run else "became"
-    print(
-        f"{len(planned.released)} held off-lane postings {can} alertable, "
-        "within alerts.max_per_poll."
-    )
+    print(f"{len(planned.released)} held postings {can} alertable, within alerts.max_per_poll.")
     if planned.too_old:
         skip = "would get" if dry_run else "got"
         print(
@@ -2192,8 +2199,8 @@ def build_parser() -> argparse.ArgumentParser:
     lanes_sub = p.add_subparsers(dest="lanes_action", required=True)
     p = lanes_sub.add_parser(
         "reassign",
-        help="recompute every checked posting's lane against the current config; "
-        "writes search.db only",
+        help="recompute every checked posting's lane against the current config, and check "
+        "any posting not checked yet; writes search.db only",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="list each posting that would change; write nothing"
