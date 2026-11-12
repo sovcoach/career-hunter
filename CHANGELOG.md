@@ -7,6 +7,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-12
+
 ### Added
 - LM Studio's API token (ADR-025). `careerhunter secret set lm_studio_token` stores it in the Keychain; the watch run sends it as a Bearer header on every scoring and embedding call, and never prints or logs it.
 - `doctor` has an `LM Studio` line when a watch run would call it: it asks for the model list with the token, which loads no model. `OK`, `BAD unauthorized` with the command that stores the token, or `BAD unreachable`.
@@ -20,7 +22,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A posting whose scoring reply doesn't parse 3 times is given up: never sent to the model again and not counted as held (search migration 0023). `doctor`'s `bot refusals` line counts it.
 - Discovery: one engine that SearXNG reports as throttled or suspended no longer stops a pass while others answer. A pass fails only when no query is answered or SearXNG itself answers 429; it stops after two blocked queries in a row. The throttled engines are named and kept (search migration 0025). The backoff after a failed pass is one interval, doubled for each further failure, at most 24 hours (was up to 7 days).
 - `lanes reassign` also checks postings not checked against the lanes yet, listed as `not checked -> <lane>` in the dry run.
-- `search.db` moves from schema version 21 (0.5.0) to 25, through search migrations 0022 to 0025, and the EI record from version 2 to 3, through EI migration 0003. See the new "Upgrading from 0.5.0 to 0.5.1" in `docs/SETUP.md`; the 0.4.0 to 0.5.0 notes stay as released.
+- `search.db` moves from schema version 21 (0.5.0) to 25, through search migrations 0022 to 0025, and the EI record from version 2 to 3, through EI migration 0003. See the new "Upgrading from 0.5.0 to 0.5.1" in `docs/SETUP.md`; the 0.4.0 to 0.5.0 notes stay as released. Its release checkout uses `v0.5.1`.
 
 ### Fixed
 - An application recorded by `import`, `careerhunter log` or the bot's `/log` or Applied is checked against `search.lanes` when its posting is created, so it no longer shows `No lane` until the next watch run.
@@ -246,7 +248,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/sovcoach/career-hunter/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/sovcoach/career-hunter/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sovcoach/career-hunter/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/sovcoach/career-hunter/compare/v0.2.0...v0.3.0
