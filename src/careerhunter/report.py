@@ -12,7 +12,8 @@ mode 0600, in the data folder, never overwritten; the terminal prints only its p
 relative to the data folder. It holds the EI facts of each application (employer, role,
 date, method, the latest EI status, the canonical link and a JD reference, ADR-024)
 beside the search side's lane, fit word and source, and counts by lane. The JD
-reference is the EI record's current JD, `JD <first 8 of sha256> (<source>)`, or `JD
+reference is the EI record's current JD, `JD <first 8 of sha256> (<source>)`, or `JD --
+(<explanation>)` when the JD was marked unavailable (EI migration 0003), or `JD
 missing`, or `JD missing (pre-feature)`; a claim file still at EI migration 0001 has
 no JDs, and every row of it is pre-feature. Orphans on either side are counted, not
 listed: `doctor` names them.
@@ -101,6 +102,23 @@ WHERE j.id = (SELECT max(id) FROM ei.job_descriptions WHERE application_id = j.a
 """
 
 
+_UNAVAILABLE = """
+SELECT a.correlation_id, u.explanation
+FROM ei.jd_unavailable u JOIN ei.applications a ON a.id = u.application_id
+WHERE u.id = (SELECT max(id) FROM ei.jd_unavailable WHERE application_id = u.application_id)
+"""
+
+
+def _ei_unavailable(conn: sqlite3.Connection) -> dict[str, str]:
+    """The current JD-unavailable explanation per correlation id, in `ei` (EI 0003)."""
+    has_table = conn.execute(
+        "SELECT 1 FROM ei.sqlite_master WHERE type = 'table' AND name = 'jd_unavailable'"
+    ).fetchone()
+    if not has_table:
+        return {}
+    return {str(r[0]): str(r[1]) for r in conn.execute(_UNAVAILABLE)}
+
+
 def _ei_jds(conn: sqlite3.Connection) -> tuple[dict[str, int], dict[str, tuple[str, str]]]:
     """jd_expected and the current JD (hash, source) per correlation id, in `ei`."""
     columns = {r["name"] for r in conn.execute("PRAGMA ei.table_info(applications)")}
@@ -124,6 +142,7 @@ def build(conn: sqlite3.Connection, claim: str) -> Report:
     rows: list[Row] = []
     voided = 0
     expected, current = _ei_jds(conn)
+    unavailable = _ei_unavailable(conn)
     for r in conn.execute(_ROWS):
         if r["voided"]:
             voided += 1
@@ -139,7 +158,7 @@ def build(conn: sqlite3.Connection, claim: str) -> Report:
                 fit=str(r["fit"]).capitalize() if r["fit"] else "not scored",
                 source=str(r["source"]),
                 link=_link(r["posting_url"] or r["url"]),
-                jd=_jd(str(r["correlation_id"]), expected, current),
+                jd=_jd(str(r["correlation_id"]), expected, current, unavailable),
             )
         )
     only_ei = int(conn.execute(_ONLY_EI).fetchone()[0])
@@ -210,9 +229,14 @@ def _link(url: object) -> str:
     return urls.canonical(str(url)) if url else "no link"
 
 
-def _jd(corr: str, expected: dict[str, int], current: dict[str, tuple[str, str]]) -> str:
+def _jd(
+    corr: str,
+    expected: dict[str, int],
+    current: dict[str, tuple[str, str]],
+    unavailable: dict[str, str],
+) -> str:
     sha, source = current.get(corr, (None, None))
-    return ei_store.jd_reference(sha, source, expected.get(corr, 0))
+    return ei_store.jd_reference(sha, source, expected.get(corr, 0), unavailable.get(corr))
 
 
 def _lane(lane: object, checked: object) -> str:

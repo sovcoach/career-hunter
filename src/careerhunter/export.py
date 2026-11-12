@@ -17,7 +17,8 @@ Voided applications and activities are left out. They stay in the database, with
 void reason, but they are not part of the job-search record.
 
 Every application row carries a JD reference (ADR-024): `JD <first 8 of sha256>
-(<source>)` for its current job description, else `JD missing`, or `JD missing
+(<source>)` for its current job description, else `JD -- (<explanation>)` when it was
+marked unavailable (EI migration 0003), else `JD missing`, or `JD missing
 (pre-feature)` for one recorded before JDs were kept. Beside the CSVs and the PDF, the
 JDs themselves go in a folder, `<stem>-job-descriptions/`: one `.txt` per application
 that has one (a header with the employer, role, date, reference and hash, then the
@@ -110,6 +111,7 @@ def collect_applications(
     ).fetchall()
     expected = ei_store.jd_expected(conn)
     current = ei_store.current_job_descriptions(conn)
+    unavailable = ei_store.jd_unavailable(conn)
     history: dict[int, list[sqlite3.Row]] = {}
     for h in conn.execute(
         "SELECT application_id, status, status_date FROM status_history ORDER BY id"
@@ -142,6 +144,7 @@ def collect_applications(
                     jd.text_sha256 if jd else None,
                     jd.source if jd else None,
                     expected.get(corr, 0),
+                    unavailable.get(corr),
                 ),
                 "_sort_date": a["date_applied"] or a["week_of"],
                 "_jd": jd,

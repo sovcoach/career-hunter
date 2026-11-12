@@ -1829,8 +1829,19 @@ def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
 
 
 def _doctor_job_descriptions(report: _Report, search: sqlite3.Connection) -> None:
-    """Applications with no job description (ADR-024)."""
+    """Applications with no job description (ADR-024). One marked unavailable, with why,
+    is `--`, never a warning."""
     missing, pre_feature = search_store.jd_counts(search)
+    unavailable = search_store.jd_unavailable_counts(search)
+    if unavailable:
+        total = sum(count for _, count in unavailable)
+        shown = "; ".join(why for why, _ in unavailable[:3])
+        more = f"; and {len(unavailable) - 3} more" if len(unavailable) > 3 else ""
+        report.line(
+            "job descriptions",
+            "--",
+            f"{plural(total, 'application', 'applications')}: JD unavailable ({shown}{more})",
+        )
     older = (
         f"; {plural(pre_feature, 'application', 'applications')} from before JDs were kept"
         if pre_feature
@@ -1850,6 +1861,8 @@ def _doctor_job_descriptions(report: _Report, search: sqlite3.Connection) -> Non
             f"{plural(pre_feature, 'application', 'applications')} from before JDs were "
             "kept, with no JD",
         )
+    elif unavailable:
+        report.line("job descriptions", "OK", "every other application has one")
     else:
         report.line("job descriptions", "OK", "every application has one")
 
