@@ -126,7 +126,12 @@ from careerhunter.ats import (
     Skip,
 )
 from careerhunter.ats import board_url as board_url  # the tests build list URLs with it
-from careerhunter.config import max_posting_age_days, off_lane_min_fit, tier_fits
+from careerhunter.config import (
+    max_posting_age_days,
+    off_lane_min_fit,
+    scoring_timeout_seconds,
+    tier_fits,
+)
 from careerhunter.deadline import Deadline
 from careerhunter.discover import Pass
 from careerhunter.embed import Embedder, miss_line
@@ -216,6 +221,7 @@ class _State:
     # reserve left for the passes after the boards. Never written anywhere.
     queued: dict[int, PostingText] = field(default_factory=dict)
     held_new: dict[int, PostingText] = field(default_factory=dict)
+    score_timeout: float = 120.0  # scoring.timeout_seconds: a call needs this much budget
 
     def out_of_time(self) -> bool:
         return self.budget is not None and self.budget.expired()
@@ -233,6 +239,11 @@ class _State:
 
     def in_reserve(self) -> bool:
         return self.budget is not None and self.budget.remaining() < SCORE_RESERVE
+
+    def short_for_a_call(self) -> bool:
+        """Less of the budget is left than one scoring call may take, so a call is not
+        started: the budget would cut it short and waste the model's work."""
+        return self.budget is not None and self.budget.remaining() < self.score_timeout
 
     @property
     def resume_sha256(self) -> str | None:
@@ -337,6 +348,7 @@ def run(
         lanes_on=lanes.configured(rules) is not None,
         max_age=max_posting_age_days(rules),
         today=today,
+        score_timeout=float(scoring_timeout_seconds(rules)),
     )
     lines = state.lines
     with db.transaction(conn):
@@ -1069,6 +1081,11 @@ def _record_jobs(
                 _line(name, ats, f"{item.title!r} left for scoring after the boards (reserve)")
             )
             continue
+        if state.short_for_a_call():
+            state.left_by_budget(
+                _line(name, ats, f"{item.title!r} left for the next run (run budget reached)")
+            )
+            continue
         _attempt(conn, state, posting_id, seen, scorer, today, name, ats, embedder)
     lines.append(_line(name, ats, f"{new} new, {existing} already recorded"))
 
@@ -1230,7 +1247,7 @@ def _score_passes(
                 f"watch: scoring: {state.model_state()}; {left} postings left for the next run"
             )
             return
-        if state.out_of_time():
+        if state.out_of_time() or state.short_for_a_call():
             state.left_by_budget(_partly("scoring", left))
             return
         with _isolated(conn, state.lines, str(row["company"]), state.hook):

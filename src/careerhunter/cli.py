@@ -60,6 +60,7 @@ from careerhunter.config import (
     load_config,
     load_exclusions,
     off_lane_min_fit,
+    scoring_timeout_seconds,
     telegram_chat_id,
     timezone_name,
     watch_interval_minutes,
@@ -1116,7 +1117,12 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             return score_posting(
                 posting,
                 doc,
-                transport=partial(score_transport, budget=budget, token=token),
+                transport=partial(
+                    score_transport,
+                    budget=budget,
+                    token=token,
+                    timeout=scoring_timeout_seconds(doc),
+                ),
                 resume=loaded,
                 examples=examples,
             )

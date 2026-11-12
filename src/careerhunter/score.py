@@ -61,7 +61,8 @@ from careerhunter.search_store import Example
 DEFAULT_URL = "http://127.0.0.1:1234/v1/chat/completions"
 MODEL_NAME = DEFAULT_CHAT_MODEL  # what is sent when scoring.chat_model is unset
 # The request does not stream, so no byte arrives until generation ends. One step has
-# to cover that wait, so the step limit is the whole total.
+# to cover that wait, so the step limit is the whole total. A watch run uses
+# `scoring.timeout_seconds` instead; TOTAL is the limit when none is given.
 TOTAL = 120.0
 TIMEOUT = TOTAL
 # The reply as it arrives. A reasoning model's thinking can run far past what is kept,
@@ -157,12 +158,19 @@ def model_headers(token: str | None) -> dict[str, str]:
 
 
 def default_transport(
-    url: str, payload: bytes, *, budget: Deadline | None = None, token: str | None = None
+    url: str,
+    payload: bytes,
+    *,
+    budget: Deadline | None = None,
+    token: str | None = None,
+    timeout: float | None = None,
 ) -> tuple[int, bytes]:
-    """POST once, within TOTAL. A redirect status is returned as-is and is not followed.
+    """POST once, within `timeout` (`scoring.timeout_seconds`; TOTAL if None). A redirect
+    status is returned as-is and is not followed.
 
     `token` is sent as a Bearer header when set; it is never logged or put in an error.
     """
+    limit = TOTAL if timeout is None else timeout
     host, port, path = require_loopback(url)
     try:
         return loopback.exchange(
@@ -172,8 +180,8 @@ def default_transport(
             path,
             body=payload,
             headers=model_headers(token),
-            total=TOTAL,
-            per_op=TIMEOUT,
+            total=limit,
+            per_op=limit,
             max_bytes=MAX_REPLY,
             budget=budget,
         )

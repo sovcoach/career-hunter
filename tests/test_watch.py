@@ -2032,6 +2032,7 @@ def test_scoring_waiting_rows_stops_when_the_budget_runs_out(
         fetcher=fetcher,
         scorer=scorer,
         budget=minutes(clock, 10),
+        config={"scoring": {"timeout_seconds": 120}},  # the fake call's 120 s
     )
     assert "watch: scoring: run budget reached; 1 postings left for the next run" in lines
     assert [row["llm_output"] for row in postings(search)].count("kept") == 2
