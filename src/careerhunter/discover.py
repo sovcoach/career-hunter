@@ -31,6 +31,7 @@ from typing import Any
 
 from careerhunter import db, loopback, search_store
 from careerhunter.ats import (
+    ASHBY_SLUG,
     Board,
     BoardHTTPError,
     BoardParseError,
@@ -734,7 +735,7 @@ def _board(host: str, segments: list[str], query: str) -> _Board | None:
         slug = _one_or_two(segments)
         return ("lever", slug, None, None) if slug else None
     if host == "jobs.ashbyhq.com":
-        slug = _one_or_two(segments)
+        slug = _one_or_two(segments, ASHBY_SLUG)
         return ("ashby", slug, None, None) if slug else None
     if host in _SMARTRECRUITERS:
         slug = _smartrecruiters_slug(segments)
@@ -792,8 +793,8 @@ def _greenhouse_slug(segments: list[str]) -> str | None:
     return segments[0]
 
 
-def _one_or_two(segments: list[str]) -> str | None:
-    if not segments or len(segments) > 2 or _slug(segments[0]) is None:
+def _one_or_two(segments: list[str], pattern: re.Pattern[str] = _SLUG) -> str | None:
+    if not segments or len(segments) > 2 or pattern.fullmatch(segments[0]) is None:
         return None
     if len(segments) == 2 and not segments[1]:
         return None

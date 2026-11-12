@@ -180,6 +180,14 @@ def test_board_url_is_built_only_from_a_safe_slug() -> None:
 )
 def test_an_unsafe_slug_builds_no_url(slug: str) -> None:
     for ats in ("greenhouse", "lever", "ashby"):
+        if ats == "ashby" and slug == "evil.example":
+            # An Ashby board name may contain dots (test_ashby_slug): it is still one path
+            # segment on Ashby's own host, never another host.
+            assert w.board_url(ats, slug) == (
+                "https://api.ashbyhq.com/posting-api/job-board/evil.example"
+                "?includeCompensation=true"
+            )
+            continue
         assert w.board_url(ats, slug) is None
 
 
