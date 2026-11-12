@@ -42,7 +42,7 @@ def test_a_clean_setup(ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixt
         "ei claim        OK  2026-27 active (from 2026-08-05)",
         f"search.db       OK  schema version {db.latest_version('search')}",
         "search.db       OK  0600",
-        "claim 2026-27   OK  schema version 2",
+        "claim 2026-27   OK  schema version 3",
         "claim 2026-27   OK  active, from 2026-08-05",
         "claim 2026-27   OK  0600",
         "reconcile       OK  search.db and 1 claim record agree",

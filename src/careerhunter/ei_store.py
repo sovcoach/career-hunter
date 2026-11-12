@@ -197,6 +197,37 @@ _CURRENT_JDS = (
 )
 
 
+def has_jd_unavailable(conn: sqlite3.Connection) -> bool:
+    """False for a file still at EI migration 0001 or 0002."""
+    return _has_table(conn, "jd_unavailable")
+
+
+def insert_jd_unavailable(conn: sqlite3.Connection, application_id: int, explanation: str) -> int:
+    """Mark the application's JD unavailable, with why (EI migration 0003)."""
+    cur = conn.execute(
+        "INSERT INTO jd_unavailable (application_id, explanation) VALUES (?, ?)",
+        (application_id, explanation),
+    )
+    return int(cur.lastrowid or 0)
+
+
+_CURRENT_UNAVAILABLE = (
+    "SELECT a.correlation_id, u.explanation FROM jd_unavailable u "
+    "JOIN applications a ON a.id = u.application_id "
+    "WHERE u.id = (SELECT max(id) FROM jd_unavailable WHERE application_id = u.application_id)"
+)
+
+
+def jd_unavailable(conn: sqlite3.Connection) -> dict[str, str]:
+    """Each marked application's latest explanation, keyed by correlation id. A file
+    still at 0001 or 0002 has none."""
+    if not has_jd_unavailable(conn):
+        return {}
+    return {
+        str(r["correlation_id"]): str(r["explanation"]) for r in conn.execute(_CURRENT_UNAVAILABLE)
+    }
+
+
 def current_job_description(
     conn: sqlite3.Connection, correlation_id: str
 ) -> EiJobDescription | None:
@@ -238,13 +269,22 @@ def posting_urls(conn: sqlite3.Connection) -> dict[str, str | None]:
     }
 
 
-def jd_reference(text_sha256: str | None, source: str | None, jd_expected: int) -> str:
+def jd_reference(
+    text_sha256: str | None,
+    source: str | None,
+    jd_expected: int,
+    unavailable: str | None = None,
+) -> str:
     """How a report or an export names an application's JD (ADR-024).
 
     Any JD shows its reference, `JD <first 8 of sha256> (<source>)`, even before the
-    feature. With none, `JD missing`, or `JD missing (pre-feature)` for an application
-    recorded before a JD was expected.
+    feature, and even when the JD was marked unavailable before it arrived. With none,
+    `JD -- (<explanation>)` when it was marked unavailable (EI migration 0003), else
+    `JD missing`, or `JD missing (pre-feature)` for an application recorded before a JD
+    was expected.
     """
     if text_sha256:
         return f"JD {text_sha256[:8]} ({source})"
+    if unavailable:
+        return f"JD -- ({unavailable})"
     return "JD missing" if jd_expected else "JD missing (pre-feature)"

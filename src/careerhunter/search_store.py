@@ -201,6 +201,14 @@ def set_application_jd(
     )
 
 
+def set_jd_unavailable(conn: sqlite3.Connection, application_id: int, explanation: str) -> None:
+    """Mirror the EI record's latest JD-unavailable explanation (search migration 0024)."""
+    conn.execute(
+        "UPDATE applications SET jd_unavailable_reason = ? WHERE id = ?",
+        (explanation, application_id),
+    )
+
+
 @dataclass(frozen=True)
 class JdReference:
     """An application's JD fields in search.db, with its posting's URL and snapshot."""
@@ -213,11 +221,13 @@ class JdReference:
     jd_path: str | None
     url: str | None
     snapshot_path: str | None
+    jd_unavailable: str | None = None  # why the JD is unavailable, when it was marked
 
 
 _JD_REFERENCES = (
     "SELECT a.correlation_id, a.id, a.posting_id, a.ei_claim, a.jd_expected, a.jd_sha256, "
-    "a.jd_path, p.url, p.snapshot_path FROM applications a JOIN postings p ON p.id = a.posting_id"
+    "a.jd_path, a.jd_unavailable_reason, p.url, p.snapshot_path "
+    "FROM applications a JOIN postings p ON p.id = a.posting_id"
 )
 
 
@@ -231,6 +241,7 @@ def _jd_reference(row: sqlite3.Row) -> JdReference:
         jd_path=row["jd_path"],
         url=row["url"],
         snapshot_path=row["snapshot_path"],
+        jd_unavailable=row["jd_unavailable_reason"],
     )
 
 
@@ -310,12 +321,24 @@ def posting_company(conn: sqlite3.Connection, posting_id: int) -> str | None:
 
 
 def jd_counts(conn: sqlite3.Connection) -> tuple[int, int]:
-    """Applications with no JD: (expected one, from before JDs were kept)."""
+    """Applications with no JD and not marked unavailable: (expected one, from before
+    JDs were kept)."""
     row = conn.execute(
         "SELECT coalesce(sum(jd_expected = 1), 0), coalesce(sum(jd_expected = 0), 0) "
-        "FROM applications WHERE jd_sha256 IS NULL"
+        "FROM applications WHERE jd_sha256 IS NULL AND jd_unavailable_reason IS NULL"
     ).fetchone()
     return int(row[0]), int(row[1])
+
+
+def jd_unavailable_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Applications with no JD that were marked unavailable, by explanation, most
+    common first (search migration 0024)."""
+    rows = conn.execute(
+        "SELECT jd_unavailable_reason, count(*) AS n FROM applications "
+        "WHERE jd_sha256 IS NULL AND jd_unavailable_reason IS NOT NULL "
+        "GROUP BY jd_unavailable_reason ORDER BY n DESC, jd_unavailable_reason"
+    )
+    return [(str(r[0]), int(r[1])) for r in rows]
 
 
 def posting_urls(conn: sqlite3.Connection) -> list[tuple[int, str]]:

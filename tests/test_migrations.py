@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 24)), "ei_record": [1, 2]}[track]
+    expected = {"search": list(range(1, 25)), "ei_record": [1, 2, 3]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -978,7 +978,7 @@ def test_ei_0002_marks_every_existing_row_pre_feature_past_a_voided_one(tmp_path
     conn = _ei_at_0001(tmp_path / "ei.db")
     try:
         edits = conn.execute("SELECT count(*) FROM edits").fetchone()[0]
-        assert db.migrate(conn, "ei_record") == [2]
+        assert db.migrate(conn, "ei_record") == list(range(2, db.latest_version("ei_record") + 1))
         rows = conn.execute("SELECT jd_expected FROM applications ORDER BY id").fetchall()
         assert [r[0] for r in rows] == [0, 0]
         assert conn.execute("SELECT count(*) FROM edits").fetchone()[0] == edits  # no UPDATE
@@ -1072,4 +1072,4 @@ def test_search_0021_lets_a_checked_lane_move_and_logs_it(tmp_path: Path) -> Non
 def test_trigger_counts_on_a_fresh_file(fresh: sqlite3.Connection, track: str) -> None:
     """The counts ARCHITECTURE states for a fresh file."""
     found = fresh.execute("SELECT count(*) FROM sqlite_master WHERE type = 'trigger'").fetchone()
-    assert found[0] == {"search": 9, "ei_record": 37}[track]
+    assert found[0] == {"search": 9, "ei_record": 41}[track]

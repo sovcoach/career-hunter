@@ -50,6 +50,8 @@ ALLOWED_COLUMNS = {
         "file_type",
         "recorded_at",
     },
+    # EI migration 0003, widened on purpose (ADR-024, amended).
+    "jd_unavailable": {"id", "application_id", "explanation", "recorded_at"},
     "edits": {"id", "table_name", "row_id", "column_name", "old_value", "new_value", "edited_at"},
     "schema_migrations": {"version", "name", "checksum", "applied_at"},
     "db_identity": {"id", "track", "created_at"},
