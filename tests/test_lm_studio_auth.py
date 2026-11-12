@@ -190,8 +190,12 @@ def test_migration_0022_keeps_every_health_row(tmp_path: Path) -> None:
     try:
         before = [m for m in db.load_migrations("search") if m.version <= 21]
         db.migrate(conn, "search", before)
-        with db.transaction(conn):
-            search_store.record_component(conn, "searxng", failed="throttled", stamp=STAMP)
+        with db.transaction(conn):  # as 0021's code wrote it
+            conn.execute(
+                "UPDATE component_health SET failures = 1, last_failure = 'throttled', "
+                "held = 0, updated_at = ? WHERE component = 'searxng'",
+                (STAMP,),
+            )
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "UPDATE component_health SET failures = 1, last_failure = 'unauthorized' "

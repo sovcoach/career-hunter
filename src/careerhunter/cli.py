@@ -1738,8 +1738,10 @@ def _doctor_alert_hold(report: _Report, search: sqlite3.Connection) -> None:
 
 
 def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
-    """Postings the bot gave up on after Telegram refused them too often (#42)."""
+    """Postings given up: the bot's, after Telegram refused them too often (#42), and the
+    watcher's, after the model's replies for them did not parse too often (0023)."""
     given_up = search_store.given_up_count(search)
+    unparsed = search_store.parse_given_up_count(search)
     if given_up:
         report.line(
             "bot refusals",
@@ -1747,7 +1749,15 @@ def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
             f"{plural(given_up, 'posting', 'postings')} refused by Telegram "
             f"{bot.REFUSALS_TO_GIVE_UP} times; given up and never sent (see logs/bot.log)",
         )
-    else:
+    if unparsed:
+        report.line(
+            "bot refusals",
+            "WARN",
+            f"{plural(unparsed, 'posting', 'postings')} got a model reply that did not "
+            f"parse {watch.PARSE_FAILURES_TO_GIVE_UP} times; given up and never scored "
+            "(see logs/watch.log)",
+        )
+    if not given_up and not unparsed:
         report.line("bot refusals", "OK", "no posting given up")
 
 

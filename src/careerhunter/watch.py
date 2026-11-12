@@ -152,6 +152,9 @@ Tally = Literal["fetched", "failed", "left"]
 RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
 # All of one board's replies together (ats.py). The CLI also caps each request with it.
 BOARD_MAX_BYTES = ats_boards.BOARD_MAX_BYTES
+# Replies for one posting that did not parse before the watcher stops sending it to the
+# model (search migration 0023). The same count as the bot's Telegram refusals.
+PARSE_FAILURES_TO_GIVE_UP = 3
 # Inline scoring of new postings stops once less than this is left of the budget.
 SCORE_RESERVE = 240.0
 _LEFT = "run budget reached; left for the next run"
@@ -1170,12 +1173,15 @@ def _recheck_one(
 # was never tried, so a retry stamped at T goes ahead of every posting stored after T
 # and new arrivals can't push it back forever. Both stamps are UTC to the second. The
 # re-score passes keep never-tried first, then the oldest attempt, then the oldest
-# posting.
+# posting. A posting given up after PARSE_FAILURES_TO_GIVE_UP replies that did not
+# parse (search migration 0023) is in neither.
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM score_parse_failures f "
+    "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
     "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
@@ -1185,6 +1191,8 @@ _RESCORE_SQL = (
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM score_parse_failures f "
+    "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
     "ORDER BY p.score_attempted_at IS NOT NULL, p.score_attempted_at, p.first_seen, p.id"
 )
 _NEEDS_RESCORE_SQL = (
@@ -1307,7 +1315,21 @@ def _attempt(
     state.scorer_answered = True
     if result is None:
         kept = "; old score kept" if rescore else ""
-        lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
+        with db.transaction(conn):
+            gave_up = search_store.record_parse_failure(
+                conn, posting_id, _iso(state.now()), give_up_after=PARSE_FAILURES_TO_GIVE_UP
+            )
+        if gave_up:
+            lines.append(
+                _line(
+                    name,
+                    ats,
+                    f"{title} left unscored (unparseable reply){kept}; given up after "
+                    f"{PARSE_FAILURES_TO_GIVE_UP} unparseable replies, not tried again",
+                )
+            )
+        else:
+            lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
     else:
         metadata = None if result.tier is None else json.dumps({"tier": result.tier})
         fit = None if result.tier is None else state.fits.get(result.tier)
@@ -1323,6 +1345,7 @@ def _attempt(
                 key_requirements=result.key_requirements,
                 run_id=state.run_id,
             )
+            search_store.clear_parse_failures(conn, posting_id)
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):
                 search_store.insert_skip(conn, posting_id, today, "gap_tier")
         if result.excluded:

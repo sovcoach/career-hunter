@@ -486,7 +486,9 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
     row = conn.execute(
         """
         SELECT
-          coalesce(sum(p.llm_output IS NULL), 0) AS unscored,
+          coalesce(sum(p.llm_output IS NULL AND NOT EXISTS (
+            SELECT 1 FROM score_parse_failures f
+            WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL)), 0) AS unscored,
           coalesce(sum(p.llm_output IS NOT NULL AND p.fit IS NULL AND p.alerted_at IS NULL), 0)
             AS no_fit
         FROM postings p
@@ -859,6 +861,36 @@ def clear_refusal(conn: sqlite3.Connection, posting_id: int) -> None:
 def given_up_count(conn: sqlite3.Connection) -> int:
     """Postings the bot stopped sending after too many refusals."""
     row = conn.execute("SELECT count(*) FROM alert_refusals WHERE given_up_at IS NOT NULL")
+    return int(row.fetchone()[0])
+
+
+def record_parse_failure(
+    conn: sqlite3.Connection, posting_id: int, stamp: str, *, give_up_after: int
+) -> bool:
+    """Count one scoring reply for this posting that did not parse (search migration
+    0023). True when this one reached `give_up_after`, so the posting is now given up."""
+    conn.execute(
+        "INSERT INTO score_parse_failures (posting_id, failures, last_failed_at) "
+        "VALUES (?, 1, ?) ON CONFLICT (posting_id) DO UPDATE SET failures = failures + 1, "
+        "last_failed_at = excluded.last_failed_at",
+        (posting_id, stamp),
+    )
+    cur = conn.execute(
+        "UPDATE score_parse_failures SET given_up_at = ? "
+        "WHERE posting_id = ? AND given_up_at IS NULL AND failures >= ?",
+        (stamp, posting_id, give_up_after),
+    )
+    return cur.rowcount == 1
+
+
+def clear_parse_failures(conn: sqlite3.Connection, posting_id: int) -> None:
+    """A reply for the posting parsed: forget its failures."""
+    conn.execute("DELETE FROM score_parse_failures WHERE posting_id = ?", (posting_id,))
+
+
+def parse_given_up_count(conn: sqlite3.Connection) -> int:
+    """Postings the watcher stopped scoring after too many replies that did not parse."""
+    row = conn.execute("SELECT count(*) FROM score_parse_failures WHERE given_up_at IS NOT NULL")
     return int(row.fetchone()[0])
 
 
