@@ -770,8 +770,17 @@ def repo_push_checks(repo: Path) -> list[tuple[str, str]]:
         found.append(("WARN", f"push.default is {shown}, not current; run: make hooks"))
     hook = (repo / git("rev-parse", "--git-path", "hooks") / "pre-push").resolve()
     guard = (repo / "scripts" / "pre_push_guard.py").resolve()
+    # Worktrees of one repository share its hooks folder, so the hook `make hooks` put
+    # there from one checkout runs the guard for every other one too.
+    shared = {
+        (Path(line.removeprefix("worktree ")) / "scripts" / "pre_push_guard.py").resolve()
+        for line in git("worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    }
     if hook == guard:
         found.append(("OK", "pre-push guard installed"))
+    elif hook in shared and hook.is_file():
+        found.append(("OK", "pre-push guard installed, shared with another worktree"))
     else:
         found.append(("WARN", "the pre-push guard isn't installed; run: make hooks"))
     return found
