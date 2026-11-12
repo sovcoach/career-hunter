@@ -25,11 +25,12 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2); amended by 024 |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
 | 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023; amended (#39, #42, #44) |
-| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30); amended (#40, #41); amended (#42) |
+| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30); amended (#40, #41); amended (#42); amended (0.5.1) |
 | 021 | The public repo is MIT | Accepted (Phase 5) |
-| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32, #35, #36, #40, #41, #42) |
+| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32, #35, #36, #40, #41, #42); amended by 025 |
 | 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37); amended (#38, #43, #44) |
-| 024 | Each application keeps its job description | Accepted (0.5.0) |
+| 024 | Each application keeps its job description | Accepted (0.5.0); amended (0.5.1) |
+| 025 | LM Studio needs an API token, and the chat model may be a reasoning model | Accepted (0.5.1) |
 
 ---
 
@@ -748,3 +749,27 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - **A pasted JD is stored as Telegram delivered it, not byte for byte as pasted.** Telegram normalizes whitespace: it turns tabs into spaces, trims trailing spaces, and splits a long paste at blank lines, dropping them. The bot puts a blank line (`\n\n`) back between the parts, so no words fuse and the paragraph breaks return, but other whitespace stays as Telegram sent it. The text's hash covers that stored text. To keep the exact bytes, send the JD as a file (a `.txt`, PDF or HTML), which is kept as it came.
 - Applications recorded before 0.5.0 have no JD until one is attached. The watcher keeps no description (it is used in memory for the filters and scoring only), so Applied from an alert records no JD and always asks for it, and a JD request replaces the screenshot request there: a page that is only a JavaScript shell needs the JD sent as text or a PDF, HTML or text file, not an image.
 - A scanned PDF gives no text, so its application stays flagged until the JD is sent as text.
+
+> **Amended in 0.5.1: a JD that can't be kept.** A posting can be gone before its JD was saved, and the application then warned in `doctor` forever. EI migration 0003 adds an append-only `jd_unavailable` table: one row per time the operator marks the JD unavailable, with an explanation of 1 to 200 characters (the column is `explanation`, since the EI schema keeps no column called `reason`). It follows the record's rules: no deletes, no updates, nothing added once sealed or to a voided application, and the latest row is current. Search migration 0024 mirrors the current explanation in `applications.jd_unavailable_reason`, written EI first by `ledger.mark_jd_unavailable`, and `reconcile` compares the two. It is set with `careerhunter jd unavailable --reason` or an import entry's `jd_unavailable`, and refused for an application that has a JD. `doctor` and the report show it as `--` with the explanation (`JD -- (<explanation>)`), never as a warning. A JD found later attaches as usual and is shown in its place; the marker stays in the record. *Alternative:* a status or a note. Rejected: notes never reach the EI record, and a status is about the application, not its JD.
+
+## ADR-025: LM Studio needs an API token, and the chat model may be a reasoning model
+
+**Context.**
+- LM Studio's server can require an API token, and this Mac's server keeps that on. Without the token every call is refused with 401, which looked the same as a server that was down.
+- The only chat model available is a reasoning model shared with other services. It writes its thinking (`<think>…</think>`) before its answer and takes far longer than 120 seconds on some postings.
+
+**Decision.**
+- **The token is a secret.** `lm_studio_token` joins `telegram_bot_token` in the Keychain (ADR-003), set with `careerhunter secret set`. The watch run reads it once and sends it as `Authorization: Bearer` on every chat and embedding call. It is never printed, logged or put in an error.
+- **Unauthorized is not unreachable.** A 401 or 403 is its own failure kind, `unauthorized` (search migration 0022 widens `component_health`), in the watch log line, in `component_health` and in the bot's health message, each with the command that stores the token. `doctor` asks for `GET /v1/models` with the token, which loads no model: OK, `BAD unauthorized`, or `BAD unreachable`.
+- **Thinking is removed before parsing.** Every `<think>`, `<thinking>` or `<reasoning>` block, and anything before a leftover closing tag, is stripped from the reply before it is parsed or stored. A separate `reasoning_content` field is never read. A tag that never closes means the thinking was cut off: the reply does not parse. The reply body may be 256 KiB, since the thinking can be long; what is stored is capped as before.
+- **A time limit for a reasoning model (amends ADR-022).** `scoring.timeout_seconds` (60 to 540, default 300) bounds one scoring call. The run budget stays at 600 seconds so a run still ends inside the shortest watch interval, and a call starts only while that much budget is left, so the budget never cuts one short and wastes the model's work.
+- **Give up on a reply that never parses.** Search migration 0023 counts the unparseable replies per posting. At 3 (as for Telegram's refusals) the posting is given up: never sent to the model again, not counted as held for scoring, and counted on `doctor`'s `bot refusals` line. A reply that parses clears the count.
+
+**Alternatives.**
+- Turning LM Studio's authentication off. Rejected: the server is shared, and the token keeps other local programs out.
+- Asking the model not to think (a reasoning-effort setting). Left out for now: the model is shared, and how a setting is honoured differs between models.
+- A larger run budget. Rejected: a run must finish before the next one at the shortest interval, 15 minutes.
+
+**Trade-offs.**
+- At the default 300 seconds and a 60-minute interval, a slow model may score only one posting per run; the rest wait their turn.
+- A given-up posting is never scored, so it never alerts. It stays visible only as a count in `doctor`.

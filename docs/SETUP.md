@@ -263,7 +263,17 @@ scoring:
   embedding_model: example-embedding-model
 ```
 
-Each is text of 1 to 200 characters, with no control characters and no spaces at either end. Left out or `null`, career-hunter asks for `local-model` and `local-embedding`. `scoring` takes no other key: a `url` is refused.
+Each is text of 1 to 200 characters, with no control characters and no spaces at either end. Left out or `null`, career-hunter asks for `local-model` and `local-embedding`. `scoring` takes one other key, `timeout_seconds` (below): a `url` is refused.
+
+4. **LM Studio's API token.** Keep authentication on in LM Studio's server settings, create an API token there, and store it in the Keychain the same way as the bot's token:
+
+   ```bash
+   uv run careerhunter secret set lm_studio_token
+   ```
+
+   It is sent as a Bearer header on every scoring and embedding call, and never printed or logged. `doctor` asks LM Studio for its model list with it: `LM Studio OK` when it is accepted, `BAD unauthorized` when LM Studio refuses it (store it again), and `BAD unreachable` when the server isn't running. A refused token is never reported as unreachable, in the watch log or in the bot's health message either.
+
+**Reasoning models.** A chat model that thinks before it answers works: its thinking (`<think>…</think>` and the like) is removed before the reply is read, and never stored. Because a reasoning model takes longer, one scoring call may take up to `scoring.timeout_seconds` (60 to 540, default 300). A call starts only while that much of the 600-second watch run is left, so the budget never cuts one short. A reply that doesn't parse leaves the posting unscored for the next run; after 3 such replies for one posting, it is given up and never sent to the model again, and `doctor`'s `bot refusals` line counts it.
 
 **Choosing models for your Mac's memory.** On a Mac with Apple silicon, the models share memory with everything else. A model's size on disk is roughly the memory it needs once loaded, plus some for the prompt. Leave at least a third of the memory for macOS and your other apps. As a guide, for chat models stored at 4-bit quantization:
 
@@ -453,11 +463,21 @@ Keep the job description with it: `--jd-file path/to/ad.pdf` takes a PDF, HTML o
 
 **LinkedIn links are never fetched**, so `--company` and `--title` are required with one. Better still, open the posting, follow it to the company's own career site, and log that page's link instead: its job description can be fetched. Pasting the description is the fallback, and so is a LinkedIn Easy Apply posting with no career-site page. If you already logged an application to the same role at the same company (a repost counts: the title is compared without its requisition code), it is still recorded, and one more line names the earlier date, for example `You logged an application to this role on 2026-10-27.` Without a readable `config.yaml`, nothing is fetched or recorded. The bot's `/log` does the same from Telegram.
 
+### When the posting is gone before you saved it
+
+If an application's job ad was taken down before its job description was kept, say so, so it stops showing as missing:
+
+```bash
+uv run careerhunter jd unavailable --url https://jobs.example.com/ads/7 --reason "posting removed before capture"
+```
+
+Pick the application by its link, or by `--company`, `--title` and `--date` (the day you applied, or the Monday of its week) when it has none; more than one match is refused. The reason (1 to 200 characters) is added to the EI record and never changed there: a new reason is a new row. `doctor` and the report then show `--` with the reason instead of a warning. If you find the job description later, attach it as usual: it takes the reason's place everywhere it is shown, and the reason stays in the record. An import entry can do the same with `jd_unavailable` (below).
+
 ### Backfilling applications and their job descriptions
 
 `seed` brings in your history once. `careerhunter import` is for adding job descriptions, and applications you haven't recorded yet, later on: it matches each entry to what is already recorded, and never changes an application's date.
 
-1. **Prepare the file.** Copy `import.example.json` from the repo into the `imports/` folder in your data folder (`init` creates it, owner-only), for example as `imports/backfill.json`, and replace the example entries with yours. The file must sit under `imports/`: a file anywhere else, even elsewhere in the data folder, is refused. Each entry needs `employer`, `role`, `date`, `date_precision` (`day`, or `week` when you only know the week; any day of that week works, and it's stored as its Monday) and `method`. `location`, `work_model`, `url`, `notes` (kept in `search.db` only, and only for a new application) and one of `jd_text` (the description, pasted) or `jd_file` (a PDF, HTML or text file, named relative to the JSON file and also under `imports/`) are optional. Links are saved in their canonical form, so a LinkedIn link with tracking parameters becomes `https://www.linkedin.com/jobs/view/<id>/`. Nothing is fetched.
+1. **Prepare the file.** Copy `import.example.json` from the repo into the `imports/` folder in your data folder (`init` creates it, owner-only), for example as `imports/backfill.json`, and replace the example entries with yours. The file must sit under `imports/`: a file anywhere else, even elsewhere in the data folder, is refused. Each entry needs `employer`, `role`, `date`, `date_precision` (`day`, or `week` when you only know the week; any day of that week works, and it's stored as its Monday) and `method`. `location`, `work_model`, `url`, `notes` (kept in `search.db` only, and only for a new application) and one of `jd_text` (the description, pasted), `jd_file` (a PDF, HTML or text file, named relative to the JSON file and also under `imports/`) or `jd_unavailable` (why there is no job description, such as `posting removed before capture`; see "When the posting is gone before you saved it") are optional. Links are saved in their canonical form, so a LinkedIn link with tracking parameters becomes `https://www.linkedin.com/jobs/view/<id>/`. Nothing is fetched.
 2. **Dry run.** It opens both databases read-only and writes nothing, not even a file:
 
    ```bash
@@ -819,6 +839,52 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
 
+## Upgrading from 0.5.0 to 0.5.1
+
+Follow the nine steps above with the tag `v0.5.1` (`git checkout v0.5.1` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Before step 5:** store LM Studio's API token (see "Run the local models"), once, from either checkout:
+
+  ```bash
+  uv run careerhunter secret set lm_studio_token
+  ```
+
+- **Step 4:** nothing to add. A 0.5.0 `config.yaml` is valid as it is. For a reasoning chat model, the default `scoring.timeout_seconds` of 300 is a good start.
+- **Step 5:** `doctor` exits 1 with this line, because `search.db` is four migrations behind:
+
+  ```text
+  search.db       BAD schema version 21, expected 25; run: careerhunter migrate
+  ```
+
+  The active claim's record is one behind, at schema version 2.
+- **Step 6:** `migrate` applies four migrations to `search.db` and one to the claim's record. The claim will be yours:
+
+  ```text
+  search.db: applied [22, 23, 24, 25]; schema version 25
+  ei_record_2026-27.db: applied [3]; schema version 3
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+  A sealed claim's record is not migrated, and is still read.
+- **Step 7:** skip it. The resume was imported for 0.4.0.
+- **Step 8:** these lines show the upgrade took:
+
+  ```text
+  search.db       OK  schema version 25
+  claim 2026-27   OK  schema version 3
+  LM Studio       OK  answers with the API token
+  git push        OK  pre-push guard installed, shared with another worktree
+  ```
+
+  The last line is the release checkout's: it shares the first checkout's hooks, so it no longer warns. If discovery was backing off, `discovery WARN` shows until when, with `careerhunter discover clear-backoff` to end it.
+- **After step 9:** applications recorded by `import` or `/log` before this release may have no lane. Check them, and see any other moves, without changing anything:
+
+  ```bash
+  cd ~/Projects/career-hunter-release && uv run careerhunter lanes reassign --dry-run
+  ```
+
+  Postings not checked yet are listed as `not checked -> <lane>`. If the list looks right, run it without `--dry-run`.
+
 ## Upgrading from 0.4.0 to 0.5.0
 
 Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the release checkout, then `uv sync --locked`). These steps differ:
@@ -827,15 +893,15 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 - **Step 5:** `doctor` exits 1 with this line, because `search.db` is two migrations behind:
 
   ```text
-  search.db       BAD schema version 19, expected 25; run: careerhunter migrate
+  search.db       BAD schema version 19, expected 21; run: careerhunter migrate
   ```
 
   The active claim's record is one behind, at schema version 1.
 - **Step 6:** `migrate` applies two migrations to `search.db` and one to the claim's record. The claim will be yours:
 
   ```text
-  search.db: applied [20, 21]; schema version 25
-  ei_record_2026-27.db: applied [2]; schema version 3
+  search.db: applied [20, 21]; schema version 21
+  ei_record_2026-27.db: applied [2]; schema version 2
   EI claim 2026-27 (from 2026-08-02)
   ```
 
@@ -850,8 +916,8 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 - **Step 8:** these lines show the upgrade took. The count is yours, and `imports/` counts the files you put there:
 
   ```text
-  search.db       OK  schema version 25
-  claim 2026-27   OK  schema version 3
+  search.db       OK  schema version 21
+  claim 2026-27   OK  schema version 2
   imports/        OK  0 files, all owner-only
   job descriptions --  14 applications from before JDs were kept, with no JD
   ```
@@ -875,6 +941,9 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `… is NOT encrypted` | The drive isn't encrypted yet | Step 2 |
 | `… is encrypted but locked` | The drive needs its password | Open it in Finder and enter the password |
 | `… is inside the code repository` / `… inside a git work tree` | The data folder points somewhere inside a git project | Point `CAREERHUNTER_DATA_DIR` at the external drive |
+| `LM Studio BAD unauthorized: LM Studio refused the API token` | The token in the Keychain is missing, old, or not LM Studio's current one | Copy the token from LM Studio's server settings and run `uv run careerhunter secret set lm_studio_token` |
+| `LM Studio BAD unreachable at 127.0.0.1:1234` | LM Studio's server isn't running, or not on port 1234 | Start the server in LM Studio and load the models |
+| `discovery WARN backing off until …` | Recent discovery passes failed: SearXNG was down, or every engine was throttled | Wait, or run `uv run careerhunter discover clear-backoff` to try at the next due pass |
 | `… is readable by other users … chmod 700` | Folder permissions are too open | Run the `chmod` command it prints |
 | `seed file has N problem(s)` | Something in `seed.yaml` needs fixing | Each line names the entry and field. Fix them and re-run |
 | `… is before claim 2026-27 started` | A seed date falls outside your claim | Fix the date, or see `--route-out-of-claim-to-search` in Step 8 |
