@@ -209,6 +209,7 @@ class _State:
     max_age: int = 7  # search.max_posting_age_days
     today: str = ""  # the configured date, YYYY-MM-DD
     model_down: bool = False
+    model_failure: str = "unreachable"  # or "unauthorized": LM Studio refused the token
     scorer_answered: bool = False  # the scorer replied at least once, parsed or not
     budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
@@ -218,6 +219,12 @@ class _State:
 
     def out_of_time(self) -> bool:
         return self.budget is not None and self.budget.expired()
+
+    def model_state(self) -> str:
+        """How a model that stopped answering is named in a line."""
+        if self.model_failure == "unauthorized":
+            return "model unauthorized: LM Studio refused the API token"
+        return "model unreachable"
 
     def left_by_budget(self, line: str) -> None:
         """Log what the budget left for the next run, and remember that it did."""
@@ -460,7 +467,9 @@ def _finish_run(
         elif counts["failed"]:
             search_store.record_component(conn, "boards", failed="failed", stamp=stamp)
         if state.model_down:
-            search_store.record_component(conn, "lm_studio", failed="unreachable", stamp=stamp)
+            search_store.record_component(
+                conn, "lm_studio", failed=state.model_failure, stamp=stamp
+            )
         elif state.scorer_answered:
             search_store.record_component(conn, "lm_studio", failed=None, stamp=stamp)
 
@@ -1051,7 +1060,7 @@ def _record_jobs(
             continue
         if state.model_down:
             lines.append(
-                _line(name, ats, f"{item.title!r} left for the next run (model unreachable)")
+                _line(name, ats, f"{item.title!r} left for the next run ({state.model_state()})")
             )
             continue
         if state.in_reserve():
@@ -1218,7 +1227,7 @@ def _score_passes(
         left = len(work) - index
         if state.model_down:
             state.lines.append(
-                f"watch: scoring: model unreachable; {left} postings left for the next run"
+                f"watch: scoring: {state.model_state()}; {left} postings left for the next run"
             )
             return
         if state.out_of_time():
@@ -1265,7 +1274,7 @@ def _attempt(
     title = repr(posting.title)
     try:
         result = scorer(posting)
-    except (ScoreError, OSError):
+    except (ScoreError, OSError) as exc:
         with db.transaction(conn):
             search_store.set_score_attempted_at(conn, posting_id, previous)
         if state.out_of_time():
@@ -1274,8 +1283,9 @@ def _attempt(
             )
         else:
             state.model_down = True
+            state.model_failure = getattr(exc, "kind", "unreachable")
             kept = "; old score kept" if rescore else ""
-            lines.append(_line(name, ats, f"{title} left unscored (model unreachable){kept}"))
+            lines.append(_line(name, ats, f"{title} left unscored ({state.model_state()}){kept}"))
         return
     state.scorer_answered = True
     if result is None:

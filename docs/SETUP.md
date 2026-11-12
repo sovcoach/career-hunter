@@ -162,7 +162,7 @@ created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 21
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 22
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -359,7 +359,7 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 21
+search.db: applied nothing; schema version 22
 ei_record_2026-27.db: created; schema version 2
 EI claim 2026-27 (from 2026-08-02)
 ```
@@ -378,7 +378,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 21
+search.db       OK  schema version 22
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -827,14 +827,14 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 - **Step 5:** `doctor` exits 1 with this line, because `search.db` is two migrations behind:
 
   ```text
-  search.db       BAD schema version 19, expected 21; run: careerhunter migrate
+  search.db       BAD schema version 19, expected 22; run: careerhunter migrate
   ```
 
   The active claim's record is one behind, at schema version 1.
 - **Step 6:** `migrate` applies two migrations to `search.db` and one to the claim's record. The claim will be yours:
 
   ```text
-  search.db: applied [20, 21]; schema version 21
+  search.db: applied [20, 21]; schema version 22
   ei_record_2026-27.db: applied [2]; schema version 2
   EI claim 2026-27 (from 2026-08-02)
   ```
@@ -850,7 +850,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 - **Step 8:** these lines show the upgrade took. The count is yours, and `imports/` counts the files you put there:
 
   ```text
-  search.db       OK  schema version 21
+  search.db       OK  schema version 22
   claim 2026-27   OK  schema version 2
   imports/        OK  0 files, all owner-only
   job descriptions --  14 applications from before JDs were kept, with no JD
@@ -882,7 +882,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 21` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 22` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |

@@ -511,7 +511,7 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
 
 
 COMPONENTS = ("lm_studio", "searxng", "boards")
-FAILURE_KINDS = ("unreachable", "bad-reply", "throttled", "failed")
+FAILURE_KINDS = ("unreachable", "unauthorized", "bad-reply", "throttled", "failed")
 
 
 def record_component(

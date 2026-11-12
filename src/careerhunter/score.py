@@ -61,6 +61,7 @@ TOTAL = 120.0
 TIMEOUT = TOTAL
 MAX_OUTPUT = 20_000
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
+UNAUTHORIZED = frozenset({401, 403})  # LM Studio refused the API token, or none was sent
 MAX_GAP_TEXT = 120
 COPY_RUN = 40
 MAX_REQUIREMENT = 60
@@ -86,8 +87,14 @@ Transport = Callable[[str, bytes], tuple[int, bytes]]
 class ScoreError(Exception):
     """The model did not answer: a refused URL, no connection, a timeout, or not HTTP 200.
 
-    The message is fixed; it never carries the request or the reply.
+    The message is fixed; it never carries the request, the reply or the token. `kind`
+    is `unauthorized` for a 401 or 403 (LM Studio refused the API token), else
+    `unreachable`.
     """
+
+    def __init__(self, message: str, *, kind: str = "unreachable") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 @dataclass(frozen=True)
@@ -187,6 +194,8 @@ def score_posting(
         status, body = send(url, _request_body(posting, config, resume, examples))
     except (ScoreError, OSError, http.client.HTTPException):
         raise ScoreError("the local model could not be reached") from None
+    if status in UNAUTHORIZED:
+        raise ScoreError("the local model refused the API token", kind="unauthorized")
     if status != 200:
         raise ScoreError(f"the local model answered HTTP {int(status)}")
     content = _content(body)

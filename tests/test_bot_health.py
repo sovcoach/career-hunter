@@ -167,3 +167,15 @@ def test_a_recovery_between_the_read_and_the_mark_is_not_lost(env: Env) -> None:
     assert (health.alerted_failures, health.recovery_due) == (None, True)
     env.bot.send_health()
     assert _health_texts(env) == ["Health: LM Studio is working again."]
+
+
+def test_an_unauthorized_outage_says_so(env: Env) -> None:
+    _fail(env, "lm_studio", 3, "unauthorized")
+    env.bot.send_health()
+    (text,) = _health_texts(env)
+    assert text == (
+        "Health: LM Studio has failed 3 runs in a row: unauthorized, it refused the API "
+        "token (run: careerhunter secret set lm_studio_token). "
+        "0 postings are waiting to be scored."
+    )
+    assert "unreachable" not in text

@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 22)), "ei_record": [1, 2]}[track]
+    expected = {"search": list(range(1, 23)), "ei_record": [1, 2]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1017,7 +1017,7 @@ def test_search_0020_marks_every_existing_application_pre_feature(tmp_path: Path
             "method) VALUES (?, ?, '2026-10-30', 'exact', 'email')",
             ("a" * 32, posting),
         )
-        assert db.migrate(conn, "search") == [20, 21]
+        assert db.migrate(conn, "search") == list(range(20, db.latest_version("search") + 1))
         row = conn.execute("SELECT jd_expected, jd_sha256, jd_path FROM applications").fetchone()
         assert tuple(row) == (0, None, None)
         with pytest.raises(sqlite3.IntegrityError, match="jd_expected"):
@@ -1055,7 +1055,7 @@ def test_search_0021_lets_a_checked_lane_move_and_logs_it(tmp_path: Path) -> Non
         conn.execute("UPDATE postings SET lane = 'ops', lane_checked = 1 WHERE id = ?", (checked,))
         with pytest.raises(sqlite3.IntegrityError, match="set once"):
             conn.execute("UPDATE postings SET lane = 'support' WHERE id = ?", (checked,))
-        assert db.migrate(conn, "search") == [21]
+        assert db.migrate(conn, "search") == list(range(21, db.latest_version("search") + 1))
         rows = conn.execute("SELECT id, lane, lane_checked FROM postings ORDER BY id")
         assert [tuple(r) for r in rows] == [(checked, "ops", 1), (unchecked, None, 0)]
         conn.execute("UPDATE postings SET lane = 'support' WHERE id = ?", (checked,))
