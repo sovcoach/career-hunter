@@ -33,6 +33,11 @@ dropped, so gap names never reach the digest; with a resume in use, a phrase tha
 repeats COPY_RUN characters of the resume is dropped. Duplicates go, and at most three
 are kept. A `requirements` field that is missing or the wrong shape gives none. It
 never makes the reply unparseable: the score stands either way.
+
+Reasoning models. The chat model may think before it answers. Its thinking is removed
+before anything is parsed or stored (`strip_reasoning`), and a reply whose thinking
+never closes does not parse. The body may be up to MAX_REPLY bytes, since the thinking
+can be long; at most MAX_OUTPUT characters of what is left are stored.
 """
 
 from __future__ import annotations
@@ -59,7 +64,10 @@ MODEL_NAME = DEFAULT_CHAT_MODEL  # what is sent when scoring.chat_model is unset
 # to cover that wait, so the step limit is the whole total.
 TOTAL = 120.0
 TIMEOUT = TOTAL
-MAX_OUTPUT = 20_000
+# The reply as it arrives. A reasoning model's thinking can run far past what is kept,
+# so the cap on the body is well above MAX_OUTPUT.
+MAX_REPLY = 262_144
+MAX_OUTPUT = 20_000  # characters of the stripped reply kept, without a resume
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 UNAUTHORIZED = frozenset({401, 403})  # LM Studio refused the API token, or none was sent
 MAX_GAP_TEXT = 120
@@ -69,6 +77,12 @@ MAX_REQUIREMENTS = 3
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _SPACES = re.compile(r"\s+")
 _FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+# A reasoning model's thinking, in the tags such models use. Matched without regard to
+# case. A reply whose thinking never closes is treated as one that does not parse.
+_THINK_TAGS = "think|thinking|reasoning"
+_THINK_BLOCK = re.compile(rf"<({_THINK_TAGS})>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+_THINK_OPEN = re.compile(rf"<(?:{_THINK_TAGS})>", re.IGNORECASE)
+_THINK_CLOSE = re.compile(rf"</(?:{_THINK_TAGS})\s*>", re.IGNORECASE)
 _GATE_KEYS = (
     "min_salary",
     "required_languages",
@@ -160,7 +174,7 @@ def default_transport(
             headers=model_headers(token),
             total=TOTAL,
             per_op=TIMEOUT,
-            max_bytes=MAX_OUTPUT,
+            max_bytes=MAX_REPLY,
             budget=budget,
         )
     except loopback.LoopbackError as exc:
@@ -229,7 +243,8 @@ def score_posting(
         raise ScoreError("the local model refused the API token", kind="unauthorized")
     if status != 200:
         raise ScoreError(f"the local model answered HTTP {int(status)}")
-    content = _content(body)
+    raw = _content(body)
+    content = None if raw is None else strip_reasoning(raw)
     if content is None:
         return None
     parsed = _parse_gaps(content)
@@ -250,6 +265,25 @@ def score_posting(
         resume_sha256=None if resume is None else resume.sha256,
         key_requirements=_requirements(content, parsed, None if resume is None else resume.text),
     )
+
+
+def strip_reasoning(content: str) -> str | None:
+    """The reply without a reasoning model's thinking, or None when nothing is left.
+
+    Every `<think>…</think>` block (also `<thinking>` and `<reasoning>`) goes. When a
+    closing tag is left over (a chat template that opened the tag itself), everything
+    up to the last one goes too. A tag that opens and never closes means the thinking
+    was cut off: None, so the posting stays unscored. A separate `reasoning_content`
+    field is never read: only `message.content` is.
+    """
+    text = _THINK_BLOCK.sub("", content)
+    closes = list(_THINK_CLOSE.finditer(text))
+    if closes:
+        text = text[closes[-1].end() :]
+    if _THINK_OPEN.search(text):
+        return None
+    text = text.strip()
+    return text or None
 
 
 def canonical_gaps(gaps: list[_Gap]) -> str:
