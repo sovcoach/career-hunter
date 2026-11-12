@@ -1649,7 +1649,7 @@ class Bot:
                     path = snapshots.save(self.datadir.root, captured.data, captured.ext, today)
             app = Application(replace(posting, snapshot_path=path), dating, method)
             try:
-                recorded = ledger.record_application(search, active, app)
+                recorded = ledger.record_application(search, active, app, lane_config=doc)
             except sqlite3.IntegrityError:
                 raise Refusal("That application is already recorded.") from None
             if path and posting.snapshot_path is None:
@@ -1697,6 +1697,7 @@ class Bot:
                     today,
                     self.fetcher,
                     jd,
+                    lane_config=doc,
                 )
             except selfsourced.LogError as exc:
                 raise Refusal(str(exc)) from None

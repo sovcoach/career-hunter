@@ -35,11 +35,12 @@ from __future__ import annotations
 
 import secrets
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from typing import Any
 
-from careerhunter import discover, ei_store, enums, search_store, urls
+from careerhunter import discover, ei_store, enums, lanes, search_store, urls
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating, read_file_claim
 from careerhunter.db import transaction
 from careerhunter.ei_store import EiApplication, EiJobDescription
@@ -128,11 +129,17 @@ def record_application(
     active: ActiveClaim | None,
     app: Application,
     jd: SavedJd | None = None,
+    *,
+    lane_config: Mapping[str, Any] | None = None,
 ) -> Recorded:
     """Record an application in both layers (search.db only when no claim is active).
 
     `jd` is a JD whose file is already saved. Its text, when it has any, is recorded in
     both layers; its file becomes the job-ad snapshot when the posting has none.
+
+    `lane_config` is config.yaml: while it has `search.lanes`, a posting not yet checked
+    against them (one created here, say) is checked now, in the same transaction, as the
+    watcher checks its own. Search-only; the EI record has no lanes.
     """
     warning = ""
     if active is not None:
@@ -150,6 +157,9 @@ def record_application(
         )
         if jd is not None and not created:
             search_store.fill_posting_snapshot(search, posting_id, jd.path)
+        if lane_config is not None and lanes.configured(lane_config) is not None:
+            found = lanes.match(app.posting.title, lane_config)
+            search_store.set_posting_lane(search, posting_id, None if found is None else found.name)
         app_id = search_store.insert_application(search, posting_id, app, correlation_id, label)
         search_store.add_decision(search, app_id, "applied", status_date)
         if jd is not None and jd.has_text:

@@ -283,7 +283,7 @@ def cmd_import(datadir: DataDir, args: argparse.Namespace) -> int:
         planned = backfill.plan(w.search, record, parsed, route_out_of_claim=route)
         print(_describe_claim(record.claim))
         _print_plan(planned)
-        outcomes = backfill.apply(datadir.root, w.search, w.active, planned, today)
+        outcomes = backfill.apply(datadir.root, w.search, w.active, planned, today, lane_config=doc)
     for item, outcome in zip(planned, outcomes, strict=True):
         if outcome.kind != item.kind:
             print(f"{outcome.number:3} {outcome.kind.upper():9} not written: {outcome.detail}")
@@ -462,7 +462,16 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
         )
         with _writable(datadir) as w:
             logged = selfsourced.record(
-                datadir.root, w.search, w.active, posting, method, dating, today, fetch_page, jd
+                datadir.root,
+                w.search,
+                w.active,
+                posting,
+                method,
+                dating,
+                today,
+                fetch_page,
+                jd,
+                lane_config=doc,
             )
     except jobdesc.JobDescError as exc:
         _err(f"error: {exc} Nothing was recorded.")

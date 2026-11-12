@@ -45,6 +45,7 @@ import json
 import re
 import sqlite3
 import urllib.parse
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -714,9 +715,11 @@ def apply(
     active: ActiveClaim | None,
     planned: list[Planned],
     today: dt.date,
+    lane_config: Mapping[str, Any] | None = None,
 ) -> list[Outcome]:
     """Write exactly what `planned` says, one entry at a time, each in its own ledger
-    call. Only create and attach write anything."""
+    call. Only create and attach write anything. A created posting is checked against
+    `search.lanes` in `lane_config` (config.yaml), as the watcher would."""
     outcomes: list[Outcome] = []
     for item in planned:
         entry = item.entry
@@ -737,6 +740,7 @@ def apply(
                     refuse_fetch,
                     entry.jd,
                     notes=entry.notes,
+                    lane_config=lane_config,
                 )
                 if entry.jd_unavailable is not None:
                     ledger.mark_jd_unavailable(
