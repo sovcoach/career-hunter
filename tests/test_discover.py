@@ -1220,85 +1220,186 @@ def test_failed_passes_back_off_exponentially_and_a_success_clears_it(tmp_path: 
     down = _Talk(b"", status=0, fail_at=1)
     run = {"today": "2026-11-02", "now": clock}
     assert discover.run(conn, _ETIQUETTE, transport=down, **run).notice == discover.MISS
-    assert _state(conn) == (0, 1, "2026-11-02T11:00:00Z")  # 60 minutes times 2
-    clock.advance(minutes=119)
+    assert _state(conn) == (0, 1, "2026-11-02T10:00:00Z")  # one interval, 60 minutes
+    clock.advance(minutes=59)
     waiting = _empty()
     outcome = discover.run(conn, _ETIQUETTE, transport=waiting, **run)
-    assert outcome == discover.Outcome("discovery backing off until 2026-11-02T11:00:00Z", ())
+    assert outcome == discover.Outcome("discovery backing off until 2026-11-02T10:00:00Z", ())
     assert waiting.calls == []
     clock.advance(minutes=1)
     assert discover.run(conn, _ETIQUETTE, transport=down, **run).notice == discover.MISS
-    assert _state(conn) == (0, 2, "2026-11-02T15:00:00Z")  # 60 times 4, from 11:00
-    clock.advance(hours=4)
+    assert _state(conn) == (0, 2, "2026-11-02T12:00:00Z")  # 60 times 2, from 10:00
+    clock.advance(hours=2)
     assert discover.run(conn, _ETIQUETTE, transport=_empty(), **run).notice is None
     assert _state(conn) == (3, 0, None)
     conn.close()
 
 
-def test_the_backoff_is_capped_at_seven_days() -> None:
-    assert discover.backoff_for(1, 60) == dt.timedelta(hours=2)
-    assert discover.backoff_for(3, 1440) == dt.timedelta(days=7)
-    assert discover.backoff_for(99, 60) == dt.timedelta(days=7)
+def test_the_backoff_doubles_from_one_interval_and_is_capped_at_a_day() -> None:
+    assert dt.timedelta(hours=24) == discover.BACKOFF_CAP
+    assert discover.backoff_for(1, 60) == dt.timedelta(hours=1)
+    assert discover.backoff_for(2, 60) == dt.timedelta(hours=2)
+    assert discover.backoff_for(5, 60) == dt.timedelta(hours=16)
+    assert discover.backoff_for(6, 60) == dt.timedelta(hours=24)
+    assert discover.backoff_for(99, 60) == dt.timedelta(hours=24)
+    # With the default daily interval, a failed pass waits for the next normal one.
+    assert discover.backoff_for(1, 1440) == discover.backoff_for(3, 1440) == dt.timedelta(days=1)
 
 
-@pytest.mark.parametrize(
-    "reply",
-    [
-        pytest.param((429, b""), id="http-429"),
-        pytest.param(
-            (
-                200,
-                json.dumps(
-                    {
-                        "results": [{"url": _GOOD}],
-                        "unresponsive_engines": [["example engine", "CAPTCHA"]],
-                    }
-                ).encode(),
-            ),
-            id="captcha",
-        ),
-        pytest.param(
-            (
-                200,
-                json.dumps(
-                    {
-                        "results": [],
-                        "unresponsive_engines": [["example engine", "too many requests"]],
-                    }
-                ).encode(),
-            ),
-            id="too-many-requests",
-        ),
-        pytest.param(
-            (
-                200,
-                json.dumps(
-                    {
-                        "results": [],
-                        "unresponsive_engines": [["example engine", "Suspended: CAPTCHA"]],
-                    }
-                ).encode(),
-            ),
-            id="suspended-captcha",
-        ),
-    ],
-)
-def test_a_429_or_a_captcha_stops_the_pass_and_starts_the_backoff(
-    tmp_path: Path, reply: tuple[int, bytes]
+def test_clear_backoff_ends_it_and_keeps_the_rest(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    clock = _Clock()
+    down = _Talk(b"", status=0, fail_at=1)
+    discover.run(conn, _ETIQUETTE, transport=down, today="2026-11-02", now=clock)
+    before = discover.clear_backoff(conn)
+    assert before == discover.Backoff(1, "2026-11-02T10:00:00Z")
+    assert _state(conn) == (0, 0, None)
+    unproductive = conn.execute("SELECT unproductive FROM discovery_state").fetchone()[0]
+    assert unproductive == 1  # not cleared: it counts passes that ran
+    assert discover.clear_backoff(conn) == discover.Backoff(0, None)
+    assert (
+        discover.run(conn, _ETIQUETTE, transport=_empty(), today="2026-11-02", now=clock).notice
+        is None
+    )
+    conn.close()
+
+
+def test_the_cli_clears_the_backoff(
+    inited: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    conn = db.connect(inited / "search.db")
+    try:
+        conn.execute(
+            "UPDATE discovery_state SET failures = 3, backoff_until = '2026-11-03T09:00:00Z'"
+        )
+    finally:
+        conn.close()
+    assert cli.main(["discover", "clear-backoff"], probe=probe) == 0
+    assert capsys.readouterr().out == (
+        "discovery: backoff cleared (it was until 2026-11-03T09:00:00Z, after 3 failed "
+        "passes in a row); the next pass runs when it is due\n"
+    )
+    assert cli.main(["discover", "clear-backoff"], probe=probe) == 0
+    assert capsys.readouterr().out == "discovery: no backoff to clear\n"
+    assert cli.main(["discover", "clear-backoff", "3"], probe=probe) == 1
+
+
+def test_doctor_names_the_backoff_and_the_command_that_ends_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     conn = _search_db(tmp_path)
+    now = dt.datetime(2026, 11, 2, 9, 30, tzinfo=dt.UTC)
+    talk = _Talk(_engines([], ("engine one", "CAPTCHA")))
+    discover.run(conn, _ETIQUETTE, transport=talk, today="2026-11-02", now=_Clock())
+    cli._doctor_discovery_backoff(cli._Report(), conn, _ETIQUETTE, now)
+    assert capsys.readouterr().out == (
+        "discovery       WARN backing off until 2026-11-02T10:00:00Z after 1 failed pass in a "
+        "row; engines throttled: engine one; to retry sooner, run: careerhunter discover "
+        "clear-backoff\n"
+    )
+    later = dt.datetime(2026, 11, 2, 10, 30, tzinfo=dt.UTC)  # past it: no warning
+    cli._doctor_discovery_backoff(cli._Report(), conn, _ETIQUETTE, later)
+    assert capsys.readouterr().out == (
+        "discovery       --  engines throttled in the last pass: engine one\n"
+    )
+    cli._doctor_discovery_backoff(cli._Report(), conn, {"discovery": {"searxng_url": None}}, now)
+    assert capsys.readouterr().out == ""  # discovery off
+    conn.close()
+
+
+def _engines(results: list[dict[str, str]], *pairs: tuple[str, str]) -> bytes:
+    return json.dumps(
+        {"results": results, "unresponsive_engines": [list(pair) for pair in pairs]}
+    ).encode()
+
+
+def _suspended(conn: sqlite3.Connection) -> tuple[object, ...]:
+    row = conn.execute("SELECT suspended_engines, suspended_at FROM discovery_state")
+    return tuple(row.fetchone())
+
+
+def test_a_429_from_searxng_stops_the_pass_and_starts_the_backoff(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    talk = _Talk(b"", status=429, fail_at=1)
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk)
+    assert outcome == discover.Outcome(discover.THROTTLED, ())
+    assert len(talk.calls) == 1  # stopped at once
+    assert _rows(conn) == 0
+    assert _state(conn)[:2] == (0, 1)
+    conn.close()
+
+
+@pytest.mark.parametrize("error", ["CAPTCHA", "too many requests", "Suspended: CAPTCHA"])
+def test_one_throttled_engine_does_not_stop_a_pass_that_gets_results(
+    tmp_path: Path, error: str
+) -> None:
+    conn = _search_db(tmp_path)
+    talk = _Talk(_engines([{"url": _GOOD}], ("Example Engine", error)))
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk, confirm=_exists)
+    assert outcome.notice is None
+    assert len(talk.calls) == 3  # every query was asked
+    assert "discovery: engines throttled or suspended: example engine" in outcome.notes
+    assert _rows(conn) == 1
+    assert _state(conn) == (3, 0, None)  # the cursor moved, no backoff
+    assert _suspended(conn)[0] == '["example engine"]'
+    conn.close()
+
+
+def test_a_blocked_query_is_passed_over_while_others_answer(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    replies = [
+        _engines([], ("example engine", "Suspended: too many requests")),  # blocked
+        _engines([{"url": _GOOD}], ("example engine", "Suspended: too many requests")),
+        _engines([]),  # answered, with nothing found
+    ]
     calls: list[str] = []
 
     def talk(url: str) -> tuple[int, bytes]:
         calls.append(url)
-        return reply
+        return 200, replies[len(calls) - 1]
 
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk, confirm=_exists)
+    assert outcome.notice is None and len(calls) == 3
+    assert _rows(conn) == 1 and _state(conn)[1:] == (0, None)
+
+
+@pytest.mark.parametrize("error", ["CAPTCHA", "too many requests", "Suspended: access denied"])
+def test_when_every_engine_is_throttled_the_pass_stops_and_backs_off(
+    tmp_path: Path, error: str
+) -> None:
+    conn = _search_db(tmp_path)
+    talk = _Talk(_engines([], ("engine one", error), ("engine two", error)))
     outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk)
-    assert outcome == discover.Outcome(discover.THROTTLED, ())
-    assert len(calls) == 1  # stopped at once
+    assert outcome.notice == discover.THROTTLED
+    assert outcome.notes == ("discovery: engines throttled or suspended: engine one, engine two",)
+    assert len(talk.calls) == discover.BLOCKED_IN_A_ROW  # stopped early
     assert _rows(conn) == 0
     assert _state(conn)[:2] == (0, 1)
+    assert _suspended(conn)[0] == '["engine one", "engine two"]'
+    (health,) = [h for h in search_store.component_health(conn) if h.component == "searxng"]
+    assert health.last_failure == "throttled"
     conn.close()
+
+
+def test_a_pass_with_no_throttled_engine_clears_the_record(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    discover.run(
+        conn,
+        _ETIQUETTE,
+        today="2026-11-02",
+        transport=_Talk(_engines([], ("engine one", "CAPTCHA"))),
+    )
+    assert _suspended(conn)[0] is not None
+    conn.execute("UPDATE discovery_state SET failures = 0, backoff_until = NULL")
+    discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=_empty())
+    assert _suspended(conn) == (None, None)
+
+
+def test_an_engine_name_that_is_not_plain_text_is_unnamed(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    talk = _Talk(_engines([{"url": _GOOD}], ("<b>engine</b>", "CAPTCHA")))
+    outcome = discover.run(conn, _ETIQUETTE, today="2026-11-02", transport=talk)
+    assert "discovery: engines throttled or suspended: unnamed" in outcome.notes
 
 
 def test_another_engine_error_is_not_a_stop(tmp_path: Path) -> None:
@@ -1359,3 +1460,13 @@ def test_the_pauses_of_a_pass_must_fit_its_share_of_the_watch_run() -> None:
     assert any("must be at most 120 seconds" in p for p in validate_config(doc))
     doc = {"discovery": {"queries_per_run": 24, "query_delay_seconds": 5}}
     assert not any("discovery" in p for p in validate_config(doc))
+
+
+def test_the_engine_record_must_be_a_json_array(tmp_path: Path) -> None:
+    conn = _search_db(tmp_path)
+    for bad in ("not json", '{"a": 1}'):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE discovery_state SET suspended_engines = ?", (bad,))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE discovery_state SET suspended_at = 'yesterday'")
+    conn.close()

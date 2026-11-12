@@ -408,8 +408,11 @@ def _pack(entries: list[_DigestEntry]) -> list[list[_Numbered]]:
 HEALTH_NAMES = {"lm_studio": "LM Studio", "searxng": "SearXNG", "boards": "Every board"}
 
 
-def _failure_text(name: str, failures: int, held: int | None) -> str:
-    """The one message for an outage: the component, the count, the postings held."""
+def _failure_text(name: str, failures: int, held: int | None, kind: str | None = None) -> str:
+    """The one message for an outage: the component, the count, the postings held.
+
+    An `unauthorized` failure says so, with the command that stores the token, so a
+    refused token is never read as a server that is down."""
     if held is None:
         waiting = "The number of postings waiting to be scored is not known."
     elif held == 1:
@@ -417,6 +420,11 @@ def _failure_text(name: str, failures: int, held: int | None) -> str:
     else:
         waiting = f"{held} postings are waiting to be scored."
     runs = "1 run" if failures == 1 else f"{failures} runs"
+    if kind == "unauthorized":
+        return (
+            f"Health: {name} has failed {runs} in a row: unauthorized, it refused the API "
+            f"token (run: careerhunter secret set lm_studio_token). {waiting}"
+        )
     return f"Health: {name} has failed {runs} in a row. {waiting}"
 
 
@@ -923,7 +931,9 @@ class Bot:
                     with self._search() as search, db.transaction(search):
                         search_store.mark_recovery_told(search, health.component)
                 if health.failures >= limit and health.alerted_failures is None:
-                    self.send(_failure_text(name, health.failures, health.held))
+                    self.send(
+                        _failure_text(name, health.failures, health.held, health.last_failure)
+                    )
                     with self._search() as search, db.transaction(search):
                         search_store.mark_failure_told(
                             search, health.component, health.failures, limit
@@ -1639,7 +1649,7 @@ class Bot:
                     path = snapshots.save(self.datadir.root, captured.data, captured.ext, today)
             app = Application(replace(posting, snapshot_path=path), dating, method)
             try:
-                recorded = ledger.record_application(search, active, app)
+                recorded = ledger.record_application(search, active, app, lane_config=doc)
             except sqlite3.IntegrityError:
                 raise Refusal("That application is already recorded.") from None
             if path and posting.snapshot_path is None:
@@ -1687,6 +1697,7 @@ class Bot:
                     today,
                     self.fetcher,
                     jd,
+                    lane_config=doc,
                 )
             except selfsourced.LogError as exc:
                 raise Refusal(str(exc)) from None

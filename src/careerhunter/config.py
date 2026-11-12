@@ -102,8 +102,15 @@ HEALTH_KEYS = ("unproductive_runs", "failure_runs")
 # local server. The URLs are loopback constants in score.py and embed.py, never config.
 DEFAULT_CHAT_MODEL = "local-model"
 DEFAULT_EMBEDDING_MODEL = "local-embedding"
-SCORING_KEYS = ("chat_model", "embedding_model")
+MODEL_KEYS = ("chat_model", "embedding_model")
+SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds")
 MAX_MODEL_ID = 200
+# scoring.timeout_seconds: the most one scoring call may take. A reasoning model thinks
+# before it answers, and the request does not stream. The upper bound leaves room in
+# the 600-second watch run for the boards and one call.
+DEFAULT_SCORE_TIMEOUT_SECONDS = 300
+MIN_SCORE_TIMEOUT_SECONDS = 60
+MAX_SCORE_TIMEOUT_SECONDS = 540
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _CAREER_HOST = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -543,13 +550,21 @@ def _validate_scoring(section: Any, problems: list[str]) -> None:
     extra = set(section) - set(SCORING_KEYS)
     if extra:
         problems.append(f"scoring has unknown keys: {sorted(extra)}")
-    for key in SCORING_KEYS:
+    for key in MODEL_KEYS:
         value = section.get(key)
         if value is not None and not _model_id(value):
             problems.append(
                 f"scoring.{key} must be a model identifier: text of 1 to {MAX_MODEL_ID} "
                 "characters, with no control characters and no leading or trailing spaces"
             )
+    timeout = section.get("timeout_seconds")
+    if timeout is not None and (
+        not _int(timeout) or not MIN_SCORE_TIMEOUT_SECONDS <= timeout <= MAX_SCORE_TIMEOUT_SECONDS
+    ):
+        problems.append(
+            f"scoring.timeout_seconds must be an integer from {MIN_SCORE_TIMEOUT_SECONDS} "
+            f"to {MAX_SCORE_TIMEOUT_SECONDS}"
+        )
 
 
 def _validate_telegram(section: Any, problems: list[str]) -> None:
@@ -780,6 +795,15 @@ def _scoring_model(doc: Mapping[str, Any] | None, key: str, default: str) -> str
 def chat_model(doc: Mapping[str, Any] | None) -> str:
     """The chat model id the scorer sends; `local-model` if unset."""
     return _scoring_model(doc, "chat_model", DEFAULT_CHAT_MODEL)
+
+
+def scoring_timeout_seconds(doc: Mapping[str, Any] | None) -> int:
+    """The most one scoring call may take, in seconds; 300 if unset."""
+    section = doc.get("scoring") if isinstance(doc, Mapping) else None
+    value = section.get("timeout_seconds") if isinstance(section, Mapping) else None
+    if _int(value) and MIN_SCORE_TIMEOUT_SECONDS <= value <= MAX_SCORE_TIMEOUT_SECONDS:
+        return int(value)
+    return DEFAULT_SCORE_TIMEOUT_SECONDS
 
 
 def embedding_model(doc: Mapping[str, Any] | None) -> str:

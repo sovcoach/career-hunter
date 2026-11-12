@@ -162,7 +162,7 @@ created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 21
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 25
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -215,7 +215,7 @@ Lanes label and order alerts; they never skip a posting. A title is matched agai
 
 Every alert carries a fit: `Fit: High`, `Medium` or `Low`, from the `fit` of the tier the posting was scored into. A posting the model hasn't scored yet, or scored into a tier name that is no longer in `gap_tiers`, is held and not alerted until it has a fit. `doctor` counts what is held.
 
-**After you change `search.lanes`, or upgrade to a release that matches titles differently,** run `uv run careerhunter lanes reassign --dry-run`. It lists each stored posting whose lane would change, with its id, title, and old and new lane (`off-lane` for none), then the counts and how many held off-lane postings would become alertable. It writes nothing. If the list looks right, run `uv run careerhunter lanes reassign` to apply exactly those moves; each is logged in `search.db`. Released postings alert at the bot's next poll, within `alerts.max_per_poll`, and one older than `search.max_posting_age_days` is skipped as `too_old` instead. Without `search.lanes` it refuses.
+**After you change `search.lanes`, or upgrade to a release that matches titles differently,** run `uv run careerhunter lanes reassign --dry-run`. It lists each stored posting whose lane would change, with its id, title, and old and new lane (`off-lane` for none), and each posting not checked against the lanes yet (`not checked -> <lane>`), then the counts and how many held postings would become alertable. It writes nothing. If the list looks right, run `uv run careerhunter lanes reassign` to apply exactly those moves; each is logged in `search.db`. Released postings alert at the bot's next poll, within `alerts.max_per_poll`, and one older than `search.max_posting_age_days` is skipped as `too_old` instead. Without `search.lanes` it refuses.
 
 **Upgrading from 0.3.0?** Follow "Upgrading to a new release" near the end of this guide. Postings that were already scored, and not yet alerted, get their fit from your config on the next watch run, by their tier name. With `search.lanes` set, that run also gives every stored posting its lane.
 
@@ -263,7 +263,17 @@ scoring:
   embedding_model: example-embedding-model
 ```
 
-Each is text of 1 to 200 characters, with no control characters and no spaces at either end. Left out or `null`, career-hunter asks for `local-model` and `local-embedding`. `scoring` takes no other key: a `url` is refused.
+Each is text of 1 to 200 characters, with no control characters and no spaces at either end. Left out or `null`, career-hunter asks for `local-model` and `local-embedding`. `scoring` takes one other key, `timeout_seconds` (below): a `url` is refused.
+
+4. **LM Studio's API token.** Keep authentication on in LM Studio's server settings, create an API token there, and store it in the Keychain the same way as the bot's token:
+
+   ```bash
+   uv run careerhunter secret set lm_studio_token
+   ```
+
+   It is sent as a Bearer header on every scoring and embedding call, and never printed or logged. `doctor` asks LM Studio for its model list with it: `LM Studio OK` when it is accepted, `BAD unauthorized` when LM Studio refuses it (store it again), and `BAD unreachable` when the server isn't running. A refused token is never reported as unreachable, in the watch log or in the bot's health message either.
+
+**Reasoning models.** A chat model that thinks before it answers works: its thinking (`<think>…</think>` and the like) is removed before the reply is read, and never stored. Because a reasoning model takes longer, one scoring call may take up to `scoring.timeout_seconds` (60 to 540, default 300). A call starts only while that much of the 600-second watch run is left, so the budget never cuts one short. A reply that doesn't parse leaves the posting unscored for the next run; after 3 such replies for one posting, it is given up and never sent to the model again, and `doctor`'s `bot refusals` line counts it.
 
 **Choosing models for your Mac's memory.** On a Mac with Apple silicon, the models share memory with everything else. A model's size on disk is roughly the memory it needs once loaded, plus some for the prompt. Leave at least a third of the memory for macOS and your other apps. As a guide, for chat models stored at 4-bit quantization:
 
@@ -314,7 +324,7 @@ With the template files, the prompt names Example Staffing Mill, the title keywo
 
 SearXNG runs on this Mac and listens on `127.0.0.1` only. Leave `public_instance` and `image_proxy` off, leave the limiter off, and add `json` to `search.formats`. Leave engines that need an API key disabled. Set `discovery.searxng_url` to that loopback URL, for example `http://127.0.0.1:8888/search`. A null URL leaves discovery off.
 
-Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`. A pass sends the next `discovery.queries_per_run` site-restricted queries (default 12), `discovery.query_delay_seconds` apart (default 5), and the next pass carries on from there, so over several passes every title, place and host is asked. Titles come from your lanes, places from `search.location_rules`, and hosts are each supported ATS plus `discovery.career_hosts`. A posting URL in the results is fetched once from its ATS and goes through the same gates, scoring and digest as a watched posting, with no approval. A board is queued only after one request to its API confirms it exists; a board that does not exist is never queued again, and a company in `exclusions.companies` is never queued. Career pages are not queued. A down server prints `discovery miss: unreachable`, and one that answers with an error or a reply that is not a result list prints `discovery miss: bad-reply`; either stores nothing; HTTP 429 or a CAPTCHA reported by SearXNG stops the pass, and either way later passes wait longer each time, up to seven days. `careerhunter discover` runs one pass by hand and prints each new pending row. `careerhunter discover list` prints the pending rows again.
+Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`. A pass sends the next `discovery.queries_per_run` site-restricted queries (default 12), `discovery.query_delay_seconds` apart (default 5), and the next pass carries on from there, so over several passes every title, place and host is asked. Titles come from your lanes, places from `search.location_rules`, and hosts are each supported ATS plus `discovery.career_hosts`. A posting URL in the results is fetched once from its ATS and goes through the same gates, scoring and digest as a watched posting, with no approval. A board is queued only after one request to its API confirms it exists; a board that does not exist is never queued again, and a company in `exclusions.companies` is never queued. Career pages are not queued. A down server prints `discovery miss: unreachable`, and one that answers with an error or a reply that is not a result list prints `discovery miss: bad-reply`; either stores nothing; HTTP 429 from SearXNG stops the pass. One engine that SearXNG reports as rate limited, asking for a CAPTCHA or suspended doesn't: the pass goes on while other engines answer, names the throttled engines in its log line, and fails only when no query got an answer. After a failed pass the next one waits one `discovery.interval_minutes`, doubled for each further failure in a row, up to 24 hours. `doctor` shows the backoff with the command that ends it early, `careerhunter discover clear-backoff`. `careerhunter discover` runs one pass by hand and prints each new pending row. `careerhunter discover list` prints the pending rows again.
 
 ```bash
 make discover
@@ -359,8 +369,8 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 21
-ei_record_2026-27.db: created; schema version 2
+search.db: applied nothing; schema version 25
+ei_record_2026-27.db: created; schema version 3
 EI claim 2026-27 (from 2026-08-02)
 ```
 
@@ -378,7 +388,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 21
+search.db       OK  schema version 25
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -386,7 +396,7 @@ watch run       --  none recorded yet
 watch useful    --  no useful run recorded yet
 bot alerts      OK  not held
 bot refusals    OK  no posting given up
-claim 2026-27   OK  schema version 2
+claim 2026-27   OK  schema version 3
 claim 2026-27   OK  active, from 2026-08-02
 claim 2026-27   OK  0600
 reconcile       OK  search.db and 1 claim record agree
@@ -453,11 +463,21 @@ Keep the job description with it: `--jd-file path/to/ad.pdf` takes a PDF, HTML o
 
 **LinkedIn links are never fetched**, so `--company` and `--title` are required with one. Better still, open the posting, follow it to the company's own career site, and log that page's link instead: its job description can be fetched. Pasting the description is the fallback, and so is a LinkedIn Easy Apply posting with no career-site page. If you already logged an application to the same role at the same company (a repost counts: the title is compared without its requisition code), it is still recorded, and one more line names the earlier date, for example `You logged an application to this role on 2026-10-27.` Without a readable `config.yaml`, nothing is fetched or recorded. The bot's `/log` does the same from Telegram.
 
+### When the posting is gone before you saved it
+
+If an application's job ad was taken down before its job description was kept, say so, so it stops showing as missing:
+
+```bash
+uv run careerhunter jd unavailable --url https://jobs.example.com/ads/7 --reason "posting removed before capture"
+```
+
+Pick the application by its link, or by `--company`, `--title` and `--date` (the day you applied, or the Monday of its week) when it has none; more than one match is refused. The reason (1 to 200 characters) is added to the EI record and never changed there: a new reason is a new row. `doctor` and the report then show `--` with the reason instead of a warning. If you find the job description later, attach it as usual: it takes the reason's place everywhere it is shown, and the reason stays in the record. An import entry can do the same with `jd_unavailable` (below).
+
 ### Backfilling applications and their job descriptions
 
 `seed` brings in your history once. `careerhunter import` is for adding job descriptions, and applications you haven't recorded yet, later on: it matches each entry to what is already recorded, and never changes an application's date.
 
-1. **Prepare the file.** Copy `import.example.json` from the repo into the `imports/` folder in your data folder (`init` creates it, owner-only), for example as `imports/backfill.json`, and replace the example entries with yours. The file must sit under `imports/`: a file anywhere else, even elsewhere in the data folder, is refused. Each entry needs `employer`, `role`, `date`, `date_precision` (`day`, or `week` when you only know the week; any day of that week works, and it's stored as its Monday) and `method`. `location`, `work_model`, `url`, `notes` (kept in `search.db` only, and only for a new application) and one of `jd_text` (the description, pasted) or `jd_file` (a PDF, HTML or text file, named relative to the JSON file and also under `imports/`) are optional. Links are saved in their canonical form, so a LinkedIn link with tracking parameters becomes `https://www.linkedin.com/jobs/view/<id>/`. Nothing is fetched.
+1. **Prepare the file.** Copy `import.example.json` from the repo into the `imports/` folder in your data folder (`init` creates it, owner-only), for example as `imports/backfill.json`, and replace the example entries with yours. The file must sit under `imports/`: a file anywhere else, even elsewhere in the data folder, is refused. Each entry needs `employer`, `role`, `date`, `date_precision` (`day`, or `week` when you only know the week; any day of that week works, and it's stored as its Monday) and `method`. `location`, `work_model`, `url`, `notes` (kept in `search.db` only, and only for a new application) and one of `jd_text` (the description, pasted), `jd_file` (a PDF, HTML or text file, named relative to the JSON file and also under `imports/`) or `jd_unavailable` (why there is no job description, such as `posting removed before capture`; see "When the posting is gone before you saved it") are optional. Links are saved in their canonical form, so a LinkedIn link with tracking parameters becomes `https://www.linkedin.com/jobs/view/<id>/`. Nothing is fetched.
 2. **Dry run.** It opens both databases read-only and writes nothing, not even a file:
 
    ```bash
@@ -819,6 +839,52 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
 
+## Upgrading from 0.5.0 to 0.5.1
+
+Follow the nine steps above with the tag `v0.5.1` (`git checkout v0.5.1` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Before step 5:** store LM Studio's API token (see "Run the local models"), once, from either checkout:
+
+  ```bash
+  uv run careerhunter secret set lm_studio_token
+  ```
+
+- **Step 4:** nothing to add. A 0.5.0 `config.yaml` is valid as it is. For a reasoning chat model, the default `scoring.timeout_seconds` of 300 is a good start.
+- **Step 5:** `doctor` exits 1 with this line, because `search.db` is four migrations behind:
+
+  ```text
+  search.db       BAD schema version 21, expected 25; run: careerhunter migrate
+  ```
+
+  The active claim's record is one behind, at schema version 2.
+- **Step 6:** `migrate` applies four migrations to `search.db` and one to the claim's record. The claim will be yours:
+
+  ```text
+  search.db: applied [22, 23, 24, 25]; schema version 25
+  ei_record_2026-27.db: applied [3]; schema version 3
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+  A sealed claim's record is not migrated, and is still read.
+- **Step 7:** skip it. The resume was imported for 0.4.0.
+- **Step 8:** these lines show the upgrade took:
+
+  ```text
+  search.db       OK  schema version 25
+  claim 2026-27   OK  schema version 3
+  LM Studio       OK  answers with the API token
+  git push        OK  pre-push guard installed, shared with another worktree
+  ```
+
+  The last line is the release checkout's: it shares the first checkout's hooks, so it no longer warns. If discovery was backing off, `discovery WARN` shows until when, with `careerhunter discover clear-backoff` to end it.
+- **After step 9:** applications recorded by `import` or `/log` before this release may have no lane. Check them, and see any other moves, without changing anything:
+
+  ```bash
+  cd ~/Projects/career-hunter-release && uv run careerhunter lanes reassign --dry-run
+  ```
+
+  Postings not checked yet are listed as `not checked -> <lane>`. If the list looks right, run it without `--dry-run`.
+
 ## Upgrading from 0.4.0 to 0.5.0
 
 Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the release checkout, then `uv sync --locked`). These steps differ:
@@ -875,6 +941,9 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `… is NOT encrypted` | The drive isn't encrypted yet | Step 2 |
 | `… is encrypted but locked` | The drive needs its password | Open it in Finder and enter the password |
 | `… is inside the code repository` / `… inside a git work tree` | The data folder points somewhere inside a git project | Point `CAREERHUNTER_DATA_DIR` at the external drive |
+| `LM Studio BAD unauthorized: LM Studio refused the API token` | The token in the Keychain is missing, old, or not LM Studio's current one | Copy the token from LM Studio's server settings and run `uv run careerhunter secret set lm_studio_token` |
+| `LM Studio BAD unreachable at 127.0.0.1:1234` | LM Studio's server isn't running, or not on port 1234 | Start the server in LM Studio and load the models |
+| `discovery WARN backing off until …` | Recent discovery passes failed: SearXNG was down, or every engine was throttled | Wait, or run `uv run careerhunter discover clear-backoff` to try at the next due pass |
 | `… is readable by other users … chmod 700` | Folder permissions are too open | Run the `chmod` command it prints |
 | `seed file has N problem(s)` | Something in `seed.yaml` needs fixing | Each line names the entry and field. Fix them and re-run |
 | `… is before claim 2026-27 started` | A seed date falls outside your claim | Fix the date, or see `--route-out-of-claim-to-search` in Step 8 |
@@ -882,7 +951,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 21` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 25` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |

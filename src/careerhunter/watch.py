@@ -126,7 +126,12 @@ from careerhunter.ats import (
     Skip,
 )
 from careerhunter.ats import board_url as board_url  # the tests build list URLs with it
-from careerhunter.config import max_posting_age_days, off_lane_min_fit, tier_fits
+from careerhunter.config import (
+    max_posting_age_days,
+    off_lane_min_fit,
+    scoring_timeout_seconds,
+    tier_fits,
+)
 from careerhunter.deadline import Deadline
 from careerhunter.discover import Pass
 from careerhunter.embed import Embedder, miss_line
@@ -147,6 +152,9 @@ Tally = Literal["fetched", "failed", "left"]
 RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
 # All of one board's replies together (ats.py). The CLI also caps each request with it.
 BOARD_MAX_BYTES = ats_boards.BOARD_MAX_BYTES
+# Replies for one posting that did not parse before the watcher stops sending it to the
+# model (search migration 0023). The same count as the bot's Telegram refusals.
+PARSE_FAILURES_TO_GIVE_UP = 3
 # Inline scoring of new postings stops once less than this is left of the budget.
 SCORE_RESERVE = 240.0
 _LEFT = "run budget reached; left for the next run"
@@ -209,15 +217,23 @@ class _State:
     max_age: int = 7  # search.max_posting_age_days
     today: str = ""  # the configured date, YYYY-MM-DD
     model_down: bool = False
+    model_failure: str = "unreachable"  # or "unauthorized": LM Studio refused the token
     scorer_answered: bool = False  # the scorer replied at least once, parsed or not
     budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
     # reserve left for the passes after the boards. Never written anywhere.
     queued: dict[int, PostingText] = field(default_factory=dict)
     held_new: dict[int, PostingText] = field(default_factory=dict)
+    score_timeout: float = 120.0  # scoring.timeout_seconds: a call needs this much budget
 
     def out_of_time(self) -> bool:
         return self.budget is not None and self.budget.expired()
+
+    def model_state(self) -> str:
+        """How a model that stopped answering is named in a line."""
+        if self.model_failure == "unauthorized":
+            return "model unauthorized: LM Studio refused the API token"
+        return "model unreachable"
 
     def left_by_budget(self, line: str) -> None:
         """Log what the budget left for the next run, and remember that it did."""
@@ -226,6 +242,11 @@ class _State:
 
     def in_reserve(self) -> bool:
         return self.budget is not None and self.budget.remaining() < SCORE_RESERVE
+
+    def short_for_a_call(self) -> bool:
+        """Less of the budget is left than one scoring call may take, so a call is not
+        started: the budget would cut it short and waste the model's work."""
+        return self.budget is not None and self.budget.remaining() < self.score_timeout
 
     @property
     def resume_sha256(self) -> str | None:
@@ -330,6 +351,7 @@ def run(
         lanes_on=lanes.configured(rules) is not None,
         max_age=max_posting_age_days(rules),
         today=today,
+        score_timeout=float(scoring_timeout_seconds(rules)),
     )
     lines = state.lines
     with db.transaction(conn):
@@ -460,7 +482,9 @@ def _finish_run(
         elif counts["failed"]:
             search_store.record_component(conn, "boards", failed="failed", stamp=stamp)
         if state.model_down:
-            search_store.record_component(conn, "lm_studio", failed="unreachable", stamp=stamp)
+            search_store.record_component(
+                conn, "lm_studio", failed=state.model_failure, stamp=stamp
+            )
         elif state.scorer_answered:
             search_store.record_component(conn, "lm_studio", failed=None, stamp=stamp)
 
@@ -1051,13 +1075,18 @@ def _record_jobs(
             continue
         if state.model_down:
             lines.append(
-                _line(name, ats, f"{item.title!r} left for the next run (model unreachable)")
+                _line(name, ats, f"{item.title!r} left for the next run ({state.model_state()})")
             )
             continue
         if state.in_reserve():
             state.held_new[posting_id] = seen
             lines.append(
                 _line(name, ats, f"{item.title!r} left for scoring after the boards (reserve)")
+            )
+            continue
+        if state.short_for_a_call():
+            state.left_by_budget(
+                _line(name, ats, f"{item.title!r} left for the next run (run budget reached)")
             )
             continue
         _attempt(conn, state, posting_id, seen, scorer, today, name, ats, embedder)
@@ -1144,12 +1173,15 @@ def _recheck_one(
 # was never tried, so a retry stamped at T goes ahead of every posting stored after T
 # and new arrivals can't push it back forever. Both stamps are UTC to the second. The
 # re-score passes keep never-tried first, then the oldest attempt, then the oldest
-# posting.
+# posting. A posting given up after PARSE_FAILURES_TO_GIVE_UP replies that did not
+# parse (search migration 0023) is in neither.
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM score_parse_failures f "
+    "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
     "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
@@ -1159,6 +1191,8 @@ _RESCORE_SQL = (
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM score_parse_failures f "
+    "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
     "ORDER BY p.score_attempted_at IS NOT NULL, p.score_attempted_at, p.first_seen, p.id"
 )
 _NEEDS_RESCORE_SQL = (
@@ -1218,10 +1252,10 @@ def _score_passes(
         left = len(work) - index
         if state.model_down:
             state.lines.append(
-                f"watch: scoring: model unreachable; {left} postings left for the next run"
+                f"watch: scoring: {state.model_state()}; {left} postings left for the next run"
             )
             return
-        if state.out_of_time():
+        if state.out_of_time() or state.short_for_a_call():
             state.left_by_budget(_partly("scoring", left))
             return
         with _isolated(conn, state.lines, str(row["company"]), state.hook):
@@ -1265,7 +1299,7 @@ def _attempt(
     title = repr(posting.title)
     try:
         result = scorer(posting)
-    except (ScoreError, OSError):
+    except (ScoreError, OSError) as exc:
         with db.transaction(conn):
             search_store.set_score_attempted_at(conn, posting_id, previous)
         if state.out_of_time():
@@ -1274,13 +1308,28 @@ def _attempt(
             )
         else:
             state.model_down = True
+            state.model_failure = getattr(exc, "kind", "unreachable")
             kept = "; old score kept" if rescore else ""
-            lines.append(_line(name, ats, f"{title} left unscored (model unreachable){kept}"))
+            lines.append(_line(name, ats, f"{title} left unscored ({state.model_state()}){kept}"))
         return
     state.scorer_answered = True
     if result is None:
         kept = "; old score kept" if rescore else ""
-        lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
+        with db.transaction(conn):
+            gave_up = search_store.record_parse_failure(
+                conn, posting_id, _iso(state.now()), give_up_after=PARSE_FAILURES_TO_GIVE_UP
+            )
+        if gave_up:
+            lines.append(
+                _line(
+                    name,
+                    ats,
+                    f"{title} left unscored (unparseable reply){kept}; given up after "
+                    f"{PARSE_FAILURES_TO_GIVE_UP} unparseable replies, not tried again",
+                )
+            )
+        else:
+            lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
     else:
         metadata = None if result.tier is None else json.dumps({"tier": result.tier})
         fit = None if result.tier is None else state.fits.get(result.tier)
@@ -1296,6 +1345,7 @@ def _attempt(
                 key_requirements=result.key_requirements,
                 run_id=state.run_id,
             )
+            search_store.clear_parse_failures(conn, posting_id)
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):
                 search_store.insert_skip(conn, posting_id, today, "gap_tier")
         if result.excluded:

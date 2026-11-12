@@ -201,6 +201,14 @@ def set_application_jd(
     )
 
 
+def set_jd_unavailable(conn: sqlite3.Connection, application_id: int, explanation: str) -> None:
+    """Mirror the EI record's latest JD-unavailable explanation (search migration 0024)."""
+    conn.execute(
+        "UPDATE applications SET jd_unavailable_reason = ? WHERE id = ?",
+        (explanation, application_id),
+    )
+
+
 @dataclass(frozen=True)
 class JdReference:
     """An application's JD fields in search.db, with its posting's URL and snapshot."""
@@ -213,11 +221,13 @@ class JdReference:
     jd_path: str | None
     url: str | None
     snapshot_path: str | None
+    jd_unavailable: str | None = None  # why the JD is unavailable, when it was marked
 
 
 _JD_REFERENCES = (
     "SELECT a.correlation_id, a.id, a.posting_id, a.ei_claim, a.jd_expected, a.jd_sha256, "
-    "a.jd_path, p.url, p.snapshot_path FROM applications a JOIN postings p ON p.id = a.posting_id"
+    "a.jd_path, a.jd_unavailable_reason, p.url, p.snapshot_path "
+    "FROM applications a JOIN postings p ON p.id = a.posting_id"
 )
 
 
@@ -231,6 +241,7 @@ def _jd_reference(row: sqlite3.Row) -> JdReference:
         jd_path=row["jd_path"],
         url=row["url"],
         snapshot_path=row["snapshot_path"],
+        jd_unavailable=row["jd_unavailable_reason"],
     )
 
 
@@ -259,11 +270,13 @@ class StoredApplication:
     snapshot_path: str | None
     dating: Dating
     jd_sha256: str | None
+    jd_unavailable: str | None = None  # why the JD is unavailable, when it was marked
 
 
 _STORED_APPLICATIONS = (
     "SELECT a.id, a.correlation_id, a.ei_claim, a.posting_id, c.name, p.title, p.location, "
-    "p.url, p.snapshot_path, a.date_precision, a.date_applied, a.week_of, a.jd_sha256 "
+    "p.url, p.snapshot_path, a.date_precision, a.date_applied, a.week_of, a.jd_sha256, "
+    "a.jd_unavailable_reason "
     "FROM applications a JOIN postings p ON p.id = a.posting_id "
     "JOIN companies c ON c.id = p.company_id"
 )
@@ -282,6 +295,7 @@ def _stored_application(row: sqlite3.Row) -> StoredApplication:
         snapshot_path=row["snapshot_path"],
         dating=Dating(str(row["date_precision"]), row["date_applied"], row["week_of"]),
         jd_sha256=row["jd_sha256"],
+        jd_unavailable=row["jd_unavailable_reason"],
     )
 
 
@@ -310,12 +324,24 @@ def posting_company(conn: sqlite3.Connection, posting_id: int) -> str | None:
 
 
 def jd_counts(conn: sqlite3.Connection) -> tuple[int, int]:
-    """Applications with no JD: (expected one, from before JDs were kept)."""
+    """Applications with no JD and not marked unavailable: (expected one, from before
+    JDs were kept)."""
     row = conn.execute(
         "SELECT coalesce(sum(jd_expected = 1), 0), coalesce(sum(jd_expected = 0), 0) "
-        "FROM applications WHERE jd_sha256 IS NULL"
+        "FROM applications WHERE jd_sha256 IS NULL AND jd_unavailable_reason IS NULL"
     ).fetchone()
     return int(row[0]), int(row[1])
+
+
+def jd_unavailable_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Applications with no JD that were marked unavailable, by explanation, most
+    common first (search migration 0024)."""
+    rows = conn.execute(
+        "SELECT jd_unavailable_reason, count(*) AS n FROM applications "
+        "WHERE jd_sha256 IS NULL AND jd_unavailable_reason IS NOT NULL "
+        "GROUP BY jd_unavailable_reason ORDER BY n DESC, jd_unavailable_reason"
+    )
+    return [(str(r[0]), int(r[1])) for r in rows]
 
 
 def posting_urls(conn: sqlite3.Connection) -> list[tuple[int, str]]:
@@ -486,7 +512,9 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
     row = conn.execute(
         """
         SELECT
-          coalesce(sum(p.llm_output IS NULL), 0) AS unscored,
+          coalesce(sum(p.llm_output IS NULL AND NOT EXISTS (
+            SELECT 1 FROM score_parse_failures f
+            WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL)), 0) AS unscored,
           coalesce(sum(p.llm_output IS NOT NULL AND p.fit IS NULL AND p.alerted_at IS NULL), 0)
             AS no_fit
         FROM postings p
@@ -511,7 +539,7 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
 
 
 COMPONENTS = ("lm_studio", "searxng", "boards")
-FAILURE_KINDS = ("unreachable", "bad-reply", "throttled", "failed")
+FAILURE_KINDS = ("unreachable", "unauthorized", "bad-reply", "throttled", "failed")
 
 
 def record_component(
@@ -648,6 +676,21 @@ def move_posting_lane(
         (new, posting_id, old),
     )
     return cur.rowcount == 1
+
+
+def unchecked_lanes(conn: sqlite3.Connection) -> list[CheckedLane]:
+    """Every posting not yet checked against the lanes, oldest first, for `lanes
+    reassign`. Each has no lane yet."""
+    rows = conn.execute(
+        "SELECT id, title, coalesce(posted_date, first_seen) AS posted "
+        "FROM postings WHERE lane_checked = 0 ORDER BY id"
+    )
+    return [
+        CheckedLane(
+            posting_id=int(r["id"]), title=str(r["title"]), lane=None, posted=str(r["posted"])
+        )
+        for r in rows
+    ]
 
 
 def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
@@ -859,6 +902,36 @@ def clear_refusal(conn: sqlite3.Connection, posting_id: int) -> None:
 def given_up_count(conn: sqlite3.Connection) -> int:
     """Postings the bot stopped sending after too many refusals."""
     row = conn.execute("SELECT count(*) FROM alert_refusals WHERE given_up_at IS NOT NULL")
+    return int(row.fetchone()[0])
+
+
+def record_parse_failure(
+    conn: sqlite3.Connection, posting_id: int, stamp: str, *, give_up_after: int
+) -> bool:
+    """Count one scoring reply for this posting that did not parse (search migration
+    0023). True when this one reached `give_up_after`, so the posting is now given up."""
+    conn.execute(
+        "INSERT INTO score_parse_failures (posting_id, failures, last_failed_at) "
+        "VALUES (?, 1, ?) ON CONFLICT (posting_id) DO UPDATE SET failures = failures + 1, "
+        "last_failed_at = excluded.last_failed_at",
+        (posting_id, stamp),
+    )
+    cur = conn.execute(
+        "UPDATE score_parse_failures SET given_up_at = ? "
+        "WHERE posting_id = ? AND given_up_at IS NULL AND failures >= ?",
+        (stamp, posting_id, give_up_after),
+    )
+    return cur.rowcount == 1
+
+
+def clear_parse_failures(conn: sqlite3.Connection, posting_id: int) -> None:
+    """A reply for the posting parsed: forget its failures."""
+    conn.execute("DELETE FROM score_parse_failures WHERE posting_id = ?", (posting_id,))
+
+
+def parse_given_up_count(conn: sqlite3.Connection) -> int:
+    """Postings the watcher stopped scoring after too many replies that did not parse."""
+    row = conn.execute("SELECT count(*) FROM score_parse_failures WHERE given_up_at IS NOT NULL")
     return int(row.fetchone()[0])
 
 

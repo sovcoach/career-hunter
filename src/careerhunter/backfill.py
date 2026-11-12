@@ -17,6 +17,9 @@ search.db, printed in capitals:
   `titles.canonical` title, or several do and exactly one has the same dating. The JD,
   and the link when the application has none, go through
   `ledger.attach_job_description`. The application's date never changes.
+  `jd_unavailable` (instead of `jd_text` or `jd_file`) marks the JD unavailable, with
+  why, through `ledger.mark_jd_unavailable`, unless the application has a JD or the same
+  explanation already; a create is marked the same way once recorded.
 - unchanged: the matched application already has this JD (or no JD is given), and its
   link is the same, or empty with none given. A `"new"` entry already recorded (the
   posting and date natural key) is unchanged too.
@@ -42,6 +45,7 @@ import json
 import re
 import sqlite3
 import urllib.parse
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -80,6 +84,7 @@ _KEYS = frozenset(
         "url",
         "jd_text",
         "jd_file",
+        "jd_unavailable",
         "notes",
         "resolve",
     }
@@ -116,6 +121,7 @@ class Entry:
     jd: JobDescription | None = field(repr=False)
     notes: str | None = field(repr=False)
     resolve: int | str | None
+    jd_unavailable: str | None = None  # why the JD can't be kept (EI migration 0003)
 
     @property
     def posting(self) -> Posting:
@@ -154,6 +160,7 @@ class Planned:
     set_url: bool = False  # ATTACHING: the empty link is filled
     add_jd: bool = False  # ATTACHING: the JD becomes the current one
     set_snapshot: bool = False  # ATTACHING: a text-less JD file becomes the job-ad copy
+    mark_unavailable: bool = False  # ATTACHING: the JD is marked unavailable, with why
     warning: str = ""
     label: str = ""
 
@@ -324,8 +331,14 @@ def _entry(number: int, item: Any, json_path: Path, base: Path, today: dt.date) 
     dating = _dating(item, today, problems) if "date" in item else None
     url = _url(item, problems)
     jd: JobDescription | None = None
-    if "jd_text" in item and "jd_file" in item:
-        problems.append("give jd_text or jd_file, not both")
+    unavailable: str | None = None
+    if sum(key in item for key in ("jd_text", "jd_file", "jd_unavailable")) > 1:
+        problems.append("give one of jd_text, jd_file and jd_unavailable, not more")
+    elif "jd_unavailable" in item:
+        try:
+            unavailable = jobdesc.unavailable_explanation(item["jd_unavailable"])
+        except JobDescError as exc:
+            problems.append(f"jd_unavailable: {exc}")
     elif "jd_text" in item:
         text = _string(item, "jd_text", problems, low=1, high=jobdesc.MAX_CHARS)
         if text is not None:
@@ -359,6 +372,7 @@ def _entry(number: int, item: Any, json_path: Path, base: Path, today: dt.date) 
             jd=jd,
             notes=notes.strip() or None if isinstance(notes, str) else None,
             resolve=resolve,
+            jd_unavailable=unavailable,
         ),
         label=label,
     )
@@ -517,7 +531,13 @@ def _against(
             target.snapshot_path is None or (ei_row is not None and ei_row["snapshot_path"] is None)
         )
     )
-    if not (set_url or add_jd or set_snapshot):
+    # A JD the application already has stands; a marker would change nothing shown.
+    mark_unavailable = (
+        entry.jd_unavailable is not None
+        and target.jd_sha256 is None
+        and target.jd_unavailable != entry.jd_unavailable
+    )
+    if not (set_url or add_jd or set_snapshot or mark_unavailable):
         return Planned(entry.number, UNCHANGED, entry, target=target)
     if (
         entry.url is not None
@@ -542,6 +562,7 @@ def _against(
         set_url=set_url,
         add_jd=add_jd,
         set_snapshot=set_snapshot,
+        mark_unavailable=mark_unavailable,
     )
 
 
@@ -694,9 +715,11 @@ def apply(
     active: ActiveClaim | None,
     planned: list[Planned],
     today: dt.date,
+    lane_config: Mapping[str, Any] | None = None,
 ) -> list[Outcome]:
     """Write exactly what `planned` says, one entry at a time, each in its own ledger
-    call. Only create and attach write anything."""
+    call. Only create and attach write anything. A created posting is checked against
+    `search.lanes` in `lane_config` (config.yaml), as the watcher would."""
     outcomes: list[Outcome] = []
     for item in planned:
         entry = item.entry
@@ -717,19 +740,32 @@ def apply(
                     refuse_fetch,
                     entry.jd,
                     notes=entry.notes,
+                    lane_config=lane_config,
                 )
+                if entry.jd_unavailable is not None:
+                    ledger.mark_jd_unavailable(
+                        search,
+                        active if item.to_ei else None,
+                        logged.correlation_id,
+                        entry.jd_unavailable,
+                    )
                 outcomes.append(Outcome(item.number, CREATE, logged.correlation_id))
             elif target is not None:
                 saved = None
                 if entry.jd is not None and (item.add_jd or item.set_snapshot):
                     saved = jobdesc.save(data_dir, entry.jd, today)
-                ledger.attach_job_description(
-                    search,
-                    active,
-                    target.correlation_id,
-                    saved,
-                    entry.url if item.set_url else None,
-                )
+                if item.set_url or item.add_jd or item.set_snapshot:
+                    ledger.attach_job_description(
+                        search,
+                        active,
+                        target.correlation_id,
+                        saved,
+                        entry.url if item.set_url else None,
+                    )
+                if item.mark_unavailable and entry.jd_unavailable is not None:
+                    ledger.mark_jd_unavailable(
+                        search, active, target.correlation_id, entry.jd_unavailable
+                    )
                 outcomes.append(Outcome(item.number, ATTACHING, target.correlation_id))
         except (selfsourced.LogError, ledger.AttachRefused) as exc:
             outcomes.append(Outcome(item.number, REFUSED, str(exc)))

@@ -38,6 +38,7 @@ from careerhunter.fetch import FetchError
 from careerhunter.snapshots import Fetcher
 
 MAX_CHARS = 100_000
+MAX_EXPLANATION = 200  # why a JD is unavailable (EI migration 0003)
 MAX_FILE_BYTES = 20 * 1024 * 1024  # the bot's upload cap
 MAX_PAGES = 200  # the resume reader's page cap
 SOURCES = ("pasted", "file", "fetched")
@@ -58,6 +59,10 @@ _MESSAGES = {
     "pdf_unreadable": "The PDF could not be read. Nothing was saved.",
     "too_many_pages": f"The PDF has more than {MAX_PAGES} pages.",
     "no_text": "No text was found in the file.",
+    "explanation": (
+        f"Say why the job description is unavailable in 1 to {MAX_EXPLANATION} characters "
+        "of text, with no control characters."
+    ),
 }
 
 
@@ -120,6 +125,21 @@ class SavedJd:
     @property
     def has_text(self) -> bool:
         return self.description.has_text
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def unavailable_explanation(text: object) -> str:
+    """Why an application's JD is unavailable, as it is kept: whitespace runs become one
+    space, then it is trimmed. Refused unless it is text of 1 to MAX_EXPLANATION
+    characters with no control characters."""
+    if not isinstance(text, str):
+        raise JobDescError("explanation")
+    cleaned = " ".join(text.split())
+    if not cleaned or len(cleaned) > MAX_EXPLANATION or _CONTROL.search(cleaned):
+        raise JobDescError("explanation")
+    return cleaned
 
 
 def _checked_text(text: str) -> str:

@@ -260,3 +260,82 @@ def test_the_export_reads_an_ei_file_still_at_0001(datadir: DataDir) -> None:
         (row,) = list(csv.DictReader(fh))
     assert row["job_description"] == "JD missing (pre-feature)"
     assert result.job_descriptions is None
+
+
+# --- a JD marked unavailable (EI migration 0003) ------------------------------------------
+
+GONE = "posting removed before capture"
+
+
+def _planner(search: sqlite3.Connection) -> str:
+    return str(
+        search.execute(
+            "SELECT a.correlation_id FROM applications a JOIN postings p ON p.id = a.posting_id "
+            "WHERE p.title = 'Planner'"
+        ).fetchone()[0]
+    )
+
+
+def test_doctor_shows_a_marked_jd_as_dashes_not_a_warning(
+    search: sqlite3.Connection,
+    active: ActiveClaim,
+    mixed: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ledger.mark_jd_unavailable(search, active, _planner(search), GONE)
+    assert _doctor_line(search, capsys).splitlines() == [
+        f"job descriptions --  1 application: JD unavailable ({GONE})",
+        "job descriptions --  1 application from before JDs were kept, with no JD",
+    ]
+
+
+def test_doctor_is_ok_when_every_other_application_has_a_jd(
+    search: sqlite3.Connection, active: ActiveClaim, capsys: pytest.CaptureFixture[str]
+) -> None:
+    corr = ledger.record_application(search, active, application("Planner")).correlation_id
+    ledger.mark_jd_unavailable(search, active, corr, GONE)
+    assert _doctor_line(search, capsys).splitlines() == [
+        f"job descriptions --  1 application: JD unavailable ({GONE})",
+        "job descriptions OK  every other application has one",
+    ]
+
+
+def test_doctor_lists_at_most_three_explanations(
+    search: sqlite3.Connection, active: ActiveClaim, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for number in range(5):
+        app = application(f"Role {number}", url=f"https://careers.example.com/r{number}")
+        corr = ledger.record_application(search, active, app).correlation_id
+        ledger.mark_jd_unavailable(search, active, corr, f"gone {number}")
+    first = _doctor_line(search, capsys).splitlines()[0]
+    assert first == (
+        "job descriptions --  5 applications: JD unavailable (gone 0; gone 1; gone 2; and 2 more)"
+    )
+
+
+def test_the_report_and_the_export_show_a_marked_jd(
+    datadir: DataDir, search: sqlite3.Connection, active: ActiveClaim, mixed: dict[str, Any]
+) -> None:
+    ledger.mark_jd_unavailable(search, active, _planner(search), GONE)
+    rows = {row.role: row for row in _report_rows(datadir)}
+    assert rows["Planner"].jd == f"JD -- ({GONE})"
+    assert rows["Coordinator"].jd == "JD missing (pre-feature)"
+    result = export(active.conn, datadir.exports, *RANGE, now=NOW)
+    with result.applications_csv.open(newline="", encoding="utf-8") as fh:
+        refs = {r["role"]: r["job_description"] for r in csv.DictReader(fh)}
+    assert refs["Planner"] == f"JD -- ({GONE})"
+
+
+def test_a_later_jd_replaces_the_marker_in_the_report(
+    datadir: DataDir,
+    search: sqlite3.Connection,
+    active: ActiveClaim,
+    mixed: dict[str, Any],
+    saved: Any,
+) -> None:
+    corr = _planner(search)
+    ledger.mark_jd_unavailable(search, active, corr, GONE)
+    jd = saved(jobdesc.from_paste("Synthetic planner duties, found later."))
+    ledger.attach_job_description(search, active, corr, jd)
+    rows = {row.role: row for row in _report_rows(datadir)}
+    assert rows["Planner"].jd == f"JD {jd.description.text_sha256[:8]} (pasted)"

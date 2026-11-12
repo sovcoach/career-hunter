@@ -18,8 +18,9 @@ before a separator (comma, dash, bracket), so "IT Support Associate Manager" is 
 
 A stored lane moves only through `careerhunter lanes reassign` (`plan_reassign`,
 `reassign`): it recomputes every checked posting's lane against the current config and
-matcher, and search migration 0021 logs each move to `lane_changes`. The watcher only
-fills in postings not yet checked.
+matcher, and search migration 0021 logs each move to `lane_changes`. It also checks
+every posting not checked yet, as the watcher's fill-in would; a first check is not a
+move and is not logged. The watcher only fills in postings not yet checked.
 
 Lanes only label and order postings. They never skip one and never exempt one from a
 hard gate: `hard_gates.never_gated_families` is a separate list, and neither reads the
@@ -161,13 +162,18 @@ class Reassignment:
 
     checked: int  # postings already checked against the lanes
     moves: tuple[LaneMove, ...]
-    released: tuple[int, ...]  # held off-lane, and alertable once moved
+    released: tuple[int, ...]  # held, and alertable once moved or checked
     too_old: tuple[int, ...]  # released from the hold but past the posting-age gate
     newly_held: int  # alertable now, held off-lane once moved
+    # Postings never checked against the lanes, checked now: `old` is None and means
+    # "not checked", not off-lane. The watcher's own first check is not logged to
+    # `lane_changes`, and neither is this one.
+    first_checks: tuple[LaneMove, ...] = ()
 
 
 def plan_reassign(conn: sqlite3.Connection, doc: Mapping[str, Any], today: dt.date) -> Reassignment:
-    """Every checked posting's lane against the current config and matcher. Reads only.
+    """Every checked posting's lane against the current config and matcher, and every
+    posting not checked yet (`first_checks`). Reads only.
 
     A posting the move releases from the off-lane hold alerts as usual, through the
     bot's `alert_order` and `alerts.max_per_poll`. One past `search.max_posting_age_days`
@@ -181,15 +187,25 @@ def plan_reassign(conn: sqlite3.Connection, doc: Mapping[str, Any], today: dt.da
         new = None if found is None else found.name
         if new != row.lane:
             moves.append(LaneMove(row.posting_id, row.title, row.lane, new))
+    unchecked = search_store.unchecked_lanes(conn)
+    first = []
+    for row in unchecked:
+        found = match(row.title, doc)
+        first.append(
+            LaneMove(row.posting_id, row.title, None, None if found is None else found.name)
+        )
     moved = {move.posting_id: move.new for move in moves}
+    moved.update({move.posting_id: move.new for move in first})
     pending = search_store.pending_alerts(conn)
     after = [
-        replace(alert, lane=moved[alert.posting_id]) if alert.posting_id in moved else alert
+        replace(alert, lane=moved[alert.posting_id], lane_checked=True)
+        if alert.posting_id in moved
+        else alert
         for alert in pending
     ]
     before_ids = {item.posting_id for item in alert_order(pending, doc)}
     after_ids = {item.posting_id for item in alert_order(after, doc)}
-    posted = {row.posting_id: row.posted for row in rows}
+    posted = {row.posting_id: row.posted for row in (*rows, *unchecked)}
     max_age = max_posting_age_days(doc)
     released: list[int] = []
     aged: list[int] = []
@@ -202,6 +218,7 @@ def plan_reassign(conn: sqlite3.Connection, doc: Mapping[str, Any], today: dt.da
         released=tuple(released),
         too_old=tuple(aged),
         newly_held=len(before_ids - after_ids),
+        first_checks=tuple(first),
     )
 
 
@@ -212,6 +229,8 @@ def reassign(conn: sqlite3.Connection, doc: Mapping[str, Any], today: dt.date) -
         planned = plan_reassign(conn, doc, today)
         for move in planned.moves:
             search_store.move_posting_lane(conn, move.posting_id, move.old, move.new)
+        for move in planned.first_checks:
+            search_store.set_posting_lane(conn, move.posting_id, move.new)
         for posting_id in planned.too_old:
             search_store.insert_skip(conn, posting_id, today.isoformat(), "too_old")
     return planned

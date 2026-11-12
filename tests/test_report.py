@@ -79,10 +79,11 @@ def test_the_report_joins_both_layers_into_a_private_file(
     text = path.read_text()
     assert "applications in both layers: 1 (0 voided in the EI record, left out)" in text
     assert "only in the EI record: 0; only in search.db: 0" in text
-    assert "  No lane: 1 (applied 1)" in text
+    # The logged posting is checked against the example lanes when it is created.
+    assert "  Off-lane: 1 (applied 1)" in text
     assert (
         f"  {DAY}  Example Robotics — Synthetic Analyst  | company_site | EI status: applied "
-        "| lane: No lane | fit: not scored | source: self_sourced"
+        "| lane: Off-lane | fit: not scored | source: self_sourced"
     ) in text
     assert str(ready) not in out  # only the relative path is printed
     assert _digest(ready) == before  # neither file changed

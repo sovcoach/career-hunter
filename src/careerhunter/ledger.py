@@ -35,11 +35,12 @@ from __future__ import annotations
 
 import secrets
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from typing import Any
 
-from careerhunter import discover, ei_store, enums, search_store, urls
+from careerhunter import discover, ei_store, enums, lanes, search_store, urls
 from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating, read_file_claim
 from careerhunter.db import transaction
 from careerhunter.ei_store import EiApplication, EiJobDescription
@@ -128,11 +129,17 @@ def record_application(
     active: ActiveClaim | None,
     app: Application,
     jd: SavedJd | None = None,
+    *,
+    lane_config: Mapping[str, Any] | None = None,
 ) -> Recorded:
     """Record an application in both layers (search.db only when no claim is active).
 
     `jd` is a JD whose file is already saved. Its text, when it has any, is recorded in
     both layers; its file becomes the job-ad snapshot when the posting has none.
+
+    `lane_config` is config.yaml: while it has `search.lanes`, a posting not yet checked
+    against them (one created here, say) is checked now, in the same transaction, as the
+    watcher checks its own. Search-only; the EI record has no lanes.
     """
     warning = ""
     if active is not None:
@@ -150,6 +157,9 @@ def record_application(
         )
         if jd is not None and not created:
             search_store.fill_posting_snapshot(search, posting_id, jd.path)
+        if lane_config is not None and lanes.configured(lane_config) is not None:
+            found = lanes.match(app.posting.title, lane_config)
+            search_store.set_posting_lane(search, posting_id, None if found is None else found.name)
         app_id = search_store.insert_application(search, posting_id, app, correlation_id, label)
         search_store.add_decision(search, app_id, "applied", status_date)
         if jd is not None and jd.has_text:
@@ -270,31 +280,12 @@ class Attached:
     snapshot_set: bool
 
 
-def _url_owner(search: sqlite3.Connection, url: str, posting_id: int) -> bool:
-    """True when another posting already has this URL, compared canonically."""
-    return any(
-        other != posting_id and urls.canonical(stored) == url
-        for other, stored in search_store.posting_urls(search)
-    )
-
-
-def attach_job_description(
-    search: sqlite3.Connection,
-    active: ActiveClaim | None,
-    correlation_id: str,
-    jd: SavedJd | None,
-    url: str | None = None,
-) -> Attached:
-    """Add a JD to an application recorded earlier, EI first (ADR-014).
-
-    `jd` is None for a URL-only attach (the import fills an empty link that way).
-
-    With `url`, an empty URL is filled with its canonical form: an audited EI update,
-    and `postings.url` when that is empty. A URL that another posting has, or that
-    differs from the one recorded, is refused. The JD file becomes the job-ad snapshot
-    when the application has none. An application recorded under a claim that is not
-    the active one, or whose claim is sealed, is refused: its record can't change.
-    """
+def _changeable(
+    search: sqlite3.Connection, active: ActiveClaim | None, correlation_id: str
+) -> tuple[search_store.JdReference, ActiveClaim | None, sqlite3.Row | None]:
+    """The application's search fields, the claim whose record gets the change (None
+    for an application in search.db only), and its EI row. Refused when its record
+    can't change: another claim's, a sealed one, or a voided application."""
     ref = search_store.jd_reference(search, correlation_id)
     if ref is None:
         raise ValueError(f"no application with correlation id {correlation_id}")
@@ -321,6 +312,67 @@ def attach_job_description(
             )
         if int(ei_row["voided"]):
             raise AttachRefused("That application was voided, so it can't change.")
+    return ref, to_ei, ei_row
+
+
+def mark_jd_unavailable(
+    search: sqlite3.Connection,
+    active: ActiveClaim | None,
+    correlation_id: str,
+    explanation: str,
+) -> bool:
+    """Mark an application's JD unavailable, with why, EI first (ADR-024, amended).
+
+    `explanation` is already checked (`jobdesc.unavailable_explanation`). The EI record
+    gets a new `jd_unavailable` row and search.db the same explanation. Returns False,
+    writing nothing, when the current explanation is already this one. Refused, writing
+    nothing, when the application has a JD, or when its record can't change. A JD
+    attached later is recorded as usual and shown in the marker's place.
+    """
+    ref, to_ei, ei_row = _changeable(search, active, correlation_id)
+    current = ei_store.current_job_description(to_ei.conn, correlation_id) if to_ei else None
+    if ref.jd_sha256 is not None or current is not None:
+        raise AttachRefused("That application already has a job description.")
+    if ref.jd_unavailable == explanation:
+        return False
+    if to_ei is not None and not ei_store.has_jd_unavailable(to_ei.conn):
+        raise ClaimError(
+            f"the EI record for claim {to_ei.claim.label} is behind this code; "
+            "run: careerhunter migrate"
+        )
+    with ei_first(search, to_ei):
+        search_store.set_jd_unavailable(search, ref.application_id, explanation)
+        if to_ei is not None and ei_row is not None:
+            ei_store.insert_jd_unavailable(to_ei.conn, int(ei_row["id"]), explanation)
+    return True
+
+
+def _url_owner(search: sqlite3.Connection, url: str, posting_id: int) -> bool:
+    """True when another posting already has this URL, compared canonically."""
+    return any(
+        other != posting_id and urls.canonical(stored) == url
+        for other, stored in search_store.posting_urls(search)
+    )
+
+
+def attach_job_description(
+    search: sqlite3.Connection,
+    active: ActiveClaim | None,
+    correlation_id: str,
+    jd: SavedJd | None,
+    url: str | None = None,
+) -> Attached:
+    """Add a JD to an application recorded earlier, EI first (ADR-014).
+
+    `jd` is None for a URL-only attach (the import fills an empty link that way).
+
+    With `url`, an empty URL is filled with its canonical form: an audited EI update,
+    and `postings.url` when that is empty. A URL that another posting has, or that
+    differs from the one recorded, is refused. The JD file becomes the job-ad snapshot
+    when the application has none. An application recorded under a claim that is not
+    the active one, or whose claim is sealed, is refused: its record can't change.
+    """
+    ref, to_ei, ei_row = _changeable(search, active, correlation_id)
     new_url = urls.canonical(url) if url else None
     url_set = False
     if new_url is not None:
@@ -392,6 +444,7 @@ def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]
         statuses = ei_store.status_sequences(conn)
         expected = ei_store.jd_expected(conn)
         current = ei_store.current_job_descriptions(conn)
+        unavailable = ei_store.jd_unavailable(conn) if ei_store.has_jd_unavailable(conn) else None
         ei_urls = ei_store.posting_urls(conn)
         for corr in sorted(statuses):
             if corr not in links:
@@ -409,6 +462,13 @@ def reconcile(search: sqlite3.Connection, records: dict[str, sqlite3.Connection]
                     Gap(corr, f"status history differs between claim {label} and search.db")
                 )
             gaps.extend(_jd_gaps(corr, label, expected, current, ei_urls, references))
+            if unavailable is not None and unavailable.get(corr) != references[corr].jd_unavailable:
+                gaps.append(
+                    Gap(
+                        corr,
+                        f"the JD-unavailable marker differs between claim {label} and search.db",
+                    )
+                )
         for corr, claim_label in sorted(links.items()):
             if claim_label == label and corr not in statuses:
                 gaps.append(Gap(corr, f"in search.db but missing from {where}", "orphan"))

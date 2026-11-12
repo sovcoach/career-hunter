@@ -175,3 +175,43 @@ def test_doctor_checks_push_default_and_the_installed_guard(tmp_path: Path) -> N
     (hooks / "pre-push").unlink()
     (hooks / "pre-push").write_text("#!/bin/sh\nexit 0\n")
     assert cli.repo_push_checks(repo)[1][0] == "WARN"
+
+
+def test_a_worktree_shares_the_guard_its_main_checkout_installed(tmp_path: Path) -> None:
+    main = tmp_path / "checkout"
+    ok(tmp_path, "init", "-q", "-b", "main", str(main))
+    (main / "scripts").mkdir()
+    shutil.copyfile(SCRIPT, main / "scripts" / "pre_push_guard.py")
+    ok(main, "add", "scripts/pre_push_guard.py")
+    ok(main, "commit", "-q", "-m", "synthetic")
+    release = tmp_path / "release"
+    ok(main, "worktree", "add", "-q", "-b", "release", str(release))
+    for checkout in (main, release):
+        ok(checkout, "config", "push.default", "current")
+    # `make hooks` from the main checkout: the hook lives in the shared folder.
+    hooks = main / ok(main, "rev-parse", "--git-path", "hooks")
+    (hooks / "pre-push").symlink_to(main / "scripts" / "pre_push_guard.py")
+    assert cli.repo_push_checks(main)[1] == ("OK", "pre-push guard installed")
+    assert cli.repo_push_checks(release)[1] == (
+        "OK",
+        "pre-push guard installed, shared with another worktree",
+    )
+    # The same from the worktree's side: the main checkout sees the worktree's guard.
+    (hooks / "pre-push").unlink()
+    (hooks / "pre-push").symlink_to(release / "scripts" / "pre_push_guard.py")
+    assert cli.repo_push_checks(release)[1] == ("OK", "pre-push guard installed")
+    assert cli.repo_push_checks(main)[1][0] == "OK"
+    # A worktree whose guard is gone doesn't count.
+    (release / "scripts" / "pre_push_guard.py").unlink()
+    assert cli.repo_push_checks(main)[1][0] == "WARN"
+
+
+def test_a_hook_from_an_unrelated_checkout_is_not_the_guard(tmp_path: Path) -> None:
+    repo = tmp_path / "checkout"
+    ok(tmp_path, "init", "-q", "-b", "main", str(repo))
+    other = tmp_path / "other" / "scripts"
+    other.mkdir(parents=True)
+    shutil.copyfile(SCRIPT, other / "pre_push_guard.py")
+    hooks = repo / ok(repo, "rev-parse", "--git-path", "hooks")
+    (hooks / "pre-push").symlink_to(other / "pre_push_guard.py")
+    assert cli.repo_push_checks(repo)[1][0] == "WARN"

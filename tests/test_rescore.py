@@ -94,6 +94,11 @@ def titles(scorer: Recorder) -> list[str]:
     return [text.title for text in scorer.calls]
 
 
+# The fake model's calls take 150 s or less, so a call may start with that much left
+# (scoring.timeout_seconds); the default 300 s would leave these runs no scoring time.
+FAST_CALLS = {"scoring": {"timeout_seconds": 150}}
+
+
 def run(
     conn: sqlite3.Connection, boards: dict[str, Any], slugs: tuple[str, ...], **kw: Any
 ) -> list[str]:
@@ -306,7 +311,7 @@ def test_later_boards_are_fetched_while_re_scores_wait(search: sqlite3.Connectio
     clock = FakeClock()
     boards = {board(slug): lever(slug, (f"{slug}1", f"Role {slug}")) for slug in slugs}
     events: list[str] = []
-    fetcher = Timed(boards, clock, cost=1.0)
+    fetcher = Timed(boards, clock, cost=0.5)
     scorer = Recorder(events)
     scorer.clock, scorer.cost = clock, 150.0  # each model call takes 150 s
 
@@ -315,9 +320,17 @@ def test_later_boards_are_fetched_while_re_scores_wait(search: sqlite3.Connectio
         return fetcher(address)
 
     lines = run(
-        search, boards, slugs, fetcher=fetch, scorer=scorer, resume=NEW, budget=minutes(clock, 10)
+        search,
+        boards,
+        slugs,
+        fetcher=fetch,
+        scorer=scorer,
+        resume=NEW,
+        budget=minutes(clock, 10),
+        config=FAST_CALLS,
     )
-    # Every board is fetched before any re-score; 180 s of fetching leaves time for all.
+    # Every board is fetched before any re-score; after 90 s of fetching, the calls
+    # start with 510, 360 and 210 s left, each at least the 150 s one may take.
     assert events == ["fetch"] * 3 + [f"score Role {slug}" for slug in slugs]
     assert all(row(search, f"Role {s}")["scored_resume_sha256"] == NEW.sha256 for s in slugs)
     assert lines[-1] == "watch: 3 boards fetched, 0 failed, 0 left"
@@ -341,12 +354,14 @@ def test_a_budget_cut_leaves_re_scores_for_the_next_run_uncounted(
         scorer=scorer,
         resume=NEW,
         budget=minutes(clock, 10),
+        config={"scoring": {"timeout_seconds": 250}},
     )
-    # Calls start at 0, 250 and 500 s; at 750 s the budget is gone.
-    assert len(scorer.calls) == 3
-    assert "watch: scoring: run budget reached; 1 postings left for the next run" in lines
+    # Calls start at 0 and 250 s. At 500 s only 100 s are left, less than the 250 s a
+    # call may take, so no third call starts: the budget would cut it short.
+    assert len(scorer.calls) == 2
+    assert "watch: scoring: run budget reached; 2 postings left for the next run" in lines
     hashes = sorted(row(search, f"Role {s}")["scored_resume_sha256"] for s in slugs)
-    assert hashes == [OLD.sha256] + [NEW.sha256] * 3
+    assert hashes.count(OLD.sha256) == 2 and hashes.count(NEW.sha256) == 2
     assert lines[-1] == "watch: 4 boards fetched, 0 failed, 0 left"
 
 
@@ -368,6 +383,7 @@ def test_new_postings_in_the_reserve_wait_for_the_passes_and_keep_their_descript
         fetcher=fetcher,
         scorer=scorer,
         budget=minutes(clock, 10),
+        config=FAST_CALLS,
     )
     assert "watch: Examplea (lever): 'First' left for scoring after the boards (reserve)" in lines
     assert "watch: Exampleb (lever): 'Second' left for scoring after the boards (reserve)" in lines

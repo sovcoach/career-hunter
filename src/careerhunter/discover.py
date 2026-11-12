@@ -5,11 +5,18 @@ no redirects, and reads result URLs only. Titles, snippets, and the response bod
 not stored. A down server yields one closed miss line and writes nothing.
 
 Etiquette (#40). Queries of one pass are `discovery.query_delay_seconds` apart. An
-HTTP 429 from SearXNG, or an engine SearXNG reports as unresponsive for a CAPTCHA or
-too many requests, stops the pass at once with a closed line. A stopped pass and a
-miss both write no queue row, leave the cursor where it was, and count as a failed
-pass: the next pass waits `discovery.interval_minutes` times 2 to the number of failed
-passes in a row, at most BACKOFF_CAP, and a pass that succeeds clears the count.
+HTTP 429 from SearXNG itself stops the pass at once with a closed line. One engine
+that SearXNG reports as unresponsive for a CAPTCHA, too many requests, or a suspension
+does not: SearXNG still asks its other engines. A query is answered when it brings
+results, or brings none with no engine throttled; it is blocked when it brings none
+and an engine was throttled. The pass goes on past a blocked query, stops after
+BLOCKED_IN_A_ROW blocked queries in a row, and fails only when no query was answered.
+The engines throttled in a pass that ran are kept in `discovery_state` (search
+migration 0025) and named in a line. A stopped pass and a miss both write no queue row,
+leave the cursor where it was, and count as a failed pass: the next pass waits
+`discovery.interval_minutes`, doubled for each failed pass in a row after the first,
+at most BACKOFF_CAP. A pass that succeeds clears the count, and so does
+`careerhunter discover clear-backoff` (`clear_backoff`).
 
 Approve and reject update this queue, and a board approval can fill a company row.
 They do not rewrite config files or open an EI record. The bot may call them.
@@ -31,6 +38,7 @@ from typing import Any
 
 from careerhunter import db, loopback, search_store
 from careerhunter.ats import (
+    ASHBY_SLUG,
     Board,
     BoardHTTPError,
     BoardParseError,
@@ -52,13 +60,17 @@ MISS = "discovery miss: unreachable"
 BAD_REPLY = "discovery miss: bad-reply"
 OFF = "discovery off"
 THROTTLED = "discovery stopped: rate limited or asked for a CAPTCHA"
-BACKOFF_CAP = dt.timedelta(days=7)
+BACKOFF_CAP = dt.timedelta(hours=24)
 # The share of the watch run's budget one discovery pass may use, in seconds. Config
 # keeps queries_per_run times query_delay_seconds well inside it (config.py).
 PASS_SECONDS = 150.0
 # Engine errors in SearXNG's `unresponsive_engines` that mean "slow down". The English
 # texts from searx/webutils.py; a suspended engine's text starts with "Suspended: ".
-_THROTTLE_WORDS = ("captcha", "too many requests")
+_THROTTLE_WORDS = ("captcha", "too many requests", "suspended")
+# Blocked queries in a row (no results, an engine throttled) before a pass stops early.
+BLOCKED_IN_A_ROW = 2
+MAX_ENGINES = 20  # engine names kept from one pass
+_ENGINE = re.compile(r"^[a-z0-9][a-z0-9 _.-]{0,39}$")
 _TOTAL = 30.0
 _TIMEOUT = 20.0
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -387,14 +399,25 @@ def run(
     seen: set[tuple[str, ...]] = set()
     postings: dict[str, PostingRef] = {}  # by the posting's URL, first one kept
     pause = sleep or _sleep
+    suspended: set[str] = set()
+    answered = blocked = 0
     for index, query in enumerate(queries):
         if index:
             pause(delay)
         answer = _ask(talk, base, query)
         if isinstance(answer, str):
-            _record_failure(conn, config, clock(), answer)
+            _record_failure(conn, config, clock(), answer, sorted(suspended))
             return Outcome(answer, ())
-        for raw in answer:
+        found, throttled = answer
+        suspended.update(throttled)
+        if not found and throttled:
+            blocked += 1
+            if blocked >= BLOCKED_IN_A_ROW:
+                break
+            continue
+        blocked = 0
+        answered += 1
+        for raw in found:
             ref = posting(raw)
             if ref is not None:
                 postings.setdefault(posting_url(ref) or raw, ref)
@@ -406,6 +429,10 @@ def run(
                 continue
             seen.add(key)
             hits.append(hit)
+    engines = sorted(suspended)[:MAX_ENGINES]
+    if not answered:  # every engine that was asked is throttled
+        _record_failure(conn, config, clock(), THROTTLED, engines)
+        return Outcome(THROTTLED, (), notes=_suspended_notes(engines))
     # The queue rows and the moved cursor go in one transaction: a miss moves neither,
     # so the same queries are asked again next time.
     boards = [hit for hit in hits if hit.kind == "board"]
@@ -413,9 +440,26 @@ def run(
         conn, config, boards, confirm, exclusions or {}, start=_cursor(conn)
     )
     stored = _store(
-        conn, config, accepted, today, career_hosts, cursor=after, gone=gone, stamp=_stamp(clock())
+        conn,
+        config,
+        accepted,
+        today,
+        career_hosts,
+        cursor=after,
+        gone=gone,
+        stamp=_stamp(clock()),
+        suspended=engines,
     )
-    return Outcome(None, tuple(stored), tuple(postings.values()), tuple(notes))
+    return Outcome(
+        None, tuple(stored), tuple(postings.values()), (*_suspended_notes(engines), *notes)
+    )
+
+
+def _suspended_notes(engines: Sequence[str]) -> tuple[str, ...]:
+    """The closed line naming the engines SearXNG reported as throttled in a pass."""
+    if not engines:
+        return ()
+    return (f"discovery: engines throttled or suspended: {', '.join(engines)}",)
 
 
 def _folded(text: str) -> str:
@@ -540,12 +584,14 @@ def posting(url: str) -> PostingRef | None:
     return found if posting_url(found) is not None else None
 
 
-def _ask(talk: Transport, base: str, query: str) -> list[str] | str:
-    """One query's result URLs, or the closed line that ends the pass.
+def _ask(talk: Transport, base: str, query: str) -> tuple[list[str], list[str]] | str:
+    """One query's result URLs and the engines SearXNG reported as throttled, or the
+    closed line that ends the pass.
 
     A transport failure or a reply over the cap is `unreachable`; another status or a
     reply that is not a usable result list is `bad-reply` (#42). Both are a miss. HTTP
-    429 or an engine throttled is a stop.
+    429 from SearXNG itself is a stop. A throttled engine is not: the caller decides
+    from the results whether the query was answered.
     """
     try:
         status, body = talk(request_url(base, query))
@@ -557,28 +603,29 @@ def _ask(talk: Transport, base: str, query: str) -> list[str] | str:
         return MISS
     if status != 200:
         return BAD_REPLY
-    if _throttled(body):
-        return THROTTLED
     urls = _result_urls(body)
-    return BAD_REPLY if urls is None else urls
+    return BAD_REPLY if urls is None else (urls, _throttled(body))
 
 
-def _throttled(body: bytes) -> bool:
-    """Whether SearXNG reports an engine that hit a CAPTCHA or too many requests.
+def _throttled(body: bytes) -> list[str]:
+    """The engines SearXNG reports as unresponsive for a CAPTCHA, too many requests, or
+    a suspension, by name, lower case. A name that is not plain text is `unnamed`.
 
     `unresponsive_engines` is a list of [engine, error text] pairs.
     """
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return False
+        return []
     engines = payload.get("unresponsive_engines") if isinstance(payload, dict) else None
+    found: list[str] = []
     for pair in engines if isinstance(engines, list) else []:
         if isinstance(pair, list) and len(pair) == 2 and isinstance(pair[1], str):
             text = pair[1].casefold()
             if any(word in text for word in _THROTTLE_WORDS):
-                return True
-    return False
+                name = pair[0].strip().casefold() if isinstance(pair[0], str) else ""
+                found.append(name if _ENGINE.fullmatch(name) else "unnamed")
+    return found
 
 
 def _stamp(moment: dt.datetime) -> str:
@@ -591,9 +638,35 @@ def _backoff_until(conn: sqlite3.Connection) -> str | None:
 
 
 def backoff_for(failures: int, interval_minutes: int) -> dt.timedelta:
-    """The wait after `failures` failed passes in a row: the interval doubled each time."""
-    wait: dt.timedelta = dt.timedelta(minutes=interval_minutes) * (2 ** min(failures, 16))
+    """The wait after `failures` failed passes in a row: one interval after the first,
+    doubled for each one after it, at most BACKOFF_CAP."""
+    doublings = min(max(failures - 1, 0), 16)
+    wait: dt.timedelta = dt.timedelta(minutes=interval_minutes) * (2**doublings)
     return wait if wait < BACKOFF_CAP else BACKOFF_CAP
+
+
+@dataclass(frozen=True)
+class Backoff:
+    """Discovery's backoff, read now: failed passes in a row and when the next may start."""
+
+    failures: int
+    until: str | None
+
+
+def backoff(conn: sqlite3.Connection) -> Backoff:
+    row = conn.execute(
+        "SELECT failures, backoff_until FROM discovery_state WHERE id = 1"
+    ).fetchone()
+    return Backoff(0, None) if row is None else Backoff(int(row[0]), row[1])
+
+
+def clear_backoff(conn: sqlite3.Connection) -> Backoff:
+    """End the backoff now, so the next due pass runs. Returns what it was. The cursor,
+    the unproductive count and SearXNG's health are left as they are."""
+    with db.transaction(conn):
+        before = backoff(conn)
+        conn.execute("UPDATE discovery_state SET failures = 0, backoff_until = NULL WHERE id = 1")
+    return before
 
 
 # The component failure kind for each line that ends a pass (#42).
@@ -601,11 +674,17 @@ _FAILURE_KINDS = {MISS: "unreachable", BAD_REPLY: "bad-reply", THROTTLED: "throt
 
 
 def _record_failure(
-    conn: sqlite3.Connection, config: Mapping[str, Any], moment: dt.datetime, line: str
+    conn: sqlite3.Connection,
+    config: Mapping[str, Any],
+    moment: dt.datetime,
+    line: str,
+    suspended: Sequence[str] = (),
 ) -> None:
-    """A pass that ran and failed: the backoff, one more unproductive pass, and one
-    more failed run of SearXNG with its kind, in one transaction."""
+    """A pass that ran and failed: the backoff, one more unproductive pass, one more
+    failed run of SearXNG with its kind, and the engines it throttled, in one
+    transaction."""
     with db.transaction(conn):
+        _set_suspended(conn, suspended, _stamp(moment))
         row = conn.execute("SELECT failures FROM discovery_state WHERE id = 1").fetchone()
         failures = (0 if row is None else int(row[0])) + 1
         until = moment + backoff_for(failures, discovery_interval_minutes(dict(config)))
@@ -617,6 +696,24 @@ def _record_failure(
         search_store.record_component(
             conn, "searxng", failed=_FAILURE_KINDS.get(line, "failed"), stamp=_stamp(moment)
         )
+
+
+def _set_suspended(conn: sqlite3.Connection, engines: Sequence[str], stamp: str) -> None:
+    """The engines throttled in the pass that just ran, or none (search migration 0025)."""
+    conn.execute(
+        "UPDATE discovery_state SET suspended_engines = ?, suspended_at = ? WHERE id = 1",
+        (json.dumps(list(engines)), stamp) if engines else (None, None),
+    )
+
+
+def suspended_engines(conn: sqlite3.Connection) -> tuple[list[str], str | None]:
+    """The engines throttled in the last pass that ran, and when."""
+    row = conn.execute(
+        "SELECT suspended_engines, suspended_at FROM discovery_state WHERE id = 1"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return [], None
+    return [str(name) for name in json.loads(row[0])], row[1]
 
 
 def claim_pass(conn: sqlite3.Connection, moment: dt.datetime, gap: dt.timedelta) -> bool:
@@ -734,7 +831,7 @@ def _board(host: str, segments: list[str], query: str) -> _Board | None:
         slug = _one_or_two(segments)
         return ("lever", slug, None, None) if slug else None
     if host == "jobs.ashbyhq.com":
-        slug = _one_or_two(segments)
+        slug = _one_or_two(segments, ASHBY_SLUG)
         return ("ashby", slug, None, None) if slug else None
     if host in _SMARTRECRUITERS:
         slug = _smartrecruiters_slug(segments)
@@ -792,8 +889,8 @@ def _greenhouse_slug(segments: list[str]) -> str | None:
     return segments[0]
 
 
-def _one_or_two(segments: list[str]) -> str | None:
-    if not segments or len(segments) > 2 or _slug(segments[0]) is None:
+def _one_or_two(segments: list[str], pattern: re.Pattern[str] = _SLUG) -> str | None:
+    if not segments or len(segments) > 2 or pattern.fullmatch(segments[0]) is None:
         return None
     if len(segments) == 2 and not segments[1]:
         return None
@@ -860,6 +957,7 @@ def _store(
     cursor: int | None = None,
     gone: Sequence[Hit] = (),
     stamp: str | None = None,
+    suspended: Sequence[str] = (),
 ) -> list[Queued]:
     """Insert new pending rows, and `gone` rows for boards that do not exist.
 
@@ -887,6 +985,7 @@ def _store(
                     "UPDATE discovery_state SET useful_at = ?, unproductive = 0 WHERE id = 1",
                     (stamp,),
                 )
+                _set_suspended(conn, suspended, stamp)
                 search_store.record_component(conn, "searxng", failed=None, stamp=stamp)
         for hit in gone:
             conn.execute(

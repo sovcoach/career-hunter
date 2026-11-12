@@ -26,9 +26,16 @@ UPGRADE = "## Upgrading to a new release"
 WALKTHROUGH_RELEASE = {"search": 19, "ei_record": 1}
 
 
+# Notes for an earlier upgrade keep that release's numbers too, as released.
+PAST_UPGRADES = {"## Upgrading from 0.4.0 to 0.5.0": {"search": 21, "ei_record": 2}}
+
+
 def _outside_walkthrough() -> str:
     head, _, rest = SETUP.partition(UPGRADE)
-    return head + rest.split("\n## ", 1)[1]
+    text = head + rest.split("\n## ", 1)[1]
+    for heading in PAST_UPGRADES:
+        text = text.replace(heading + _section(heading), "")
+    return text
 
 
 def _search_numbers(text: str) -> list[int]:
@@ -61,6 +68,14 @@ def test_the_upgrade_walkthrough_keeps_its_release_numbers() -> None:
     assert [int(n) for n in applied.group(1).split(", ")] == list(
         range(3, WALKTHROUGH_RELEASE["search"] + 1)
     )
+
+
+def test_past_upgrade_notes_keep_their_release_numbers() -> None:
+    for heading, release in PAST_UPGRADES.items():
+        notes = _section(heading)
+        search, ei = _search_numbers(notes), _ei_numbers(notes)
+        assert search and set(search) == {release["search"]}
+        assert ei and set(ei) == {release["ei_record"]}
 
 
 def test_lm_studio_is_required_and_the_addresses_are_the_constants() -> None:

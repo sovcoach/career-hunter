@@ -52,6 +52,10 @@ WORKDAY_PAGE = 20
 
 BOARDS = ("greenhouse", "lever", "ashby", "smartrecruiters", "bamboohr", "workday")
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
+# An Ashby board name may contain dots, such as a company's domain (`example.com`): runs
+# of slug characters with single dots between them. Never a lone or leading dot, and
+# never "..", so it stays one safe path segment.
+ASHBY_SLUG = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
 # A BambooHR slug and a Workday tenant are subdomains: one DNS label each.
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _WORKDAY_HOST = re.compile(r"^wd[0-9]{1,3}$")
@@ -226,7 +230,8 @@ def board_url(ats_type: str, slug: str) -> str | None:
 
     Workday needs its host and site too: see `list_url`.
     """
-    if ats_type not in BOARDS or ats_type == "workday" or _SLUG.fullmatch(slug) is None:
+    allowed = ASHBY_SLUG if ats_type == "ashby" else _SLUG
+    if ats_type not in BOARDS or ats_type == "workday" or allowed.fullmatch(slug) is None:
         return None
     if ats_type == "bamboohr":
         if _HOST_LABEL.fullmatch(slug) is None:

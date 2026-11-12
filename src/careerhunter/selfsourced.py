@@ -34,8 +34,10 @@ from __future__ import annotations
 import datetime as dt
 import re
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from careerhunter import enums, jobdesc, ledger, search_store, snapshots, urls
 from careerhunter.claims import ActiveClaim, Verdict, check_dating
@@ -195,11 +197,13 @@ def record(
     fetcher: Fetcher,
     jd: JobDescription | None = None,
     notes: str | None = None,
+    lane_config: Mapping[str, Any] | None = None,
 ) -> Logged:
     """Record the application, and the posting with it, in one ledger call.
 
     `jd` is a pasted or uploaded JD; without one, it is fetched when the host allows.
-    `notes` go to search.db only (the import's notes).
+    `notes` go to search.db only (the import's notes). `lane_config` (config.yaml)
+    checks the posting against `search.lanes`, as the watcher would.
     """
     if method not in enums.METHODS:
         raise LogError("That method isn't recognized.")
@@ -220,7 +224,7 @@ def record(
     saved = jobdesc.save(data_dir, jd, today) if jd is not None else None
     app = Application(replace(posting, snapshot_path=path), dating, method, notes=notes)
     try:
-        recorded = ledger.record_application(search, active, app, saved)
+        recorded = ledger.record_application(search, active, app, saved, lane_config=lane_config)
     except IdentityConflict:
         raise LogError("That link is already recorded for another company.") from None
     except sqlite3.IntegrityError:

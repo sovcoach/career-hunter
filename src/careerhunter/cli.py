@@ -39,12 +39,14 @@ from careerhunter import (
     embed_eval,
     jobdesc,
     lanes,
+    ledger,
     resume,
     search_store,
     secrets_store,
     selfsourced,
     service,
     storage_guard,
+    urls,
     watch,
 )
 from careerhunter import report as claim_report
@@ -60,6 +62,7 @@ from careerhunter.config import (
     load_config,
     load_exclusions,
     off_lane_min_fit,
+    scoring_timeout_seconds,
     telegram_chat_id,
     timezone_name,
     watch_interval_minutes,
@@ -74,7 +77,8 @@ from careerhunter.ledger import PartialWriteError, reconcile
 from careerhunter.models import Dating
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.runlog import RunLog, RunLogError
-from careerhunter.score import Score, score_posting
+from careerhunter.score import UNAUTHORIZED as SCORE_UNAUTHORIZED
+from careerhunter.score import Score, ScoreError, probe_models, score_posting
 from careerhunter.score import default_transport as score_transport
 from careerhunter.scout_prompt import render
 from careerhunter.seed import SeedError, Tally, import_seed
@@ -279,7 +283,7 @@ def cmd_import(datadir: DataDir, args: argparse.Namespace) -> int:
         planned = backfill.plan(w.search, record, parsed, route_out_of_claim=route)
         print(_describe_claim(record.claim))
         _print_plan(planned)
-        outcomes = backfill.apply(datadir.root, w.search, w.active, planned, today)
+        outcomes = backfill.apply(datadir.root, w.search, w.active, planned, today, lane_config=doc)
     for item, outcome in zip(planned, outcomes, strict=True):
         if outcome.kind != item.kind:
             print(f"{outcome.number:3} {outcome.kind.upper():9} not written: {outcome.detail}")
@@ -361,12 +365,13 @@ def _plan_line(item: backfill.Planned) -> list[str]:
     if item.kind == backfill.CREATE:
         fields = f"{named}, {entry.method}, link {entry.url or 'none'}"
         notes = f", notes ({len(entry.notes):,} characters)" if entry.notes else ""
-        ei = (
-            f"EI: the same without notes, {_jd_text(entry.jd)}"
-            if item.to_ei
-            else "EI: nothing (search.db only)"
+        jd = (
+            f"JD unavailable ({entry.jd_unavailable})"
+            if entry.jd_unavailable is not None
+            else _jd_text(entry.jd)
         )
-        lines = [f"{head} search.db: {fields}{notes}, {_jd_text(entry.jd)}; {ei}"]
+        ei = f"EI: the same without notes, {jd}" if item.to_ei else "EI: nothing (search.db only)"
+        lines = [f"{head} search.db: {fields}{notes}, {jd}; {ei}"]
         if item.warning:
             lines.append(f"{'':14}note: {item.warning}")
         return lines
@@ -377,6 +382,8 @@ def _plan_line(item: backfill.Planned) -> list[str]:
             parts.append(f"link {entry.url}")
         if item.add_jd or item.set_snapshot:
             parts.append(_jd_text(entry.jd))
+        if item.mark_unavailable:
+            parts.append(f"JD unavailable ({entry.jd_unavailable})")
         where = f"search.db and EI claim {target.ei_claim}" if target.ei_claim else "search.db"
         return [f"{head} {_app_text(target)} gets, in {where}: {', '.join(parts)}"]
     if target is not None and item.kind in (backfill.UNCHANGED, backfill.CONFLICT):
@@ -455,7 +462,16 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
         )
         with _writable(datadir) as w:
             logged = selfsourced.record(
-                datadir.root, w.search, w.active, posting, method, dating, today, fetch_page, jd
+                datadir.root,
+                w.search,
+                w.active,
+                posting,
+                method,
+                dating,
+                today,
+                fetch_page,
+                jd,
+                lane_config=doc,
             )
     except jobdesc.JobDescError as exc:
         _err(f"error: {exc} Nothing was recorded.")
@@ -477,6 +493,68 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
         print("No job description was saved.")
     if logged.earlier:
         print(logged.earlier)
+    return EXIT_OK
+
+
+def _selected_applications(
+    search: sqlite3.Connection, args: argparse.Namespace
+) -> list[search_store.StoredApplication]:
+    """The applications `jd unavailable` names: by the posting's link, compared
+    canonically, or by company, title and date (the day applied, or the week's Monday
+    for a week-dated one), compared without regard to case."""
+    found = search_store.stored_applications(search)
+    if args.url is not None:
+        wanted = urls.canonical(args.url)
+        return [a for a in found if a.url is not None and urls.canonical(a.url) == wanted]
+    day = args.date.isoformat()
+    return [
+        a
+        for a in found
+        if a.company.casefold() == args.company.strip().casefold()
+        and a.title.casefold() == args.title.strip().casefold()
+        and day in (a.dating.day, a.dating.week_of)
+    ]
+
+
+def cmd_jd(datadir: DataDir, args: argparse.Namespace) -> int:
+    """`jd unavailable`: mark an application's JD unavailable, with why (ADR-024)."""
+    picked_by_names = (args.company, args.title, args.date)
+    if args.url is None and None in picked_by_names:
+        _err("error: give --url, or all of --company, --title and --date")
+        return EXIT_ERROR
+    if args.url is not None and any(v is not None for v in picked_by_names):
+        _err("error: give --url, or --company, --title and --date, not both")
+        return EXIT_ERROR
+    try:
+        explanation = jobdesc.unavailable_explanation(args.reason)
+    except jobdesc.JobDescError as exc:
+        _err(f"error: {exc} Nothing was recorded.")
+        return EXIT_ERROR
+    with _writable(datadir) as w:
+        matches = _selected_applications(w.search, args)
+        if not matches:
+            _err("error: no application matches; nothing was recorded")
+            return EXIT_ERROR
+        if len(matches) > 1:
+            _err(
+                f"error: {len(matches)} applications match; give --url, or a narrower "
+                "--company, --title and --date. Nothing was recorded."
+            )
+            return EXIT_ERROR
+        (target,) = matches
+        try:
+            added = ledger.mark_jd_unavailable(
+                w.search, w.active, target.correlation_id, explanation
+            )
+        except ledger.AttachRefused as exc:
+            _err(f"error: {exc} Nothing was recorded.")
+            return EXIT_ERROR
+    where = f"EI claim {target.ei_claim}" if target.ei_claim else "search.db only"
+    name = f"{target.company} — {target.title}"
+    if added:
+        print(f"Marked: {name} ({where}): job description unavailable ({explanation}).")
+    else:
+        print(f"Already marked: {name} ({where}): {explanation}. Nothing changed.")
     return EXIT_OK
 
 
@@ -692,8 +770,17 @@ def repo_push_checks(repo: Path) -> list[tuple[str, str]]:
         found.append(("WARN", f"push.default is {shown}, not current; run: make hooks"))
     hook = (repo / git("rev-parse", "--git-path", "hooks") / "pre-push").resolve()
     guard = (repo / "scripts" / "pre_push_guard.py").resolve()
+    # Worktrees of one repository share its hooks folder, so the hook `make hooks` put
+    # there from one checkout runs the guard for every other one too.
+    shared = {
+        (Path(line.removeprefix("worktree ")) / "scripts" / "pre_push_guard.py").resolve()
+        for line in git("worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    }
     if hook == guard:
         found.append(("OK", "pre-push guard installed"))
+    elif hook in shared and hook.is_file():
+        found.append(("OK", "pre-push guard installed, shared with another worktree"))
     else:
         found.append(("WARN", "the pre-push guard isn't installed; run: make hooks"))
     return found
@@ -1087,6 +1174,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
 
     # One budget for the whole run, shared by every client the run calls.
     budget = Deadline(watch.RUN_BUDGET)
+    token = _model_token(log.note)
 
     def on_crash(who: str, exc: Exception) -> None:
         log.note(_with_traceback(f"watch: {who}", exc))
@@ -1114,7 +1202,12 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             return score_posting(
                 posting,
                 doc,
-                transport=partial(score_transport, budget=budget),
+                transport=partial(
+                    score_transport,
+                    budget=budget,
+                    token=token,
+                    timeout=scoring_timeout_seconds(doc),
+                ),
                 resume=loaded,
                 examples=examples,
             )
@@ -1129,7 +1222,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             exclusions=exclusions,
             scorer=scorer,
             data_dir=datadir.root,
-            embed_transport=partial(embed.default_transport, budget=budget),
+            embed_transport=partial(embed.default_transport, budget=budget, token=token),
             on_crash=on_crash,
             emit=log.append,
             budget=budget,
@@ -1145,6 +1238,16 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
         conn.close()
     _record_watch_success(datadir)
     return EXIT_OK
+
+
+def _model_token(note: Callable[[str], None]) -> str | None:
+    """LM Studio's API token from the Keychain, or None. The value is never printed: a
+    Keychain that can't be read is one fixed log line, and the call goes without it."""
+    try:
+        return secrets_store.get_secret("lm_studio_token")
+    except secrets_store.SecretError:
+        note("watch: lm_studio_token could not be read from the Keychain; calls go without it")
+        return None
 
 
 BUSY = "discover: another pass started less than 150 seconds ago; skipped"
@@ -1212,6 +1315,8 @@ def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
     elif candidate_id is not None:
         _err(f"error: discover {action} takes no candidate id")
         return EXIT_ERROR
+    if action == "clear-backoff":
+        return _discover_clear_backoff(datadir)
     if action != "run":
         return _discover_by_hand(datadir, action, candidate_id)
     try:
@@ -1297,6 +1402,28 @@ def _discover_by_hand(datadir: DataDir, action: str, candidate_id: int | None) -
         conn.close()
     for row in rows:
         print(discover.format_row(row))
+    return EXIT_OK
+
+
+def _discover_clear_backoff(datadir: DataDir) -> int:
+    """End discovery's backoff, so the next due pass runs. Writes search.db only."""
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    conn = db.connect(datadir.search_db_path)
+    try:
+        db.migrate(conn, "search")
+        before = discover.clear_backoff(conn)
+    finally:
+        conn.close()
+    if before.until is None:
+        print("discovery: no backoff to clear")
+    else:
+        print(
+            f"discovery: backoff cleared (it was until {before.until}, after "
+            f"{plural(before.failures, 'failed pass', 'failed passes')} in a row); "
+            "the next pass runs when it is due"
+        )
     return EXIT_OK
 
 
@@ -1411,7 +1538,8 @@ def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
 
 
 def cmd_lanes(datadir: DataDir, args: argparse.Namespace) -> int:
-    """`lanes reassign [--dry-run]`: recompute every checked posting's lane.
+    """`lanes reassign [--dry-run]`: recompute every checked posting's lane, and check
+    every posting not checked yet.
 
     The current `search.lanes` and the current matcher decide. A dry run reads
     search.db only, and needs it migrated already. Without `--dry-run` the same changes
@@ -1455,17 +1583,23 @@ def _print_reassignment(planned: lanes.Reassignment, *, dry_run: bool) -> None:
     for move in planned.moves:
         old, new = move.old or "off-lane", move.new or "off-lane"
         print(f"{move.posting_id:6} {move.title}: {old} -> {new}")
+    for move in planned.first_checks:
+        print(f"{move.posting_id:6} {move.title}: not checked -> {move.new or 'off-lane'}")
     verb = "would change" if dry_run else "changed"
     print(f"{len(planned.moves)} of {planned.checked} checked postings {verb} lane.")
     to_lane = sum(1 for m in planned.moves if m.old is None)
     to_off = sum(1 for m in planned.moves if m.new is None)
     between = len(planned.moves) - to_lane - to_off
     print(f"  from off-lane to a lane: {to_lane}; to off-lane: {to_off}; between lanes: {between}")
+    if planned.first_checks:
+        laned = sum(1 for m in planned.first_checks if m.new is not None)
+        checks = "would be checked" if dry_run else "were checked"
+        print(
+            f"{len(planned.first_checks)} postings not checked yet {checks}: "
+            f"{laned} to a lane, {len(planned.first_checks) - laned} off-lane."
+        )
     can = "would become" if dry_run else "became"
-    print(
-        f"{len(planned.released)} held off-lane postings {can} alertable, "
-        "within alerts.max_per_poll."
-    )
+    print(f"{len(planned.released)} held postings {can} alertable, within alerts.max_per_poll.")
     if planned.too_old:
         skip = "would get" if dry_run else "got"
         print(
@@ -1643,6 +1777,31 @@ def _doctor_usefulness(
         report.line("discovery useful", "--", when)
 
 
+DISCOVERY_CLEAR_HINT = "to retry sooner, run: careerhunter discover clear-backoff"
+
+
+def _doctor_discovery_backoff(
+    report: _Report, search: sqlite3.Connection, config_doc: dict[str, Any] | None, now: dt.datetime
+) -> None:
+    """Discovery inside its backoff is a warning with the command that ends it; the
+    engines SearXNG reported as throttled in the last pass are named."""
+    if not discovery_enabled(config_doc):
+        return
+    state = discover.backoff(search)
+    engines, _when = discover.suspended_engines(search)
+    named = f"; engines throttled: {', '.join(engines)}" if engines else ""
+    if state.until is not None and state.until > now.strftime("%Y-%m-%dT%H:%M:%SZ"):
+        report.line(
+            "discovery",
+            "WARN",
+            f"backing off until {state.until} after "
+            f"{plural(state.failures, 'failed pass', 'failed passes')} in a row{named}; "
+            f"{DISCOVERY_CLEAR_HINT}",
+        )
+    elif engines:
+        report.line("discovery", "--", f"engines throttled in the last pass: {', '.join(engines)}")
+
+
 def _doctor_components(
     report: _Report, search: sqlite3.Connection, config_doc: dict[str, Any] | None
 ) -> None:
@@ -1664,6 +1823,48 @@ def _doctor_components(
         )
 
 
+def _model_in_use(config_doc: dict[str, Any]) -> bool:
+    """Whether a watch run calls LM Studio: scoring needs fit_rubric.gap_tiers, and
+    embeddings need a resume in config."""
+    rubric = config_doc.get("fit_rubric")
+    tiers = rubric.get("gap_tiers") if isinstance(rubric, dict) else None
+    return isinstance(tiers, dict) or resume.configured(config_doc)
+
+
+_LM_KEY_HINT = "run: careerhunter secret set lm_studio_token"
+
+
+def lm_studio_status() -> tuple[str, str]:
+    """(status, detail) for LM Studio's server, asked for its model list with the API
+    token. A refused token (401 or 403) is `unauthorized`, never `unreachable`. The
+    token is never printed. Tests replace this with a healthy fake (conftest)."""
+    try:
+        token = secrets_store.get_secret("lm_studio_token")
+    except secrets_store.SecretError:
+        return "BAD", "lm_studio_token could not be read from the Keychain"
+    if not token:
+        return "BAD", f"lm_studio_token is missing; {_LM_KEY_HINT}"
+    try:
+        status = probe_models(token)
+    except ScoreError:
+        return "BAD", "unreachable at 127.0.0.1:1234; start LM Studio's server"
+    if status in SCORE_UNAUTHORIZED:
+        return "BAD", f"unauthorized: LM Studio refused the API token; {_LM_KEY_HINT}"
+    if status == 200:
+        return "OK", "answers with the API token"
+    return "BAD", f"answered HTTP {int(status)} to a model list request"
+
+
+def _doctor_lm_studio(report: _Report, config_doc: dict[str, Any] | None) -> None:
+    """The LM Studio line, when a watch run would call it."""
+    if config_doc is None:
+        return
+    if not _model_in_use(config_doc):
+        report.line("LM Studio", "--", "not used (no fit_rubric.gap_tiers and no resume)")
+        return
+    report.line("LM Studio", *lm_studio_status())
+
+
 def _doctor_alert_hold(report: _Report, search: sqlite3.Connection) -> None:
     """Whether the bot is holding watcher alerts because it couldn't read config.yaml."""
     since = search_store.alerts_held_since(search)
@@ -1678,8 +1879,10 @@ def _doctor_alert_hold(report: _Report, search: sqlite3.Connection) -> None:
 
 
 def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
-    """Postings the bot gave up on after Telegram refused them too often (#42)."""
+    """Postings given up: the bot's, after Telegram refused them too often (#42), and the
+    watcher's, after the model's replies for them did not parse too often (0023)."""
     given_up = search_store.given_up_count(search)
+    unparsed = search_store.parse_given_up_count(search)
     if given_up:
         report.line(
             "bot refusals",
@@ -1687,13 +1890,32 @@ def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
             f"{plural(given_up, 'posting', 'postings')} refused by Telegram "
             f"{bot.REFUSALS_TO_GIVE_UP} times; given up and never sent (see logs/bot.log)",
         )
-    else:
+    if unparsed:
+        report.line(
+            "bot refusals",
+            "WARN",
+            f"{plural(unparsed, 'posting', 'postings')} got a model reply that did not "
+            f"parse {watch.PARSE_FAILURES_TO_GIVE_UP} times; given up and never scored "
+            "(see logs/watch.log)",
+        )
+    if not given_up and not unparsed:
         report.line("bot refusals", "OK", "no posting given up")
 
 
 def _doctor_job_descriptions(report: _Report, search: sqlite3.Connection) -> None:
-    """Applications with no job description (ADR-024)."""
+    """Applications with no job description (ADR-024). One marked unavailable, with why,
+    is `--`, never a warning."""
     missing, pre_feature = search_store.jd_counts(search)
+    unavailable = search_store.jd_unavailable_counts(search)
+    if unavailable:
+        total = sum(count for _, count in unavailable)
+        shown = "; ".join(why for why, _ in unavailable[:3])
+        more = f"; and {len(unavailable) - 3} more" if len(unavailable) > 3 else ""
+        report.line(
+            "job descriptions",
+            "--",
+            f"{plural(total, 'application', 'applications')}: JD unavailable ({shown}{more})",
+        )
     older = (
         f"; {plural(pre_feature, 'application', 'applications')} from before JDs were kept"
         if pre_feature
@@ -1713,6 +1935,8 @@ def _doctor_job_descriptions(report: _Report, search: sqlite3.Connection) -> Non
             f"{plural(pre_feature, 'application', 'applications')} from before JDs were "
             "kept, with no JD",
         )
+    elif unavailable:
+        report.line("job descriptions", "OK", "every other application has one")
     else:
         report.line("job descriptions", "OK", "every application has one")
 
@@ -1848,7 +2072,10 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
     if search is not None:
         _doctor_watch_runs(report, search, now)
         _doctor_usefulness(report, search, config_doc, now)
+        _doctor_discovery_backoff(report, search, config_doc, now)
         _doctor_components(report, search, config_doc)
+    _doctor_lm_studio(report, config_doc)
+    if search is not None:
         _doctor_alert_hold(report, search)
         _doctor_refusals(report, search)
         _doctor_job_descriptions(report, search)
@@ -1963,6 +2190,20 @@ def build_parser() -> argparse.ArgumentParser:
     jd.add_argument(
         "--jd-stdin", action="store_true", help="read the job description, as text, from stdin"
     )
+    p = sub.add_parser("jd", help="job descriptions that can't be kept")
+    jd_sub = p.add_subparsers(dest="jd_action", required=True)
+    p = jd_sub.add_parser(
+        "unavailable",
+        help="mark an application's job description unavailable, with why; a JD attached "
+        "later still counts",
+    )
+    p.add_argument("--reason", required=True, help='why, e.g. "posting removed before capture"')
+    p.add_argument("--url", help="the application's job ad link")
+    p.add_argument("--company", help="the employer, with --title and --date")
+    p.add_argument("--title", help="the role, with --company and --date")
+    p.add_argument(
+        "--date", type=_date, metavar="YYYY-MM-DD", help="the day applied, or its week's Monday"
+    )
     p = sub.add_parser(
         "report",
         help="join one claim's EI record to search.db, read-only, into a private report",
@@ -1998,10 +2239,11 @@ def build_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument(
         "discover_action",
         nargs="?",
-        choices=("run", "list", "approve", "reject"),
+        choices=("run", "list", "approve", "reject", "clear-backoff"),
         default="run",
         help="run: search and queue new rows; list: print pending rows; "
-        "approve or reject: decide one pending row",
+        "approve or reject: decide one pending row; clear-backoff: end the backoff after "
+        "failed passes",
     )
     discover_parser.add_argument(
         "candidate_id",
@@ -2017,8 +2259,8 @@ def build_parser() -> argparse.ArgumentParser:
     lanes_sub = p.add_subparsers(dest="lanes_action", required=True)
     p = lanes_sub.add_parser(
         "reassign",
-        help="recompute every checked posting's lane against the current config; "
-        "writes search.db only",
+        help="recompute every checked posting's lane against the current config, and check "
+        "any posting not checked yet; writes search.db only",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="list each posting that would change; write nothing"
@@ -2049,6 +2291,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "import": cmd_import,
     "export": cmd_export,
     "log": cmd_log,
+    "jd": cmd_jd,
     "report": cmd_report,
     "claim": cmd_claim,
     "secret": cmd_secret,

@@ -10,7 +10,7 @@ import keyring
 from keyring.backend import KeyringBackend
 
 SERVICE = "career-hunter"
-ALLOWED_NAMES = frozenset({"telegram_bot_token"})
+ALLOWED_NAMES = frozenset({"telegram_bot_token", "lm_studio_token"})
 
 # Backends that would store secrets in plaintext or silently drop them.
 _INSECURE_BACKEND_PREFIXES = ("keyrings.alt", "keyring.backends.fail", "keyring.backends.null")

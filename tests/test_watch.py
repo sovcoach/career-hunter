@@ -180,6 +180,14 @@ def test_board_url_is_built_only_from_a_safe_slug() -> None:
 )
 def test_an_unsafe_slug_builds_no_url(slug: str) -> None:
     for ats in ("greenhouse", "lever", "ashby"):
+        if ats == "ashby" and slug == "evil.example":
+            # An Ashby board name may contain dots (test_ashby_slug): it is still one path
+            # segment on Ashby's own host, never another host.
+            assert w.board_url(ats, slug) == (
+                "https://api.ashbyhq.com/posting-api/job-board/evil.example"
+                "?includeCompensation=true"
+            )
+            continue
         assert w.board_url(ats, slug) is None
 
 
@@ -2032,6 +2040,7 @@ def test_scoring_waiting_rows_stops_when_the_budget_runs_out(
         fetcher=fetcher,
         scorer=scorer,
         budget=minutes(clock, 10),
+        config={"scoring": {"timeout_seconds": 120}},  # the fake call's 120 s
     )
     assert "watch: scoring: run budget reached; 1 postings left for the next run" in lines
     assert [row["llm_output"] for row in postings(search)].count("kept") == 2

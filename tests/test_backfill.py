@@ -217,7 +217,7 @@ def test_every_problem_in_an_entry_is_listed_and_the_rest_go_ahead(
         "date_precision must be one of ['day', 'week']",
         "date 2026-02-30 is not a real date",
         "url must be an http or https link",
-        "give jd_text or jd_file, not both",
+        "give one of jd_text, jd_file and jd_unavailable, not more",
         "notes must be text of at most 2000 characters, or null",
         'resolve must be a search application id (1 or more) or "new"',
     )
@@ -663,3 +663,68 @@ def test_the_plan_writes_nothing(
     assert before == after
     assert snapshots(datadir) == []
     assert rows(active.conn, "SELECT count(*) FROM job_descriptions") == [(0,)]
+
+
+# --- jd_unavailable (EI migration 0003) ----------------------------------------------------
+
+GONE = "posting removed before capture"
+
+
+def test_jd_unavailable_marks_an_existing_application(
+    datadir: DataDir, imports: Path, search: sqlite3.Connection, active: ActiveClaim
+) -> None:
+    corr = existing(search, active)
+    path = write(imports, entry(jd_unavailable=f" {GONE} "))
+    plan = planned(datadir, search, active, path)
+    assert kinds(plan) == [ATTACHING] and plan[0].mark_unavailable and not plan[0].add_jd
+    backfill.apply(datadir.root, search, active, plan, TODAY)
+    assert rows(search, "SELECT jd_unavailable_reason FROM applications") == [(GONE,)]
+    assert rows(active.conn, "SELECT explanation FROM jd_unavailable") == [(GONE,)]
+    assert snapshots(datadir) == []
+    assert kinds(planned(datadir, search, active, path)) == [UNCHANGED]  # a second run
+    assert ledger.reconcile(search, {active.claim.label: active.conn}) == []
+    assert corr
+
+
+def test_jd_unavailable_marks_a_created_application(
+    datadir: DataDir, imports: Path, search: sqlite3.Connection, active: ActiveClaim
+) -> None:
+    path = write(imports, entry(employer="Synthetic Widgets", jd_unavailable=GONE))
+    assert kinds(run(datadir, search, active, path)) == [CREATE]
+    assert rows(search, "SELECT jd_sha256, jd_unavailable_reason FROM applications") == [
+        (None, GONE)
+    ]
+    assert rows(active.conn, "SELECT explanation FROM jd_unavailable") == [(GONE,)]
+    assert search_store.jd_counts(search) == (0, 0)
+    assert kinds(planned(datadir, search, active, path)) == [UNCHANGED]
+
+
+def test_jd_unavailable_leaves_an_application_with_a_jd_unchanged(
+    datadir: DataDir, imports: Path, search: sqlite3.Connection, active: ActiveClaim
+) -> None:
+    run(datadir, search, active, write(imports, entry(jd_text=JD)))
+    path = write(imports, entry(jd_unavailable=GONE), name="second.json")
+    assert kinds(planned(datadir, search, active, path)) == [UNCHANGED]
+    assert rows(active.conn, "SELECT count(*) FROM jd_unavailable") == [(0,)]
+
+
+@pytest.mark.parametrize(
+    ("fields", "problem"),
+    [
+        ({"jd_unavailable": GONE, "jd_text": JD}, "give one of jd_text, jd_file and"),
+        ({"jd_unavailable": "  "}, "jd_unavailable: Say why"),
+        ({"jd_unavailable": "x" * 201}, "jd_unavailable: Say why"),
+        ({"jd_unavailable": None}, "jd_unavailable: Say why"),
+    ],
+)
+def test_a_bad_jd_unavailable_is_refused(
+    datadir: DataDir,
+    imports: Path,
+    search: sqlite3.Connection,
+    active: ActiveClaim,
+    fields: dict[str, Any],
+    problem: str,
+) -> None:
+    plan = planned(datadir, search, active, write(imports, entry(**fields)))
+    assert kinds(plan) == [REFUSED]
+    assert any(reason.startswith(problem) for reason in plan[0].reasons)

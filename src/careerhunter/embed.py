@@ -30,7 +30,13 @@ from careerhunter import db, loopback, resume, search_store
 from careerhunter.config import DEFAULT_EMBEDDING_MODEL, embedding_model
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
-from careerhunter.score import ScoreError, Transport, require_loopback
+from careerhunter.score import (
+    UNAUTHORIZED,
+    ScoreError,
+    Transport,
+    model_headers,
+    require_loopback,
+)
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/embeddings"
 MODEL_NAME = DEFAULT_EMBEDDING_MODEL  # what is sent when scoring.embedding_model is unset
@@ -38,12 +44,14 @@ TOTAL = 60.0
 TIMEOUT = 30.0
 # A 1536-dimension vector is about 21 KB of JSON; the cap leaves room for larger models.
 MAX_REPLY = 1_048_576
-_REASONS = frozenset({"unreachable", "bad-reply", "no-resume", "dim-mismatch"})
+_REASONS = frozenset({"unreachable", "unauthorized", "bad-reply", "no-resume", "dim-mismatch"})
 
 
 class EmbedError(Exception):
-    """A closed reason: unreachable, bad-reply, no-resume, or dim-mismatch. The text is
-    that reason.
+    """A closed reason: unreachable, unauthorized, bad-reply, no-resume, or
+    dim-mismatch. The text is that reason.
+
+    `unauthorized` (with `down` True) is a 401 or 403: LM Studio refused the API token.
 
     `unreachable` (with `down` True) is the server itself not usable: refused, timed
     out, out of time, or a reply over the cap. `bad-reply` is a reply that arrived but
@@ -81,9 +89,12 @@ def posting_text(posting: PostingText) -> str:
 
 
 def default_transport(
-    url: str, payload: bytes, *, budget: Deadline | None = None
+    url: str, payload: bytes, *, budget: Deadline | None = None, token: str | None = None
 ) -> tuple[int, bytes]:
-    """POST once, within TOTAL. A redirect status is returned as-is and is not followed."""
+    """POST once, within TOTAL. A redirect status is returned as-is and is not followed.
+
+    `token` is sent as a Bearer header when set; it is never logged or put in an error.
+    """
     host, port, path = require_loopback(url)
     try:
         return loopback.exchange(
@@ -92,7 +103,7 @@ def default_transport(
             port,
             path,
             body=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=model_headers(token),
             total=TOTAL,
             per_op=TIMEOUT,
             max_bytes=MAX_REPLY,
@@ -118,6 +129,8 @@ def embed_text(
         status, body = send(url, _request(text, model))
     except (ScoreError, OSError, http.client.HTTPException):
         raise EmbedError("unreachable", down=True) from None
+    if status in UNAUTHORIZED:
+        raise EmbedError("unauthorized", down=True)
     return _values(status, body)
 
 

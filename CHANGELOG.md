@@ -7,6 +7,26 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- LM Studio's API token (ADR-025). `careerhunter secret set lm_studio_token` stores it in the Keychain; the watch run sends it as a Bearer header on every scoring and embedding call, and never prints or logs it.
+- `doctor` has an `LM Studio` line when a watch run would call it: it asks for the model list with the token, which loads no model. `OK`, `BAD unauthorized` with the command that stores the token, or `BAD unreachable`.
+- `scoring.timeout_seconds` (60 to 540, default 300): the most one scoring call may take, for a reasoning model. A call starts only while that much of the 600-second run is left.
+- A JD that can't be kept (ADR-024, amended). `careerhunter jd unavailable --reason "…"`, with `--url` or `--company`, `--title` and `--date`, marks an application's JD unavailable, and an import entry can do the same with `jd_unavailable`. EI migration 0003 adds an append-only `jd_unavailable` table; search migration 0024 mirrors the current explanation. `doctor`, the report and the export show `--` with the explanation instead of a warning, and a JD attached later takes its place.
+- `careerhunter discover clear-backoff` ends discovery's backoff. `doctor` warns while discovery backs off, names the throttled engines and that command.
+
+### Changed
+- A refused LM Studio token (401 or 403) is `unauthorized`, never `unreachable`: in the watch log, in `component_health` (search migration 0022) and in the bot's health message.
+- A reasoning model's thinking (`<think>…</think>`, `<thinking>`, `<reasoning>`) is removed before a scoring reply is parsed or stored, and a reply may be up to 256 KiB. A reply whose thinking never closes doesn't parse.
+- A posting whose scoring reply doesn't parse 3 times is given up: never sent to the model again and not counted as held (search migration 0023). `doctor`'s `bot refusals` line counts it.
+- Discovery: one engine that SearXNG reports as throttled or suspended no longer stops a pass while others answer. A pass fails only when no query is answered or SearXNG itself answers 429; it stops after two blocked queries in a row. The throttled engines are named and kept (search migration 0025). The backoff after a failed pass is one interval, doubled for each further failure, at most 24 hours (was up to 7 days).
+- `lanes reassign` also checks postings not checked against the lanes yet, listed as `not checked -> <lane>` in the dry run.
+- `search.db` moves from schema version 21 (0.5.0) to 25, through search migrations 0022 to 0025, and the EI record from version 2 to 3, through EI migration 0003. See the new "Upgrading from 0.5.0 to 0.5.1" in `docs/SETUP.md`; the 0.4.0 to 0.5.0 notes stay as released.
+
+### Fixed
+- An application recorded by `import`, `careerhunter log` or the bot's `/log` or Applied is checked against `search.lanes` when its posting is created, so it no longer shows `No lane` until the next watch run.
+- `doctor` no longer warns that the pre-push guard isn't installed in a worktree (such as the release checkout) when the hooks it shares with its main checkout already run the guard.
+- An Ashby board name may contain a dot, such as `example.com`. It is still one path segment on Ashby's host; other boards keep the dot-free names.
+
 ## [0.5.0] - 2026-11-11
 
 ### Added
