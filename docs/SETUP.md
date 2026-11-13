@@ -104,10 +104,10 @@ pre-commit installed at .git/hooks/pre-commit
 
 The background services (Step 10c) must run from a **release checkout**: a second folder that holds one release tag and nothing else. `uv sync` installs career-hunter so that it runs whatever source is in its folder, and `careerhunter` applies any new database migration it finds there the next time it opens `search.db`. If the services ran from the folder above and you checked out an unreleased branch there, a running service could apply that branch's migration to your real `search.db`; once applied, a migration can't be changed, and every restart (a crash, a reboot) would run whatever branch was checked out.
 
-Make the release checkout next to the first one. This guide uses the tag `v0.5.1`; use the latest release tag:
+Make the release checkout next to the first one. This guide uses the tag `v0.6.0`; use the latest release tag:
 
 ```bash
-cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.5.1
+cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.6.0
 ```
 
 ```bash
