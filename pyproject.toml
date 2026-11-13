@@ -1,6 +1,6 @@
 [project]
 name = "career-hunter"
-version = "0.5.1"
+version = "0.6.0"
 description = "Self-hosted job-search tracker that doubles as an EI job-search record."
 readme = "README.md"
 license = "MIT"
