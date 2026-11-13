@@ -263,7 +263,7 @@ scoring:
   embedding_model: example-embedding-model
 ```
 
-Each is text of 1 to 200 characters, with no control characters and no spaces at either end. Left out or `null`, career-hunter asks for `local-model` and `local-embedding`. `scoring` takes one other key, `timeout_seconds` (below): a `url` is refused.
+Each is text of 1 to 200 characters, with no control characters and no spaces at either end. A `chat_model` left out or `null` asks for `local-model`. With no `embedding_model`, embeddings are off: the watcher sends no embedding request and logs no `embedding miss` line, and no cosine is stored. `scoring` takes one other key, `timeout_seconds` (below): a `url` is refused.
 
 4. **LM Studio's API token.** Keep authentication on in LM Studio's server settings, create an API token there, and store it in the Keychain the same way as the bot's token:
 

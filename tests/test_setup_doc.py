@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from careerhunter import db
-from careerhunter.config import DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_MODEL
+from careerhunter.config import DEFAULT_CHAT_MODEL
 from careerhunter.embed import DEFAULT_URL as EMBED_URL
 from careerhunter.score import DEFAULT_URL as CHAT_URL
 
@@ -84,7 +84,8 @@ def test_lm_studio_is_required_and_the_addresses_are_the_constants() -> None:
     models = _section("### Run the local models").split("\n### ", 1)[0]
     assert CHAT_URL in models and EMBED_URL in models
     assert "scoring:\n  chat_model:" in models
-    assert f"`{DEFAULT_CHAT_MODEL}` and `{DEFAULT_EMBEDDING_MODEL}`" in models
+    assert f"`{DEFAULT_CHAT_MODEL}`" in models
+    assert "embeddings are off" in models and "local-embedding" not in models
     assert "Memory" in models and "16 GB" in models
 
 

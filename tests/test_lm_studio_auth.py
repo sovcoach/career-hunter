@@ -148,7 +148,9 @@ def test_another_status_stays_unreachable() -> None:
 
 def test_a_refused_token_is_an_unauthorized_embedding_error() -> None:
     with pytest.raises(embed.EmbedError) as caught:
-        embed.embed_text("synthetic text", transport=_answering(401))
+        embed.embed_text(
+            "synthetic text", model="example-embedding-model", transport=_answering(401)
+        )
     assert caught.value.reason == "unauthorized" and caught.value.down
     assert embed.miss_line(7, "unauthorized") == "embedding miss posting 7: unauthorized"
 
