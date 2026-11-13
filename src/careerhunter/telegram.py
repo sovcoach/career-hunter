@@ -26,11 +26,14 @@ Each failure also carries the method, the error code and Telegram's own descript
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
+import socket
 import ssl
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 import truststore
@@ -41,6 +44,10 @@ TOKEN_SHAPE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
 # Telegram's own description of a refusal, as logged: one line, no token, capped.
 MAX_DESCRIPTION = 200
 MAX_ERROR_BODY = 4096  # of an HTTP error's body, read to find Telegram's description
+# How long one of the host's addresses gets to open a connection before the next is
+# tried. Without it, an IPv6 address whose connection hangs held a call for the whole
+# timeout (65 seconds) before IPv4 was tried, and a tap's answer arrived too late.
+CONNECT_TIMEOUT = 5.0
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
 
 
@@ -120,6 +127,87 @@ def _reply_description(body: str) -> object:
     return reply.get("description") if isinstance(reply, dict) else None
 
 
+Address = tuple[int, int, int, Any]  # family, type, proto, sockaddr
+Connector = Callable[[Address, float], socket.socket]
+
+
+def _addresses(host: str, port: int) -> list[Address]:
+    return [
+        (family, kind, proto, sockaddr)
+        for family, kind, proto, _, sockaddr in socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )
+    ]
+
+
+def _connect_one(address: Address, timeout: float) -> socket.socket:
+    family, kind, proto, sockaddr = address
+    sock = socket.socket(family, kind, proto)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(sockaddr)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+def connect_first(
+    addresses: Sequence[Address],
+    connect_timeout: float = CONNECT_TIMEOUT,
+    connector: Connector | None = None,
+) -> socket.socket:
+    """A socket to the first address that opens within `connect_timeout`, trying them
+    in the resolver's order. Raises the last address's OSError when none does."""
+    connect = connector or _connect_one
+    last: OSError = OSError("no address to connect to")
+    for address in addresses:
+        try:
+            return connect(address, connect_timeout)
+        except OSError as exc:
+            last = exc
+    raise last
+
+
+class _QuickConnection(http.client.HTTPSConnection):
+    """HTTPS whose connection step gives each address CONNECT_TIMEOUT seconds; the
+    request and the reply then have the call's own timeout."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = self._open_socket
+
+    def _open_socket(
+        self,
+        address: tuple[str, int],
+        timeout: float | None = None,
+        source_address: Any = None,
+    ) -> socket.socket:
+        host, port = address
+        limit = CONNECT_TIMEOUT if timeout is None else min(CONNECT_TIMEOUT, timeout)
+        sock = connect_first(_addresses(host, port), limit)
+        sock.settimeout(timeout)
+        return sock
+
+
+class _QuickHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, context: ssl.SSLContext) -> None:
+        super().__init__(context=context)
+        self._quick_context = context
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_QuickConnection, req, context=self._quick_context)
+
+
+def _urlopen(
+    request: urllib.request.Request, timeout: float, context: ssl.SSLContext
+) -> http.client.HTTPResponse:
+    """urllib's urlopen, with _QuickConnection for https."""
+    opener = urllib.request.build_opener(_QuickHTTPSHandler(context))
+    response: http.client.HTTPResponse = opener.open(request, timeout=timeout)
+    return response
+
+
 class TelegramAPI(Protocol):
     def call(
         self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None
@@ -140,7 +228,7 @@ class HttpTelegram:
         self, request: urllib.request.Request, what: str, timeout: float | None = None
     ) -> bytes:
         try:
-            with urllib.request.urlopen(  # noqa: S310 - fixed https:// API host
+            with _urlopen(  # fixed https:// API host
                 request,
                 timeout=self._timeout if timeout is None else timeout,
                 context=self._context,

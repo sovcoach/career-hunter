@@ -13,11 +13,12 @@ import json
 import logging
 import re
 import shutil
+import socket
 import sqlite3
 import urllib.error
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 import yaml
@@ -790,6 +791,18 @@ def test_a_prompt_from_before_the_upgrade_still_records_its_skip(env: Env) -> No
     assert _skip_reasons(env) == ["synthetic reason"]
 
 
+def test_a_reason_for_a_skip_that_is_gone_asks_again(env: Env) -> None:
+    alerted(env)
+    env.press("Skipped")
+    env.press("Other")
+    s = db.connect(env.datadir.search_db_path)
+    with db.transaction(s):
+        s.execute("DELETE FROM skips")
+    s.close()
+    assert env.say("synthetic reason", reply_to=env.prompt_id()) == "reply:skip_reason:retry"
+    assert env.api.texts()[-1].startswith("That skip isn't in search.db any more.")
+
+
 def test_an_old_tap_whose_answer_fails_sends_nothing(
     env: Env, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1132,7 +1145,7 @@ def test_client_errors_never_contain_the_token(monkeypatch: pytest.MonkeyPatch) 
     def failing(request: Any, timeout: float, context: Any) -> Any:
         raise urllib.error.URLError(f"cannot reach {request.full_url}")
 
-    monkeypatch.setattr(telegram.urllib.request, "urlopen", failing)
+    monkeypatch.setattr(telegram, "_urlopen", failing)
     client = telegram.HttpTelegram(TOKEN)
     with pytest.raises(telegram.TelegramError) as exc:
         client.call("getMe")
@@ -1181,7 +1194,7 @@ def test_the_client_parses_replies_and_downloads(monkeypatch: pytest.MonkeyPatch
         seen.append(request.full_url)
         return FakeReply(next(replies))
 
-    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(telegram, "_urlopen", urlopen)
     client = telegram.HttpTelegram(TOKEN)
     assert client.call("getMe") == {"is_bot": True}
     with pytest.raises(telegram.TelegramError) as exc:
@@ -1202,7 +1215,7 @@ def test_an_http_error_body_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None
         body = io.BytesIO(f"bad request near bot{TOKEN}".encode())
         raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, body)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(telegram, "_urlopen", urlopen)
     with pytest.raises(telegram.TelegramError) as exc:
         telegram.HttpTelegram(TOKEN).call("sendMessage", {"chat_id": CHAT, "text": "x"})
     assert "HTTP 400" in str(exc.value) and TOKEN not in str(exc.value)
@@ -1214,7 +1227,7 @@ def _http_refusal(monkeypatch: pytest.MonkeyPatch, code: int, body: bytes) -> No
     def urlopen(request: Any, timeout: float, context: Any) -> Any:
         raise urllib.error.HTTPError(request.full_url, code, "x", {}, io.BytesIO(body))  # type: ignore[arg-type]
 
-    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(telegram, "_urlopen", urlopen)
 
 
 def test_a_refusal_carries_the_method_code_and_description(
@@ -1235,9 +1248,7 @@ def test_an_ok_false_reply_carries_its_code_and_description(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     body = b'{"ok": false, "error_code": 400, "description": "Bad Request: synthetic"}'
-    monkeypatch.setattr(
-        telegram.urllib.request, "urlopen", lambda request, timeout, context: FakeReply(body)
-    )
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: FakeReply(body))
     with pytest.raises(telegram.TelegramRejected) as exc:
         telegram.HttpTelegram(TOKEN).call("answerCallbackQuery", {"callback_query_id": "q"})
     assert exc.value.detail() == "answerCallbackQuery 400: Bad Request: synthetic"
@@ -1269,7 +1280,7 @@ def test_no_answer_names_the_method_and_the_failure(monkeypatch: pytest.MonkeyPa
         seen.append(timeout)
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(telegram, "_urlopen", urlopen)
     client = telegram.HttpTelegram(TOKEN)
     with pytest.raises(telegram.TelegramUnreachable) as exc:
         client.call("editMessageReplyMarkup", timeout=10)
@@ -1302,6 +1313,131 @@ def test_a_refused_handler_call_is_logged_with_telegrams_reason(
 def test_a_failure_without_details_is_logged_by_its_type() -> None:
     assert botmod.failure(RuntimeError(f"synthetic {AD_URL}")) == "RuntimeError"
     assert botmod.failure(telegram.TelegramError("x")) == "TelegramError"
+
+
+V6 = (socket.AF_INET6, socket.SOCK_STREAM, 6, ("2001:db8::1", 443, 0, 0))
+V4 = (socket.AF_INET, socket.SOCK_STREAM, 6, ("192.0.2.1", 443))
+
+
+class FakeSocket:
+    def __init__(self, address: Any) -> None:
+        self.address = address
+        self.timeouts: list[float | None] = []
+
+    def settimeout(self, value: float | None) -> None:
+        self.timeouts.append(value)
+
+
+def test_a_stalled_first_address_falls_through_to_the_next() -> None:
+    tried: list[tuple[Any, float]] = []
+
+    def connector(address: Any, timeout: float) -> Any:
+        tried.append((address[0], timeout))
+        if address is V6:
+            raise TimeoutError("timed out")
+        return FakeSocket(address)
+
+    sock = telegram.connect_first([V6, V4], connector=connector)
+    assert isinstance(sock, FakeSocket) and sock.address is V4
+    assert tried == [
+        (socket.AF_INET6, telegram.CONNECT_TIMEOUT),
+        (socket.AF_INET, telegram.CONNECT_TIMEOUT),
+    ]
+
+
+def test_no_address_opening_raises_the_last_failure() -> None:
+    def connector(address: Any, timeout: float) -> Any:
+        raise ConnectionRefusedError(f"refused {address[0]}")
+
+    with pytest.raises(ConnectionRefusedError, match=str(int(socket.AF_INET))):
+        telegram.connect_first([V6, V4], connector=connector)
+    with pytest.raises(OSError, match="no address"):
+        telegram.connect_first([], connector=connector)
+
+
+def test_every_address_failing_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def connector(address: Any, timeout: float) -> Any:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(telegram, "_addresses", lambda host, port: [V6, V4])
+    monkeypatch.setattr(telegram, "_connect_one", connector)
+    with pytest.raises(telegram.TelegramUnreachable) as exc:
+        telegram.HttpTelegram(TOKEN).call("getMe")
+    assert exc.value.method == "getMe" and TOKEN not in str(exc.value)
+
+
+@pytest.mark.parametrize(("call_timeout", "limit"), [(65, 5.0), (10, 5.0), (2, 2)])
+def test_the_connect_limit_leaves_the_calls_own_timeout_for_the_reply(
+    monkeypatch: pytest.MonkeyPatch, call_timeout: float, limit: float
+) -> None:
+    limits: list[float] = []
+
+    def connector(address: Any, timeout: float) -> Any:
+        limits.append(timeout)
+        return FakeSocket(address)
+
+    monkeypatch.setattr(telegram, "_addresses", lambda host, port: [V4])
+    monkeypatch.setattr(telegram, "_connect_one", connector)
+    conn = telegram._QuickConnection("api.telegram.org", timeout=call_timeout)
+    sock: Any = conn._create_connection(("api.telegram.org", 443), call_timeout)
+    assert limits == [limit]
+    assert sock.timeouts == [call_timeout]  # the request and the reply keep the full time
+
+
+def test_addresses_come_from_the_resolver_in_its_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    def getaddrinfo(host: str, port: int, type: int) -> list[Any]:
+        assert (host, port, type) == ("api.telegram.org", 443, socket.SOCK_STREAM)
+        return [(*V6[:3], "", V6[3]), (*V4[:3], "", V4[3])]
+
+    monkeypatch.setattr(telegram.socket, "getaddrinfo", getaddrinfo)
+    assert telegram._addresses("api.telegram.org", 443) == [V6, V4]
+
+
+class FakeRawSocket:
+    made: ClassVar[list[FakeRawSocket]] = []
+
+    def __init__(self, family: int, kind: int, proto: int) -> None:
+        self.family, self.timeout, self.closed = family, None, False
+        FakeRawSocket.made.append(self)
+
+    def settimeout(self, value: float) -> None:
+        self.timeout = value
+
+    def connect(self, sockaddr: Any) -> None:
+        if self.family == socket.AF_INET6:
+            raise TimeoutError("timed out")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_one_address_is_tried_with_the_connect_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeRawSocket.made = []
+    monkeypatch.setattr(telegram.socket, "socket", FakeRawSocket)
+    with pytest.raises(TimeoutError):
+        telegram._connect_one(V6, 5.0)
+    opened: Any = telegram._connect_one(V4, 5.0)
+    stalled, ok = FakeRawSocket.made
+    assert stalled.closed and not ok.closed and opened is ok and ok.timeout == 5.0
+
+
+def test_https_goes_through_the_quick_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    used: list[Any] = []
+
+    def do_open(self: Any, http_class: Any, req: Any, **kwargs: Any) -> Any:
+        used.append(http_class)
+        import email.message
+        import io
+        import urllib.response
+
+        body = io.BytesIO(b'{"ok": true, "result": {"is_bot": true}}')
+        reply = urllib.response.addinfourl(body, email.message.Message(), req.full_url, 200)
+        reply.msg = "OK"  # type: ignore[attr-defined]
+        return reply
+
+    monkeypatch.setattr(telegram._QuickHTTPSHandler, "do_open", do_open)
+    assert telegram.HttpTelegram(TOKEN).call("getMe") == {"is_bot": True}
+    assert used == [telegram._QuickConnection]
 
 
 # --- watcher alerts -----------------------------------------------------------------------------
@@ -2117,7 +2253,7 @@ def test_an_http_status_maps_to_its_failure_kind(
     def urlopen(request: Any, timeout: float, context: Any) -> Any:
         raise urllib.error.HTTPError(request.full_url, code, "x", {}, io.BytesIO(b"{}"))  # type: ignore[arg-type]
 
-    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(telegram, "_urlopen", urlopen)
     with pytest.raises(kind) as exc:
         telegram.HttpTelegram(TOKEN).call("sendMessage", {"chat_id": CHAT, "text": "x"})
     assert TOKEN not in str(exc.value)
@@ -2141,9 +2277,7 @@ def test_an_http_status_maps_to_its_failure_kind(
 def test_a_reply_body_maps_to_its_failure_kind(
     monkeypatch: pytest.MonkeyPatch, body: bytes, kind: type[Exception]
 ) -> None:
-    monkeypatch.setattr(
-        telegram.urllib.request, "urlopen", lambda request, timeout, context: FakeReply(body)
-    )
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: FakeReply(body))
     with pytest.raises(kind):
         telegram.HttpTelegram(TOKEN).call("sendMessage", {"chat_id": CHAT, "text": "x"})
 
@@ -2152,6 +2286,6 @@ def test_a_network_failure_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> No
     def urlopen(request: Any, timeout: float, context: Any) -> Any:
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(telegram, "_urlopen", urlopen)
     with pytest.raises(telegram.TelegramUnreachable):
         telegram.HttpTelegram(TOKEN).call("getUpdates")
