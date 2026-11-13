@@ -93,6 +93,7 @@ from careerhunter.config import (
 )
 from careerhunter.config import timezone as config_timezone
 from careerhunter.config import today as config_today
+from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.fetch import Fetched, fetch
 from careerhunter.ledger import PartialWriteError
 from careerhunter.models import Activity, Application, Dating, Posting
@@ -416,7 +417,29 @@ def _pack(entries: list[_DigestEntry]) -> list[list[_Numbered]]:
     return messages
 
 
-HEALTH_NAMES = {"lm_studio": "LM Studio", "searxng": "SearXNG", "boards": "Every board"}
+HEALTH_NAMES = {
+    "lm_studio": "LM Studio",
+    "searxng": "SearXNG",
+    "boards": "Every board",
+    "criteria": "The criteria file",
+}
+
+
+def _waiting(held: int | None) -> str:
+    if held is None:
+        return "The number of postings waiting to be scored is not known."
+    if held == 1:
+        return "1 posting is waiting to be scored."
+    return f"{held} postings are waiting to be scored."
+
+
+def _criteria_text(held: int | None, kind: str | None) -> str:
+    """Why scoring is held for the criteria file: its fixed reason, never its path or text."""
+    why = CRITERIA_REASONS.get(kind or "", "it can't be used")
+    return (
+        f"Health: scoring is held because the criteria file can't be used: {why} "
+        f"(search.criteria_file; see careerhunter doctor). {_waiting(held)}"
+    )
 
 
 def _failure_text(name: str, failures: int, held: int | None, kind: str | None = None) -> str:
@@ -424,12 +447,7 @@ def _failure_text(name: str, failures: int, held: int | None, kind: str | None =
 
     An `unauthorized` failure says so, with the command that stores the token, so a
     refused token is never read as a server that is down."""
-    if held is None:
-        waiting = "The number of postings waiting to be scored is not known."
-    elif held == 1:
-        waiting = "1 posting is waiting to be scored."
-    else:
-        waiting = f"{held} postings are waiting to be scored."
+    waiting = _waiting(held)
     runs = "1 run" if failures == 1 else f"{failures} runs"
     if kind == "unauthorized":
         return (
@@ -927,7 +945,7 @@ class Bot:
         doc = self._alert_config()
         if doc is None:
             return
-        limit = health_failure_runs(doc)
+        runs = health_failure_runs(doc)
         try:
             with self._search() as search:
                 states = search_store.component_health(search)
@@ -936,14 +954,24 @@ class Bot:
             return
         for health in states:
             name = HEALTH_NAMES[health.component]
+            # A criteria file that holds scoring is a setting to fix, not an outage that
+            # may pass: it is told after the first run it holds.
+            criteria = health.component == "criteria"
+            limit = 1 if criteria else runs
             try:
                 if health.recovery_due:
-                    self.send(f"Health: {name} is working again.")
+                    self.send(
+                        "Health: the criteria file can be used again; scoring resumes."
+                        if criteria
+                        else f"Health: {name} is working again."
+                    )
                     with self._search() as search, db.transaction(search):
                         search_store.mark_recovery_told(search, health.component)
                 if health.failures >= limit and health.alerted_failures is None:
                     self.send(
-                        _failure_text(name, health.failures, health.held, health.last_failure)
+                        _criteria_text(health.held, health.last_failure)
+                        if criteria
+                        else _failure_text(name, health.failures, health.held, health.last_failure)
                     )
                     with self._search() as search, db.transaction(search):
                         search_store.mark_failure_told(

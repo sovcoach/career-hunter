@@ -74,6 +74,7 @@ from typing import Any, TypeGuard
 import yaml
 
 from careerhunter.claims import validate_section
+from careerhunter.criteria import path_problem as criteria_path_problem
 from careerhunter.enums import ATS_TYPES, FIT_LEVELS, WORK_MODELS
 
 DEFAULT_WATCH_INTERVAL_MINUTES = 60
@@ -602,6 +603,9 @@ def validate_config(doc: Any) -> list[str]:
             _validate_location_rules(rules, problems)
         if "resume" in search:
             _resume_path(search["resume"], problems)
+        criteria_problem = criteria_path_problem(search.get("criteria_file"))
+        if criteria_problem is not None:
+            problems.append(f"search.criteria_file {criteria_problem}")
         age = search.get("max_posting_age_days", DEFAULT_MAX_POSTING_AGE_DAYS)
         if not _int(age) or not 1 <= age <= MAX_POSTING_AGE_LIMIT:
             problems.append(

@@ -212,6 +212,7 @@ def test_migration_0022_keeps_every_health_row(tmp_path: Path) -> None:
             "lm_studio": (0, None, None),
             "searxng": (1, "throttled", STAMP),
             "boards": (0, None, None),
+            "criteria": (0, None, None),  # added by 0027
         }
         with db.transaction(conn):
             search_store.record_component(conn, "lm_studio", failed="unauthorized", stamp=STAMP)

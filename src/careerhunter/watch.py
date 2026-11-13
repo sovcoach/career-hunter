@@ -133,6 +133,7 @@ from careerhunter.config import (
     scoring_timeout_seconds,
     tier_fits,
 )
+from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.deadline import Deadline
 from careerhunter.discover import Pass
 from careerhunter.embed import Embedder, miss_line
@@ -227,6 +228,8 @@ class _State:
     queued: dict[int, PostingText] = field(default_factory=dict)
     held_new: dict[int, PostingText] = field(default_factory=dict)
     score_timeout: float = 120.0  # scoring.timeout_seconds: a call needs this much budget
+    criteria_failure: str | None = None  # why the criteria file held scoring this run
+    criteria_ok: bool = False  # scoring was not held for the criteria file
 
     def out_of_time(self) -> bool:
         return self.budget is not None and self.budget.expired()
@@ -326,6 +329,7 @@ def run(
     resume: Resume | None = None,
     resume_problem: str | None = None,
     monotonic: Callable[[], float] | None = None,
+    criteria_problem: str | None = None,
     poster: Poster | None = None,
     discovery: Callable[[sqlite3.Connection], Pass] | None = None,
 ) -> list[str]:
@@ -338,6 +342,9 @@ def run(
 
     Each log line is handed to `emit` as it happens; the same lines are returned.
     `budget` bounds the whole run; the caller also gives it to each client it builds.
+    `criteria_problem` is the fixed reason (a key of `criteria.REASONS`) a configured
+    criteria file could not be used; then nothing is scored, and the `criteria`
+    component records it so the bot can say why.
     `resume` is the resume the scorer was given, or None. `resume_problem` is the
     fixed reason a configured resume could not be used; then nothing is scored.
     """
@@ -373,6 +380,13 @@ def run(
         with _isolated(conn, lines, "discovery", state.hook):
             found = discovery(conn)
             lines.extend(found.lines)
+    if scorer is not None and criteria_problem is not None:
+        why = CRITERIA_REASONS.get(criteria_problem, criteria_problem)
+        lines.append(f"watch: scoring: criteria file not usable ({why}); left for the next run")
+        state.criteria_failure = criteria_problem
+        scorer = None
+    elif scorer is not None:
+        state.criteria_ok = True
     if scorer is not None and resume_problem is not None:
         lines.append(f"watch: scoring: resume not usable ({resume_problem}); left for the next run")
         scorer = None
@@ -491,6 +505,12 @@ def _finish_run(
             )
         elif state.scorer_answered:
             search_store.record_component(conn, "lm_studio", failed=None, stamp=stamp)
+        if state.criteria_failure is not None:
+            search_store.record_component(
+                conn, "criteria", failed=state.criteria_failure, stamp=stamp
+            )
+        elif state.criteria_ok:
+            search_store.record_component(conn, "criteria", failed=None, stamp=stamp)
 
 
 def _fill_lanes(conn: sqlite3.Connection, state: _State, config: Mapping[str, Any]) -> None:

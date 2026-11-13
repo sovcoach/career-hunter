@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import title_key
 from careerhunter.models import Application, Dating, Posting
@@ -538,8 +539,17 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
     return HeldCounts(unscored=int(row["unscored"]), no_fit=int(row["no_fit"]), off_lane=off_lane)
 
 
-COMPONENTS = ("lm_studio", "searxng", "boards")
-FAILURE_KINDS = ("unreachable", "unauthorized", "bad-reply", "throttled", "failed")
+# `criteria` is the criteria file (search migration 0027): it fails when it holds scoring,
+# with one of its fixed reasons as the kind.
+COMPONENTS = ("lm_studio", "searxng", "boards", "criteria")
+FAILURE_KINDS = (
+    "unreachable",
+    "unauthorized",
+    "bad-reply",
+    "throttled",
+    "failed",
+    *CRITERIA_REASONS,
+)
 
 
 def record_component(

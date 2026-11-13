@@ -56,6 +56,11 @@ search:
   # resume/current.txt (no other value is used) so scoring and embeddings read your
   # resume. Null leaves the resume out of scoring and skips embeddings.
   resume: null
+  # Optional. A text file in the data folder with your own scoring criteria in plain
+  # words (e.g. criteria.md), sent with each scoring call; the model weighs them when
+  # it marks a gap minor or core. At most 4,000 characters, owner-only (chmod 600).
+  # A file that can't be used holds scoring until fixed. Null sends no criteria.
+  criteria_file: null
 
 # Hard gates: a posting failing any of these is skipped, with the reason recorded.
 hard_gates:

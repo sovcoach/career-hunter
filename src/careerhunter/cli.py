@@ -33,6 +33,7 @@ from careerhunter import (
     backfill,
     bot,
     claims,
+    criteria,
     db,
     demo,
     discover,
@@ -1194,6 +1195,14 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             loaded = resume.load(datadir.root, conn, doc)
         except resume.ResumeError as exc:
             problem = str(exc)
+        # The criteria file, read once per run like the resume (search.criteria_file).
+        stated: str | None = None
+        criteria_problem: str | None = None
+        try:
+            found = criteria.load(datadir.root, doc)
+            stated = None if found is None else found.text
+        except criteria.CriteriaError as exc:
+            criteria_problem = exc.reason
 
         # The operator's labelled postings, read once per run (#43). They reach the
         # local model's request only.
@@ -1211,6 +1220,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
                 ),
                 resume=loaded,
                 examples=examples,
+                criteria=stated,
             )
 
         watch.run(
@@ -1229,6 +1239,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             budget=budget,
             resume=loaded,
             resume_problem=problem,
+            criteria_problem=criteria_problem,
             discovery=partial(_discovery_pass, datadir, doc, exclusions, budget),
         )
     except (sqlite3.Error, db.MigrationError) as exc:
@@ -1655,6 +1666,33 @@ def _record_discover_success(datadir: DataDir) -> None:
 _RUN_GRACE = dt.timedelta(seconds=watch.RUN_BUDGET + 300)
 
 
+def _doctor_criteria(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
+    """search.criteria_file: whether it is set, its size, and whether it is usable or
+    over the cap. A file that can't be used holds scoring. No path and no text shown."""
+    if criteria.configured_value(config_doc) is None:
+        report.line("criteria", "--", f"not set (optional: {criteria.CONFIG_KEY})")
+        return
+    try:
+        found = criteria.load(datadir.root, config_doc)
+    except criteria.CriteriaError as exc:
+        if exc.reason == "too-long":
+            size = "" if exc.chars is None else f" ({exc.chars:,} characters)"
+            report.line(
+                "criteria",
+                "WARN",
+                f"over the {criteria.MAX_CHARS:,}-character cap{size}; scoring is held",
+            )
+        else:
+            report.line("criteria", "BAD", f"{exc}; scoring is held")
+        return
+    if found is not None:
+        report.line(
+            "criteria",
+            "OK",
+            f"{found.chars:,} of {criteria.MAX_CHARS:,} characters; sent with each scoring call",
+        )
+
+
 def _doctor_lanes(report: _Report, config_doc: dict[str, Any] | None) -> None:
     """Whether lane checking is on, so it is never off without saying so."""
     if config_doc is None:
@@ -1710,7 +1748,12 @@ def _doctor_watch_runs(report: _Report, search: sqlite3.Connection, now: dt.date
         report.line("watch held", "OK", detail)
 
 
-COMPONENT_NAMES = {"lm_studio": "LM Studio", "searxng": "SearXNG", "boards": "every board"}
+COMPONENT_NAMES = {
+    "lm_studio": "LM Studio",
+    "searxng": "SearXNG",
+    "boards": "every board",
+    "criteria": "the criteria file",
+}
 
 
 def _ago(now: dt.datetime, stamp: str) -> str:
@@ -1844,7 +1887,7 @@ def _doctor_components(
     """A component failing now: a warning at health.failure_runs runs in a row."""
     limit = health_failure_runs(config_doc)
     for health in search_store.component_health(search):
-        if not health.failures:
+        if not health.failures or health.component == "criteria":  # its own line
             continue
         held = (
             ""
@@ -2104,6 +2147,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
     else:
         report.line("search.db", "--", "not created yet (run: careerhunter init)")
     _doctor_resume(report, datadir, config_doc, search)
+    _doctor_criteria(report, datadir, config_doc)
     _doctor_lanes(report, config_doc)
     if search is not None:
         _doctor_watch_runs(report, search, now)
