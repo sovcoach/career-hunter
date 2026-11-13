@@ -62,18 +62,24 @@ class FakeTelegram:
         self.files: dict[str, bytes] = {}
         self.me: Any = {"is_bot": True, "username": "synthetic_bot"}
         self.fail_sends = 0
-        # A method listed here is refused with that error, every time it is called.
+        # A method listed here is refused with that error, every time it is called. A
+        # refused call goes in `refused`, not `calls`, so it uses up no message id.
         self.refuse: dict[str, telegram.TelegramError] = {}
+        self.refused: list[tuple[str, dict[str, Any]]] = []
         self.timeouts: list[tuple[str, float | None]] = []  # (method, per-call timeout)
+        self.on_call: Any = None  # called with the method before each call is answered
 
     def call(
         self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None
     ) -> Any:
         params = params or {}
-        self.calls.append((method, params))
+        if self.on_call is not None:
+            self.on_call(method)
         self.timeouts.append((method, timeout))
         if method in self.refuse:
+            self.refused.append((method, params))
             raise self.refuse[method]
+        self.calls.append((method, params))
         if method == "sendMessage":
             if self.fail_sends:
                 self.fail_sends -= 1
@@ -703,6 +709,119 @@ def test_skipped_with_a_typed_reason(env: Env) -> None:
         s.execute("SELECT reason FROM skips").fetchone()[0] == "synthetic reason: rotating weekends"
     )
     s.close()
+
+
+def _refusal(method: str, description: str = "Bad Request: synthetic") -> telegram.TelegramError:
+    return telegram.TelegramRejected(
+        f"{method}: {description}", method=method, error_code=400, description=description
+    )
+
+
+def _skip_reasons(env: Env) -> list[str]:
+    s = env.search()
+    try:
+        return [r[0] for r in s.execute("SELECT reason FROM skips WHERE by_operator = 1")]
+    finally:
+        s.close()
+
+
+def test_a_refused_answer_still_records_the_skip(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    alerted(env)
+    env.press("Skipped")
+    env.api.refuse["answerCallbackQuery"] = _refusal(
+        "answerCallbackQuery", "Bad Request: query is too old"
+    )
+    with caplog.at_level(logging.WARNING, logger="careerhunter.bot"):
+        assert env.press("Location") == "callback:skip_reason"
+    assert _skip_reasons(env) == ["location"]
+    assert env.api.texts()[-1] == "Skipped: Example Robotics — Synthetic Analyst."
+    assert (
+        "callback answer failed: TelegramRejected "
+        "(answerCallbackQuery 400: Bad Request: query is too old)" in caplog.text
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _refusal("editMessageReplyMarkup"),
+        telegram.TelegramUnreachable(
+            "editMessageReplyMarkup: TimeoutError",
+            method="editMessageReplyMarkup",
+            description="TimeoutError",
+        ),
+    ],
+)
+def test_buttons_that_cannot_be_taken_off_still_record_the_skip(
+    env: Env, error: telegram.TelegramError
+) -> None:
+    alerted(env)
+    env.press("Skipped")
+    env.api.refuse["editMessageReplyMarkup"] = error
+    assert env.press("Pay") == "callback:skip_reason"
+    assert _skip_reasons(env) == ["pay"]
+
+
+def test_other_records_the_skip_before_the_prompt(env: Env) -> None:
+    alerted(env)
+    env.press("Skipped")
+    env.api.refuse["sendMessage"] = _refusal("sendMessage")
+    assert env.press("Other") == "error:TelegramRejected"
+    assert _skip_reasons(env) == ["other"]  # kept, though the prompt never went out
+
+
+def test_a_typed_reason_replaces_other_on_the_same_skip(env: Env) -> None:
+    alerted(env)
+    env.press("Skipped")
+    env.press("Other")
+    assert _skip_reasons(env) == ["other"]
+    env.say("synthetic reason: rotating weekends", reply_to=env.prompt_id())
+    assert _skip_reasons(env) == ["synthetic reason: rotating weekends"]
+    assert env.api.texts()[-1] == "Skipped: Example Robotics — Synthetic Analyst."
+
+
+def test_a_prompt_from_before_the_upgrade_still_records_its_skip(env: Env) -> None:
+    posting_id = alerted(env)
+    with env.bot._search() as search:
+        env.bot._prompt(search, "Reply with the reason.", "skip_reason", {"posting_id": posting_id})
+    env.say("synthetic reason", reply_to=env.prompt_id())
+    assert _skip_reasons(env) == ["synthetic reason"]
+
+
+def test_an_old_tap_whose_answer_fails_sends_nothing(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    alerted(env)
+    env.press("Skipped")
+    env.press("Location")
+    sent = len(env.api.sent())
+    env.api.refuse["answerCallbackQuery"] = _refusal(
+        "answerCallbackQuery", "Bad Request: query is too old"
+    )
+    with caplog.at_level(logging.WARNING, logger="careerhunter.bot"):
+        assert env.press("Seniority") == "callback:rejected"  # the spent keyboard
+    assert len(env.api.sent()) == sent  # no "Something went wrong"
+    assert "callback answer failed" in caplog.text
+    assert _skip_reasons(env) == ["location"]
+
+
+@pytest.mark.parametrize("label", [label for label, _ in botmod.SKIP_BUTTONS])
+def test_every_skip_reason_answers_first_and_writes_before_other_calls(
+    env: Env, label: str
+) -> None:
+    alerted(env)
+    env.press("Skipped")
+    seen: list[tuple[str, int]] = []
+    env.api.on_call = lambda method: seen.append((method, len(_skip_reasons(env))))
+    env.press(label)
+    assert seen[0] == ("answerCallbackQuery", 0)
+    assert all(count == 1 for _, count in seen[1:])  # every later call: skip recorded
+    methods = [method for method, _ in seen]
+    assert "editMessageReplyMarkup" in methods and "sendMessage" in methods
+    quick = {m: t for m, t in env.api.timeouts if m != "sendMessage"}
+    assert quick["answerCallbackQuery"] == quick["editMessageReplyMarkup"] == botmod.QUICK_TIMEOUT
 
 
 # --- /status ------------------------------------------------------------------------------------

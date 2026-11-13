@@ -1161,6 +1161,14 @@ def insert_skip(
     return int(cur.lastrowid or 0)
 
 
+def set_operator_skip_reason(conn: sqlite3.Connection, skip_id: int, reason: str) -> bool:
+    """Replace the reason of one of the operator's own skips. False if there is none."""
+    cur = conn.execute(
+        "UPDATE skips SET reason = ? WHERE id = ? AND by_operator = 1", (reason, skip_id)
+    )
+    return cur.rowcount == 1
+
+
 def claim_links(conn: sqlite3.Connection) -> dict[str, str | None]:
     """Every application's correlation id and the claim it was recorded under."""
     return {
