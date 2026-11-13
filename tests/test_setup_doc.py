@@ -27,12 +27,15 @@ WALKTHROUGH_RELEASE = {"search": 19, "ei_record": 1}
 
 
 # Notes for an earlier upgrade keep that release's numbers too, as released.
-PAST_UPGRADES = {"## Upgrading from 0.4.0 to 0.5.0": {"search": 21, "ei_record": 2}}
+PAST_UPGRADES = {
+    "## Upgrading from 0.5.0 to 0.5.1": {"search": 25, "ei_record": 3},
+    "## Upgrading from 0.4.0 to 0.5.0": {"search": 21, "ei_record": 2},
+}
 
 
 def _outside_walkthrough() -> str:
     head, _, rest = SETUP.partition(UPGRADE)
-    text = head + rest.split("\n## ", 1)[1]
+    text = head + "\n## " + rest.split("\n## ", 1)[1]  # the next section keeps its heading
     for heading in PAST_UPGRADES:
         text = text.replace(heading + _section(heading), "")
     return text

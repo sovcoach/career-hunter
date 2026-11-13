@@ -14,6 +14,7 @@ import plistlib
 import shutil
 import sqlite3
 import stat
+import statistics
 import subprocess
 import sys
 import traceback
@@ -1739,6 +1740,41 @@ def _unproductive_watch_runs(search: sqlite3.Connection, now: dt.datetime) -> in
     return count
 
 
+SCORE_CALL_DAYS = 14  # doctor's window for scoring-call durations
+SCORE_CALL_NEAR = 0.9  # a longest call at this share of scoring.timeout_seconds warns
+
+
+def _doctor_score_calls(
+    report: _Report,
+    search: sqlite3.Connection,
+    config_doc: dict[str, Any] | None,
+    now: dt.datetime,
+) -> None:
+    """Median and longest answered scoring call in the window, beside the timeout, so
+    scoring.timeout_seconds can be tuned from data (search migration 0026)."""
+    since = (now - dt.timedelta(days=SCORE_CALL_DAYS)).astimezone(dt.UTC)
+    stats = search_store.score_call_stats(search, since.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    timeout = scoring_timeout_seconds(config_doc)
+    missed = f"; {stats.not_answered} not answered" if stats.not_answered else ""
+    if not stats.answered_ms:
+        if stats.not_answered:
+            detail = f"none answered in {SCORE_CALL_DAYS} days{missed}"
+        else:
+            detail = f"no scoring call in {SCORE_CALL_DAYS} days"
+        report.line("scoring calls", "--", detail)
+        return
+    median = statistics.median(stats.answered_ms) / 1000
+    longest = stats.answered_ms[-1] / 1000
+    detail = (
+        f"{len(stats.answered_ms)} answered in {SCORE_CALL_DAYS} days: median "
+        f"{median:.0f} s, max {longest:.0f} s (timeout {timeout} s){missed}"
+    )
+    if longest >= SCORE_CALL_NEAR * timeout:
+        report.line("scoring calls", "WARN", f"{detail}; the longest is close to the timeout")
+    else:
+        report.line("scoring calls", "OK", detail)
+
+
 def _doctor_usefulness(
     report: _Report,
     search: sqlite3.Connection,
@@ -2071,6 +2107,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
     _doctor_lanes(report, config_doc)
     if search is not None:
         _doctor_watch_runs(report, search, now)
+        _doctor_score_calls(report, search, config_doc, now)
         _doctor_usefulness(report, search, config_doc, now)
         _doctor_discovery_backoff(report, search, config_doc, now)
         _doctor_components(report, search, config_doc)

@@ -699,6 +699,43 @@ def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
     return [(int(row["id"]), str(row["title"])) for row in rows]
 
 
+SCORE_OUTCOMES = ("scored", "unparseable", "unreachable", "unauthorized", "budget")
+ANSWERED_OUTCOMES = ("scored", "unparseable")  # the model replied, parsed or not
+
+
+def record_score_call(
+    conn: sqlite3.Connection,
+    run_id: int,
+    posting_id: int,
+    started_at: str,
+    finished_at: str,
+    duration_ms: int,
+    outcome: str,
+) -> None:
+    """One scoring call's timing (search migration 0026). No prompt, reply or text."""
+    conn.execute(
+        "INSERT INTO score_calls (run_id, posting_id, started_at, finished_at, duration_ms, "
+        "outcome) VALUES (?, ?, ?, ?, ?, ?)",
+        (run_id, posting_id, started_at, finished_at, max(0, duration_ms), outcome),
+    )
+
+
+@dataclass(frozen=True)
+class ScoreCallStats:
+    """Scoring calls since a moment: durations of the answered ones, and the rest."""
+
+    answered_ms: tuple[int, ...]
+    not_answered: int
+
+
+def score_call_stats(conn: sqlite3.Connection, since: str) -> ScoreCallStats:
+    rows = conn.execute(
+        "SELECT duration_ms, outcome FROM score_calls WHERE started_at >= ?", (since,)
+    ).fetchall()
+    answered = tuple(sorted(int(r[0]) for r in rows if r[1] in ANSWERED_OUTCOMES))
+    return ScoreCallStats(answered, len(rows) - len(answered))
+
+
 def start_watch_run(conn: sqlite3.Connection, started_at: str) -> int:
     """A new, unfinished `watch_runs` row. Its counts stay null until it finishes."""
     cur = conn.execute("INSERT INTO watch_runs (started_at) VALUES (?)", (started_at,))

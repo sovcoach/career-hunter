@@ -110,6 +110,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import sqlite3
+import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -208,6 +209,7 @@ class _State:
     hook: OnCrash
     budget: Deadline | None
     now: Callable[[], dt.datetime]
+    monotonic: Callable[[], float] = time.monotonic  # times each scoring call
     inserted: set[int] = field(default_factory=set)
     attempted: set[int] = field(default_factory=set)  # sent to the scorer this run
     resume: Resume | None = None
@@ -323,6 +325,7 @@ def run(
     now: Callable[[], dt.datetime] | None = None,
     resume: Resume | None = None,
     resume_problem: str | None = None,
+    monotonic: Callable[[], float] | None = None,
     poster: Poster | None = None,
     discovery: Callable[[sqlite3.Connection], Pass] | None = None,
 ) -> list[str]:
@@ -346,6 +349,7 @@ def run(
         hook=on_crash or _no_hook,
         budget=budget,
         now=now or _utc_now,
+        monotonic=monotonic or time.monotonic,
         resume=resume,
         fits=tier_fits(rules),
         lanes_on=lanes.configured(rules) is not None,
@@ -1293,16 +1297,35 @@ def _attempt(
     lines = state.lines
     state.attempted.add(posting_id)
     rescore = _scored(conn, posting_id)  # it has a score: this is a re-score
+    started_at = _iso(state.now())
     with db.transaction(conn):
         previous = search_store.score_attempted_at(conn, posting_id)
-        search_store.set_score_attempted_at(conn, posting_id, _iso(state.now()))
+        search_store.set_score_attempted_at(conn, posting_id, started_at)
     title = repr(posting.title)
+    clock = state.monotonic
+    began = clock()
+
+    def timed(outcome: str) -> None:
+        """Record this call's end and duration, in the caller's transaction."""
+        if state.run_id is not None:
+            search_store.record_score_call(
+                conn,
+                state.run_id,
+                posting_id,
+                started_at,
+                _iso(state.now()),
+                round((clock() - began) * 1000),
+                outcome,
+            )
+
     try:
         result = scorer(posting)
     except (ScoreError, OSError) as exc:
+        cut = state.out_of_time()
         with db.transaction(conn):
             search_store.set_score_attempted_at(conn, posting_id, previous)
-        if state.out_of_time():
+            timed("budget" if cut else getattr(exc, "kind", "unreachable"))
+        if cut:
             state.left_by_budget(
                 _line(name, ats, f"{title} left for the next run (run budget reached)")
             )
@@ -1316,6 +1339,7 @@ def _attempt(
     if result is None:
         kept = "; old score kept" if rescore else ""
         with db.transaction(conn):
+            timed("unparseable")
             gave_up = search_store.record_parse_failure(
                 conn, posting_id, _iso(state.now()), give_up_after=PARSE_FAILURES_TO_GIVE_UP
             )
@@ -1334,6 +1358,7 @@ def _attempt(
         metadata = None if result.tier is None else json.dumps({"tier": result.tier})
         fit = None if result.tier is None else state.fits.get(result.tier)
         with db.transaction(conn):
+            timed("scored")
             search_store.set_posting_score(
                 conn,
                 posting_id,
