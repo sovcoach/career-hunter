@@ -213,6 +213,14 @@ def chat_hash(chat_id: Any) -> str:
     return hashlib.sha256(str(chat_id).encode()).hexdigest()[:8]
 
 
+def failure(exc: BaseException) -> str:
+    """A failure as logged: its type, and for a Telegram failure the method, the code and
+    Telegram's own description. Never the request, a message's text or the token."""
+    name = type(exc).__name__
+    detail = exc.detail() if isinstance(exc, TelegramError) else ""
+    return f"{name} ({detail})" if detail else name
+
+
 def _utc(moment: dt.datetime) -> str:
     return moment.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1118,7 +1126,7 @@ class Bot:
             self.send("Not recorded: the EI record refused it. Run careerhunter doctor.")
             return "error:claim"
         except Exception as exc:
-            log.error("handler failed: %s", type(exc).__name__)
+            log.error("handler failed: %s", failure(exc))
             with contextlib.suppress(Exception):  # the failure is already logged
                 self.send("Something went wrong and nothing more was recorded. See the bot log.")
             return f"error:{type(exc).__name__}"

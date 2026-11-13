@@ -62,10 +62,18 @@ class FakeTelegram:
         self.files: dict[str, bytes] = {}
         self.me: Any = {"is_bot": True, "username": "synthetic_bot"}
         self.fail_sends = 0
+        # A method listed here is refused with that error, every time it is called.
+        self.refuse: dict[str, telegram.TelegramError] = {}
+        self.timeouts: list[tuple[str, float | None]] = []  # (method, per-call timeout)
 
-    def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def call(
+        self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None
+    ) -> Any:
         params = params or {}
         self.calls.append((method, params))
+        self.timeouts.append((method, timeout))
+        if method in self.refuse:
+            raise self.refuse[method]
         if method == "sendMessage":
             if self.fail_sends:
                 self.fail_sends -= 1
@@ -1079,6 +1087,102 @@ def test_an_http_error_body_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None
     with pytest.raises(telegram.TelegramError) as exc:
         telegram.HttpTelegram(TOKEN).call("sendMessage", {"chat_id": CHAT, "text": "x"})
     assert "HTTP 400" in str(exc.value) and TOKEN not in str(exc.value)
+
+
+def _http_refusal(monkeypatch: pytest.MonkeyPatch, code: int, body: bytes) -> None:
+    import io
+
+    def urlopen(request: Any, timeout: float, context: Any) -> Any:
+        raise urllib.error.HTTPError(request.full_url, code, "x", {}, io.BytesIO(body))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+
+
+def test_a_refusal_carries_the_method_code_and_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = json.dumps(
+        {"ok": False, "error_code": 400, "description": f"Bad Request: synthetic for {TOKEN}"}
+    ).encode()
+    _http_refusal(monkeypatch, 400, body)
+    with pytest.raises(telegram.TelegramRejected) as exc:
+        telegram.HttpTelegram(TOKEN).call("sendMessage", {"chat_id": CHAT, "text": "x"})
+    assert exc.value.method == "sendMessage" and exc.value.error_code == 400
+    assert exc.value.description == "Bad Request: synthetic for <token>"
+    assert exc.value.detail() == "sendMessage 400: Bad Request: synthetic for <token>"
+
+
+def test_an_ok_false_reply_carries_its_code_and_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b'{"ok": false, "error_code": 400, "description": "Bad Request: synthetic"}'
+    monkeypatch.setattr(
+        telegram.urllib.request, "urlopen", lambda request, timeout, context: FakeReply(body)
+    )
+    with pytest.raises(telegram.TelegramRejected) as exc:
+        telegram.HttpTelegram(TOKEN).call("answerCallbackQuery", {"callback_query_id": "q"})
+    assert exc.value.detail() == "answerCallbackQuery 400: Bad Request: synthetic"
+
+
+def test_a_refusal_without_json_has_no_description(monkeypatch: pytest.MonkeyPatch) -> None:
+    _http_refusal(monkeypatch, 403, b"<html>synthetic</html>")
+    with pytest.raises(telegram.TelegramRejected) as exc:
+        telegram.HttpTelegram(TOKEN).call("sendMessage", {"chat_id": CHAT, "text": "x"})
+    assert exc.value.description is None
+    assert exc.value.detail() == "sendMessage 403"
+
+
+def test_a_description_is_one_capped_line() -> None:
+    raw = "Bad Request:\nsynthetic\x00 line\u2028" + "y" * 400
+    cleaned = telegram.clean_description(raw)
+    assert cleaned is not None
+    assert "\n" not in cleaned and "\x00" not in cleaned and "\u2028" not in cleaned
+    assert cleaned.startswith("Bad Request: synthetic line y")
+    assert len(cleaned) == telegram.MAX_DESCRIPTION and cleaned.endswith("…")
+    assert telegram.clean_description(None) is None
+    assert telegram.clean_description("  ") is None
+
+
+def test_no_answer_names_the_method_and_the_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[float] = []
+
+    def urlopen(request: Any, timeout: float, context: Any) -> Any:
+        seen.append(timeout)
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(telegram.urllib.request, "urlopen", urlopen)
+    client = telegram.HttpTelegram(TOKEN)
+    with pytest.raises(telegram.TelegramUnreachable) as exc:
+        client.call("editMessageReplyMarkup", timeout=10)
+    assert exc.value.detail() == "editMessageReplyMarkup: TimeoutError"
+    with pytest.raises(telegram.TelegramUnreachable):
+        client.call("getUpdates")
+    assert seen == [10, 65]  # a per-call timeout, then the client's own
+
+
+def test_a_refused_handler_call_is_logged_with_telegrams_reason(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    alerted(env)
+    env.press("Skipped")
+    env.api.refuse["sendMessage"] = telegram.TelegramRejected(
+        "sendMessage: Bad Request: synthetic refusal",
+        method="sendMessage",
+        error_code=400,
+        description="Bad Request: synthetic refusal",
+    )
+    with caplog.at_level(logging.ERROR, logger="careerhunter.bot"):
+        assert env.press("Other") == "error:TelegramRejected"
+    assert (
+        "handler failed: TelegramRejected (sendMessage 400: Bad Request: synthetic refusal)"
+        in caplog.text
+    )
+    assert "Reply with the reason" not in caplog.text  # never the message's text
+
+
+def test_a_failure_without_details_is_logged_by_its_type() -> None:
+    assert botmod.failure(RuntimeError(f"synthetic {AD_URL}")) == "RuntimeError"
+    assert botmod.failure(telegram.TelegramError("x")) == "TelegramError"
 
 
 # --- watcher alerts -----------------------------------------------------------------------------
