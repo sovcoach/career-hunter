@@ -228,6 +228,15 @@ def record_skip(search: sqlite3.Connection, posting: Posting, date: str, reason:
         return search_store.insert_skip(search, posting_id, date, reason, by_operator=True)
 
 
+def set_skip_reason(search: sqlite3.Connection, skip_id: int, reason: str) -> bool:
+    """The operator's own words for a skip already recorded as `other` (Other…).
+
+    Search-only, like the skip. False when that skip is not the operator's or is gone.
+    """
+    with transaction(search):
+        return search_store.set_operator_skip_reason(search, skip_id, reason)
+
+
 def record_activity(active: ActiveClaim | None, activity: Activity) -> bool:
     """Record a job-search activity in the active claim's EI record (its only home).
 

@@ -14,7 +14,6 @@ import yaml
 from careerhunter import embed, score
 from careerhunter.config import (
     DEFAULT_CHAT_MODEL,
-    DEFAULT_EMBEDDING_MODEL,
     chat_model,
     embedding_model,
     validate_config,
@@ -46,7 +45,7 @@ def test_the_template_leaves_both_ids_unset_and_valid() -> None:
     assert doc["scoring"] == {"chat_model": None, "embedding_model": None, "timeout_seconds": None}
     assert validate_config(doc) == []
     assert chat_model(doc) == DEFAULT_CHAT_MODEL == "local-model"
-    assert embedding_model(doc) == DEFAULT_EMBEDDING_MODEL == "local-embedding"
+    assert embedding_model(doc) is None  # embeddings off
 
 
 @pytest.mark.parametrize("section", [None, {}, {"chat_model": None}])
@@ -55,7 +54,7 @@ def test_missing_ids_use_the_defaults(section: object) -> None:
     doc["scoring"] = section
     assert validate_config(doc) == []
     assert chat_model(doc) == "local-model"
-    assert embedding_model(doc) == "local-embedding"
+    assert embedding_model(doc) is None
     doc.pop("scoring")
     assert validate_config(doc) == []
     assert chat_model(doc) == "local-model"
@@ -103,7 +102,7 @@ def test_an_id_of_exactly_200_characters_is_accepted() -> None:
 def test_an_invalid_id_never_reaches_a_request() -> None:
     """Accessors on an unvalidated document fall back to the default."""
     assert chat_model({"scoring": {"chat_model": "bad\nid"}}) == "local-model"
-    assert embedding_model({"scoring": {"embedding_model": ""}}) == "local-embedding"
+    assert embedding_model({"scoring": {"embedding_model": ""}}) is None
     assert chat_model({"scoring": "x"}) == "local-model"
     assert chat_model(None) == "local-model"
 
@@ -133,10 +132,8 @@ def test_the_embedder_sends_the_configured_embedding_model() -> None:
         seen.append((url, json.loads(payload)))
         return 200, json.dumps({"data": [{"embedding": [1.0, 0.0]}]}).encode()
 
-    assert embed.embed_text("synthetic", transport=transport) == [1.0, 0.0]
     assert embed.embed_text("synthetic", transport=transport, model="example-embed") == [1.0, 0.0]
-    assert seen[0] == (embed.DEFAULT_URL, {"model": "local-embedding", "input": "synthetic"})
-    assert seen[1] == (embed.DEFAULT_URL, {"model": "example-embed", "input": "synthetic"})
+    assert seen == [(embed.DEFAULT_URL, {"model": "example-embed", "input": "synthetic"})]
 
 
 def test_the_embedder_reads_its_model_from_config(tmp_path: Path) -> None:
@@ -147,4 +144,5 @@ def test_the_embedder_reads_its_model_from_config(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert with_id.model == "example-embed"
-    assert without.model == "local-embedding"
+    assert without.model == ""
+    assert with_id.model and not without.enabled()  # no model: embeddings off

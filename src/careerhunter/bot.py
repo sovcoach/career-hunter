@@ -93,6 +93,7 @@ from careerhunter.config import (
 )
 from careerhunter.config import timezone as config_timezone
 from careerhunter.config import today as config_today
+from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.fetch import Fetched, fetch
 from careerhunter.ledger import PartialWriteError
 from careerhunter.models import Activity, Application, Dating, Posting
@@ -128,6 +129,9 @@ MAX_CAPTION = 1024  # Telegram's own caption limit
 JD_STITCH_SECONDS = 4
 STITCH_POLL_TIMEOUT = 1  # getUpdates' timeout while a JD is being stitched
 STITCH_SEPARATOR = "\n\n"  # between the parts of a split paste
+# answerCallbackQuery and taking spent buttons off: quick calls, so a slow one can't
+# hold up the taps behind it until Telegram refuses them as too old.
+QUICK_TIMEOUT = 10
 LATE_FRAGMENT_SECONDS = 60  # a plain text this soon after a saved JD was likely part of it
 FILE_KINDS = ("document", "photo", "video", "audio", "voice", "sticker", "animation")
 
@@ -211,6 +215,14 @@ class Refusal(Exception):
 
 def chat_hash(chat_id: Any) -> str:
     return hashlib.sha256(str(chat_id).encode()).hexdigest()[:8]
+
+
+def failure(exc: BaseException) -> str:
+    """A failure as logged: its type, and for a Telegram failure the method, the code and
+    Telegram's own description. Never the request, a message's text or the token."""
+    name = type(exc).__name__
+    detail = exc.detail() if isinstance(exc, TelegramError) else ""
+    return f"{name} ({detail})" if detail else name
 
 
 def _utc(moment: dt.datetime) -> str:
@@ -405,7 +417,29 @@ def _pack(entries: list[_DigestEntry]) -> list[list[_Numbered]]:
     return messages
 
 
-HEALTH_NAMES = {"lm_studio": "LM Studio", "searxng": "SearXNG", "boards": "Every board"}
+HEALTH_NAMES = {
+    "lm_studio": "LM Studio",
+    "searxng": "SearXNG",
+    "boards": "Every board",
+    "criteria": "The criteria file",
+}
+
+
+def _waiting(held: int | None) -> str:
+    if held is None:
+        return "The number of postings waiting to be scored is not known."
+    if held == 1:
+        return "1 posting is waiting to be scored."
+    return f"{held} postings are waiting to be scored."
+
+
+def _criteria_text(held: int | None, kind: str | None) -> str:
+    """Why scoring is held for the criteria file: its fixed reason, never its path or text."""
+    why = CRITERIA_REASONS.get(kind or "", "it can't be used")
+    return (
+        f"Health: scoring is held because the criteria file can't be used: {why} "
+        f"(search.criteria_file; see careerhunter doctor). {_waiting(held)}"
+    )
 
 
 def _failure_text(name: str, failures: int, held: int | None, kind: str | None = None) -> str:
@@ -413,12 +447,7 @@ def _failure_text(name: str, failures: int, held: int | None, kind: str | None =
 
     An `unauthorized` failure says so, with the command that stores the token, so a
     refused token is never read as a server that is down."""
-    if held is None:
-        waiting = "The number of postings waiting to be scored is not known."
-    elif held == 1:
-        waiting = "1 posting is waiting to be scored."
-    else:
-        waiting = f"{held} postings are waiting to be scored."
+    waiting = _waiting(held)
     runs = "1 run" if failures == 1 else f"{failures} runs"
     if kind == "unauthorized":
         return (
@@ -916,7 +945,7 @@ class Bot:
         doc = self._alert_config()
         if doc is None:
             return
-        limit = health_failure_runs(doc)
+        runs = health_failure_runs(doc)
         try:
             with self._search() as search:
                 states = search_store.component_health(search)
@@ -925,14 +954,24 @@ class Bot:
             return
         for health in states:
             name = HEALTH_NAMES[health.component]
+            # A criteria file that holds scoring is a setting to fix, not an outage that
+            # may pass: it is told after the first run it holds.
+            criteria = health.component == "criteria"
+            limit = 1 if criteria else runs
             try:
                 if health.recovery_due:
-                    self.send(f"Health: {name} is working again.")
+                    self.send(
+                        "Health: the criteria file can be used again; scoring resumes."
+                        if criteria
+                        else f"Health: {name} is working again."
+                    )
                     with self._search() as search, db.transaction(search):
                         search_store.mark_recovery_told(search, health.component)
                 if health.failures >= limit and health.alerted_failures is None:
                     self.send(
-                        _failure_text(name, health.failures, health.held, health.last_failure)
+                        _criteria_text(health.held, health.last_failure)
+                        if criteria
+                        else _failure_text(name, health.failures, health.held, health.last_failure)
                     )
                     with self._search() as search, db.transaction(search):
                         search_store.mark_failure_told(
@@ -1118,7 +1157,7 @@ class Bot:
             self.send("Not recorded: the EI record refused it. Run careerhunter doctor.")
             return "error:claim"
         except Exception as exc:
-            log.error("handler failed: %s", type(exc).__name__)
+            log.error("handler failed: %s", failure(exc))
             with contextlib.suppress(Exception):  # the failure is already logged
                 self.send("Something went wrong and nothing more was recorded. See the bot log.")
             return f"error:{type(exc).__name__}"
@@ -1448,21 +1487,11 @@ class Bot:
             return "ignored:chat"
         taken = self._take_token(query.get("data"), message.get("message_id"))
         if taken is None:
-            self.api.call(
-                "answerCallbackQuery",
-                {"callback_query_id": query.get("id"), "text": "That button has expired."},
-            )
+            self._answer(query.get("id"), "That button has expired.")
             return "callback:rejected"
-        self.api.call("answerCallbackQuery", {"callback_query_id": query.get("id")})
-        with contextlib.suppress(TelegramError):  # the keyboard is spent; take it off
-            self.api.call(
-                "editMessageReplyMarkup",
-                {
-                    "chat_id": self.chat_id,
-                    "message_id": message.get("message_id"),
-                    "reply_markup": {"inline_keyboard": self._live_buttons(message)},
-                },
-            )
+        # Answered at once, so the tap never goes stale behind slower calls. A failed
+        # answer only leaves the button's spinner on: the tap is still acted on.
+        self._answer(query.get("id"))
         action, payload = taken
         try:
             self._dispatch(action, payload)
@@ -1470,7 +1499,35 @@ class Bot:
             log.info("discovery decision refused (%s)", type(exc).__name__)
             self.send("Not changed.")
             return f"callback:{action}:refused"
+        finally:
+            self._take_off_buttons(message)
         return f"callback:{action}"
+
+    def _answer(self, query_id: Any, text: str | None = None) -> None:
+        """answerCallbackQuery, quickly. A failure is logged, never raised."""
+        params: dict[str, Any] = {"callback_query_id": query_id}
+        if text is not None:
+            params["text"] = text
+        try:
+            self.api.call("answerCallbackQuery", params, timeout=QUICK_TIMEOUT)
+        except TelegramError as exc:
+            log.warning("callback answer failed: %s", failure(exc))
+
+    def _take_off_buttons(self, message: Mapping[str, Any]) -> None:
+        """Take a spent keyboard off its message, after the tap's own writes. A failure
+        is logged and leaves the buttons showing; tapping one again says it expired."""
+        try:
+            self.api.call(
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": self.chat_id,
+                    "message_id": message.get("message_id"),
+                    "reply_markup": {"inline_keyboard": self._live_buttons(message)},
+                },
+                timeout=QUICK_TIMEOUT,
+            )
+        except TelegramError as exc:
+            log.info("spent buttons not taken off: %s", failure(exc))
 
     def _dispatch(self, action: str, p: dict[str, Any]) -> None:
         if action == "apply":
@@ -1530,16 +1587,19 @@ class Bot:
             with self._search() as search:
                 self._keyboard(search, "Why skip it?", rows, STEP_TTL)
         elif action == "skip_reason":
+            # The skip is recorded first, as `other` for Other…, so no later Telegram
+            # failure can lose it; a typed reason then replaces `other`.
+            skip_id = self._finish_skip(
+                int(p["posting_id"]), str(p["reason"]), reply=p.get("reason") != "other"
+            )
             if p.get("reason") == "other":
                 with self._search() as search:
                     self._prompt(
                         search,
-                        "Reply with the reason, in a few words.",
+                        "Skipped. Reply with the reason, in a few words.",
                         "skip_reason",
-                        {"posting_id": p["posting_id"]},
+                        {"posting_id": p["posting_id"], "skip_id": skip_id},
                     )
-                return
-            self._finish_skip(int(p["posting_id"]), str(p["reason"]))
         elif action == "status_pick":
             rows = [
                 [(_words(s), "status_set", {"application_id": p["application_id"], "status": s})]
@@ -1608,7 +1668,7 @@ class Bot:
                 reason = " ".join(text.split())
                 if not reason or len(reason) > MAX_TEXT:
                     raise Refusal("Please reply with a short reason.")
-                self._finish_skip(int(payload["posting_id"]), reason)
+                self._finish_typed_skip(payload, reason)
             elif kind == "snapshot" and payload.get("jd") is True:
                 self._attach_jd(message, str(payload["correlation_id"]))
             elif kind == "snapshot":
@@ -1761,13 +1821,30 @@ class Bot:
         except (ConfigError, OSError, yaml.YAMLError, ValueError):
             raise Refusal(CONFIG_UNREADABLE) from None
 
-    def _finish_skip(self, posting_id: int, reason: str) -> None:
+    def _finish_skip(self, posting_id: int, reason: str, *, reply: bool = True) -> int:
+        """Record the operator's skip, then (with `reply`) say so. Returns the skip's id."""
         doc = self._config()
         with self._writable(doc) as (search, _):
             posting = search_store.posting_by_id(search, posting_id)
             if posting is None:
                 raise Refusal("That posting isn't in search.db any more.")
-            ledger.record_skip(search, posting, self._today(doc).isoformat(), reason)
+            skip_id = ledger.record_skip(search, posting, self._today(doc).isoformat(), reason)
+        if reply:
+            self.send(f"Skipped: {posting.company} — {posting.title}.")
+        return skip_id
+
+    def _finish_typed_skip(self, payload: Mapping[str, Any], reason: str) -> None:
+        """The reason typed after Other…: it replaces `other` on the skip recorded at the
+        tap. A prompt from before that skip was recorded (no skip id) records it now."""
+        skip_id = payload.get("skip_id")
+        if isinstance(skip_id, bool) or not isinstance(skip_id, int):
+            self._finish_skip(int(payload["posting_id"]), reason)
+            return
+        doc = self._config()
+        with self._writable(doc) as (search, _):
+            posting = search_store.posting_by_id(search, int(payload["posting_id"]))
+            if posting is None or not ledger.set_skip_reason(search, skip_id, reason):
+                raise Refusal("That skip isn't in search.db any more.")
         self.send(f"Skipped: {posting.company} — {posting.title}.")
 
     def _finish_status(self, application_id: int, status: str) -> None:

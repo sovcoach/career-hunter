@@ -162,7 +162,7 @@ created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 25
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 27
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -197,6 +197,7 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | How many missing requirements still count, and the fit each tier means | `fit_rubric.gap_tiers` (every tier needs `fit: low`, `medium` or `high`) |
 | The lowest fit at which a title outside every lane still alerts | `search.off_lane_min_fit` (default `high`) |
 | Your resume, for scoring and a similarity score that `embed-eval` reads (see "Import your resume") | `search.resume: resume/current.txt` |
+| Preferences in your own words, which the scorer weighs when it marks a gap minor or core (see "Your scoring criteria") | `search.criteria_file: criteria.md` |
 | Languages, credentials, shifts, pay, seniority (in the title, or also the description), and a minimum salary | `hard_gates` |
 | A cap on weekend days | `schedule_limits` |
 | Which roles to keep at one company | that company's `role_filters` |
@@ -263,7 +264,7 @@ scoring:
   embedding_model: example-embedding-model
 ```
 
-Each is text of 1 to 200 characters, with no control characters and no spaces at either end. Left out or `null`, career-hunter asks for `local-model` and `local-embedding`. `scoring` takes one other key, `timeout_seconds` (below): a `url` is refused.
+Each is text of 1 to 200 characters, with no control characters and no spaces at either end. A `chat_model` left out or `null` asks for `local-model`. With no `embedding_model`, embeddings are off: the watcher sends no embedding request and logs no `embedding miss` line, and no cosine is stored. `scoring` takes one other key, `timeout_seconds` (below): a `url` is refused.
 
 4. **LM Studio's API token.** Keep authentication on in LM Studio's server settings, create an API token there, and store it in the Keychain the same way as the bot's token:
 
@@ -273,7 +274,7 @@ Each is text of 1 to 200 characters, with no control characters and no spaces at
 
    It is sent as a Bearer header on every scoring and embedding call, and never printed or logged. `doctor` asks LM Studio for its model list with it: `LM Studio OK` when it is accepted, `BAD unauthorized` when LM Studio refuses it (store it again), and `BAD unreachable` when the server isn't running. A refused token is never reported as unreachable, in the watch log or in the bot's health message either.
 
-**Reasoning models.** A chat model that thinks before it answers works: its thinking (`<think>…</think>` and the like) is removed before the reply is read, and never stored. Because a reasoning model takes longer, one scoring call may take up to `scoring.timeout_seconds` (60 to 540, default 300). A call starts only while that much of the 600-second watch run is left, so the budget never cuts one short. A reply that doesn't parse leaves the posting unscored for the next run; after 3 such replies for one posting, it is given up and never sent to the model again, and `doctor`'s `bot refusals` line counts it.
+**Reasoning models.** A chat model that thinks before it answers works: its thinking (`<think>…</think>` and the like) is removed before the reply is read, and never stored. Because a reasoning model takes longer, one scoring call may take up to `scoring.timeout_seconds` (60 to 540, default 300). Each call's duration is recorded, and `doctor`'s `scoring calls` line shows the median and the longest answered call of the last 14 days beside the timeout, such as `scoring calls   OK  12 answered in 14 days: median 118 s, max 166 s (timeout 200 s)`. It warns when the longest reaches 90% of the timeout: raise the timeout, or use a faster model. A call starts only while that much of the 600-second watch run is left, so the budget never cuts one short. A reply that doesn't parse leaves the posting unscored for the next run; after 3 such replies for one posting, it is given up and never sent to the model again, and `doctor`'s `bot refusals` line counts it.
 
 **Choosing models for your Mac's memory.** On a Mac with Apple silicon, the models share memory with everything else. A model's size on disk is roughly the memory it needs once loaded, plus some for the prompt. Leave at least a third of the memory for macOS and your other apps. As a guide, for chat models stored at 4-bit quantization:
 
@@ -307,6 +308,35 @@ search:
 No other value is accepted. The next watch run re-scores the postings you haven't skipped or applied to. Postings still listed on their board are re-scored with the description the board sends, when it sends one, and the rest from what was stored. That can take a few runs: new postings go first, and each run stops at its time budget. A posting you were already alerted about is re-scored but not sent again.
 
 Don't edit `resume/current.txt` by hand. If it no longer matches what was imported, scoring and embeddings stop using it and `doctor` says so. Run `resume import` again.
+
+### Your scoring criteria
+
+Some preferences don't fit a field: which kind of role you'd take a gap for, or which missing requirement you can pick up quickly. Write them in plain words in a text file in the data folder, and the scorer sends them with each posting as your own stated criteria. The model is told to weigh them when it decides whether a gap is minor or core, and never to treat them as requirements of the posting.
+
+1. Create the file, owner-only:
+
+   ```bash
+   touch "$CAREERHUNTER_DATA_DIR/criteria.md" && chmod 600 "$CAREERHUNTER_DATA_DIR/criteria.md"
+   ```
+
+2. Write your criteria in it, for example: `Prefers operations roles at small companies; a missing forklift licence is minor.`
+3. Set this in `config.yaml`:
+
+   ```yaml
+   search:
+     criteria_file: criteria.md
+   ```
+
+The path is relative to the data folder and must stay inside it, even through a symlink. The file must be UTF-8 text that only you can read, and at most 4,000 characters. Only this file is read: other notes in the data folder never reach the scorer. Leave the key out, or set it to `null`, to send no criteria.
+
+If the file can't be used (missing, readable by others, empty, not UTF-8, or over the cap), the watch run holds scoring and logs `watch: scoring: criteria file not usable (<reason>); left for the next run`. The bot tells you why after the first run it holds, and again when scoring resumes. `doctor` shows it too:
+
+```text
+criteria        OK  1,240 of 4,000 characters; sent with each scoring call
+criteria        WARN over the 4,000-character cap (4,100 characters); scoring is held
+```
+
+Editing the file doesn't re-score anything: postings already scored keep their gaps, and the new text applies from the next posting scored.
 
 ### Refresh the scout prompt
 
@@ -369,7 +399,7 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 25
+search.db: applied nothing; schema version 27
 ei_record_2026-27.db: created; schema version 3
 EI claim 2026-27 (from 2026-08-02)
 ```
@@ -388,7 +418,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 25
+search.db       OK  schema version 27
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -686,12 +716,12 @@ health:
 | `/log …` with the job description | Paste the job description on the lines after the `/log` line, in the same message. Telegram splits a long paste into several messages; the bot joins every plain text message that arrives within 4 seconds of the one before, with a blank line between them (where Telegram split it), and records the application once they stop. Telegram changes whitespace on the way (tabs become spaces, trailing spaces go, and the blank lines where it splits are dropped and put back by the bot), so a pasted job description is kept as Telegram delivered it. To keep the exact text, send it as a file instead. Or send the job description as a PDF, HTML or text file with the `/log` line as its caption. The reply ends `Job description saved.` and never repeats the text. |
 | A reply with the job description | When no job description was saved, the bot asks for it: reply to that message with the text, or with a PDF, HTML or text file. If a long paste wasn't joined in full, the bot says so: reply to the `Recorded` message with the whole description as a `.txt` file, which replaces the one saved. |
 | **Applied** | The bot asks how you applied, then when: **Today**, **Yesterday**, **This week**, **Last week** or **Other date** (reply with YYYY-MM-DD). It saves a copy of the job ad when the page gives one, then asks for the job description: reply with the text, or with a PDF, HTML or text file (which also becomes the copy of the ad if none was saved). |
-| **Skipped** | Asks why, then records the skip. Skips never go into the EI record. |
+| **Skipped** | Asks why, then records the skip as soon as you tap a reason. **Other…** records it at once as `other` and asks for your words: reply to that message (within a day) and your words replace `other`. Skips never go into the EI record. |
 | `/status a7 interview_scheduled` | Updates an application. References like `a7` come from `/recent` and last 7 days. Send just `/status` to choose with buttons. |
 | `/activity networking 2026-10-27 Coffee with a recruiter` | Records a job-search activity. Leave out the date to choose it with buttons. |
 | `/recent` | Your latest applications, their references and current statuses. |
 
-Every date must fall inside your active EI claim, as with `seed`, and future dates are refused. Buttons work once: tap a button twice, or use an old one, and the bot says it has expired.
+Every date must fall inside your active EI claim, as with `seed`, and future dates are refused. Buttons work once: tap a button twice, or use an old one, and the bot says it has expired. There's no hurry: the buttons on an alert work for 7 days, and the follow-up buttons and the questions the bot asks (a date, a reason) for a day.
 
 With `alerts.weekly_digest: {day: monday, hour: 9}` in `config.yaml`, the bot also sends a weekly message at that local time (`schedule.timezone`) with counts for the week before, by lane: alerts, Applied, Skipped, responses (an employer's first reply: screening and later, or a rejection) and outcomes. It has numbers and lane names only, never titles:
 
@@ -702,7 +732,7 @@ Off-lane: 1 alerts, 0 applied, 1 skipped, 0 responses, 0 outcomes
 All lanes: 3 alerts, 1 applied, 2 skipped, 2 responses, 2 outcomes
 ```
 
-The bot also tells you when something stops working. After `health.failure_runs` watch runs in a row (default 3) in which the local model, SearXNG, or every board failed, it sends one message, such as `Health: LM Studio has failed 3 runs in a row. 4 postings are waiting to be scored.`, and when that part works again, one more: `Health: LM Studio is working again.` It sends nothing more about the same outage in between.
+The bot also tells you when something stops working. After `health.failure_runs` watch runs in a row (default 3) in which the local model, SearXNG, or every board failed, it sends one message, such as `Health: LM Studio has failed 3 runs in a row. 4 postings are waiting to be scored.`, and when that part works again, one more: `Health: LM Studio is working again.` It sends nothing more about the same outage in between. A criteria file that holds scoring (see "Your scoring criteria") is told after the first run, with the reason, and again when scoring resumes.
 
 ---
 
@@ -839,6 +869,39 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
 
+## Upgrading from 0.5.1 to 0.6.0
+
+Follow the nine steps above with the tag `v0.6.0` (`git checkout v0.6.0` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 4:** nothing has to change. A 0.5.1 `config.yaml` is valid as it is. Two things to know:
+  - With no `scoring.embedding_model`, embeddings are now off: no request, no `embedding miss` line. Set it only if LM Studio runs an embedding model.
+  - To give the scorer your own criteria, see "Your scoring criteria". It is optional.
+- **Step 5:** `doctor` exits 1 with this line, because `search.db` is two migrations behind:
+
+  ```text
+  search.db       BAD schema version 25, expected 27; run: careerhunter migrate
+  ```
+
+  The claim's record is already at schema version 3.
+- **Step 6:** `migrate` applies two migrations to `search.db` and none to the claim's record:
+
+  ```text
+  search.db: applied [26, 27]; schema version 27
+  ei_record_2026-27.db: applied nothing; schema version 3
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+- **Step 7:** skip it.
+- **Step 8:** these lines show the upgrade took:
+
+  ```text
+  search.db       OK  schema version 27
+  criteria        --  not set (optional: search.criteria_file)
+  scoring calls   --  no scoring call in 14 days
+  ```
+
+  `scoring calls` fills in as watch runs score postings. If you set `search.criteria_file`, the `criteria` line shows its size instead.
+
 ## Upgrading from 0.5.0 to 0.5.1
 
 Follow the nine steps above with the tag `v0.5.1` (`git checkout v0.5.1` in the release checkout, then `uv sync --locked`). These steps differ:
@@ -951,7 +1014,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 25` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 27` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |

@@ -18,7 +18,6 @@ from careerhunter import embed as embedding
 from careerhunter import resume as resume_store
 from careerhunter.embed import (
     DEFAULT_URL,
-    MODEL_NAME,
     EmbedError,
     cosine,
     embed_text,
@@ -32,6 +31,7 @@ from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
 from tests.test_score import BROKEN, RUBRIC, broken_connection
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, url
 
+MODEL = "example-embedding-model"
 RESUME = "Synthetic resume for operations work."
 DESC = "Synthetic posting for an operations coordinator."
 RESUME_VEC = [1.0, 0.0]
@@ -49,7 +49,7 @@ class EmbedScript:
     def __call__(self, url: str, payload: bytes) -> tuple[int, bytes]:
         assert url == DEFAULT_URL
         body = json.loads(payload)
-        assert body["model"] == MODEL_NAME
+        assert body["model"] == MODEL
         text = body["input"]
         assert isinstance(text, str)
         self.calls.append(text)
@@ -60,6 +60,7 @@ class EmbedScript:
 def _config(resume: str | None, *, weight: float | None = None) -> dict[str, Any]:
     doc = copy.deepcopy(RUBRIC)
     doc["search"]["resume"] = resume
+    doc["scoring"] = {"embedding_model": MODEL}
     if weight is not None:
         doc["fit_rubric"]["embedding_weight"] = weight
     return doc
@@ -97,15 +98,19 @@ def _run(
     resume: str | None = resume_store.CONFIG_VALUE,
     weight: float | None = None,
     scorer: Any = _kept,
+    model: str | None = MODEL,
 ) -> list[str]:
     board = url("greenhouse", "examplerobotics")
     body = one_greenhouse("examplerobotics")
+    config = _config(resume, weight=weight)
+    if model is None:
+        config.pop("scoring")
     return watch.run(
         search,
         [company("Example Robotics", "greenhouse", "examplerobotics")],
         today=DAY,
         fetcher=Scripted({board: fetched(body)}),
-        config=_config(resume, weight=weight),
+        config=config,
         scorer=scorer,
         data_dir=datadir.root,
         embed_transport=transport,
@@ -147,6 +152,22 @@ def test_a_kept_posting_stores_the_cosine_beside_the_tier(
     captured = capsys.readouterr()
     _absent(captured.out)
     _absent(captured.err)
+
+
+def test_no_embedding_model_sends_nothing_and_logs_no_miss(
+    search: sqlite3.Connection, datadir: DataDir, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_resume(datadir, search)
+
+    def refuse(url: str, payload: bytes) -> tuple[int, bytes]:
+        raise AssertionError("no embedding request may be sent without a model")
+
+    lines = _run(search, datadir, refuse, model=None)
+    assert not any("embedding miss" in line for line in lines)
+    assert "embedding miss" not in capsys.readouterr().out
+    assert _score(search) is None
+    assert search.execute("SELECT count(*) AS n FROM resume_embedding").fetchone()["n"] == 0
+    assert search.execute("SELECT llm_output FROM postings").fetchone()[0] == "model text"
 
 
 def test_a_down_server_leaves_the_cosine_null_and_the_run_finishes(
@@ -442,7 +463,7 @@ def test_embed_text_refuses_anything_but_loopback() -> None:
         raise AssertionError(url)
 
     with pytest.raises(EmbedError) as exc:
-        embed_text(RESUME, url="http://example.com/v1/embeddings", transport=boom)
+        embed_text(RESUME, model=MODEL, url="http://example.com/v1/embeddings", transport=boom)
     assert str(exc.value) == "unreachable"
     assert "example.com" not in str(exc.value)
     assert RESUME not in str(exc.value)
@@ -450,11 +471,11 @@ def test_embed_text_refuses_anything_but_loopback() -> None:
 
 def test_a_redirect_and_a_bad_body_are_bad_replies() -> None:
     with pytest.raises(EmbedError) as redirect:
-        embed_text(RESUME, transport=lambda url, payload: (302, b"go away"))
+        embed_text(RESUME, model=MODEL, transport=lambda url, payload: (302, b"go away"))
     assert str(redirect.value) == "bad-reply"
     assert RESUME not in str(redirect.value)
     with pytest.raises(EmbedError) as bad:
-        embed_text(RESUME, transport=lambda url, payload: (200, b"not-json"))
+        embed_text(RESUME, model=MODEL, transport=lambda url, payload: (200, b"not-json"))
     assert str(bad.value) == "bad-reply"
     assert RESUME not in str(bad.value)
 
@@ -465,7 +486,7 @@ def test_the_default_transport_posts_once_and_does_not_follow_a_redirect(
     server = FakeServer(Reply(302, b"go away"))
     monkeypatch.setattr(loopback, "LoopbackConnection", server)
     with pytest.raises(EmbedError) as exc:
-        embed_text(RESUME)
+        embed_text(RESUME, model=MODEL)
     assert str(exc.value) == "bad-reply"  # it answered, with a redirect
     assert [(host, address, port) for host, address, port, _t in server.opened] == [
         ("127.0.0.1", "127.0.0.1", 1234)
@@ -537,7 +558,7 @@ def test_a_broken_reply_from_the_default_transport_is_unreachable(
 ) -> None:
     monkeypatch.setattr(loopback, "LoopbackConnection", broken_connection(error))
     with pytest.raises(EmbedError) as exc:
-        embed_text(RESUME)
+        embed_text(RESUME, model=MODEL)
     assert str(exc.value) == "unreachable"
     assert RESUME not in str(exc.value)
 
@@ -547,7 +568,7 @@ def test_an_injected_transport_that_breaks_is_unreachable() -> None:
         raise http.client.RemoteDisconnected("synthetic")
 
     with pytest.raises(EmbedError) as exc:
-        embed_text(RESUME, transport=broken)
+        embed_text(RESUME, model=MODEL, transport=broken)
     assert str(exc.value) == "unreachable"
     assert RESUME not in str(exc.value)
 
@@ -572,7 +593,7 @@ def _vector(value: object) -> bytes:
 )
 def test_a_reply_of_the_wrong_shape_is_a_bad_reply(body: bytes) -> None:
     with pytest.raises(EmbedError) as exc:
-        embed_text(RESUME, transport=lambda url, payload: (200, body))
+        embed_text(RESUME, model=MODEL, transport=lambda url, payload: (200, body))
     assert str(exc.value) == "bad-reply"
     assert RESUME not in str(exc.value)
 
@@ -583,7 +604,7 @@ def test_a_bug_in_our_own_parser_still_raises(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(embedding, "_values", bug)
     with pytest.raises(RuntimeError, match="synthetic bug"):
-        embed_text(RESUME, transport=lambda url, payload: (200, _vector([1.0, 0.0])))
+        embed_text(RESUME, model=MODEL, transport=lambda url, payload: (200, _vector([1.0, 0.0])))
 
 
 def test_a_1536_dimension_reply_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -591,7 +612,7 @@ def test_a_1536_dimension_reply_is_accepted(monkeypatch: pytest.MonkeyPatch) -> 
     body = json.dumps({"data": [{"embedding": vector}]}).encode()
     assert len(body) > 20_000  # larger than the scoring cap this client used to share
     monkeypatch.setattr(loopback, "LoopbackConnection", FakeServer(Reply(body=body)))
-    assert len(embed_text(RESUME)) == 1536
+    assert len(embed_text(RESUME, model=MODEL)) == 1536
 
 
 def test_a_reply_over_the_embedding_cap_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -599,7 +620,7 @@ def test_a_reply_over_the_embedding_cap_is_unreachable(monkeypatch: pytest.Monke
     server = FakeServer(Reply(body=body, step=65536))
     monkeypatch.setattr(loopback, "LoopbackConnection", server)
     with pytest.raises(EmbedError) as exc:
-        embed_text(RESUME)
+        embed_text(RESUME, model=MODEL)
     assert str(exc.value) == "unreachable"
     assert server.reads == 17  # 16 full chunks, then the one that passes the cap
 
@@ -614,7 +635,7 @@ def test_embedding_has_its_own_60_second_deadline(
     monkeypatch.setattr(loopback, "_clock", clock)
     monkeypatch.setattr(loopback, "LoopbackConnection", server)
     with pytest.raises(EmbedError) as exc:
-        embed_text(RESUME)
+        embed_text(RESUME, model=MODEL)
     assert str(exc.value) == "unreachable"
     assert [a.seconds for a in loopback_watchdog.armed] == [60.0]
     assert [timeout for *_rest, timeout in server.opened] == [30.0]

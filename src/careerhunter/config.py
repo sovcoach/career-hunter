@@ -36,8 +36,9 @@ LaunchAgent runs, default 60 and at least 15.
   local model, SearXNG or every board may fail before the bot says so. Both are
   integers from 1 to 50, default 3.
 - scoring.chat_model and scoring.embedding_model: the model identifiers sent to the
-  local server, text of 1 to 200 characters with no control characters; defaults
-  `local-model` and `local-embedding`. The server URLs are not config.
+  local server, text of 1 to 200 characters with no control characters. chat_model
+  defaults to `local-model`; with no embedding_model, embeddings are off (no request
+  is sent). The server URLs are not config.
 
 With lanes present, search.target_titles becomes optional; with gap_tiers present, the
 fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
@@ -73,6 +74,7 @@ from typing import Any, TypeGuard
 import yaml
 
 from careerhunter.claims import validate_section
+from careerhunter.criteria import path_problem as criteria_path_problem
 from careerhunter.enums import ATS_TYPES, FIT_LEVELS, WORK_MODELS
 
 DEFAULT_WATCH_INTERVAL_MINUTES = 60
@@ -101,7 +103,6 @@ HEALTH_KEYS = ("unproductive_runs", "failure_runs")
 # scoring.chat_model and scoring.embedding_model: the model identifiers sent to the
 # local server. The URLs are loopback constants in score.py and embed.py, never config.
 DEFAULT_CHAT_MODEL = "local-model"
-DEFAULT_EMBEDDING_MODEL = "local-embedding"
 MODEL_KEYS = ("chat_model", "embedding_model")
 SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds")
 MAX_MODEL_ID = 200
@@ -602,6 +603,9 @@ def validate_config(doc: Any) -> list[str]:
             _validate_location_rules(rules, problems)
         if "resume" in search:
             _resume_path(search["resume"], problems)
+        criteria_problem = criteria_path_problem(search.get("criteria_file"))
+        if criteria_problem is not None:
+            problems.append(f"search.criteria_file {criteria_problem}")
         age = search.get("max_posting_age_days", DEFAULT_MAX_POSTING_AGE_DAYS)
         if not _int(age) or not 1 <= age <= MAX_POSTING_AGE_LIMIT:
             problems.append(
@@ -806,9 +810,11 @@ def scoring_timeout_seconds(doc: Mapping[str, Any] | None) -> int:
     return DEFAULT_SCORE_TIMEOUT_SECONDS
 
 
-def embedding_model(doc: Mapping[str, Any] | None) -> str:
-    """The embedding model id the embedder sends; `local-embedding` if unset."""
-    return _scoring_model(doc, "embedding_model", DEFAULT_EMBEDDING_MODEL)
+def embedding_model(doc: Mapping[str, Any] | None) -> str | None:
+    """The embedding model id the embedder sends, or None when unset: embeddings off."""
+    section = doc.get("scoring") if isinstance(doc, Mapping) else None
+    value = section.get("embedding_model") if isinstance(section, Mapping) else None
+    return value if _model_id(value) else None
 
 
 def health_unproductive_runs(doc: Mapping[str, Any] | None) -> int:

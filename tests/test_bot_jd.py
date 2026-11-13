@@ -369,10 +369,12 @@ class Ticking(test_bot.FakeTelegram):
         super().__init__()
         self.clock = clock
 
-    def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def call(
+        self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None
+    ) -> Any:
         if method == "getUpdates":
             self.clock.now += dt.timedelta(seconds=5)
-        return super().call(method, params)
+        return super().call(method, params, timeout=timeout)
 
 
 def test_the_loop_polls_briefly_while_stitching_and_orders_a_batch(

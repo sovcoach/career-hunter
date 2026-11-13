@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from careerhunter import db
-from careerhunter.config import DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_MODEL
+from careerhunter.config import DEFAULT_CHAT_MODEL
 from careerhunter.embed import DEFAULT_URL as EMBED_URL
 from careerhunter.score import DEFAULT_URL as CHAT_URL
 
@@ -27,12 +27,15 @@ WALKTHROUGH_RELEASE = {"search": 19, "ei_record": 1}
 
 
 # Notes for an earlier upgrade keep that release's numbers too, as released.
-PAST_UPGRADES = {"## Upgrading from 0.4.0 to 0.5.0": {"search": 21, "ei_record": 2}}
+PAST_UPGRADES = {
+    "## Upgrading from 0.5.0 to 0.5.1": {"search": 25, "ei_record": 3},
+    "## Upgrading from 0.4.0 to 0.5.0": {"search": 21, "ei_record": 2},
+}
 
 
 def _outside_walkthrough() -> str:
     head, _, rest = SETUP.partition(UPGRADE)
-    text = head + rest.split("\n## ", 1)[1]
+    text = head + "\n## " + rest.split("\n## ", 1)[1]  # the next section keeps its heading
     for heading in PAST_UPGRADES:
         text = text.replace(heading + _section(heading), "")
     return text
@@ -84,7 +87,8 @@ def test_lm_studio_is_required_and_the_addresses_are_the_constants() -> None:
     models = _section("### Run the local models").split("\n### ", 1)[0]
     assert CHAT_URL in models and EMBED_URL in models
     assert "scoring:\n  chat_model:" in models
-    assert f"`{DEFAULT_CHAT_MODEL}` and `{DEFAULT_EMBEDDING_MODEL}`" in models
+    assert f"`{DEFAULT_CHAT_MODEL}`" in models
+    assert "embeddings are off" in models and "local-embedding" not in models
     assert "Memory" in models and "16 GB" in models
 
 

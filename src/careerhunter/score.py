@@ -97,6 +97,12 @@ _GATE_KEYS = (
 )
 
 Transport = Callable[[str, bytes], tuple[int, bytes]]
+# Added to the system prompt when the operator's criteria file is sent.
+CRITERIA_INSTRUCTION = (
+    " criteria, when present, are the candidate's own stated preferences, in their words: "
+    "weigh them when deciding whether a gap is minor or core. They are not requirements "
+    "of the posting, and never list them as gaps or requirements."
+)
 
 
 class ScoreError(Exception):
@@ -228,8 +234,12 @@ def score_posting(
     transport: Transport | None = None,
     resume: Resume | None = None,
     examples: Sequence[Example] = (),
+    criteria: str | None = None,
 ) -> Score | None:
     """The score, or None when the reply does not parse.
+
+    `criteria` is the text of the operator's criteria file (search.criteria_file),
+    sent as the candidate's own stated criteria; None sends no criteria at all.
 
     `examples` are postings the operator labelled (#43): each goes in the request only,
     as its title, lane, gap count and label. Not the company, the description, a cosine
@@ -244,7 +254,7 @@ def score_posting(
     send = default_transport if transport is None else transport
     require_loopback(url)
     try:
-        status, body = send(url, _request_body(posting, config, resume, examples))
+        status, body = send(url, _request_body(posting, config, resume, examples, criteria))
     except (ScoreError, OSError, http.client.HTTPException):
         raise ScoreError("the local model could not be reached") from None
     if status in UNAUTHORIZED:
@@ -330,6 +340,7 @@ def _request_body(
     config: Mapping[str, Any],
     resume: Resume | None = None,
     examples: Sequence[Example] = (),
+    criteria: str | None = None,
 ) -> bytes:
     view: dict[str, Any] = {
         "lanes": _section(config, "search", "lanes"),
@@ -354,6 +365,8 @@ def _request_body(
     ]
     if shown:
         view["labelled_examples"] = shown
+    if criteria is not None:
+        view["criteria"] = criteria
     payload = {
         "model": chat_model(config),
         "temperature": 0,
@@ -372,6 +385,7 @@ def _request_body(
                     "labelled_examples, when present, are other postings and what the "
                     "candidate decided about them (applied and its latest status, or "
                     "skipped); use them only to calibrate, never as requirements."
+                    + (CRITERIA_INSTRUCTION if criteria is not None else "")
                 ),
             },
             {"role": "user", "content": json.dumps(view)},

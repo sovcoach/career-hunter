@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import title_key
 from careerhunter.models import Application, Dating, Posting
@@ -538,8 +539,17 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
     return HeldCounts(unscored=int(row["unscored"]), no_fit=int(row["no_fit"]), off_lane=off_lane)
 
 
-COMPONENTS = ("lm_studio", "searxng", "boards")
-FAILURE_KINDS = ("unreachable", "unauthorized", "bad-reply", "throttled", "failed")
+# `criteria` is the criteria file (search migration 0027): it fails when it holds scoring,
+# with one of its fixed reasons as the kind.
+COMPONENTS = ("lm_studio", "searxng", "boards", "criteria")
+FAILURE_KINDS = (
+    "unreachable",
+    "unauthorized",
+    "bad-reply",
+    "throttled",
+    "failed",
+    *CRITERIA_REASONS,
+)
 
 
 def record_component(
@@ -697,6 +707,43 @@ def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
     """Every posting whose title has not been checked against the lanes, oldest first."""
     rows = conn.execute("SELECT id, title FROM postings WHERE lane_checked = 0 ORDER BY id")
     return [(int(row["id"]), str(row["title"])) for row in rows]
+
+
+SCORE_OUTCOMES = ("scored", "unparseable", "unreachable", "unauthorized", "budget")
+ANSWERED_OUTCOMES = ("scored", "unparseable")  # the model replied, parsed or not
+
+
+def record_score_call(
+    conn: sqlite3.Connection,
+    run_id: int,
+    posting_id: int,
+    started_at: str,
+    finished_at: str,
+    duration_ms: int,
+    outcome: str,
+) -> None:
+    """One scoring call's timing (search migration 0026). No prompt, reply or text."""
+    conn.execute(
+        "INSERT INTO score_calls (run_id, posting_id, started_at, finished_at, duration_ms, "
+        "outcome) VALUES (?, ?, ?, ?, ?, ?)",
+        (run_id, posting_id, started_at, finished_at, max(0, duration_ms), outcome),
+    )
+
+
+@dataclass(frozen=True)
+class ScoreCallStats:
+    """Scoring calls since a moment: durations of the answered ones, and the rest."""
+
+    answered_ms: tuple[int, ...]
+    not_answered: int
+
+
+def score_call_stats(conn: sqlite3.Connection, since: str) -> ScoreCallStats:
+    rows = conn.execute(
+        "SELECT duration_ms, outcome FROM score_calls WHERE started_at >= ?", (since,)
+    ).fetchall()
+    answered = tuple(sorted(int(r[0]) for r in rows if r[1] in ANSWERED_OUTCOMES))
+    return ScoreCallStats(answered, len(rows) - len(answered))
 
 
 def start_watch_run(conn: sqlite3.Connection, started_at: str) -> int:
@@ -1159,6 +1206,14 @@ def insert_skip(
         (posting_id, date, reason, int(by_operator)),
     )
     return int(cur.lastrowid or 0)
+
+
+def set_operator_skip_reason(conn: sqlite3.Connection, skip_id: int, reason: str) -> bool:
+    """Replace the reason of one of the operator's own skips. False if there is none."""
+    cur = conn.execute(
+        "UPDATE skips SET reason = ? WHERE id = ? AND by_operator = 1", (reason, skip_id)
+    )
+    return cur.rowcount == 1
 
 
 def claim_links(conn: sqlite3.Connection) -> dict[str, str | None]:

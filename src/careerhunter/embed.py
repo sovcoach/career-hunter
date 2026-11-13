@@ -3,8 +3,8 @@
 The client is not `fetch.py`. That client refuses loopback, which is right for a job
 ad and wrong for a model on this Mac. This client allows only `http` to `127.0.0.1`,
 `localhost` or `::1`, follows no redirects, and refuses any other host. The URL is a
-constant, not a config field. The model id is `scoring.embedding_model` (default
-`local-embedding`).
+constant, not a config field. The model id is `scoring.embedding_model`. With no
+model set, embeddings are off: nothing is sent and no miss is logged.
 
 A cosine is stored beside the LLM tier. It does not cause a skip, and
 `fit_rubric.embedding_weight` is not read. The resume is read only through
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from careerhunter import db, loopback, resume, search_store
-from careerhunter.config import DEFAULT_EMBEDDING_MODEL, embedding_model
+from careerhunter.config import embedding_model
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
 from careerhunter.score import (
@@ -39,7 +39,6 @@ from careerhunter.score import (
 )
 
 DEFAULT_URL = "http://127.0.0.1:1234/v1/embeddings"
-MODEL_NAME = DEFAULT_EMBEDDING_MODEL  # what is sent when scoring.embedding_model is unset
 TOTAL = 60.0
 TIMEOUT = 30.0
 # A 1536-dimension vector is about 21 KB of JSON; the cap leaves room for larger models.
@@ -116,9 +115,9 @@ def default_transport(
 def embed_text(
     text: str,
     *,
+    model: str,
     url: str = DEFAULT_URL,
     transport: Transport | None = None,
-    model: str = MODEL_NAME,
 ) -> list[float]:
     """One embedding, from the model named `model`. A transport failure is
     EmbedError('unreachable', down=True); a reply that is not a usable vector is
@@ -177,7 +176,7 @@ class Embedder:
         self.config = config
         self.transport = transport
         self.url = url
-        self.model = embedding_model(config)
+        self.model = embedding_model(config) or ""  # empty: embeddings off
         self._cached: tuple[str, int, list[float]] | None = None
         self._failed: str | None = None
         self._reported: set[int] = set()
@@ -212,11 +211,12 @@ class Embedder:
             return self._miss(posting_id, exc.reason)
 
     def enabled(self) -> bool:
-        """Whether a resume is configured, so refresh and attach have work to do."""
+        """Whether an embedding model and a resume are configured, so refresh and attach
+        have work to do. With no model, embeddings are off: nothing is sent."""
         return self._enabled()
 
     def _enabled(self) -> bool:
-        return self.data_dir is not None and resume.configured(self.config)
+        return bool(self.model) and self.data_dir is not None and resume.configured(self.config)
 
     def _resume_vector(self) -> tuple[str, int, list[float]]:
         if self.data_dir is None:

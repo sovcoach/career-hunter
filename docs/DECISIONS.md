@@ -520,6 +520,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 > **Amended: the model id is config (#44).** The embedding request's model id is `scoring.embedding_model` (default `local-embedding`), and the scoring request's is `scoring.chat_model` (default `local-model`). Each is text of 1 to 200 characters with no control characters and no leading or trailing spaces; any other key under `scoring` is refused, so neither URL can be set. The URLs stay the loopback constants below. Stored vectors do not record the model that made them: after `scoring.embedding_model` changes, stored posting vectors are compared with the new resume vector as they are. A vector of another dimension is a `dim-mismatch` miss; one of the same dimension gives a cosine across two models. A cosine still decides nothing.
 
+> **Amended: no embedding model, no embeddings (0.6.0).** `scoring.embedding_model` has no default any more. Unset or null turns embeddings off: the watcher sends no embedding request, logs no `embedding miss` line, and stores no cosine. Before, an unset model sent `local-embedding`, which a server with no embedding model loaded refused on every run.
+
 > **Amended: a bad reply has its own reason (#42).** An embedding miss is now `unreachable` only when the server could not be used (refused, out of time, or a reply over the cap); a reply that arrived but is not a usable vector (another status, a body of the wrong shape, an empty, zero or non-finite vector) is the new reason `bad-reply`. Only `unreachable` stops embedding for the rest of the run, as before. The log line is still `embedding miss posting <id>: <reason>` and nothing else. Scoring already told the two apart (ADR-023): a `ScoreError` is a down model, a reply that does not parse leaves the posting as it was.
 
 > **Amended: loopback deadlines (#30).** The scoring, embedding and SearXNG clients share one exchange with a total deadline: 120 seconds for scoring, 60 for embedding and 30 for discovery. The lookup, the connect, the reply headers and the body all count against it, and a watchdog shuts the socket down when it passes.
@@ -773,3 +775,26 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 **Trade-offs.**
 - At the default 300 seconds and a 60-minute interval, a slow model may score only one posting per run; the rest wait their turn.
 - A given-up posting is never scored, so it never alerts. It stays visible only as a count in `doctor`.
+
+## ADR-026: The scorer takes the operator's own criteria from a file in the data folder
+
+**Context.**
+- The scorer's prompt is built from structured config only: lanes, location rules, hard gates, `gap_tiers`, the resume and labelled examples. Preferences that don't fit a field, stated in plain words, had no way in, and a note kept elsewhere in the data folder was never read.
+- Whether a missing requirement is minor or core is exactly where such preferences matter.
+
+**Decision.**
+- **One file, named in config.** `search.criteria_file` is a path relative to the data folder (for example `criteria.md`). Unset or null means no criteria: the request has no `criteria` key and the system prompt says nothing about them. No other file is ever read for this.
+- **The file stays in the data folder.** The path is resolved with every symlink followed, and must land inside the data folder. Config validation refuses an absolute path or one starting with `~`; reading refuses anything that resolves outside, a file that isn't a regular file, one others can read, one that isn't UTF-8, an empty one, and one over 4,000 characters (about 1,000 tokens, which a slow local model reads in seconds, not minutes).
+- **Weighed, never required.** The text goes in the user message as `criteria`, and the system prompt tells the model they are the candidate's own stated preferences, to weigh when deciding whether a gap is minor or core, and never to list them as gaps or requirements.
+- **A file that can't be used holds scoring.** Scoring without criteria the operator expects to be applied would give scores that silently ignore them, so the run holds scoring, as for a resume that can't be used. The `criteria` component (search migration 0027) records the fixed reason, and the bot tells the operator after the first run it holds, not after `health.failure_runs`, because a setting won't fix itself; it says when scoring resumes. `doctor` shows whether the key is set, the file's size against the cap, and the reason when it can't be used.
+- **No re-score on a change.** Unlike the resume (ADR-023), the file's contents are not part of a score's checked key, so editing it applies to postings scored from then on.
+- **Nothing is logged.** No log line, doctor line or bot message carries the path or the text, only fixed reasons and sizes.
+
+**Alternatives.**
+- Truncating a file over the cap. Rejected: the criteria that were cut would be dropped without notice.
+- Free text inside `config.yaml`. Rejected: a long multi-line text is awkward in YAML, and config is validated and backed up as settings, not notes.
+- Re-scoring on every change. Left out for now: a re-score costs a slow model call per stored posting.
+
+**Trade-offs.**
+- A mistake in the file (wrong permissions, too long) stops scoring until it is fixed, though the bot and `doctor` say so at once.
+- Postings scored before an edit keep the gaps they were given.

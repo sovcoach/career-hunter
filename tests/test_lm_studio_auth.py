@@ -148,7 +148,9 @@ def test_another_status_stays_unreachable() -> None:
 
 def test_a_refused_token_is_an_unauthorized_embedding_error() -> None:
     with pytest.raises(embed.EmbedError) as caught:
-        embed.embed_text("synthetic text", transport=_answering(401))
+        embed.embed_text(
+            "synthetic text", model="example-embedding-model", transport=_answering(401)
+        )
     assert caught.value.reason == "unauthorized" and caught.value.down
     assert embed.miss_line(7, "unauthorized") == "embedding miss posting 7: unauthorized"
 
@@ -210,6 +212,7 @@ def test_migration_0022_keeps_every_health_row(tmp_path: Path) -> None:
             "lm_studio": (0, None, None),
             "searxng": (1, "throttled", STAMP),
             "boards": (0, None, None),
+            "criteria": (0, None, None),  # added by 0027
         }
         with db.transaction(conn):
             search_store.record_component(conn, "lm_studio", failed="unauthorized", stamp=STAMP)
