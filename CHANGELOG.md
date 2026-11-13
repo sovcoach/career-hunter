@@ -7,6 +7,20 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Scoring criteria in plain words (ADR-026). `search.criteria_file` names a text file in the data folder, such as `criteria.md`. Its text goes in each scoring request as your own stated criteria, and the model is told to weigh them when it marks a gap minor or core. The file must stay inside the data folder once symlinks are resolved, be owner-only UTF-8 text, and be at most 4,000 characters. A file that can't be used holds scoring until it is fixed; the bot's health message says why after the first run it holds, and says when scoring resumes (search migration 0027). `doctor` has a `criteria` line. A change to the file does not re-score anything.
+- Each scoring call's end and duration are recorded (search migration 0026, `score_calls`), with its outcome. `doctor`'s `scoring calls` line shows the median and longest answered call of the last 14 days beside `scoring.timeout_seconds`, and warns when the longest reaches 90% of it.
+
+### Changed
+- With no `scoring.embedding_model`, embeddings are off: no embedding request, no `embedding miss` line, no cosine. An unset model used to send `local-embedding`.
+- The bot's **Other…** skip reason records the skip at once as `other`, then asks for your words; your reply replaces `other` on that skip.
+- `search.db` moves from schema version 25 (0.5.1) to 27, through search migrations 0026 and 0027. The EI record stays at version 3. See the new "Upgrading from 0.5.1 to 0.6.0" in `docs/SETUP.md`; the earlier upgrade notes stay as released.
+
+### Fixed
+- A Skipped reason (or any other button) could be lost: when a call to Telegram stalled, the tap was answered too late, Telegram refused the answer, and nothing was recorded. A tap is now answered first with a 10-second limit, a failed answer is only logged, and the skip is recorded before any other Telegram call. Spent buttons are taken off afterwards.
+- A connection to Telegram whose IPv6 address hangs no longer holds a call for 65 seconds: each address gets 5 seconds to open before the next is tried.
+- The bot log names the method, the error code and Telegram's own reason when a call is refused, instead of only `TelegramRejected`. No message text is logged.
+
 ## [0.5.1] - 2026-11-12
 
 ### Added
