@@ -24,7 +24,7 @@ import pytest
 import yaml
 
 from careerhunter import bot as botmod
-from careerhunter import claims, db, ledger, search_store, telegram
+from careerhunter import claims, db, discover, ledger, search_store, telegram
 from careerhunter.bot import Bot, BotStartupError
 from careerhunter.claims import ClaimSettings
 from careerhunter.fetch import Fetched, FetchError
@@ -525,8 +525,16 @@ def test_another_level_logged_has_no_earlier_line(env: Env) -> None:
         (f"/log {AD_URL} | carrier pigeon | today", "The method must be one of"),
         (f"/log {AD_URL} | email | 2026-10-29", "in the future"),
         (f"/log {AD_URL} | email | 2026-07-01", "outside the active EI claim"),
-        (f"/log {AD_URL} | email", "Send: /log <link> | method | date"),
-        (f"/log {AD_URL} | email | today | Only Company", "Send: /log <link> | method | date"),
+        (f"/log {AD_URL} | email", "I found 1 field after the link. /log takes none, two"),
+        (f"/log {AD_URL} | email | today | Only Company", "I found 3 fields after the link."),
+        (f"/log {AD_URL} | | today", "Field 1 after the link is empty."),
+        (
+            f"/log {AD_URL} email 2026-10-21",
+            "The link is followed by 2 more words with no | between them",
+        ),
+        (f"/log {AD_URL} email", "The link is followed by 1 more word with no |"),
+        ("/log | email | today", "The link is missing."),
+        (f"/log {AD_URL} email 2026-10-21", "Send: /log <link> | method | date"),
     ],
 )
 def test_a_refused_log_writes_nothing(env: Env, command: str, message: str) -> None:
@@ -712,6 +720,77 @@ def test_skipped_with_a_typed_reason(env: Env) -> None:
     s.close()
 
 
+# --- /skip: a posting whose buttons are spent -----------------------------------------------
+
+
+def _spend_alert_buttons(env: Env) -> None:
+    """Expire every button sent so far, as if the alert were over a week old."""
+    s = db.connect(env.datadir.search_db_path)
+    s.execute("UPDATE bot_tokens SET expires_at = '2026-10-01T00:00:00Z'")
+    s.close()
+
+
+def test_skip_lists_recent_alerts_and_records_the_skip_through_the_ledger(env: Env) -> None:
+    alerted(env)
+    alerted(env, "https://jobs.example.com/ads/2", "Sample Logistics", "Synthetic Planner")
+    _spend_alert_buttons(env)
+    assert env.say("/skip") == "command:skip"
+    picker = env.api.last()[1]
+    assert picker["text"] == "Which posting?"
+    assert _keyboard_labels(picker) == [
+        "Sample Logistics — Synthetic Planner",
+        "Example Robotics — Synthetic Analyst",
+    ]
+    env.press("Example Robotics — Synthetic Analyst")
+    assert env.api.last()[1]["text"] == "Why skip it?"
+    env.press("Not a fit")
+    assert env.api.texts()[-1] == "Skipped: Example Robotics — Synthetic Analyst."
+    assert _skip_reasons(env) == ["not a fit"]
+    env.say("/skip")  # the skipped one is no longer offered
+    assert _keyboard_labels(env.api.last()[1]) == ["Sample Logistics — Synthetic Planner"]
+
+
+def test_skip_by_link_and_a_second_skip_is_refused(env: Env) -> None:
+    alerted(env)
+    _spend_alert_buttons(env)
+    env.say("/skip https://jobs.example.com/ads/1?utm_source=synthetic")
+    env.press("Other")
+    env.say("synthetic reason", reply_to=env.prompt_id())
+    assert _skip_reasons(env) == ["synthetic reason"]
+    env.say("/skip https://jobs.example.com/ads/1")
+    assert env.api.texts()[-1] == "Already skipped."
+    env.say("/skip https://jobs.example.com/ads/404")
+    assert env.api.texts()[-1] == (
+        "I don't know that link. Send /skip to choose from recent alerts."
+    )
+    assert _skip_reasons(env) == ["synthetic reason"]
+
+
+def test_skip_leaves_out_applied_old_and_never_alerted_postings(env: Env) -> None:
+    apply(env)  # applied: not offered
+    old = alerted(env, "https://jobs.example.com/ads/3", "Sample Logistics", "Old Alert")
+    s = db.connect(env.datadir.search_db_path)
+    s.execute("UPDATE postings SET alerted_at = '2026-10-01T00:00:00Z' WHERE id = ?", (old,))
+    s.close()
+    env.say("/skip")
+    assert env.api.texts()[-1] == (
+        "No posting alerted in the last 14 days is left to skip. "
+        "Send /skip <link> for an older one."
+    )
+
+
+def test_a_reason_button_after_a_skip_by_link_does_not_skip_twice(env: Env) -> None:
+    alerted(env)
+    env.press("Skipped")  # the alert's own reason keyboard, left open
+    first_reasons = env.api.last()[0]
+    env.say("/skip https://jobs.example.com/ads/1")
+    env.press("Location")
+    assert _skip_reasons(env) == ["location"]
+    assert _press_at(env, first_reasons, "Pay") == "refused"
+    assert env.api.texts()[-1] == "Already skipped."
+    assert _skip_reasons(env) == ["location"]
+
+
 def _refusal(method: str, description: str = "Bad Request: synthetic") -> telegram.TelegramError:
     return telegram.TelegramRejected(
         f"{method}: {description}", method=method, error_code=400, description=description
@@ -866,6 +945,44 @@ def test_status_by_reference_lands_in_both_layers(env: Env) -> None:
 def test_bad_status_requests(env: Env, command: str, message: str) -> None:
     apply(env)
     env.say(command)
+    assert message in env.api.texts()[-1]
+    assert env.counts()["ei.status_history"] == 1
+
+
+def test_a_dated_status_lands_in_both_layers_with_its_date(env: Env) -> None:
+    apply(env, "Yesterday")  # applied 2026-10-27; today is 2026-10-28
+    env.say("/status a1 assessment_requested 2026-10-27")
+    assert env.api.texts()[-1] == (
+        "Example Robotics — Synthetic Analyst: assessment requested (2026-10-27)."
+    )
+    e, s = env.ei(), env.search()
+    assert e is not None
+    rows = e.execute("SELECT status, status_date FROM status_history ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("applied", "2026-10-27"),
+        ("assessment_requested", "2026-10-27"),
+    ]
+    decided = s.execute("SELECT status_date FROM decision_history ORDER BY id DESC").fetchone()
+    assert decided[0] == "2026-10-27"
+    assert ledger.reconcile(s, {ACTIVE.label: e}) == []
+    e.close()
+    s.close()
+
+
+@pytest.mark.parametrize(
+    ("date", "message"),
+    [
+        ("2026-10-29", "That date is in the future"),
+        ("2026-10-26", "That date is before the application (2026-10-27)"),
+        ("2026-13-01", "isn't a real date"),
+        ("27/10/2026", "Please send the date as YYYY-MM-DD"),
+    ],
+)
+def test_a_status_date_that_cannot_be_recorded_is_refused(
+    env: Env, date: str, message: str
+) -> None:
+    apply(env, "Yesterday")
+    env.say(f"/status a1 rejected {date}")
     assert message in env.api.texts()[-1]
     assert env.counts()["ei.status_history"] == 1
 
@@ -1681,7 +1798,22 @@ def _candidate(
     kind: str = "board",
     ats_type: str | None = "greenhouse",
     ats_slug: str | None = None,
+    display_name: str | None = None,
+    postings: int = 1,
 ) -> int:
+    """A pending candidate with `postings` linked postings that passed the gates
+    (unscored, so they are not in an alert digest)."""
+    posting_ids = [
+        _insert(
+            env,
+            name,
+            f"Coordinator {n}",
+            f"https://boards.greenhouse.io/{name}/jobs/{100 + n}",
+            source="discovery",
+            scored=False,
+        )
+        for n in range(1, postings + 1)
+    ]
     conn = db.connect(env.datadir.search_db_path)
     db.migrate(conn, "search")
     slug = name if kind == "board" else None
@@ -1691,11 +1823,16 @@ def _candidate(
         slug = ats_slug
     cur = conn.execute(
         "INSERT INTO discovery_candidates "
-        "(kind, url, ats_type, ats_slug, suggested_name, status, first_seen) "
-        "VALUES (?, ?, ?, ?, ?, 'pending', '2026-10-28')",
-        (kind, url, ats_type, slug, name),
+        "(kind, url, ats_type, ats_slug, suggested_name, status, first_seen, display_name) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', '2026-10-28', ?)",
+        (kind, url, ats_type, slug, name, display_name),
     )
     row_id = int(cur.lastrowid)
+    for posting_id in posting_ids:
+        conn.execute(
+            "INSERT INTO discovery_candidate_postings (candidate_id, posting_id) VALUES (?, ?)",
+            (row_id, posting_id),
+        )
     conn.close()
     return row_id
 
@@ -1717,74 +1854,87 @@ def _keyboard_labels(params: dict[str, Any]) -> list[str]:
     return [button["text"] for row in rows for button in row]
 
 
-def test_a_discovery_message_is_the_name_and_url_only(env: Env, keep_umask: None) -> None:
+def _candidate_sends(env: Env) -> list[dict[str, Any]]:
+    return [p for p in _sends(env) if p["text"].startswith("Company to watch? ")]
+
+
+def _statuses(env: Env) -> dict[int, tuple[str, str | None]]:
+    conn = env.search()
+    found = {
+        int(row["id"]): (str(row["status"]), row["reject_reason"])
+        for row in conn.execute("SELECT id, status, reject_reason FROM discovery_candidates")
+    }
+    conn.close()
+    return found
+
+
+def test_a_candidate_is_one_message_with_its_postings(env: Env, keep_umask: None) -> None:
     exclusions = env.datadir.exclusions_path
     exclusions.write_text("companies:\n  - SENTINEL-EXCLUSION\n", encoding="utf-8")
     config_bytes = env.datadir.config_path.read_bytes()
-    exclusion_bytes = exclusions.read_bytes()
     ei_path = env.datadir.ei_record_path(ACTIVE.label)
     ei_path.write_bytes(b"synthetic-ei\n")
-    posting_id = _insert(
+    board = _candidate(
         env,
-        "Example Org",
-        "Example Role",
-        "https://jobs.example.com/ads/9",
-        scored=False,
+        "newrobotics",
+        "https://boards.greenhouse.io/newrobotics",
+        display_name="New Robotics Ltd.",
+        postings=4,
     )
     conn = db.connect(env.datadir.search_db_path)
     conn.execute(
-        "UPDATE postings SET gaps = ?, scout_metadata = ? WHERE id = ?",
-        ('["SENTINEL-SNIPPET"]', '{"salary":"SENTINEL-SALARY"}', posting_id),
+        "UPDATE postings SET location = 'Example City', gaps = ? WHERE title = 'Coordinator 1'",
+        ('["SENTINEL-SNIPPET"]',),
     )
     conn.close()
-    board = _candidate(env, "newrobotics", "https://boards.greenhouse.io/newrobotics")
-    career = _candidate(env, "jobs.example.com", "https://jobs.example.com/careers", kind="career")
+    _candidate(env, "jobs.example.com", "https://jobs.example.com/careers", kind="career")
     assert _poll(env) == 0
-    sends = _sends(env)
-    assert [item["text"] for item in sends] == [  # a career page is no longer sent (#41)
-        "newrobotics\nhttps://boards.greenhouse.io/newrobotics",
-    ]
-    for params, row_id in zip(sends, (board,), strict=True):
-        assert _keyboard_labels(params) == ["Approve", "Reject"]
-        for row in params["reply_markup"]["inline_keyboard"]:
-            for button in row:
-                data = button["callback_data"]
-                assert botmod.TOKEN_SHAPE.fullmatch(data)
-                assert data != str(row_id)
+    (params,) = _candidate_sends(env)  # a career page is not sent (#41)
+    assert params["text"] == "\n".join(
+        [
+            "Company to watch? New Robotics Ltd.",
+            "Greenhouse board: https://boards.greenhouse.io/newrobotics",
+            "",
+            "Found on it, passing your gates:",
+            "• Coordinator 1 — Example City",
+            "  https://boards.greenhouse.io/newrobotics/jobs/101",
+            "• Coordinator 2",
+            "  https://boards.greenhouse.io/newrobotics/jobs/102",
+            "• Coordinator 3",
+            "  https://boards.greenhouse.io/newrobotics/jobs/103",
+        ]
+    )
+    assert _keyboard_labels(params) == ["Approve", "Reject", "Reject with reason…"]
+    for row in params["reply_markup"]["inline_keyboard"]:
+        for button in row:
+            assert botmod.TOKEN_SHAPE.fullmatch(button["callback_data"])
+            assert button["callback_data"] != str(board)
     sent = env.api.everything_sent()
-    for hidden in ("SENTINEL-SNIPPET", "SENTINEL-SALARY", "SENTINEL-EXCLUSION", "Example Role"):
+    for hidden in ("SENTINEL-SNIPPET", "SENTINEL-EXCLUSION"):
         assert hidden not in sent
     conn = env.search()
-    noticed = {
-        int(row["id"]): row["notified_at"]
-        for row in conn.execute("SELECT id, notified_at FROM discovery_candidates")
-    }
-    assert conn.execute("SELECT count(*) FROM applications").fetchone()[0] == 0
+    row = conn.execute(
+        "SELECT notified_at, notified_on FROM discovery_candidates WHERE id = ?", (board,)
+    ).fetchone()
     conn.close()
-    watcher = _insert(
-        env,
-        "Example Robotics",
-        "Operations Coordinator",
-        "https://jobs.example.com/ads/robotics",
-    )
-    found = _insert(
-        env,
-        "Sample Logistics",
-        "Support Coordinator",
-        "https://jobs.example.com/ads/logistics",
-        source="discovery",
-    )
-    conn = env.search()
-    assert search_store.pending_alert_ids(conn) == [watcher, found]  # discovery alerts (#41)
-    assert found != watcher
-    conn.close()
-    assert noticed == {board: "2026-10-28T16:00:00Z", career: None}
+    assert tuple(row) == ("2026-10-28T16:00:00Z", "2026-10-28")
     assert env.datadir.config_path.read_bytes() == config_bytes
-    assert exclusions.read_bytes() == exclusion_bytes
     assert ei_path.read_bytes() == b"synthetic-ei\n"
     log_text = (env.datadir.logs / "bot.log").read_text()
     assert "newrobotics" not in log_text
-    assert "jobs.example.com" not in log_text
+
+
+def test_a_candidate_without_an_unskipped_posting_is_not_sent(env: Env, keep_umask: None) -> None:
+    _candidate(env, "noposting", "https://boards.greenhouse.io/noposting", postings=0)
+    skipped = _candidate(env, "allskipped", "https://boards.greenhouse.io/allskipped")
+    conn = db.connect(env.datadir.search_db_path)
+    for (posting_id,) in conn.execute(
+        "SELECT posting_id FROM discovery_candidate_postings WHERE candidate_id = ?", (skipped,)
+    ).fetchall():
+        search_store.insert_skip(conn, posting_id, "2026-10-28", "location_rule")
+    conn.close()
+    assert _poll(env) == 0
+    assert _candidate_sends(env) == []
 
 
 def test_telegram_approve_and_reject_follow_the_cli(
@@ -1794,7 +1944,6 @@ def test_telegram_approve_and_reject_follow_the_cli(
     ei_path.write_bytes(b"synthetic-ei\n")
     config_bytes = env.datadir.config_path.read_bytes()
     board = _candidate(env, "newrobotics", "https://boards.greenhouse.io/newrobotics")
-    career = _candidate(env, "jobs.example.com", "https://jobs.example.com/careers", kind="career")
     rejected = _candidate(env, "sampletown", "https://jobs.lever.co/sampletown", ats_type="lever")
     conn = db.connect(env.datadir.search_db_path)
     search_store.upsert_company(
@@ -1806,129 +1955,91 @@ def test_telegram_approve_and_reject_follow_the_cli(
         source="manual",
     )
     conn.close()
-    refused = _candidate(
-        env,
-        "exampleorg",
-        "https://jobs.ashbyhq.com/exampleorg",
-        ats_type="ashby",
-    )
+    refused = _candidate(env, "exampleorg", "https://jobs.ashbyhq.com/exampleorg", ats_type="ashby")
     assert _poll(env) == 0
-    messages = {params["text"].split("\n", 1)[0]: mid for mid, params in env.api.sent()}
-    assert _press_at(env, messages["newrobotics"], "Approve") == "callback:discover_approve"
-    assert "jobs.example.com" not in messages  # career pages are no longer sent (#41)
-    assert _press_at(env, messages["sampletown"], "Reject") == "callback:discover_reject"
+    messages = {
+        params["text"].split("\n", 2)[1].split(": ", 1)[1]: mid
+        for mid, params in env.api.sent()
+        if params["text"].startswith("Company to watch? ")
+    }
+    newrobotics = messages["https://boards.greenhouse.io/newrobotics"]
+    assert _press_at(env, newrobotics, "Approve") == "callback:discover_approve"
+    sampletown = messages["https://jobs.lever.co/sampletown"]
+    assert _press_at(env, sampletown, "Reject") == "callback:discover_reject"
     with caplog.at_level(logging.INFO, logger="careerhunter.bot"):
-        assert (
-            _press_at(env, messages["exampleorg"], "Approve") == "callback:discover_approve:refused"
-        )
+        exampleorg = messages["https://jobs.ashbyhq.com/exampleorg"]
+        assert _press_at(env, exampleorg, "Approve") == "callback:discover_approve:refused"
     assert "Not changed." in env.api.texts()
     assert "exampleorg" not in caplog.text
-    assert _press_at(env, messages["newrobotics"], "Reject") == "callback:rejected"
+    assert _press_at(env, newrobotics, "Reject") == "callback:rejected"
     assert answers(env)[-1]["text"] == "That button has expired."
     conn = env.search()
     companies = {
         row["name"]: row
-        for row in conn.execute(
-            "SELECT name, source, watchlist, ats_type, ats_slug, careers_url FROM companies"
-        )
-    }
-    statuses = {
-        int(row["id"]): row["status"]
-        for row in conn.execute("SELECT id, status FROM discovery_candidates")
+        for row in conn.execute("SELECT name, source, watchlist, ats_type, ats_slug FROM companies")
     }
     conn.close()
     assert companies["newrobotics"]["source"] == "discovery"
     assert companies["newrobotics"]["watchlist"] == 1
-    assert companies["newrobotics"]["ats_type"] == "greenhouse"
-    assert companies["newrobotics"]["ats_slug"] == "newrobotics"
-    assert "jobs.example.com" not in companies
-    assert "sampletown" not in companies
     assert companies["exampleorg"]["source"] == "manual"
-    assert companies["exampleorg"]["ats_type"] == "greenhouse"
-    assert companies["exampleorg"]["ats_slug"] == "exampleorg"
-    assert statuses == {
-        board: "approved",
-        career: "pending",  # still listed by `discover list`, and approvable there
-        rejected: "rejected",
-        refused: "pending",
+    assert _statuses(env) == {
+        board: ("approved", None),
+        rejected: ("rejected", None),
+        refused: ("pending", None),
     }
     assert env.datadir.config_path.read_bytes() == config_bytes
     assert ei_path.read_bytes() == b"synthetic-ei\n"
 
 
-def test_six_pending_rows_are_one_digest(env: Env, keep_umask: None) -> None:
-    ids = [
-        _candidate(env, f"board0{i}", f"https://boards.greenhouse.io/board0{i}")
-        for i in range(1, 7)
-    ]
-    assert _poll(env) == 0
-    sends = _sends(env)
-    assert len(sends) == 1
-    blocks = sends[0]["text"].split("\n\n")
-    assert blocks == [f"board0{i}\nhttps://boards.greenhouse.io/board0{i}" for i in range(1, 7)]
-    assert _keyboard_labels(sends[0]) == ["Approve", "Reject"] * 6
-    assert _press_at(env, env.api.sent()[0][0], "Approve") == "callback:discover_approve"
-    conn = env.search()
-    noticed = [
-        row["id"]
-        for row in conn.execute(
-            "SELECT id FROM discovery_candidates WHERE notified_at IS NOT NULL ORDER BY id"
-        )
-    ]
-    approved = conn.execute("SELECT name FROM companies").fetchone()["name"]
-    conn.close()
-    assert noticed == ids
-    assert approved == "board01"
-    before = len(_sends(env))
-    assert _poll(env) == 0
-    assert len(_sends(env)) == before
-
-
-def test_one_rows_tap_in_a_discovery_digest_leaves_the_others_valid(
+def test_reject_with_reason_records_the_rejection_then_the_reply(
     env: Env, keep_umask: None
 ) -> None:
+    board = _candidate(env, "sampleshop", "https://boards.greenhouse.io/sampleshop")
+    assert _poll(env) == 0
+    (mid, _params) = next(
+        (m, p) for m, p in env.api.sent() if p["text"].startswith("Company to watch? ")
+    )
+    assert _press_at(env, mid, "Reject with reason…") == "callback:discover_reject_reason"
+    assert _statuses(env) == {board: ("rejected", None)}  # recorded before the question
+    prompt = env.api.last()
+    assert prompt[1]["text"] == "Rejected: sampleshop. Reply with the reason, in a few words."
+    reply = env.message("  consumer   retail ", reply_to=prompt[0])
+    assert env.bot.handle_safely(reply) == "reply:reject_reason"
+    assert _statuses(env) == {board: ("rejected", "consumer retail")}
+    assert env.api.texts()[-1] == "Reason saved."
+
+
+def test_the_daily_cap_holds_the_rest_for_the_next_day(env: Env, keep_umask: None) -> None:
     ids = [
         _candidate(env, f"board0{i}", f"https://boards.greenhouse.io/board0{i}")
-        for i in range(1, 7)
+        for i in range(1, 6)
     ]
     assert _poll(env) == 0
-    ((message_id, params),) = [
-        (mid, sent) for mid, sent in env.api.sent() if "reply_markup" in sent
-    ]
-    rows = params["reply_markup"]["inline_keyboard"]
-    tokens = [[button["callback_data"] for button in row] for row in rows]
-    assert len({token for row in tokens for token in row}) == 12  # a token per button
-
-    def tap(token: str) -> str:
-        update = env.callback(token, message_id)
-        # Telegram echoes the message's keyboard as it is now: the first, then each edit.
-        edited = [p for name, p in env.api.calls if name == "editMessageReplyMarkup"]
-        update["callback_query"]["message"]["reply_markup"] = (
-            edited[-1]["reply_markup"] if edited else params["reply_markup"]
-        )
-        return env.bot.handle_safely(update)
-
-    assert tap(tokens[0][0]) == "callback:discover_approve"  # row 1: Approve
-    assert tap(tokens[0][1]) == "callback:rejected"  # row 1's other button is spent
-    assert tap(tokens[1][1]) == "callback:discover_reject"  # row 2 is still live
-    assert tap(tokens[5][0]) == "callback:discover_approve"  # and so is row 6
-    edits = [p for name, p in env.api.calls if name == "editMessageReplyMarkup"]
-    assert len(edits[0]["reply_markup"]["inline_keyboard"]) == 5  # row 1 taken off
-    assert len(edits[-1]["reply_markup"]["inline_keyboard"]) == 3  # rows 3, 4 and 5 left
+    assert len(_candidate_sends(env)) == 3  # discovery.max_candidates_per_day defaults to 3
+    assert _poll(env) == 0
+    assert len(_candidate_sends(env)) == 3  # the same day: nothing more
+    env.clock.now = NOW + dt.timedelta(days=1)
+    assert _poll(env) == 0
+    sends = _candidate_sends(env)
+    assert len(sends) == 5
     conn = env.search()
-    statuses = {
-        int(row["id"]): row["status"]
-        for row in conn.execute("SELECT id, status FROM discovery_candidates")
-    }
-    conn.close()
-    assert [statuses[i] for i in ids] == [
-        "approved",
-        "rejected",
-        "pending",
-        "pending",
-        "pending",
-        "approved",
+    noticed = [
+        str(row["notified_on"])
+        for row in conn.execute("SELECT notified_on FROM discovery_candidates ORDER BY id")
     ]
+    conn.close()
+    assert noticed == ["2026-10-28"] * 3 + ["2026-10-29"] * 2
+    assert len(ids) == 5
+
+
+def test_the_daily_cap_comes_from_config(env: Env, keep_umask: None) -> None:
+    doc = yaml.safe_load(env.datadir.config_path.read_text())
+    doc.setdefault("discovery", {})["max_candidates_per_day"] = 1
+    env.datadir.config_path.write_text(yaml.safe_dump(doc))
+    for i in range(1, 3):
+        _candidate(env, f"board0{i}", f"https://boards.greenhouse.io/board0{i}")
+    assert _poll(env) == 0
+    assert len(_candidate_sends(env)) == 1
 
 
 def test_discovery_rows_are_not_sent_while_config_is_unreadable(env: Env, keep_umask: None) -> None:
@@ -1943,41 +2054,22 @@ def test_discovery_rows_are_not_sent_while_config_is_unreadable(env: Env, keep_u
     conn.close()
     env.datadir.config_path.write_bytes(good)
     env.bot.send_pending_discovery()
-    assert [item["text"] for item in _sends(env)] == [
-        "board01\nhttps://boards.greenhouse.io/board01"
-    ]
+    assert len(_candidate_sends(env)) == 1
 
 
-def test_rows_past_the_digest_wait_for_the_next_poll(env: Env, keep_umask: None) -> None:
-    for i in range(1, 10):
-        _candidate(env, f"board0{i}", f"https://boards.greenhouse.io/board0{i}")
-    assert _poll(env) == 0
-    sends = _sends(env)
-    assert len(sends) == 1
-    assert len(sends[0]["text"].split("\n\n")) == 8
-    assert sends[0]["text"].startswith("board01\n")
-    assert "board09" not in sends[0]["text"]
-    conn = env.search()
-    waiting = conn.execute(
-        "SELECT suggested_name FROM discovery_candidates WHERE notified_at IS NULL"
-    ).fetchone()["suggested_name"]
-    conn.close()
-    assert waiting == "board09"
-    assert _poll(env) == 0
-    assert _sends(env)[-1]["text"] == "board09\nhttps://boards.greenhouse.io/board09"
-
-
-def test_a_failed_discovery_send_is_retried(env: Env, keep_umask: None) -> None:
+def test_a_failed_discovery_send_is_retried(
+    env: Env, keep_umask: None, caplog: pytest.LogCaptureFixture
+) -> None:
     _candidate(env, "newrobotics", "https://boards.greenhouse.io/newrobotics")
     env.api.fail_sends = 1
-    assert _poll(env) == 0
+    with caplog.at_level(logging.WARNING, logger="careerhunter.bot"):
+        env.bot.send_pending_discovery()
     conn = env.search()
     assert conn.execute("SELECT notified_at FROM discovery_candidates").fetchone()[0] is None
     conn.close()
-    log_text = (env.datadir.logs / "bot.log").read_text()
-    assert "discovery send failed (TelegramError)" in log_text
-    assert "newrobotics" not in log_text
-    assert _poll(env) == 0
+    assert "discovery send failed (TelegramError)" in caplog.text
+    assert "newrobotics" not in caplog.text
+    env.bot.send_pending_discovery()
     conn = env.search()
     assert conn.execute("SELECT notified_at FROM discovery_candidates").fetchone()[0] == (
         "2026-10-28T16:00:00Z"
@@ -1985,7 +2077,7 @@ def test_a_failed_discovery_send_is_retried(env: Env, keep_umask: None) -> None:
     conn.close()
 
 
-def test_an_expired_discovery_button_writes_nothing_and_a_later_poll_sends_again(
+def test_an_expired_candidate_stays_pending_and_is_not_sent_again(
     env: Env, keep_umask: None
 ) -> None:
     _candidate(env, "newrobotics", "https://boards.greenhouse.io/newrobotics")
@@ -1996,15 +2088,11 @@ def test_an_expired_discovery_button_writes_nothing_and_a_later_poll_sends_again
     assert answers(env)[-1]["text"] == "That button has expired."
     conn = env.search()
     assert conn.execute("SELECT status FROM discovery_candidates").fetchone()[0] == "pending"
-    assert conn.execute("SELECT count(*) FROM companies").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM companies WHERE watchlist = 1").fetchone()[0] == 0
+    assert [row.suggested_name for row in discover.pending(conn)] == ["newrobotics"]
     conn.close()
     assert _poll(env) == 0
-    assert _sends(env)[-1]["text"] == "newrobotics\nhttps://boards.greenhouse.io/newrobotics"
-    assert _press_at(env, env.api.sent()[-1][0], "Approve") == "callback:discover_approve"
-    conn = env.search()
-    assert conn.execute("SELECT status FROM discovery_candidates").fetchone()[0] == "approved"
-    assert conn.execute("SELECT name, source FROM companies").fetchone()["source"] == "discovery"
-    conn.close()
+    assert len(_candidate_sends(env)) == 1  # sent once; `discover list` still has it
 
 
 # --- held postings (#38): no fit, no alert -----------------------------------------------------

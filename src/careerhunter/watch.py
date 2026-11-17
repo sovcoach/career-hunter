@@ -59,7 +59,7 @@ stops once less than SCORE_RESERVE seconds of the budget are left, so the passes
 the boards always get time. A stored posting on a fetched board whose score was made
 with another resume (or none) is queued for re-scoring with its description, which
 stays in memory only. After the boards, under the budget, come never-scored postings,
-then the queued re-scores, then re-scores from the stored fields. Never-scored postings
+then the queued re-scores, then the other re-scores. Never-scored postings
 go first come, first served: by the last score attempt, or by when the posting was
 stored (`created_at`) if it was never tried, then by id. A posting that keeps failing
 goes behind what was stored before its last attempt, and new arrivals can't push it
@@ -67,6 +67,16 @@ back forever. Within each re-score pass the order is the last score attempt
 (never-tried first), then the oldest posting. A posting with a skip or an application
 keeps its score and is not re-scored. An alerted posting is re-scored and not alerted
 again. A failed re-score keeps the old score, fit and hash.
+
+The gate before scoring (ADR-027). Nothing is scored on its stored fields alone. Just
+before each call, the posting is gated again (`filters.decide`, every check) with its
+full description: the one this run's board read gave it, or else one read again from
+its board, through the single-posting endpoint (an Ashby board, which has none, is read
+once per run and kept in memory). A posting its board no longer has is skipped as
+`gone`; one with neither a usable key nor a link is skipped as `no_reference`; one
+that could not be read (a fetch error, HTTP 429, which blocks that host for the run,
+or another status) is left for the next run, unscored. The description is still never
+stored.
 
 The fit. A score stores the fit of its tier, from that tier's `fit` key in config
 (`config.tier_fits`), in the same UPDATE as the score. A tier name that is not in
@@ -120,6 +130,7 @@ from typing import Any, Literal, NamedTuple, NoReturn, Self, SupportsIndex
 
 from careerhunter import ats as ats_boards
 from careerhunter import db, filters, lanes, search_store
+from careerhunter import discover as discovery
 from careerhunter.ats import (
     BoardHTTPError,
     BoardParseError,
@@ -136,6 +147,7 @@ from careerhunter.config import (
 from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.deadline import Deadline
 from careerhunter.discover import Pass
+from careerhunter.discover import posting as discovered_posting
 from careerhunter.embed import Embedder, miss_line
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout, FetchTooLarge
 from careerhunter.filters import PostingText
@@ -230,6 +242,13 @@ class _State:
     score_timeout: float = 120.0  # scoring.timeout_seconds: a call needs this much budget
     criteria_failure: str | None = None  # why the criteria file held scoring this run
     criteria_ok: bool = False  # scoring was not held for the criteria file
+    # Each watchlist company's role filters, by folded name, for the gate before scoring.
+    roles: Mapping[str, Mapping[str, Any] | None] = field(default_factory=dict)
+    # Ashby boards read this run for a description, by board key: the jobs by their id.
+    # In memory only, like every description.
+    ashby: dict[str, dict[str, Job]] = field(default_factory=dict)
+    # Stored postings met on their board this run, with the description it sent.
+    met: dict[int, PostingText] = field(default_factory=dict)
 
     def out_of_time(self) -> bool:
         return self.budget is not None and self.budget.expired()
@@ -405,6 +424,8 @@ def run(
             scorer,
             embedder,
         )
+        with _isolated(conn, lines, "discovery links", state.hook):
+            _link_discovered(conn, state, found)
     counts = {"fetched": 0, "failed": 0, "left": 0}
     for item in _by_last_attempt(conn, _with_discovery_boards(conn, watchlist)):
         entry = _entry(item)
@@ -435,6 +456,7 @@ def run(
         else:
             with _isolated(conn, lines, "embedding refresh", state.hook):
                 lines.extend(embedder.refresh())
+    state.roles = _roles(watchlist)
     rechecked = False
     if state.out_of_time():
         state.left_by_budget(f"watch: recheck: {_LEFT}")
@@ -445,7 +467,14 @@ def run(
             # Never score a row the current config has not filtered again.
             state.left_by_budget(f"watch: scoring: {_LEFT}")
         else:
-            _score_passes(conn, scorer, today, embedder, state)
+            _score_passes(
+                conn,
+                scorer,
+                today,
+                embedder,
+                state,
+                _Gate(rules, skipped, ats_boards.Client(fetcher, poster=poster), blocked),
+            )
     _finish_run(conn, state, run_id, counts, rules)
     lines.append(
         f"watch: {counts['fetched']} boards fetched, {counts['failed']} failed, "
@@ -894,6 +923,26 @@ def _record_discovered(
                 )
 
 
+def _link_discovered(conn: sqlite3.Connection, state: _State, found: Pass) -> None:
+    """Link each posting a discovery pass found that is stored with no skip to its
+    board's pending candidate, so the bot can send that candidate with it."""
+    linked = 0
+    for ref in found.postings:
+        with db.transaction(conn):
+            posting_id = search_store.posting_id_for(
+                conn, ats_boards.posting_key(ref), ats_boards.posting_url(ref)
+            )
+            if posting_id is None or search_store.posting_has_skip(conn, posting_id):
+                continue
+            candidate = discovery.candidate_for(conn, ref.board)
+            if candidate is not None and candidate[1] == "pending":
+                linked += discovery.link(conn, candidate[0], posting_id)
+    if linked:
+        state.lines.append(
+            f"discover: {linked} postings that passed the gates linked to candidates"
+        )
+
+
 def _fetch_posting(
     state: _State,
     blocked: set[str],
@@ -1079,6 +1128,8 @@ def _record_jobs(
         )
         if not inserted:
             existing += 1
+            if seen.description:
+                state.met[posting_id] = seen  # in memory, for the gate before scoring
             if scorer is not None and _needs_rescore(conn, posting_id, state.resume_sha256):
                 state.queued[posting_id] = seen  # scored after the boards
             continue
@@ -1130,9 +1181,7 @@ def _recheck(
     Postings inserted this run were filtered with the current config already. Returns
     whether every row was reached before the run budget ran out.
     """
-    roles = {
-        entry[0].casefold(): entry[3] for item in watchlist if (entry := _entry(item)) is not None
-    }
+    roles = _roles(watchlist)
     rows = conn.execute(
         "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, "
         "p.requisition_id, p.schedule, p.posted_date, p.first_seen FROM postings p "
@@ -1148,6 +1197,13 @@ def _recheck(
         with _isolated(conn, state.lines, str(row["company"]), state.hook):
             _recheck_one(conn, row, roles, config, exclusions, today, state.lines, state.max_age)
     return True
+
+
+def _roles(watchlist: Sequence[Any]) -> dict[str, Mapping[str, Any] | None]:
+    """Each watchlist company's role filters, by its folded name."""
+    return {
+        entry[0].casefold(): entry[3] for item in watchlist if (entry := _entry(item)) is not None
+    }
 
 
 def _partly(label: str, left: int) -> str:
@@ -1200,7 +1256,8 @@ def _recheck_one(
 # posting. A posting given up after PARSE_FAILURES_TO_GIVE_UP replies that did not
 # parse (search migration 0023) is in neither.
 _NEVER_SCORED_SQL = (
-    "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
+    "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
+    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
@@ -1209,7 +1266,8 @@ _NEVER_SCORED_SQL = (
     "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
-    "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id "
+    "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
+    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
@@ -1246,21 +1304,43 @@ def _stored_text(row: sqlite3.Row) -> PostingText:
     )
 
 
+@dataclass(frozen=True)
+class _Gate:
+    """What the gate before scoring needs: the rules, and a client to read descriptions."""
+
+    config: Mapping[str, Any]
+    exclusions: Mapping[str, Any]
+    client: ats_boards.Client
+    blocked: set[str]
+
+
+# Skip reasons from the gate before scoring (ADR-027). Not a filter's reason: the
+# posting itself could not be read again.
+GONE = "gone"  # no longer on its board
+NO_REFERENCE = "no_reference"  # nothing stored says where on its board it is
+
+
 def _score_passes(
     conn: sqlite3.Connection,
     scorer: Scorer,
     today: str,
     embedder: Embedder,
     state: _State,
+    gate: _Gate,
 ) -> None:
     """Never-scored postings, then queued re-scores, then re-scores from stored fields.
 
     A posting already sent to the scorer this run is not sent again. Within a pass the
     order is the last attempt (never-tried first), then the oldest posting.
+
+    Every posting is gated on its full description just before it is scored (ADR-027).
+    One read this run supplies it (a new posting, or a stored one met on its board);
+    otherwise it is read again from its board (`_described`). A posting that cannot be
+    read this run is left for the next run and is never scored on its stored fields.
     """
     never = conn.execute(_NEVER_SCORED_SQL).fetchall()
-    work: list[tuple[sqlite3.Row, PostingText]] = [
-        (row, state.held_new.get(int(row["id"])) or _stored_text(row))
+    work: list[tuple[sqlite3.Row, PostingText | None]] = [
+        (row, state.held_new.get(int(row["id"])) or state.met.get(int(row["id"])))
         for row in never
         if int(row["id"]) not in state.attempted
     ]
@@ -1271,8 +1351,12 @@ def _score_passes(
         work += [
             (row, state.queued[int(row["id"])]) for row in fresh if int(row["id"]) in state.queued
         ]
-        work += [(row, _stored_text(row)) for row in fresh if int(row["id"]) not in state.queued]
-    for index, (row, text) in enumerate(work):
+        work += [
+            (row, state.met.get(int(row["id"])))
+            for row in fresh
+            if int(row["id"]) not in state.queued
+        ]
+    for index, (row, known) in enumerate(work):
         left = len(work) - index
         if state.model_down:
             state.lines.append(
@@ -1282,18 +1366,130 @@ def _score_passes(
         if state.out_of_time() or state.short_for_a_call():
             state.left_by_budget(_partly("scoring", left))
             return
-        with _isolated(conn, state.lines, str(row["company"]), state.hook):
-            _attempt(
-                conn,
-                state,
-                int(row["id"]),
-                text,
-                scorer,
-                today,
-                str(row["company"]),
-                None,
-                embedder,
-            )
+        name = str(row["company"])
+        with _isolated(conn, state.lines, name, state.hook):
+            text = known if known is not None and known.description else None
+            if text is None:
+                text = _described(conn, state, gate, row, today)
+            if text is None or not _passes(conn, state, gate, row, text, today):
+                continue
+            _attempt(conn, state, int(row["id"]), text, scorer, today, name, None, embedder)
+
+
+def _passes(
+    conn: sqlite3.Connection,
+    state: _State,
+    gate: _Gate,
+    row: sqlite3.Row,
+    text: PostingText,
+    today: str,
+) -> bool:
+    """The full gate, with the description, right before the call. A skip is stored."""
+    posting_id = int(row["id"])
+    verdict = filters.decide(
+        text,
+        config=gate.config,
+        exclusions=gate.exclusions,
+        role_filters=state.roles.get(str(row["company"]).casefold()),
+        applied=search_store.posting_has_application(conn, posting_id),
+    )
+    with db.transaction(conn):
+        if verdict.reason:
+            if not search_store.posting_has_skip(conn, posting_id):
+                search_store.insert_skip(conn, posting_id, today, verdict.reason)
+        elif verdict.schedule != row["schedule"]:
+            search_store.set_posting_schedule(conn, posting_id, verdict.schedule)
+    if verdict.reason:
+        state.lines.append(
+            _line(str(row["company"]), None, f"{row['title']!r} skipped ({verdict.reason})")
+        )
+        return False
+    return True
+
+
+def _posting_ref(row: sqlite3.Row) -> ats_boards.PostingRef | None:
+    """Where the posting is on its board: its company's board and the id in its key, or
+    else its stored link read the way discovery reads one (Workday always: its key keeps
+    only the id, not the path)."""
+    ats, slug, key = row["ats_type"], row["ats_slug"], row["ats_key"]
+    if ats and slug and key and ats != "workday":
+        prefix = f"{ats}:{str(slug).casefold()}:"
+        if str(key).startswith(prefix) and len(str(key)) > len(prefix):
+            board = ats_boards.Board(str(ats), str(slug), row["ats_host"], row["ats_site"])
+            return ats_boards.PostingRef(board, str(key)[len(prefix) :])
+    return discovered_posting(str(row["url"])) if row["url"] else None
+
+
+def _described(
+    conn: sqlite3.Connection, state: _State, gate: _Gate, row: sqlite3.Row, today: str
+) -> PostingText | None:
+    """The stored posting with its description read again from its board, or None when
+    it was not read: skipped (`gone`, `no_reference`) or left for the next run."""
+    posting_id, name, title = int(row["id"]), str(row["company"]), repr(row["title"])
+    ref = _posting_ref(row)
+    if ref is None:
+        with db.transaction(conn):
+            if not search_store.posting_has_skip(conn, posting_id):
+                search_store.insert_skip(conn, posting_id, today, NO_REFERENCE)
+        state.lines.append(_line(name, None, f"{title} skipped ({NO_REFERENCE})"))
+        return None
+    ats = ref.board.ats
+    host = urllib.parse.urlsplit(ats_boards.list_url(ref.board) or "").hostname or ""
+    if host in gate.blocked:
+        state.lines.append(
+            _line(name, ats, f"{title}: {host} already returned HTTP 429 this run; {_UNREAD}")
+        )
+        return None
+    try:
+        job = _read_again(state, gate.client, ref, dt.date.fromisoformat(today))
+    except BoardHTTPError as exc:
+        if exc.status in (404, 410):
+            job = None
+        else:
+            if exc.status == 429:
+                gate.blocked.add(urllib.parse.urlsplit(exc.url).hostname or host)
+            state.lines.append(_line(name, ats, f"{title}: HTTP {exc.status}; {_UNREAD}"))
+            return None
+    except (FetchError, BoardParseError) as exc:
+        state.lines.append(_line(name, ats, f"{title}: {type(exc).__name__}; {_UNREAD}"))
+        return None
+    if job is None:
+        with db.transaction(conn):
+            if not search_store.posting_has_skip(conn, posting_id):
+                search_store.insert_skip(conn, posting_id, today, GONE)
+        state.lines.append(_line(name, ats, f"{title} skipped ({GONE})"))
+        return None
+    return PostingText(
+        company=name,
+        title=str(row["title"]),
+        location=str(row["location"] or ""),
+        work_model=row["work_model"],
+        description=job.description or "",  # read: an empty one is all the board has
+        requisition_id=row["requisition_id"],
+    )
+
+
+_UNREAD = "description not read; left for the next run"
+
+
+def _read_again(
+    state: _State, client: ats_boards.Client, ref: ats_boards.PostingRef, day: dt.date
+) -> Job | None:
+    """The posting from its board, or None when the board no longer has it. An Ashby
+    board has no single-posting endpoint, so it is read once per run and kept in
+    memory for the other postings on it."""
+    if ref.board.ats != "ashby":
+        return ats_boards.read_posting(ref, client, today=day)
+    jobs = state.ashby.get(ref.board.key)
+    if jobs is None:
+        read = ats_boards.read(ref.board, client)
+        jobs = {
+            job.requisition_id: job
+            for job in read.jobs
+            if isinstance(job, Job) and job.requisition_id is not None
+        }
+        state.ashby[ref.board.key] = jobs
+    return jobs.get(ref.ref)
 
 
 def _attempt(

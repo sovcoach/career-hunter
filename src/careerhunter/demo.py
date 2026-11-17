@@ -54,7 +54,6 @@ CONFIG: dict[str, Any] = {
         "location_rules": {
             "onsite_hybrid": ["Example City"],
             "remote": ["Example Region"],
-            "allow_travel_outside": False,
         },
         "resume": None,
     },

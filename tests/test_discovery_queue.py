@@ -113,7 +113,7 @@ def test_a_board_that_does_not_exist_is_gone_and_never_queued_again(
     outcome = run(conn, again, NEW)
     assert again.boards == []  # not even asked again
     assert rows(conn) == [("board", "greenhouse", "newrobotics", "gone")]
-    assert discover.due(conn, notified_before="2026-12-01T00:00:00Z") == []
+    assert discover.due(conn, today="2026-12-01", per_day=20) == []
     assert discover.pending(conn) == []
 
 

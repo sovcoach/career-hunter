@@ -97,7 +97,7 @@ def test_a_budget_cut_in_the_scoring_pass_sets_the_flag_and_counts_what_is_held(
         search,
         [],
         today=DAY,
-        fetcher=Scripted({}),
+        fetcher=Scripted({}, on_board=True),
         scorer=scorer,
         budget=minutes(clock, 10),
         config=FITS,

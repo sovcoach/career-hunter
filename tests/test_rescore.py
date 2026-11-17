@@ -18,7 +18,18 @@ from careerhunter.filters import PostingText
 from careerhunter.resume import Resume
 from careerhunter.score import Score, ScoreError
 from tests.fakes import FakeClock
-from tests.test_watch import DAY, Scripted, Timed, company, fetched, minutes, ticking, url
+from tests.test_watch import (
+    DAY,
+    STILL_LISTED,
+    OnBoard,
+    Scripted,
+    Timed,
+    company,
+    fetched,
+    minutes,
+    ticking,
+    url,
+)
 
 OLD = Resume("Avery Example, first version of a synthetic resume.", "a" * 64)
 NEW = Resume("Avery Example, second version of a synthetic resume.", "b" * 64)
@@ -194,7 +205,8 @@ def test_a_stored_posting_on_a_fetched_board_is_re_scored_after_the_boards_with_
 
 
 def test_passes_go_never_scored_then_queued_then_stored_fields(search: sqlite3.Connection) -> None:
-    # Stored with the old resume: one stays on a fetched board, one is gone from it.
+    # Stored with the old resume: one stays on a fetched board, one is gone from its list
+    # and is read again on its own before it is re-scored (ADR-027).
     seed(search, "examplerobotics", ("r1", "Listed"), ("r2", "Delisted"), resume=OLD)
     # Stored but never scored.
     run(
@@ -203,20 +215,43 @@ def test_passes_go_never_scored_then_queued_then_stored_fields(search: sqlite3.C
         ("samplelogistics",),
     )
     scorer = Recorder()
+    boards = {
+        board("examplerobotics"): lever("examplerobotics", ("r1", "Listed")),
+        board("samplelogistics"): lever("samplelogistics", ("s1", "Waiting")),
+    }
     run(
         search,
-        {
-            board("examplerobotics"): lever("examplerobotics", ("r1", "Listed")),
-            board("samplelogistics"): lever("samplelogistics", ("s1", "Waiting")),
-        },
+        boards,
         ("examplerobotics", "samplelogistics"),
+        fetcher=OnBoard(boards),
         scorer=scorer,
         resume=NEW,
     )
     assert titles(scorer) == ["Waiting", "Listed", "Delisted"]
-    listed, delisted = scorer.calls[1], scorer.calls[2]
+    waiting, listed, delisted = scorer.calls
+    assert waiting.description == f"{DESC} (Waiting)"  # met on its board this run
     assert listed.description == f"{DESC} (Listed)"
-    assert delisted.description is None  # from the stored fields only
+    assert delisted.description == STILL_LISTED  # read again: never the stored fields only
+
+
+def test_a_re_score_whose_posting_left_its_board_is_skipped_as_gone(
+    search: sqlite3.Connection,
+) -> None:
+    seed(search, "examplerobotics", ("r1", "Listed"), ("r2", "Delisted"), resume=OLD)
+    single = "https://api.lever.co/v0/postings/examplerobotics/r2?mode=json"
+    boards = {
+        board("examplerobotics"): lever("examplerobotics", ("r1", "Listed")),
+        single: fetched({}, status=404),
+    }
+    scorer = Recorder()
+    lines = run(search, boards, ("examplerobotics",), scorer=scorer, resume=NEW)
+    assert titles(scorer) == ["Listed"]
+    assert "watch: Examplerobotics (lever): 'Delisted' skipped (gone)" in lines
+    reasons = search.execute(
+        "SELECT s.reason FROM skips s JOIN postings p ON p.id = s.posting_id "
+        "WHERE p.title = 'Delisted'"
+    ).fetchall()
+    assert [r[0] for r in reasons] == ["gone"]
 
 
 def test_skipped_and_applied_postings_keep_their_score(search: sqlite3.Connection) -> None:
@@ -410,7 +445,7 @@ def test_a_posting_that_keeps_failing_goes_behind_the_others(search: sqlite3.Con
             search,
             [],
             today=DAY,
-            fetcher=Scripted({}),
+            fetcher=OnBoard({}),
             scorer=scorer,
             budget=minutes(clock, 10),
             now=ticking(),
@@ -433,7 +468,7 @@ def test_never_scored_postings_go_before_re_scores_and_the_rest_is_not_counted(
         search,
         [],
         today=DAY,
-        fetcher=Scripted({}),
+        fetcher=OnBoard({}),
         scorer=scorer,
         resume=NEW,
         budget=minutes(clock, 10),
@@ -450,7 +485,7 @@ def test_a_model_that_goes_down_stops_the_passes_and_counts_what_is_left(
     seed(search, "examplea", ("a1", "One"), ("a2", "Two"), ("a3", "Three"), resume=OLD)
     scorer = Recorder()
     scorer.replies["One"] = ScoreError("the local model could not be reached")
-    lines = w.run(search, [], today=DAY, fetcher=Scripted({}), scorer=scorer, resume=NEW)
+    lines = w.run(search, [], today=DAY, fetcher=OnBoard({}), scorer=scorer, resume=NEW)
     assert titles(scorer) == ["One"]
     assert "watch: scoring: model unreachable; 2 postings left for the next run" in lines
 
@@ -481,7 +516,7 @@ def test_a_budget_that_runs_out_during_a_call_keeps_the_postings_place(
         search,
         [],
         today=DAY,
-        fetcher=Scripted({}),
+        fetcher=OnBoard({}),
         scorer=slow_then_cut,
         budget=minutes(clock, 10),
         now=ticking(),

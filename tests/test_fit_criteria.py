@@ -156,7 +156,11 @@ def _set(path: str, value: Any) -> Any:
         (_set("search.lanes.0.titles", [["A", 3]]), "a title may be a list of variants"),
         (_set("search.lanes.0.colour", "red"), "unknown keys"),
         (_set("search.location_rules.remote", "Canada"), "location_rules.remote"),
-        (_set("search.location_rules.allow_travel_outside", "no"), "allow_travel_outside"),
+        (
+            _set("search.location_rules.allow_travel_outside", False),
+            "search.location_rules.allow_travel_outside is no longer a setting: delete that "
+            "line from config.yaml",
+        ),
         (_set("search.location_rules.radius", 5), "unknown keys"),
         (_set("fit_rubric.gap_tiers.tiers", []), "tiers must be a non-empty list"),
         (

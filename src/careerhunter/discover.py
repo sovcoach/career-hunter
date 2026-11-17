@@ -141,6 +141,33 @@ class Queued:
 
 
 @dataclass(frozen=True)
+class Found:
+    """A posting found on a candidate's board that passed the gates, as it is sent."""
+
+    title: str
+    location: str
+    url: str | None
+
+
+@dataclass(frozen=True)
+class Sendable:
+    """A candidate the bot may send: its row, the name its board's reply gave, and up
+    to MAX_SENT_POSTINGS of its linked postings that are still unskipped."""
+
+    row: Queued
+    display_name: str | None
+    postings: tuple[Found, ...]
+
+    @property
+    def name(self) -> str:
+        return self.display_name or self.row.suggested_name
+
+
+MAX_SENT_POSTINGS = 3
+MAX_REJECT_REASON = 500
+
+
+@dataclass(frozen=True)
 class Outcome:
     """`notice` is a closed stderr line. `rows` are the rows inserted on this run.
 
@@ -288,6 +315,33 @@ def classify(url: str, career_hosts: Sequence[str]) -> Hit | None:
     return Hit("career", f"https://{host}{path}", None, None, host)
 
 
+def candidate_for(conn: sqlite3.Connection, board: Board) -> tuple[int, str] | None:
+    """The queue row for this board, whatever its status: its id and status."""
+    key = _board_key(board.ats, board.slug, board.host, board.site)
+    for row in conn.execute(
+        "SELECT id, status, ats_type, ats_slug, ats_host, ats_site FROM discovery_candidates "
+        "WHERE kind = 'board' AND ats_type = ? AND ats_slug IS NOT NULL",
+        (board.ats,),
+    ):
+        found = _board_key(
+            str(row["ats_type"]), str(row["ats_slug"]), row["ats_host"], row["ats_site"]
+        )
+        if found == key:
+            return int(row["id"]), str(row["status"])
+    return None
+
+
+def link(conn: sqlite3.Connection, candidate_id: int, posting_id: int) -> bool:
+    """Link a posting that passed the gates to its board's candidate. False when it was
+    linked already."""
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO discovery_candidate_postings (candidate_id, posting_id) "
+        "VALUES (?, ?)",
+        (candidate_id, posting_id),
+    )
+    return cur.rowcount == 1
+
+
 def format_row(row: Queued) -> str:
     """id, kind, suggested name, ATS type, and the slug or career URL."""
     ats = row.ats_type if row.ats_type else "-"
@@ -303,28 +357,58 @@ def pending(conn: sqlite3.Connection) -> list[Queued]:
     return [_queued(row) for row in rows]
 
 
-def due(conn: sqlite3.Connection, *, notified_before: str) -> list[Queued]:
-    """Pending boards never sent, or last sent at or before `notified_before`.
+def due(conn: sqlite3.Connection, *, today: str, per_day: int) -> list[Sendable]:
+    """Candidates to send now, oldest first: pending boards never sent, each with at
+    least one linked posting that is still unskipped, at most `per_day` sent on
+    `today` (the configured date) counted with those already sent that day.
 
-    Career pages are no longer sent (#41); old pending ones stay listed by `pending`.
+    Each is sent once. One whose buttons expire stays pending, listed by `pending`.
+    Career pages are no longer sent (#41), and rows queued before search migration
+    0028 have no linked postings, so neither is sent.
     """
-    rows = conn.execute(
-        "SELECT id, kind, suggested_name, ats_type, ats_slug, url "
-        "FROM discovery_candidates "
-        "WHERE status = 'pending' AND kind = 'board' "
-        "AND (notified_at IS NULL OR notified_at <= ?) "
-        "ORDER BY id",
-        (notified_before,),
+    sent_today = int(
+        conn.execute(
+            "SELECT count(*) FROM discovery_candidates WHERE notified_on = ?", (today,)
+        ).fetchone()[0]
     )
-    return [_queued(row) for row in rows]
+    room = per_day - sent_today
+    if room <= 0:
+        return []
+    rows = conn.execute(
+        "SELECT id, kind, suggested_name, ats_type, ats_slug, url, display_name "
+        "FROM discovery_candidates c "
+        "WHERE status = 'pending' AND kind = 'board' AND notified_at IS NULL "
+        "AND EXISTS (SELECT 1 FROM discovery_candidate_postings l "
+        "WHERE l.candidate_id = c.id AND NOT EXISTS "
+        "(SELECT 1 FROM skips s WHERE s.posting_id = l.posting_id)) "
+        "ORDER BY id LIMIT ?",
+        (room,),
+    ).fetchall()
+    return [
+        Sendable(_queued(row), row["display_name"], _found(conn, int(row["id"]))) for row in rows
+    ]
 
 
-def mark_notified(conn: sqlite3.Connection, candidate_ids: Sequence[int], notified_at: str) -> None:
-    """Record that Telegram accepted the message for these rows."""
+def _found(conn: sqlite3.Connection, candidate_id: int) -> tuple[Found, ...]:
+    rows = conn.execute(
+        "SELECT p.title, p.location, p.url FROM discovery_candidate_postings l "
+        "JOIN postings p ON p.id = l.posting_id WHERE l.candidate_id = ? "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+        "ORDER BY p.id LIMIT ?",
+        (candidate_id, MAX_SENT_POSTINGS),
+    )
+    return tuple(Found(str(r[0]), str(r[1] or ""), r[2]) for r in rows)
+
+
+def mark_notified(
+    conn: sqlite3.Connection, candidate_ids: Sequence[int], notified_at: str, notified_on: str
+) -> None:
+    """Record that Telegram accepted the message for these rows, and on which day (the
+    configured date) for the daily cap."""
     for candidate_id in candidate_ids:
         conn.execute(
-            "UPDATE discovery_candidates SET notified_at = ? WHERE id = ?",
-            (notified_at, candidate_id),
+            "UPDATE discovery_candidates SET notified_at = ?, notified_on = ? WHERE id = ?",
+            (notified_at, notified_on, candidate_id),
         )
 
 
@@ -340,12 +424,39 @@ def approve(conn: sqlite3.Connection, candidate_id: int) -> Queued:
     return _queued(row)
 
 
-def reject(conn: sqlite3.Connection, candidate_id: int) -> Queued:
-    """Mark one pending row rejected. No company is inserted."""
+def reject(conn: sqlite3.Connection, candidate_id: int, reason: str | None = None) -> Queued:
+    """Mark one pending row rejected, with the operator's reason when one is given. No
+    company is inserted."""
+    clean = _reason(reason) if reason is not None else None
     row = _pending_row(conn, candidate_id)
     with db.transaction(conn):
         _mark(conn, candidate_id, "rejected")
+        if clean is not None:
+            conn.execute(
+                "UPDATE discovery_candidates SET reject_reason = ? WHERE id = ?",
+                (clean, candidate_id),
+            )
     return _queued(row)
+
+
+def set_reject_reason(conn: sqlite3.Connection, candidate_id: int, reason: str) -> bool:
+    """The operator's reason for a rejection already recorded with none. False when the
+    row is not rejected or has a reason already."""
+    clean = _reason(reason)
+    with db.transaction(conn):
+        cur = conn.execute(
+            "UPDATE discovery_candidates SET reject_reason = ? "
+            "WHERE id = ? AND status = 'rejected' AND reject_reason IS NULL",
+            (clean, candidate_id),
+        )
+    return cur.rowcount == 1
+
+
+def _reason(reason: str) -> str:
+    clean = " ".join(reason.split())
+    if not clean or len(clean) > MAX_REJECT_REASON:
+        raise DiscoverError(f"a reason is 1 to {MAX_REJECT_REASON} characters")
+    return clean
 
 
 def _utc_now() -> dt.datetime:
@@ -377,9 +488,14 @@ def run(
 
     The queue (#41): a board hit is queued only after `confirm` (one board-API request)
     says it exists, and never when it, or a company name the confirming reply gives,
-    is in `exclusions.companies`. A board that does not exist is stored as `gone` and
+    is in `exclusions.companies`. The first name that reply gives is kept as the
+    candidate's `display_name`. A board that does not exist is stored as `gone` and
     never queued again. Career pages are not queued: `discovery.career_hosts` only adds
     `site:` hosts. Without `confirm`, no board is queued.
+
+    A queued board is not sent yet: the watch run links each posting found on it that
+    is recorded with no skip (`link`), and the bot sends a candidate only while one of
+    its linked postings is still unskipped (`due`).
     """
     clock = now or _utc_now
     base = _configured_url(config)
@@ -442,13 +558,14 @@ def run(
     stored = _store(
         conn,
         config,
-        accepted,
+        [hit for hit, _name in accepted],
         today,
         career_hosts,
         cursor=after,
         gone=gone,
         stamp=_stamp(clock()),
         suspended=engines,
+        names={_hit_key(hit): name for hit, name in accepted if name},
     )
     return Outcome(
         None, tuple(stored), tuple(postings.values()), (*_suspended_notes(engines), *notes)
@@ -484,7 +601,7 @@ def _confirmed(
     exclusions: Mapping[str, Any],
     *,
     start: int = 0,
-) -> tuple[list[Hit], list[Hit], list[str]]:
+) -> tuple[list[tuple[Hit, str | None]], list[Hit], list[str]]:
     """The new boards to queue and the gone ones to record, with a note for each other.
 
     Boards already watched or in the queue (pending, approved, rejected or gone) and
@@ -497,7 +614,7 @@ def _confirmed(
     watched = _watched_boards(config)
     known = _known_boards(conn)
     excluded = _excluded_names(exclusions)
-    accepted: list[Hit] = []
+    accepted: list[tuple[Hit, str | None]] = []  # with the name the board's reply gave
     gone: list[Hit] = []
     notes: list[str] = []
     asked = 0
@@ -537,7 +654,8 @@ def _confirmed(
         elif answer.exists is None:
             notes.append(f"{who}: no postings to confirm it; not queued")
         else:
-            accepted.append(hit)
+            named = next((n.strip() for n in answer.names if n.strip()), None)
+            accepted.append((hit, named[:200] if named else None))
     return accepted, gone, notes
 
 
@@ -958,6 +1076,7 @@ def _store(
     gone: Sequence[Hit] = (),
     stamp: str | None = None,
     suspended: Sequence[str] = (),
+    names: Mapping[tuple[str, ...], str] | None = None,
 ) -> list[Queued]:
     """Insert new pending rows, and `gone` rows for boards that do not exist.
 
@@ -1016,8 +1135,8 @@ def _store(
                 known_careers.add(hit.url)
             cur = conn.execute(
                 "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, ats_host, "
-                "ats_site, suggested_name, status, first_seen) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                "ats_site, suggested_name, status, first_seen, display_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (
                     hit.kind,
                     hit.url,
@@ -1027,6 +1146,7 @@ def _store(
                     hit.ats_site,
                     hit.suggested_name,
                     today,
+                    (names or {}).get(_hit_key(hit)),
                 ),
             )
             stored.append(

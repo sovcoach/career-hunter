@@ -15,7 +15,7 @@ from careerhunter import watch as w
 from careerhunter.score import Score
 from tests.fakes import FakeClock
 from tests.test_rescore import NEW, OLD, Recorder, board, lever, run, titles
-from tests.test_watch import DAY, Scripted, minutes
+from tests.test_watch import DAY, OnBoard, Scripted, minutes
 
 FITS = {
     "fit_rubric": {
@@ -164,11 +164,12 @@ def test_a_crash_in_the_fill_in_is_isolated(search: sqlite3.Connection, monkeypa
 
 
 def _waiting(conn: sqlite3.Connection, title: str, created_at: str) -> int:
-    """An unscored watcher posting stored at `created_at`."""
+    """An unscored watcher posting stored at `created_at`, with a Lever link it is read
+    again from before it is scored (ADR-027)."""
     posting_id = _scored_without_fit(conn, title, None)
     conn.execute(
-        "UPDATE postings SET gaps = NULL, llm_output = NULL, created_at = ? WHERE id = ?",
-        (created_at, posting_id),
+        "UPDATE postings SET gaps = NULL, llm_output = NULL, created_at = ?, url = ? WHERE id = ?",
+        (created_at, f"https://jobs.lever.co/examplea/w{posting_id}", posting_id),
     )
     return posting_id
 
@@ -181,7 +182,7 @@ def test_a_retry_goes_ahead_of_postings_stored_after_its_attempt(
     search_store.set_score_attempted_at(search, retry, "2026-11-01T09:00:00Z")
     _waiting(search, "Stored after", "2026-11-01T10:00:00Z")
     scorer = Recorder()
-    w.run(search, [], today=DAY, fetcher=Scripted({}), scorer=scorer, config=FITS)
+    w.run(search, [], today=DAY, fetcher=OnBoard({}), scorer=scorer, config=FITS)
     assert titles(scorer) == ["Stored before", "Retry", "Stored after"]
 
 
@@ -191,7 +192,7 @@ def test_equal_stamps_keep_the_oldest_id_first(search: sqlite3.Connection) -> No
     search_store.set_score_attempted_at(search, second, "2026-11-01T08:00:00Z")
     assert first < second
     scorer = Recorder()
-    w.run(search, [], today=DAY, fetcher=Scripted({}), scorer=scorer, config=FITS)
+    w.run(search, [], today=DAY, fetcher=OnBoard({}), scorer=scorer, config=FITS)
     assert titles(scorer) == ["First", "Second"]
 
 
@@ -215,7 +216,7 @@ def test_new_arrivals_every_run_cannot_push_a_retry_back_forever(
             search,
             [],
             today=DAY,
-            fetcher=Scripted({}),
+            fetcher=OnBoard({}),
             scorer=scorer,
             budget=minutes(clock, 10),
             now=lambda m=moment: m + dt.timedelta(minutes=30),
@@ -240,7 +241,7 @@ def test_a_retry_that_fails_again_waits_behind_what_arrived_before_it(
         search,
         [],
         today=DAY,
-        fetcher=Scripted({}),
+        fetcher=OnBoard({}),
         scorer=scorer,
         now=lambda: stamp,
         config=FITS,
@@ -248,7 +249,7 @@ def test_a_retry_that_fails_again_waits_behind_what_arrived_before_it(
     assert titles(scorer) == ["Retry", "Arrived at nine"]
     _waiting(search, "Arrived at eleven", "2026-11-01T11:00:00Z")
     scorer = Recorder()
-    w.run(search, [], today=DAY, fetcher=Scripted({}), scorer=scorer, config=FITS)
+    w.run(search, [], today=DAY, fetcher=OnBoard({}), scorer=scorer, config=FITS)
     assert titles(scorer) == ["Retry", "Arrived at eleven"]  # its 10:00 stamp is older
 
 

@@ -30,7 +30,7 @@ def _run(search: sqlite3.Connection, content: str) -> list[str]:
         search,
         [ENTRY],
         today=DAY,
-        fetcher=Scripted({BOARD: fetched(one_greenhouse("examplerobotics"))}),
+        fetcher=Scripted({BOARD: fetched(one_greenhouse("examplerobotics"))}, on_board=True),
         config=RUBRIC,
         scorer=scorer,
     )
@@ -80,7 +80,7 @@ def test_a_model_that_does_not_answer_is_not_a_parse_failure(search: sqlite3.Con
             search,
             [ENTRY],
             today=DAY,
-            fetcher=Scripted({BOARD: fetched(one_greenhouse("examplerobotics"))}),
+            fetcher=Scripted({BOARD: fetched(one_greenhouse("examplerobotics"))}, on_board=True),
             config=RUBRIC,
             scorer=down,
         )

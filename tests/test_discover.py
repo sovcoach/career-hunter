@@ -598,6 +598,47 @@ def test_reject_inserts_no_company(search: sqlite3.Connection) -> None:
         discover.reject(search, 99)
 
 
+def test_a_reject_reason_is_kept_once_and_checked(search: sqlite3.Connection) -> None:
+    first = _insert_candidate(
+        search, url="https://boards.greenhouse.io/sampleshop", ats_slug="sampleshop", name="a"
+    )
+    second = _insert_candidate(
+        search, url="https://boards.greenhouse.io/sampletown", ats_slug="sampletown", name="b"
+    )
+    discover.reject(search, first, "  consumer\n retail ")
+    assert discover.set_reject_reason(search, first, "again") is False  # it has one
+    assert discover.set_reject_reason(search, second, "still pending") is False
+    discover.reject(search, second)
+    with pytest.raises(discover.DiscoverError, match="1 to 500 characters"):
+        discover.set_reject_reason(search, second, "   ")
+    with pytest.raises(discover.DiscoverError, match="1 to 500 characters"):
+        discover.set_reject_reason(search, second, "x" * 501)
+    assert discover.set_reject_reason(search, second, "a German shop") is True
+    reasons = [
+        row[0]
+        for row in search.execute("SELECT reject_reason FROM discovery_candidates ORDER BY id")
+    ]
+    assert reasons == ["consumer retail", "a German shop"]
+
+
+def test_the_cli_rejects_with_a_reason_and_refuses_one_elsewhere(
+    inited: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    conn = db.connect(inited / "search.db")
+    board = _insert_candidate(conn)
+    conn.close()
+    assert cli.main(["discover", "approve", str(board), "--reason", "x"], probe=probe) == (
+        cli.EXIT_ERROR
+    )
+    assert capsys.readouterr().err == "error: --reason goes with discover reject only\n"
+    assert cli.main(["discover", "reject", str(board), "--reason", "off target"], probe=probe) == 0
+    capsys.readouterr()
+    conn = db.connect(inited / "search.db")
+    row = conn.execute("SELECT status, reject_reason FROM discovery_candidates").fetchone()
+    conn.close()
+    assert tuple(row) == ("rejected", "off target")
+
+
 def test_approve_and_reject_leave_config_and_the_ei_file_alone(
     inited: Path,
     probe: SystemProbe,

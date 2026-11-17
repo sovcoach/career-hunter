@@ -68,7 +68,15 @@ def test_a_call_starts_only_while_the_timeout_fits_in_the_budget(
         search,
         entries(*NAMES),
         today=DAY,
-        fetcher=Timed(three_boards().mapping, clock, cost=2),  # 6 minutes of fetching
+        # 6 minutes of fetching; reading the stored postings again before scoring
+        # (ADR-027) costs nothing here.
+        fetcher=Timed(
+            three_boards().mapping,
+            clock,
+            cost=2,
+            costs={_single(name): 0.0 for name in NAMES},
+            on_board=True,
+        ),
         scorer=scorer,
         budget=minutes(clock, 10),
         config={"scoring": {"timeout_seconds": 200}},
@@ -76,6 +84,12 @@ def test_a_call_starts_only_while_the_timeout_fits_in_the_budget(
     # 240 s are left: one call (240 >= 200), then 140 s, too few for the next.
     assert [row["llm_output"] for row in postings(search)].count("kept") == 1
     assert "watch: scoring: run budget reached; 2 postings left for the next run" in lines
+
+
+def _single(name: str) -> str:
+    """The Greenhouse single-posting request for a stored posting on `name`'s board."""
+    slug = name.lower().replace(" ", "")
+    return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs/1001"
 
 
 @pytest.fixture

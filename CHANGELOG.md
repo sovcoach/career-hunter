@@ -7,6 +7,26 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `/skip` re-skips a posting whose alert buttons are spent or expired, or whose skip was lost: pick one of the postings alerted in the last 14 days, or send `/skip <link>`. The same reasons and the same ledger call as **Skipped**; a posting is never skipped twice.
+- Dated statuses: `/status <ref> <status> YYYY-MM-DD`, and `careerhunter status <status> --on YYYY-MM-DD` with `--id`, `--url`, or `--company` and `--title` (and `--applied` when two match); `--dry-run` writes nothing. A date in the future or before the application is refused.
+- Two statuses: `assessment_requested` and `position_closed` (EI migration 0004, search migration 0030).
+- `careerhunter rescore --posting <id>` or `--gap <text>` queues scored postings with no skip and no application for the next watch run to score again (ADR-027); `--dry-run` lists them with their fit.
+- Discovery: `discovery.max_candidates_per_day` (1 to 20, default 3), and an optional reason for a rejection, from **Reject with reason…** in the bot or `careerhunter discover reject <id> --reason "…"` (search migrations 0028 and 0029).
+
+### Changed
+- The scorer no longer sees `hard_gates`, and every posting is gated on its full description just before it is scored, read again from its board when this run's read didn't give it (ADR-027). A posting its board no longer has is skipped as `gone`; one that can't be read waits, unscored.
+- A discovery candidate is one message: the company name its board gave, the ATS, the board link, and up to three of the postings found on it that passed your gates, each with title, location and link. It is sent once, and only while one of those postings is unskipped.
+- Travel never skips a posting (offsites, retreats, conferences, client visits, required travel). A posting whose description asks for regular office days outside your `onsite_hybrid` places is always skipped as `office_days_elsewhere`.
+- `/log` says exactly what is wrong with how a line is laid out (words after the link with no `|`, an empty field, the wrong number of fields) and shows an example.
+- `search.db` moves from schema version 27 to 30, and the EI record from 3 to 4.
+
+### Removed
+- `search.location_rules.allow_travel_outside`. A `config.yaml` that still has it is refused with a message naming the line to delete; see "Upgrading from 0.6.0 to 0.7.0" in `docs/SETUP.md`.
+
+### Fixed
+- A language in `hard_gates.required_languages` came back from the scorer as the posting's own requirement, as a core gap and a key requirement in the alert, for postings that never stated it.
+
 ## [0.6.0] - 2026-11-13
 
 ### Added

@@ -51,7 +51,6 @@ search:
   location_rules:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here
     remote: [Canada]                    # fully remote only within these regions
-    allow_travel_outside: false         # refuse roles needing office days elsewhere
   # Optional. After `careerhunter resume import <file>`, set this to
   # resume/current.txt (no other value is used) so scoring and embeddings read your
   # resume. Null leaves the resume out of scoring and skips embeddings.
@@ -182,6 +181,9 @@ discovery:
   interval_minutes: 1440
   queries_per_run: 12
   query_delay_seconds: 5
+  # The bot sends at most this many discovery candidates a day (1 to 20), each
+  # with the postings found on it that passed your gates.
+  max_candidates_per_day: 3
 
 # EI claims. career-hunter keeps one EI job-search record file per claim,
 # ei_record_<label>.db. Set the active claim here: it is never worked out for you.

@@ -218,13 +218,7 @@ def test_two_different_units_in_a_sentence_with_none_attached_count_for_nothing(
 
 def test_location_rules_and_role_filters() -> None:
     config = {
-        "search": {
-            "location_rules": {
-                "onsite_hybrid": ["Example City"],
-                "remote": ["Canada"],
-                "allow_travel_outside": False,
-            }
-        }
+        "search": {"location_rules": {"onsite_hybrid": ["Example City"], "remote": ["Canada"]}}
     }
     assert verdict("Coordinator", location="Canada", config=config).reason is None
     assert verdict("Coordinator", location="Example City", config=config).reason == "location_rule"
@@ -722,3 +716,73 @@ def test_a_recheck_skips_a_stored_empty_location_once_rules_are_set(
     )
     assert any("skipped (empty_location)" in line for line in lines)
     assert [r["reason"] for r in search.execute("SELECT reason FROM skips")] == ["empty_location"]
+
+
+# --- travel never skips; regular office days elsewhere do ------------------------------------
+
+PLACES = {
+    "search": {
+        "location_rules": {"onsite_hybrid": ["Example City", "Sampleton"], "remote": ["Canada"]}
+    }
+}
+
+
+def _office(description: str, *, location: str = "Remote, Canada", work_model: str = "remote"):
+    return verdict(
+        "Coordinator",
+        location=location,
+        work_model=work_model,
+        description=description,
+        config=PLACES,
+    ).reason
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Occasional travel to our Example Town office for team events.",  # optional travel
+        "Travel up to 50% of the time is required, mostly to client sites.",  # required travel
+        "You must be willing to travel to head office quarterly.",
+        "Our office is in Example Town, and the team meets there each quarter.",
+        "Visit clients in Example Town and across the region as needed.",  # client visits
+        "Join the whole company at our annual offsite in Example Town each spring.",
+        "Attend two industry conferences and a team retreat every year.",
+    ],
+)
+def test_travel_never_skips_a_posting(description: str) -> None:
+    assert _office(description) is None
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "This role works 3 days a week in our Example Town office.",
+        "Hybrid: in the office two days per week, at our headquarters in Example Town.",
+        "You will be on-site once a month.",
+        "Expect to work in person every Tuesday.",
+        "Commute to our Example Town office 1 to 3 days a week.",
+    ],
+)
+def test_regular_office_days_outside_the_approved_places_skip(description: str) -> None:
+    assert _office(description) == "office_days_elsewhere"
+
+
+@pytest.mark.parametrize(
+    ("description", "location", "work_model"),
+    [
+        ("Work 3 days a week in our Example City office.", "Remote, Canada", "remote"),
+        ("Hybrid, in the office 3 days per week.", "Example City", "hybrid"),
+        ("On-site four days a week; the rest from home.", "Sampleton, Canada", "onsite"),
+    ],
+)
+def test_regular_office_days_in_an_approved_place_are_kept(
+    description: str, location: str, work_model: str
+) -> None:
+    assert _office(description, location=location, work_model=work_model) is None
+
+
+def test_a_hybrid_posting_here_with_weekly_days_at_a_named_office_elsewhere_skips() -> None:
+    reason = _office(
+        "Two days a week at our Example Town office.", location="Example City", work_model="hybrid"
+    )
+    assert reason == "office_days_elsewhere"

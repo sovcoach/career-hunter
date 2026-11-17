@@ -6,10 +6,17 @@ ad and wrong for a model on this Mac. This client allows only `http` to `127.0.0
 constant, not a config field. The model id is `scoring.chat_model` (default
 `local-model`).
 
-The prompt is built from lanes, location rules, hard gates and `gap_tiers`, the
-posting fields, and the resume when one is in use. The model lists gaps. This module
-applies `gap_tiers` and stores the tier name. `fit_rating` is left null. There is no
-mapping onto 0-10.
+The prompt is built from lanes, location rules and `gap_tiers`, the posting fields,
+and the resume when one is in use. The model lists gaps. This module applies
+`gap_tiers` and stores the tier name. `fit_rating` is left null. There is no mapping
+onto 0-10.
+
+The hard gates are not sent (ADR-027). `filters.decide` has applied them before any
+posting is scored, and a model shown `required_languages` next to a posting reported
+those languages as the posting's own requirement. As a guard, a gap or a key
+requirement that names a `hard_gates.required_languages` term is dropped unless the
+posting text sent (title, location and description) contains that term, matched the
+way the filter matches.
 
 Two kinds of failure are told apart. A server that cannot be reached, a timeout, a
 refused URL, or any HTTP status other than 200 (a redirect included) raises
@@ -54,7 +61,7 @@ from typing import Any
 from careerhunter import loopback
 from careerhunter.config import DEFAULT_CHAT_MODEL, chat_model
 from careerhunter.deadline import Deadline
-from careerhunter.filters import PostingText
+from careerhunter.filters import PostingText, mentions
 from careerhunter.resume import Resume
 from careerhunter.search_store import Example
 
@@ -84,18 +91,6 @@ _THINK_TAGS = "think|thinking|reasoning"
 _THINK_BLOCK = re.compile(rf"<({_THINK_TAGS})>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
 _THINK_OPEN = re.compile(rf"<(?:{_THINK_TAGS})>", re.IGNORECASE)
 _THINK_CLOSE = re.compile(rf"</(?:{_THINK_TAGS})\s*>", re.IGNORECASE)
-_GATE_KEYS = (
-    "min_salary",
-    "required_languages",
-    "credentials",
-    "shift_patterns",
-    "pay_structures",
-    "seniority_words",
-    "seniority_in_description",
-    "title_exceptions",
-    "never_gated_families",
-)
-
 Transport = Callable[[str, bytes], tuple[int, bytes]]
 # Added to the system prompt when the operator's criteria file is sent.
 CRITERIA_INSTRUCTION = (
@@ -268,6 +263,13 @@ def score_posting(
     parsed = _parse_gaps(content)
     if parsed is None:
         return None
+    parsed = [
+        gap
+        for gap in parsed
+        if not any(
+            unstated_language(text, posting, config) for text in (gap.name, gap.type) if text
+        )
+    ]
     if resume is not None and _copies_resume(parsed, resume.text):
         return None
     counted, tier, excluded = _apply_tiers(parsed, rubric)
@@ -281,7 +283,13 @@ def score_posting(
         tier=tier,
         excluded=excluded,
         resume_sha256=None if resume is None else resume.sha256,
-        key_requirements=_requirements(content, parsed, None if resume is None else resume.text),
+        key_requirements=tuple(
+            phrase
+            for phrase in _requirements(
+                content, parsed, None if resume is None else resume.text, limit=None
+            )
+            if not unstated_language(phrase, posting, config)
+        )[:MAX_REQUIREMENTS],
     )
 
 
@@ -345,7 +353,6 @@ def _request_body(
     view: dict[str, Any] = {
         "lanes": _section(config, "search", "lanes"),
         "location_rules": _section(config, "search", "location_rules"),
-        "hard_gates": _gates(config),
         "gap_tiers": _rubric(config),
         "posting": {
             "company": posting.company,
@@ -394,9 +401,19 @@ def _request_body(
     return json.dumps(payload).encode()
 
 
-def _gates(config: Mapping[str, Any]) -> dict[str, Any]:
-    gates = _mapping(config.get("hard_gates"))
-    return {key: gates[key] for key in _GATE_KEYS if key in gates}
+def unstated_language(phrase: str, posting: PostingText, config: Mapping[str, Any]) -> bool:
+    """True when `phrase` names a `required_languages` term the posting text lacks."""
+    terms = [
+        term
+        for term in _strings(_mapping(config.get("hard_gates")).get("required_languages"))
+        if mentions(phrase, term)
+    ]
+    if not terms:
+        return False
+    text = "\n".join(
+        part for part in (posting.title, posting.location, posting.description) if part
+    )
+    return not any(mentions(text, term) for term in terms)
 
 
 def _section(config: Mapping[str, Any], parent: str, key: str) -> Any:
@@ -474,8 +491,14 @@ def _json_object(content: str) -> object | None:
     return loaded
 
 
-def _requirements(content: str, gaps: list[_Gap], resume_text: str | None) -> tuple[str, ...]:
-    """Up to three checked key requirements from the reply; () when there are none."""
+def _requirements(
+    content: str,
+    gaps: list[_Gap],
+    resume_text: str | None,
+    *,
+    limit: int | None = MAX_REQUIREMENTS,
+) -> tuple[str, ...]:
+    """Up to `limit` checked key requirements from the reply; () when there are none."""
     raw = _json_object(content)
     items = raw.get("requirements") if isinstance(raw, dict) else None
     if not isinstance(items, list):
@@ -497,7 +520,7 @@ def _requirements(content: str, gaps: list[_Gap], resume_text: str | None) -> tu
             continue
         seen.add(folded)
         kept.append(_capped(phrase))
-        if len(kept) == MAX_REQUIREMENTS:
+        if limit is not None and len(kept) == limit:
             break
     return tuple(kept)
 

@@ -162,7 +162,7 @@ created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 27
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 30
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -228,7 +228,7 @@ Every alert carries a fit: `Fit: High`, `Medium` or `Low`, from the `fit` of the
 
 `hard_gates.min_salary` is yearly pay in CAD. A figure counts only when its sentence mentions pay (salary, pay, compensation, base, wage, range) or a pay unit follows it (per hour, /yr, annually). Bonus, signing, relocation and equity amounts don't count. Hourly figures are converted at 40 hours a week, daily at 260 days a year, weekly at 52 and monthly at 12. A figure marked as another currency (USD, US$, €, £ or any three-letter code but CAD) is ignored, and a plain `$` is read as CAD. A posting is skipped only when the top of its highest range is below your minimum; a posting with no salary passes.
 
-`search.location_rules`: Greenhouse, BambooHR and Workday give no work model, so a location containing the word "remote" is treated as remote and anything else as on-site. Lever and Ashby give one, and it is used as given; SmartRecruiters says remote or hybrid when it is, and otherwise nothing. With location rules set, a posting with no location text and no work model is skipped as `empty_location`; a posting with a work model but no location text is kept.
+`search.location_rules`: Greenhouse, BambooHR and Workday give no work model, so a location containing the word "remote" is treated as remote and anything else as on-site. Lever and Ashby give one, and it is used as given; SmartRecruiters says remote or hybrid when it is, and otherwise nothing. With location rules set, a posting with no location text and no work model is skipped as `empty_location`; a posting with a work model but no location text is kept. Travel never skips a posting: offsites, retreats, conferences, client or customer visits as needed, required travel. A posting whose description asks for regular office days ("2 days a week in the office", "on-site once a month", commuting to another city 1 to 3 days a week) outside your `onsite_hybrid` places is always skipped as `office_days_elsewhere`; office days in one of those places, or at an on-site or hybrid posting's own approved location, are fine. There is no setting for this: a `config.yaml` that still has `search.location_rules.allow_travel_outside` is refused until that line is deleted.
 
 `search.max_posting_age_days` (default 7) skips a posting the board says was posted more than that many days ago, as `too_old`. A board that gives no date uses the day the posting was first seen, and the watch log says so for that posting.
 
@@ -354,7 +354,7 @@ With the template files, the prompt names Example Staffing Mill, the title keywo
 
 SearXNG runs on this Mac and listens on `127.0.0.1` only. Leave `public_instance` and `image_proxy` off, leave the limiter off, and add `json` to `search.formats`. Leave engines that need an API key disabled. Set `discovery.searxng_url` to that loopback URL, for example `http://127.0.0.1:8888/search`. A null URL leaves discovery off.
 
-Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`. A pass sends the next `discovery.queries_per_run` site-restricted queries (default 12), `discovery.query_delay_seconds` apart (default 5), and the next pass carries on from there, so over several passes every title, place and host is asked. Titles come from your lanes, places from `search.location_rules`, and hosts are each supported ATS plus `discovery.career_hosts`. A posting URL in the results is fetched once from its ATS and goes through the same gates, scoring and digest as a watched posting, with no approval. A board is queued only after one request to its API confirms it exists; a board that does not exist is never queued again, and a company in `exclusions.companies` is never queued. Career pages are not queued. A down server prints `discovery miss: unreachable`, and one that answers with an error or a reply that is not a result list prints `discovery miss: bad-reply`; either stores nothing; HTTP 429 from SearXNG stops the pass. One engine that SearXNG reports as rate limited, asking for a CAPTCHA or suspended doesn't: the pass goes on while other engines answer, names the throttled engines in its log line, and fails only when no query got an answer. After a failed pass the next one waits one `discovery.interval_minutes`, doubled for each further failure in a row, up to 24 hours. `doctor` shows the backoff with the command that ends it early, `careerhunter discover clear-backoff`. `careerhunter discover` runs one pass by hand and prints each new pending row. `careerhunter discover list` prints the pending rows again.
+Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`. A pass sends the next `discovery.queries_per_run` site-restricted queries (default 12), `discovery.query_delay_seconds` apart (default 5), and the next pass carries on from there, so over several passes every title, place and host is asked. Titles come from your lanes, places from `search.location_rules`, and hosts are each supported ATS plus `discovery.career_hosts`. A posting URL in the results is fetched once from its ATS and goes through the same gates, scoring and digest as a watched posting, with no approval. A board is queued only after one request to its API confirms it exists, with the company name that reply gives; a board that does not exist is never queued again, and a company in `exclusions.companies` is never queued. Each posting found on a queued board that passes your gates (no skip) is linked to it, and only a board with such a posting is ever sent to you. Career pages are not queued. A down server prints `discovery miss: unreachable`, and one that answers with an error or a reply that is not a result list prints `discovery miss: bad-reply`; either stores nothing; HTTP 429 from SearXNG stops the pass. One engine that SearXNG reports as rate limited, asking for a CAPTCHA or suspended doesn't: the pass goes on while other engines answer, names the throttled engines in its log line, and fails only when no query got an answer. After a failed pass the next one waits one `discovery.interval_minutes`, doubled for each further failure in a row, up to 24 hours. `doctor` shows the backoff with the command that ends it early, `careerhunter discover clear-backoff`. `careerhunter discover` runs one pass by hand and prints each new pending row. `careerhunter discover list` prints the pending rows again.
 
 ```bash
 make discover
@@ -362,9 +362,9 @@ careerhunter discover approve 4
 careerhunter discover reject 4
 ```
 
-`approve` marks that pending row approved. A board becomes a company with `watchlist` 1, and a new company has `source` discovery. The next `careerhunter watch` fetches that board. A career page queued by an earlier version stores `careers_url` and is not fetched. `reject` stores the rejection and inserts no company. Neither command rewrites `config.yaml` or `exclusions.yaml`.
+`approve` marks that pending row approved. `reject` takes an optional reason, kept with the rejection: `careerhunter discover reject 4 --reason "consumer retail"`. A board becomes a company with `watchlist` 1, and a new company has `source` discovery. The next `careerhunter watch` fetches that board. A career page queued by an earlier version stores `careers_url` and is not fetched. `reject` stores the rejection and inserts no company. Neither command rewrites `config.yaml` or `exclusions.yaml`.
 
-The bot does the same thing from the allowlisted chat. Each pending board is one message with the suggested name, the URL, and Approve and Reject. When more than five are waiting, one message lists up to eight, each row with its own buttons, and the rest follow on a later poll. A tap that does not apply answers `Not changed.` and leaves the row pending. Nothing is sent while `config.yaml` can't be read.
+The bot does the same thing from the allowlisted chat. Each candidate is one message: the company name, the ATS and the board link, then up to three of the postings found on it that passed your gates, each with its title, location and link. Its buttons are **Approve**, **Reject** and **Reject with reason…**, which records the rejection and asks for the reason as a reply. A candidate is sent once, and only while one of its postings is still unskipped; at most `discovery.max_candidates_per_day` are sent in a day (1 to 20, default 3), and the rest wait for the next day. One whose buttons expire stays pending and is still listed by `careerhunter discover list`. A tap that does not apply answers `Not changed.` and leaves the row pending. Nothing is sent while `config.yaml` can't be read.
 
 ### Compare a cosine with the tier
 
@@ -399,8 +399,8 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 27
-ei_record_2026-27.db: created; schema version 3
+search.db: applied nothing; schema version 30
+ei_record_2026-27.db: created; schema version 4
 EI claim 2026-27 (from 2026-08-02)
 ```
 
@@ -418,7 +418,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 27
+search.db       OK  schema version 30
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -426,7 +426,7 @@ watch run       --  none recorded yet
 watch useful    --  no useful run recorded yet
 bot alerts      OK  not held
 bot refusals    OK  no posting given up
-claim 2026-27   OK  schema version 3
+claim 2026-27   OK  schema version 4
 claim 2026-27   OK  active, from 2026-08-02
 claim 2026-27   OK  0600
 reconcile       OK  search.db and 1 claim record agree
@@ -717,7 +717,8 @@ health:
 | A reply with the job description | When no job description was saved, the bot asks for it: reply to that message with the text, or with a PDF, HTML or text file. If a long paste wasn't joined in full, the bot says so: reply to the `Recorded` message with the whole description as a `.txt` file, which replaces the one saved. |
 | **Applied** | The bot asks how you applied, then when: **Today**, **Yesterday**, **This week**, **Last week** or **Other date** (reply with YYYY-MM-DD). It saves a copy of the job ad when the page gives one, then asks for the job description: reply with the text, or with a PDF, HTML or text file (which also becomes the copy of the ad if none was saved). |
 | **Skipped** | Asks why, then records the skip as soon as you tap a reason. **Other…** records it at once as `other` and asks for your words: reply to that message (within a day) and your words replace `other`. Skips never go into the EI record. |
-| `/status a7 interview_scheduled` | Updates an application. References like `a7` come from `/recent` and last 7 days. Send just `/status` to choose with buttons. |
+| `/status a7 interview_scheduled` | Updates an application, dated today. Add a date to record when it happened: `/status a7 rejected 2026-11-12` (not in the future, not before the application). References like `a7` come from `/recent` and last 7 days. Send just `/status` to choose with buttons. The statuses are `screening`, `assessment_requested`, `assessment_submitted`, `interview_scheduled`, `offer`, `hired`, `rejected`, `no_response`, `withdrawn` and `position_closed`. From the command line: `careerhunter status rejected --on 2026-11-12 --company "Example Robotics" --title "Analyst"` (or `--id`, or `--url`; `--dry-run` writes nothing). |
+| `/skip` | Skips a posting whose alert buttons are spent or expired, or whose skip was lost: choose one of the postings alerted in the last 14 days, or send `/skip <link>`. Then the same reasons as **Skipped**. A posting you skipped already isn't skipped twice. |
 | `/activity networking 2026-10-27 Coffee with a recruiter` | Records a job-search activity. Leave out the date to choose it with buttons. |
 | `/recent` | Your latest applications, their references and current statuses. |
 
@@ -869,6 +870,36 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
 
+## Upgrading from 0.6.0 to 0.7.0
+
+Follow the nine steps above with the tag `v0.7.0` (`git checkout v0.7.0` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 4:** delete one line. `search.location_rules.allow_travel_outside` is no longer a setting: travel never skips a posting, and regular office days outside your `onsite_hybrid` places always do. With the services stopped and the data folder backed up (steps 1 and 2), open `config.yaml` and delete the `allow_travel_outside:` line under `search.location_rules`, and nothing else. A config that still has it is refused, and `doctor` shows `config.yaml` as BAD with the line `search.location_rules.allow_travel_outside is no longer a setting: delete that line from config.yaml (after a backup)`. Two things are new and optional: `discovery.max_candidates_per_day` (default 3) and the `/skip` command.
+- **Step 5:** `doctor` exits 1, because `search.db` is three migrations behind and the claim's record one:
+
+  ```text
+  search.db       BAD schema version 27, expected 30; run: careerhunter migrate
+  ```
+
+- **Step 6:** `migrate` applies three migrations to `search.db` and one to the claim's record. EI migration 0004 rebuilds the status history for two new statuses and copies every row as it was:
+
+  ```text
+  search.db: applied [28, 29, 30]; schema version 30
+  ei_record_2026-27.db: applied [4]; schema version 4
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+- **Step 7:** skip it.
+- **Step 8:** these lines show the upgrade took:
+
+  ```text
+  config.yaml     OK
+  search.db       OK  schema version 30
+  claim 2026-27   OK  schema version 4
+  ```
+
+  Discovery candidates queued before 0.7.0 have no linked postings, so they are not sent again; `careerhunter discover list` still lists them.
+
 ## Upgrading from 0.5.1 to 0.6.0
 
 Follow the nine steps above with the tag `v0.6.0` (`git checkout v0.6.0` in the release checkout, then `uv sync --locked`). These steps differ:
@@ -1014,7 +1045,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 27` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 30` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |

@@ -11,6 +11,7 @@ from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import title_key
 from careerhunter.models import Application, Dating, Posting
+from careerhunter.urls import canonical as canonical_url
 
 
 class IdentityConflict(Exception):
@@ -398,6 +399,14 @@ def set_ats_key(conn: sqlite3.Connection, posting_id: int, key: str) -> bool:
     return cur.rowcount == 1
 
 
+def posting_id_for(conn: sqlite3.Connection, key: str, url: str | None) -> int | None:
+    """The stored posting with this ATS identity, or else with this exact URL."""
+    row = conn.execute("SELECT id FROM postings WHERE ats_key = ?", (key,)).fetchone()
+    if row is None and url:
+        row = conn.execute("SELECT id FROM postings WHERE url = ?", (url,)).fetchone()
+    return None if row is None else int(row[0])
+
+
 def posting_url_known(conn: sqlite3.Connection, url: str) -> bool:
     """Whether a posting with this exact URL is stored, from any source."""
     return conn.execute("SELECT 1 FROM postings WHERE url = ?", (url,)).fetchone() is not None
@@ -417,6 +426,46 @@ def posting_has_skip(conn: sqlite3.Connection, posting_id: int) -> bool:
 
 def set_posting_schedule(conn: sqlite3.Connection, posting_id: int, schedule: str | None) -> None:
     conn.execute("UPDATE postings SET schedule = ? WHERE id = ?", (schedule, posting_id))
+
+
+def rescore_candidates(
+    conn: sqlite3.Connection, posting_ids: Sequence[int] = (), gap_text: str | None = None
+) -> list[sqlite3.Row]:
+    """Scored watcher or discovery postings with no skip and no application: those with
+    these ids, or those whose stored gaps or key requirements contain `gap_text`
+    (ignoring case). Each with its company, title, fit and whether it was alerted."""
+    rows = conn.execute(
+        "SELECT p.id, c.name AS company, p.title, p.fit, p.alerted_at, p.gaps, "
+        "p.key_requirements FROM postings p JOIN companies c ON c.id = p.company_id "
+        "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "ORDER BY p.id"
+    ).fetchall()
+    wanted = set(posting_ids)
+    needle = gap_text.casefold() if gap_text else None
+    return [
+        row
+        for row in rows
+        if int(row["id"]) in wanted
+        or (
+            needle is not None
+            and needle in f"{row['gaps'] or ''}\n{row['key_requirements'] or ''}".casefold()
+        )
+    ]
+
+
+def mark_for_rescore(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> int:
+    """Forget the resume these scores were made with, so the next watch run re-scores
+    them (`watch._RESCORE_SQL`). The score, fit and alert stay until then."""
+    count = 0
+    for posting_id in posting_ids:
+        count += conn.execute(
+            "UPDATE postings SET scored_resume_sha256 = NULL WHERE id = ? "
+            "AND llm_output IS NOT NULL",
+            (posting_id,),
+        ).rowcount
+    return count
 
 
 def set_posting_score(
@@ -1072,6 +1121,7 @@ def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 # A status that means the employer answered: screening and later, a rejection included.
 RESPONSE_STATUSES = (
     "screening",
+    "assessment_requested",
     "assessment_submitted",
     "interview_scheduled",
     "offer",
@@ -1079,7 +1129,7 @@ RESPONSE_STATUSES = (
     "rejected",
 )
 # A status that ends an application one way or another.
-OUTCOME_STATUSES = ("offer", "hired", "rejected", "no_response", "withdrawn")
+OUTCOME_STATUSES = ("offer", "hired", "rejected", "no_response", "withdrawn", "position_closed")
 WEEK_COUNTS = ("alerts", "applied", "skipped", "responses", "outcomes")
 
 
@@ -1206,6 +1256,38 @@ def insert_skip(
         (posting_id, date, reason, int(by_operator)),
     )
     return int(cur.lastrowid or 0)
+
+
+def has_operator_skip(conn: sqlite3.Connection, posting_id: int) -> bool:
+    """Whether the operator skipped this posting already."""
+    row = conn.execute(
+        "SELECT 1 FROM skips WHERE posting_id = ? AND by_operator = 1 LIMIT 1", (posting_id,)
+    ).fetchone()
+    return row is not None
+
+
+def skippable_postings(conn: sqlite3.Connection, since: str, limit: int) -> list[sqlite3.Row]:
+    """Postings alerted at or after `since` (UTC) that the operator has neither skipped
+    nor applied to, newest alert first: id, company and title."""
+    return conn.execute(
+        "SELECT p.id, c.name AS company, p.title FROM postings p "
+        "JOIN companies c ON c.id = p.company_id "
+        "WHERE p.alerted_at IS NOT NULL AND p.alerted_at >= ? "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id AND s.by_operator = 1) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "ORDER BY p.alerted_at DESC, p.id DESC LIMIT ?",
+        (since, limit),
+    ).fetchall()
+
+
+def posting_id_by_link(conn: sqlite3.Connection, url: str) -> int | None:
+    """The stored posting whose link is this one, compared canonically; the oldest when
+    more than one has it."""
+    wanted = canonical_url(url)
+    for row in conn.execute("SELECT id, url FROM postings WHERE url IS NOT NULL ORDER BY id"):
+        if canonical_url(str(row["url"])) == wanted:
+            return int(row["id"])
+    return None
 
 
 def set_operator_skip_reason(conn: sqlite3.Connection, skip_id: int, reason: str) -> bool:

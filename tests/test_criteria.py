@@ -189,7 +189,7 @@ def _run(search: sqlite3.Connection, problem: str | None, calls: list[str]) -> l
         search,
         [company("Example Robotics", "greenhouse", "examplerobotics")],
         today=DAY,
-        fetcher=Scripted({board: fetched(one_greenhouse("examplerobotics"))}),
+        fetcher=Scripted({board: fetched(one_greenhouse("examplerobotics"))}, on_board=True),
         config=copy.deepcopy(RUBRIC),
         scorer=scorer,
         criteria_problem=problem,

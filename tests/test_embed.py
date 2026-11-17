@@ -414,8 +414,10 @@ def test_the_description_is_embedded_once_and_stays_out_of_the_log(
         data_dir=datadir.root,
         embed_transport=transport,
     )
-    assert transport.calls[-1] == later
-    assert DESC not in later
+    # Re-scored after its board was read again (ADR-027): the description is embedded
+    # again, from memory, and never from stored fields alone.
+    assert transport.calls[-1] == seen
+    assert later not in transport.calls
     _absent("\n".join(again))
 
 

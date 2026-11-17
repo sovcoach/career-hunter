@@ -24,7 +24,9 @@ fit word (`Fit: High`, `Medium` or `Low`), the number of gaps, the schedule flag
 words, up to three key requirements the model took from the posting, and the link.
 /log records a self-sourced application at once (#34) and replies with the company,
 the title and a reference; it sends no alert. Status words and references are sent
-too. A discovery row sends the suggested name and the reduced URL only. A
+too. A discovery candidate is one message (batch M): the company name its board gave
+(or the suggested name), the ATS, the reduced board URL, and up to three of the
+postings found on it that passed the gates, each as title, location and link. A
 watchlist agency with no separate employer stored is labelled " (agency)". Never
 notes, 0-10 fit ratings, gap names, model text, vectors, snippets, queries, EI
 record details or claim labels.
@@ -86,6 +88,7 @@ from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating
 from careerhunter.config import (
     ConfigError,
     alerts_max_per_poll,
+    discovery_candidates_per_day,
     health_failure_runs,
     load_config,
     telegram_chat_id,
@@ -117,8 +120,15 @@ POLL_TIMEOUT = 50
 TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 REF_SHAPE = re.compile(r"a[1-9][0-9]{0,6}")
 ALERT_TTL = dt.timedelta(days=7)
-DISCOVERY_EACH = 5
-DISCOVERY_DIGEST = 8
+# The ATS names a discovery candidate is shown with.
+ATS_NAMES = {
+    "greenhouse": "Greenhouse",
+    "lever": "Lever",
+    "ashby": "Ashby",
+    "smartrecruiters": "SmartRecruiters",
+    "bamboohr": "BambooHR",
+    "workday": "Workday",
+}
 STEP_TTL = dt.timedelta(days=1)
 REF_TTL = dt.timedelta(days=7)
 MAX_UPLOAD = 20 * 1024 * 1024
@@ -165,7 +175,8 @@ REFUSALS_TO_GIVE_UP = 3
 
 LOG_USAGE = (
     "Send: /log <link> | method | date, or just /log <link>. "
-    "Add | Company | Title when the page doesn't show them."
+    "Add | Company | Title when the page doesn't show them. For example: "
+    "/log https://jobs.example.com/123 | company_site | 2026-11-10"
 )
 LINKEDIN_REFUSAL = (
     "LinkedIn links are never fetched, so give the company and title: "
@@ -198,11 +209,16 @@ HELP = (
     "(or /log <link> to be asked; add | Company | Title if the page doesn't show them). "
     "Paste the job description on the lines after it, or send its PDF, HTML or text "
     "file with the /log line as the caption\n"
-    "/status <ref> <status>: update an application, or /status to choose\n"
+    "/status <ref> <status> [YYYY-MM-DD]: update an application (dated today unless a "
+    "date is given), or /status to choose\n"
     "/activity <type> [YYYY-MM-DD] <description>: a recruiter call, agency "
     "registration and so on\n"
-    "/recent: your latest applications"
+    "/recent: your latest applications\n"
+    "/skip: skip a posting whose buttons are spent, or /skip <link>"
 )
+# /skip lists the postings alerted this long ago or less.
+SKIP_WINDOW = dt.timedelta(days=14)
+SKIP_CHOICES = 10
 
 
 class BotStartupError(Exception):
@@ -517,6 +533,29 @@ class _Stitch:
     title: str | None
     parts: list[str]
     last: dt.datetime
+
+
+def _log_format_problem(url: str, extra: list[str]) -> str | None:
+    """What is wrong with how a /log line is laid out, in words, or None. Nothing typed
+    is echoed back: only counts and positions."""
+    if not url:
+        return "The link is missing."
+    words = len(url.split()) - 1
+    if words:
+        return (
+            f"The link is followed by {words} more word{'s' if words != 1 else ''} with no | "
+            "between them, so I can't tell the link from the rest. Put | between the fields."
+        )
+    empty = [n for n, part in enumerate(extra, start=1) if not part]
+    if empty:
+        return f"Field {empty[0]} after the link is empty."
+    if len(extra) not in (0, 2, 4):
+        count = f"{len(extra)} field{'s' if len(extra) != 1 else ''}"
+        return (
+            f"I found {count} after the link. /log takes none, two (method and date), or "
+            "four (method, date, company and title)."
+        )
+    return None
 
 
 def _log_fields(raw: object) -> dict[str, str]:
@@ -1020,47 +1059,53 @@ class Bot:
             log.warning("weekly digest failed (%s); left for the next poll", type(exc).__name__)
 
     def send_pending_discovery(self) -> None:
-        """Send pending discovery rows that are due. Name and URL only.
+        """Send discovery candidates that are due, one message each (batch M).
 
-        Five or fewer are one message each. More than five are one digest of at
-        most eight, and the rest wait for a later poll. ``notified_at`` is set
-        only after Telegram accepts the message. Each row of a digest has its own
-        Approve and Reject tokens, so one tap leaves the other rows' buttons live (#41).
+        Due: pending boards never sent that have a linked posting still unskipped, up
+        to `discovery.max_candidates_per_day` in one configured day. Each is sent once;
+        ``notified_at`` and ``notified_on`` are set only after Telegram accepts it.
         Nothing is sent while config.yaml can't be read, like the watcher alerts.
         """
-        if self._alert_config() is None:
+        doc = self._alert_config()
+        if doc is None:
             return
-        cutoff = _utc(self.clock() - ALERT_TTL)
+        today = self._today(doc).isoformat()
         try:
             with self._search() as search:
-                rows = discovery.due(search, notified_before=cutoff)
+                rows = discovery.due(search, today=today, per_day=discovery_candidates_per_day(doc))
         except (OSError, sqlite3.Error) as exc:
             log.warning("pending discovery could not be read (%s)", type(exc).__name__)
             return
-        if len(rows) <= DISCOVERY_EACH:
-            batches: list[list[discovery.Queued]] = [[row] for row in rows]
-        else:
-            batches = [list(rows[:DISCOVERY_DIGEST])]
-        for batch in batches:
+        for row in rows:
             try:
                 with self._search() as search:
-                    self._send_discovery(search, batch)
+                    self._send_discovery(search, row, today)
             except (TelegramError, OSError, sqlite3.Error) as exc:
                 log.warning(
                     "discovery send failed (%s); left for the next poll", type(exc).__name__
                 )
+                return
 
-    def _send_discovery(self, search: sqlite3.Connection, rows: list[discovery.Queued]) -> None:
-        text = "\n\n".join(f"{row.suggested_name}\n{row.url}" for row in rows)
+    def _send_discovery(
+        self, search: sqlite3.Connection, candidate: discovery.Sendable, today: str
+    ) -> None:
+        row = candidate.row
+        ats = ATS_NAMES.get(row.ats_type or "", row.ats_type or "ATS")
+        lines = [f"Company to watch? {candidate.name}", f"{ats} board: {row.url}", ""]
+        lines.append("Found on it, passing your gates:")
+        for found in candidate.postings:
+            where = f" — {found.location}" if found.location else ""
+            lines.append(f"• {found.title}{where}")
+            if found.url:
+                lines.append(f"  {found.url}")
+        payload = {"candidate_id": row.id}
         buttons = [
-            [
-                ("Approve", "discover_approve", {"candidate_id": row.id}),
-                ("Reject", "discover_reject", {"candidate_id": row.id}),
-            ]
-            for row in rows
+            [("Approve", "discover_approve", payload), ("Reject", "discover_reject", payload)],
+            [("Reject with reason…", "discover_reject_reason", payload)],
         ]
-        self._keyboard(search, text, buttons, ALERT_TTL, per_row=True)
-        discovery.mark_notified(search, [row.id for row in rows], self._now())
+        self._keyboard(search, "\n".join(lines), buttons, ALERT_TTL)
+        with db.transaction(search):
+            discovery.mark_notified(search, [row.id], self._now(), today)
 
     # --- entry point -------------------------------------------------------------------
 
@@ -1222,6 +1267,8 @@ class Bot:
             self._cmd_activity(rest)
         elif command == "/recent":
             self._cmd_recent()
+        elif command == "/skip":
+            self._cmd_skip(rest)
         else:
             self.send("I don't know that command.\n\n" + HELP)
             return "command:unknown"
@@ -1244,8 +1291,9 @@ class Bot:
         """
         parts = [p.strip() for p in rest.split("|")]
         url, extra = parts[0], parts[1:]
-        if not url or len(extra) not in (0, 2, 4) or any(not p for p in extra):
-            raise Refusal(LOG_USAGE)
+        problem = _log_format_problem(url, extra)
+        if problem is not None:
+            raise Refusal(f"{problem} {LOG_USAGE}")
         if len(url) > selfsourced.MAX_URL or len(" ".join(extra)) > MAX_TEXT:
             raise Refusal("That's too long.")
         if (body is not None or document is not None) and not extra:
@@ -1358,15 +1406,21 @@ class Bot:
                 ]
                 self._keyboard(search, "Which application?", buttons, STEP_TTL)
                 return
-            if len(parts) != 2:
-                raise Refusal("Send: /status <ref> <status>, or just /status to choose.")
+            if len(parts) not in (2, 3):
+                raise Refusal(
+                    "Send: /status <ref> <status> [YYYY-MM-DD], or just /status to choose."
+                )
             ref, status = parts[0].lower(), enums.normalize(parts[1])
             if status not in LATER_STATUSES:
                 raise Refusal("The status must be one of: " + ", ".join(LATER_STATUSES))
             application_id = self._resolve_ref(search, ref)
         if application_id is None:
             raise Refusal("I don't know that reference. Send /recent for current ones.")
-        self._finish_status(application_id, status)
+        day = None
+        if len(parts) == 3:
+            dating = parse_date(parts[2], self._today(self._config()))
+            day = dt.date.fromisoformat(str(dating.day))
+        self._finish_status(application_id, status, day)
 
     def _cmd_activity(self, rest: str) -> None:
         kind_text, _, remainder = rest.partition(" ")
@@ -1394,6 +1448,45 @@ class Bot:
         rows = [[(label, "activity_date", {**payload, "choice": c})] for label, c in DATE_BUTTONS]
         with self._search() as search:
             self._keyboard(search, "When was it?", rows, STEP_TTL)
+
+    def _cmd_skip(self, rest: str) -> None:
+        """Skip a posting whose alert buttons are spent or expired, or whose skip was
+        lost: pick one of the latest alerts, or name it by its link. Then the same reason
+        buttons and the same `ledger.record_skip` as an alert's Skipped."""
+        with self._search() as search:
+            if not rest:
+                since = _utc(self.clock() - SKIP_WINDOW)
+                rows = search_store.skippable_postings(search, since, SKIP_CHOICES)
+                if not rows:
+                    raise Refusal(
+                        "No posting alerted in the last 14 days is left to skip. "
+                        "Send /skip <link> for an older one."
+                    )
+                buttons = [
+                    [
+                        (
+                            f"{r['company']} — {r['title']}"[:60],
+                            "skip",
+                            {"posting_id": int(r["id"])},
+                        )
+                    ]
+                    for r in rows
+                ]
+                self._keyboard(search, "Which posting?", buttons, STEP_TTL)
+                return
+            posting_id = search_store.posting_id_by_link(search, rest.split()[0])
+            if posting_id is None:
+                raise Refusal("I don't know that link. Send /skip to choose from recent alerts.")
+            if search_store.has_operator_skip(search, posting_id):
+                raise Refusal("Already skipped.")
+            self._skip_reasons(search, posting_id)
+
+    def _skip_reasons(self, search: sqlite3.Connection, posting_id: int) -> None:
+        rows = [
+            [(a, "skip_reason", {"posting_id": posting_id, "reason": r}) for a, r in pair]
+            for pair in (SKIP_BUTTONS[i : i + 2] for i in range(0, len(SKIP_BUTTONS), 2))
+        ]
+        self._keyboard(search, "Why skip it?", rows, STEP_TTL)
 
     def _cmd_recent(self) -> None:
         with self._search() as search:
@@ -1580,12 +1673,10 @@ class Bot:
             dating = choice_dating(str(p.get("choice")), self._today(doc))
             self._finish_log(found, str(p.get("method")), dating, doc)
         elif action == "skip":
-            rows = [
-                [(a, "skip_reason", {"posting_id": p["posting_id"], "reason": r}) for a, r in pair]
-                for pair in (SKIP_BUTTONS[i : i + 2] for i in range(0, len(SKIP_BUTTONS), 2))
-            ]
             with self._search() as search:
-                self._keyboard(search, "Why skip it?", rows, STEP_TTL)
+                if search_store.has_operator_skip(search, int(p["posting_id"])):
+                    raise Refusal("Already skipped.")
+                self._skip_reasons(search, int(p["posting_id"]))
         elif action == "skip_reason":
             # The skip is recorded first, as `other` for Other…, so no later Telegram
             # failure can lose it; a typed reason then replaces `other`.
@@ -1612,6 +1703,17 @@ class Bot:
         elif action in ("discover_approve", "discover_reject"):
             decision = "approve" if action == "discover_approve" else "reject"
             self._finish_discovery(p.get("candidate_id"), decision)
+        elif action == "discover_reject_reason":
+            # The rejection is recorded first, so no later Telegram failure loses it;
+            # the reply then adds the reason.
+            name = self._finish_discovery(p.get("candidate_id"), "reject", reply=False)
+            with self._search() as search:
+                self._prompt(
+                    search,
+                    f"Rejected: {name}. Reply with the reason, in a few words.",
+                    "reject_reason",
+                    {"candidate_id": p.get("candidate_id")},
+                )
         elif action == "activity_date":
             if p.get("choice") == "other":
                 with self._search() as search:
@@ -1669,6 +1771,8 @@ class Bot:
                 if not reason or len(reason) > MAX_TEXT:
                     raise Refusal("Please reply with a short reason.")
                 self._finish_typed_skip(payload, reason)
+            elif kind == "reject_reason":
+                self._finish_reject_reason(payload, text)
             elif kind == "snapshot" and payload.get("jd") is True:
                 self._attach_jd(message, str(payload["correlation_id"]))
             elif kind == "snapshot":
@@ -1682,14 +1786,29 @@ class Bot:
 
     # --- the writes --------------------------------------------------------------------
 
-    def _finish_discovery(self, candidate_id: object, decision: str) -> None:
-        """The same approve or reject as the CLI. search.db only."""
+    def _finish_discovery(self, candidate_id: object, decision: str, *, reply: bool = True) -> str:
+        """The same approve or reject as the CLI. search.db only. Returns the name."""
         if isinstance(candidate_id, bool) or not isinstance(candidate_id, int) or candidate_id < 1:
             raise discovery.DiscoverError("not a candidate")
         with self._search() as search:
             row = ledger.record_discovery_decision(search, candidate_id, decision)
-        word = "Approved" if decision == "approve" else "Rejected"
-        self.send(f"{word}: {row.suggested_name}\n{row.url}")
+        if reply:
+            word = "Approved" if decision == "approve" else "Rejected"
+            self.send(f"{word}: {row.suggested_name}\n{row.url}")
+        return row.suggested_name
+
+    def _finish_reject_reason(self, payload: Mapping[str, Any], reason: str) -> None:
+        candidate_id = payload.get("candidate_id")
+        if isinstance(candidate_id, bool) or not isinstance(candidate_id, int):
+            raise Refusal("That candidate isn't recognized.")
+        try:
+            with self._search() as search:
+                saved = discovery.set_reject_reason(search, candidate_id, reason)
+        except discovery.DiscoverError:
+            raise Refusal("Please reply with a short reason.") from None
+        if not saved:
+            raise Refusal("That rejection already has a reason, or isn't there any more.")
+        self.send("Reason saved.")
 
     def _finish_apply(self, posting_id: int, method: str, dating: Dating) -> None:
         if method not in enums.METHODS:
@@ -1828,6 +1947,8 @@ class Bot:
             posting = search_store.posting_by_id(search, posting_id)
             if posting is None:
                 raise Refusal("That posting isn't in search.db any more.")
+            if search_store.has_operator_skip(search, posting_id):
+                raise Refusal("Already skipped.")
             skip_id = ledger.record_skip(search, posting, self._today(doc).isoformat(), reason)
         if reply:
             self.send(f"Skipped: {posting.company} — {posting.title}.")
@@ -1847,18 +1968,26 @@ class Bot:
                 raise Refusal("That skip isn't in search.db any more.")
         self.send(f"Skipped: {posting.company} — {posting.title}.")
 
-    def _finish_status(self, application_id: int, status: str) -> None:
+    def _finish_status(self, application_id: int, status: str, day: dt.date | None = None) -> None:
+        """Record a status, dated `day`, or today (the configured date) without one."""
         if status not in LATER_STATUSES:
             raise Refusal("That status isn't recognized.")
         doc = self._config()
+        today = self._today(doc)
         with self._writable(doc) as (search, active):
             summary = search_store.application_summary(search, application_id)
             if summary is None:
                 raise Refusal("That application isn't in search.db any more.")
+            dated = day or today
+            try:
+                ledger.check_status_date(search, summary["correlation_id"], dated, today)
+            except ledger.StatusDateError as exc:
+                raise Refusal(str(exc)) from None
             ledger.record_status(
-                search, active, summary["correlation_id"], status, self._today(doc).isoformat()
+                search, active, summary["correlation_id"], status, dated.isoformat()
             )
-        self.send(f"{summary['company']} — {summary['title']}: {_words(status)}.")
+        when = "" if day is None else f" ({day.isoformat()})"
+        self.send(f"{summary['company']} — {summary['title']}: {_words(status)}{when}.")
 
     def _finish_activity(self, kind: str, description: str, dating: Dating) -> None:
         if kind not in enums.ACTIVITY_TYPES:

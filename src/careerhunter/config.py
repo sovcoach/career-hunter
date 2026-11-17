@@ -88,6 +88,9 @@ QUERIES_PER_RUN_LIMITS = (1, 40)
 DEFAULT_QUERY_DELAY_SECONDS = 5
 QUERY_DELAY_LIMITS = (2, 30)
 MAX_PASS_PAUSES = 120
+# discovery.max_candidates_per_day: discovery candidates the bot sends in one day.
+DEFAULT_CANDIDATES_PER_DAY = 3
+CANDIDATES_PER_DAY_LIMITS = (1, 20)
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 DEFAULT_OFF_LANE_MIN_FIT = "high"
 DEFAULT_MAX_POSTING_AGE_DAYS = 7
@@ -237,9 +240,18 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
         "interval_minutes",
         "queries_per_run",
         "query_delay_seconds",
+        "max_candidates_per_day",
     }
     if extra:
         problems.append(f"discovery has unknown keys: {sorted(extra)}")
+    low, high = CANDIDATES_PER_DAY_LIMITS
+    if "max_candidates_per_day" in section and not (
+        _int(value := section["max_candidates_per_day"]) and low <= value <= high
+    ):
+        problems.append(
+            f"discovery.max_candidates_per_day must be an integer from {low} to {high} "
+            f"(default {DEFAULT_CANDIDATES_PER_DAY})"
+        )
     if "searxng_url" in section:
         _searxng_url(section["searxng_url"], problems)
     if "career_hosts" in section:
@@ -345,13 +357,17 @@ def _validate_lanes(lanes: Any, problems: list[str]) -> None:
 
 def _validate_location_rules(rules: Any, problems: list[str]) -> None:
     where = "search.location_rules"
+    if "allow_travel_outside" in rules:
+        problems.append(
+            f"{where}.allow_travel_outside is no longer a setting: delete that line from "
+            "config.yaml (after a backup). Travel never skips a posting, and regular office "
+            "days outside onsite_hybrid always do"
+        )
     extra = set(rules) - {"onsite_hybrid", "remote", "allow_travel_outside"}
     if extra:
         problems.append(f"{where} has unknown keys: {sorted(extra)}")
     _optional_str_list(rules, "onsite_hybrid", where, problems)
     _optional_str_list(rules, "remote", where, problems)
-    if not isinstance(rules.get("allow_travel_outside", True), bool):
-        problems.append(f"{where}.allow_travel_outside must be true or false")
 
 
 def _validate_gap_tiers(rubric: Any, problems: list[str]) -> None:
@@ -833,6 +849,14 @@ def discovery_queries_per_run(doc: Mapping[str, Any] | None) -> int:
     value = section.get("queries_per_run") if isinstance(section, Mapping) else None
     low, high = QUERIES_PER_RUN_LIMITS
     return value if _int(value) and low <= value <= high else DEFAULT_QUERIES_PER_RUN
+
+
+def discovery_candidates_per_day(doc: Mapping[str, Any] | None) -> int:
+    """How many discovery candidates the bot sends in one day. 3 when it is not set."""
+    section = doc.get("discovery") if isinstance(doc, Mapping) else None
+    value = section.get("max_candidates_per_day") if isinstance(section, Mapping) else None
+    low, high = CANDIDATES_PER_DAY_LIMITS
+    return value if _int(value) and low <= value <= high else DEFAULT_CANDIDATES_PER_DAY
 
 
 def discovery_query_delay_seconds(doc: Mapping[str, Any] | None) -> int:

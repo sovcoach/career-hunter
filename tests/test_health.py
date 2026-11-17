@@ -29,7 +29,7 @@ def _board(*, fail: bool = False, title: str = "Coordinator", ident: int = 1001)
     found: Any = (
         FetchError("synthetic failure") if fail else fetched(one_greenhouse(SLUG, title, ident))
     )
-    return Scripted({url("greenhouse", SLUG): found})
+    return Scripted({url("greenhouse", SLUG): found}, on_board=True)
 
 
 def _health(conn: sqlite3.Connection) -> dict[str, tuple[int, str | None, int | None]]:
