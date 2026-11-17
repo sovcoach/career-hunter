@@ -11,6 +11,7 @@ from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import title_key
 from careerhunter.models import Application, Dating, Posting
+from careerhunter.urls import canonical as canonical_url
 
 
 class IdentityConflict(Exception):
@@ -1214,6 +1215,38 @@ def insert_skip(
         (posting_id, date, reason, int(by_operator)),
     )
     return int(cur.lastrowid or 0)
+
+
+def has_operator_skip(conn: sqlite3.Connection, posting_id: int) -> bool:
+    """Whether the operator skipped this posting already."""
+    row = conn.execute(
+        "SELECT 1 FROM skips WHERE posting_id = ? AND by_operator = 1 LIMIT 1", (posting_id,)
+    ).fetchone()
+    return row is not None
+
+
+def skippable_postings(conn: sqlite3.Connection, since: str, limit: int) -> list[sqlite3.Row]:
+    """Postings alerted at or after `since` (UTC) that the operator has neither skipped
+    nor applied to, newest alert first: id, company and title."""
+    return conn.execute(
+        "SELECT p.id, c.name AS company, p.title FROM postings p "
+        "JOIN companies c ON c.id = p.company_id "
+        "WHERE p.alerted_at IS NOT NULL AND p.alerted_at >= ? "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id AND s.by_operator = 1) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "ORDER BY p.alerted_at DESC, p.id DESC LIMIT ?",
+        (since, limit),
+    ).fetchall()
+
+
+def posting_id_by_link(conn: sqlite3.Connection, url: str) -> int | None:
+    """The stored posting whose link is this one, compared canonically; the oldest when
+    more than one has it."""
+    wanted = canonical_url(url)
+    for row in conn.execute("SELECT id, url FROM postings WHERE url IS NOT NULL ORDER BY id"):
+        if canonical_url(str(row["url"])) == wanted:
+            return int(row["id"])
+    return None
 
 
 def set_operator_skip_reason(conn: sqlite3.Connection, skip_id: int, reason: str) -> bool:

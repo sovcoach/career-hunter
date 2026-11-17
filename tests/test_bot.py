@@ -712,6 +712,77 @@ def test_skipped_with_a_typed_reason(env: Env) -> None:
     s.close()
 
 
+# --- /skip: a posting whose buttons are spent -----------------------------------------------
+
+
+def _spend_alert_buttons(env: Env) -> None:
+    """Expire every button sent so far, as if the alert were over a week old."""
+    s = db.connect(env.datadir.search_db_path)
+    s.execute("UPDATE bot_tokens SET expires_at = '2026-10-01T00:00:00Z'")
+    s.close()
+
+
+def test_skip_lists_recent_alerts_and_records_the_skip_through_the_ledger(env: Env) -> None:
+    alerted(env)
+    alerted(env, "https://jobs.example.com/ads/2", "Sample Logistics", "Synthetic Planner")
+    _spend_alert_buttons(env)
+    assert env.say("/skip") == "command:skip"
+    picker = env.api.last()[1]
+    assert picker["text"] == "Which posting?"
+    assert _keyboard_labels(picker) == [
+        "Sample Logistics — Synthetic Planner",
+        "Example Robotics — Synthetic Analyst",
+    ]
+    env.press("Example Robotics — Synthetic Analyst")
+    assert env.api.last()[1]["text"] == "Why skip it?"
+    env.press("Not a fit")
+    assert env.api.texts()[-1] == "Skipped: Example Robotics — Synthetic Analyst."
+    assert _skip_reasons(env) == ["not a fit"]
+    env.say("/skip")  # the skipped one is no longer offered
+    assert _keyboard_labels(env.api.last()[1]) == ["Sample Logistics — Synthetic Planner"]
+
+
+def test_skip_by_link_and_a_second_skip_is_refused(env: Env) -> None:
+    alerted(env)
+    _spend_alert_buttons(env)
+    env.say("/skip https://jobs.example.com/ads/1?utm_source=synthetic")
+    env.press("Other")
+    env.say("synthetic reason", reply_to=env.prompt_id())
+    assert _skip_reasons(env) == ["synthetic reason"]
+    env.say("/skip https://jobs.example.com/ads/1")
+    assert env.api.texts()[-1] == "Already skipped."
+    env.say("/skip https://jobs.example.com/ads/404")
+    assert env.api.texts()[-1] == (
+        "I don't know that link. Send /skip to choose from recent alerts."
+    )
+    assert _skip_reasons(env) == ["synthetic reason"]
+
+
+def test_skip_leaves_out_applied_old_and_never_alerted_postings(env: Env) -> None:
+    apply(env)  # applied: not offered
+    old = alerted(env, "https://jobs.example.com/ads/3", "Sample Logistics", "Old Alert")
+    s = db.connect(env.datadir.search_db_path)
+    s.execute("UPDATE postings SET alerted_at = '2026-10-01T00:00:00Z' WHERE id = ?", (old,))
+    s.close()
+    env.say("/skip")
+    assert env.api.texts()[-1] == (
+        "No posting alerted in the last 14 days is left to skip. "
+        "Send /skip <link> for an older one."
+    )
+
+
+def test_a_reason_button_after_a_skip_by_link_does_not_skip_twice(env: Env) -> None:
+    alerted(env)
+    env.press("Skipped")  # the alert's own reason keyboard, left open
+    first_reasons = env.api.last()[0]
+    env.say("/skip https://jobs.example.com/ads/1")
+    env.press("Location")
+    assert _skip_reasons(env) == ["location"]
+    assert _press_at(env, first_reasons, "Pay") == "refused"
+    assert env.api.texts()[-1] == "Already skipped."
+    assert _skip_reasons(env) == ["location"]
+
+
 def _refusal(method: str, description: str = "Bad Request: synthetic") -> telegram.TelegramError:
     return telegram.TelegramRejected(
         f"{method}: {description}", method=method, error_code=400, description=description

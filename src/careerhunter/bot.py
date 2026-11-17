@@ -211,8 +211,12 @@ HELP = (
     "/status <ref> <status>: update an application, or /status to choose\n"
     "/activity <type> [YYYY-MM-DD] <description>: a recruiter call, agency "
     "registration and so on\n"
-    "/recent: your latest applications"
+    "/recent: your latest applications\n"
+    "/skip: skip a posting whose buttons are spent, or /skip <link>"
 )
+# /skip lists the postings alerted this long ago or less.
+SKIP_WINDOW = dt.timedelta(days=14)
+SKIP_CHOICES = 10
 
 
 class BotStartupError(Exception):
@@ -1238,6 +1242,8 @@ class Bot:
             self._cmd_activity(rest)
         elif command == "/recent":
             self._cmd_recent()
+        elif command == "/skip":
+            self._cmd_skip(rest)
         else:
             self.send("I don't know that command.\n\n" + HELP)
             return "command:unknown"
@@ -1410,6 +1416,45 @@ class Bot:
         rows = [[(label, "activity_date", {**payload, "choice": c})] for label, c in DATE_BUTTONS]
         with self._search() as search:
             self._keyboard(search, "When was it?", rows, STEP_TTL)
+
+    def _cmd_skip(self, rest: str) -> None:
+        """Skip a posting whose alert buttons are spent or expired, or whose skip was
+        lost: pick one of the latest alerts, or name it by its link. Then the same reason
+        buttons and the same `ledger.record_skip` as an alert's Skipped."""
+        with self._search() as search:
+            if not rest:
+                since = _utc(self.clock() - SKIP_WINDOW)
+                rows = search_store.skippable_postings(search, since, SKIP_CHOICES)
+                if not rows:
+                    raise Refusal(
+                        "No posting alerted in the last 14 days is left to skip. "
+                        "Send /skip <link> for an older one."
+                    )
+                buttons = [
+                    [
+                        (
+                            f"{r['company']} — {r['title']}"[:60],
+                            "skip",
+                            {"posting_id": int(r["id"])},
+                        )
+                    ]
+                    for r in rows
+                ]
+                self._keyboard(search, "Which posting?", buttons, STEP_TTL)
+                return
+            posting_id = search_store.posting_id_by_link(search, rest.split()[0])
+            if posting_id is None:
+                raise Refusal("I don't know that link. Send /skip to choose from recent alerts.")
+            if search_store.has_operator_skip(search, posting_id):
+                raise Refusal("Already skipped.")
+            self._skip_reasons(search, posting_id)
+
+    def _skip_reasons(self, search: sqlite3.Connection, posting_id: int) -> None:
+        rows = [
+            [(a, "skip_reason", {"posting_id": posting_id, "reason": r}) for a, r in pair]
+            for pair in (SKIP_BUTTONS[i : i + 2] for i in range(0, len(SKIP_BUTTONS), 2))
+        ]
+        self._keyboard(search, "Why skip it?", rows, STEP_TTL)
 
     def _cmd_recent(self) -> None:
         with self._search() as search:
@@ -1596,12 +1641,10 @@ class Bot:
             dating = choice_dating(str(p.get("choice")), self._today(doc))
             self._finish_log(found, str(p.get("method")), dating, doc)
         elif action == "skip":
-            rows = [
-                [(a, "skip_reason", {"posting_id": p["posting_id"], "reason": r}) for a, r in pair]
-                for pair in (SKIP_BUTTONS[i : i + 2] for i in range(0, len(SKIP_BUTTONS), 2))
-            ]
             with self._search() as search:
-                self._keyboard(search, "Why skip it?", rows, STEP_TTL)
+                if search_store.has_operator_skip(search, int(p["posting_id"])):
+                    raise Refusal("Already skipped.")
+                self._skip_reasons(search, int(p["posting_id"]))
         elif action == "skip_reason":
             # The skip is recorded first, as `other` for Other…, so no later Telegram
             # failure can lose it; a typed reason then replaces `other`.
@@ -1872,6 +1915,8 @@ class Bot:
             posting = search_store.posting_by_id(search, posting_id)
             if posting is None:
                 raise Refusal("That posting isn't in search.db any more.")
+            if search_store.has_operator_skip(search, posting_id):
+                raise Refusal("Already skipped.")
             skip_id = ledger.record_skip(search, posting, self._today(doc).isoformat(), reason)
         if reply:
             self.send(f"Skipped: {posting.company} — {posting.title}.")
