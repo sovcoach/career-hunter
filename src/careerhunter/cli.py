@@ -621,6 +621,41 @@ def cmd_status(datadir: DataDir, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
+    """`rescore`: queue chosen postings for the next watch run to score again, gated on
+    their full description first (ADR-027). Only scored watcher or discovery postings
+    with no skip and no application; picked by `--posting` ids or by `--gap` text in
+    their stored gaps or key requirements. Prints each with its fit now. `--dry-run`
+    writes nothing."""
+    if not args.posting and not args.gap:
+        _err("error: give --posting, or --gap")
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    conn = db.connect(datadir.search_db_path)
+    try:
+        db.migrate(conn, "search")
+        rows = search_store.rescore_candidates(conn, args.posting or (), args.gap)
+        missing = sorted(set(args.posting or ()) - {int(r["id"]) for r in rows})
+        for row in rows:
+            alerted = "alerted" if row["alerted_at"] else "not alerted"
+            print(
+                f"{int(row['id']):5} {row['company']} — {row['title']}: fit {row['fit']}, {alerted}"
+            )
+        for posting_id in missing:
+            print(f"{posting_id:5} not queued: not a scored posting without a skip or application")
+        if args.dry_run:
+            print(f"dry run: nothing is written. {len(rows)} postings would be re-scored.")
+            return EXIT_OK
+        with db.transaction(conn):
+            count = search_store.mark_for_rescore(conn, [int(r["id"]) for r in rows])
+    finally:
+        conn.close()
+    print(f"{count} postings queued; the next watch run re-scores them while a resume is in use.")
+    return EXIT_OK if not missing else EXIT_ERROR
+
+
 def _jd_argument(args: argparse.Namespace) -> jobdesc.JobDescription | None:
     """The JD from --jd-file or --jd-stdin, read and checked before anything is written."""
     if args.jd_stdin:
@@ -2352,6 +2387,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--date", type=_date, metavar="YYYY-MM-DD", help="the day applied, or its week's Monday"
     )
     p = sub.add_parser(
+        "rescore",
+        help="queue scored postings for the next watch run to score again",
+    )
+    p.add_argument("--posting", type=int, action="append", metavar="ID", help="a posting id")
+    p.add_argument("--gap", metavar="TEXT", help="postings whose stored gaps mention TEXT")
+    p.add_argument("--dry-run", action="store_true", help="list them; write nothing")
+    p = sub.add_parser(
         "status",
         help="record an application's status, dated today or --on a day, in both layers",
     )
@@ -2464,6 +2506,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "log": cmd_log,
     "jd": cmd_jd,
     "status": cmd_status,
+    "rescore": cmd_rescore,
     "report": cmd_report,
     "claim": cmd_claim,
     "secret": cmd_secret,

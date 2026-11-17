@@ -428,6 +428,46 @@ def set_posting_schedule(conn: sqlite3.Connection, posting_id: int, schedule: st
     conn.execute("UPDATE postings SET schedule = ? WHERE id = ?", (schedule, posting_id))
 
 
+def rescore_candidates(
+    conn: sqlite3.Connection, posting_ids: Sequence[int] = (), gap_text: str | None = None
+) -> list[sqlite3.Row]:
+    """Scored watcher or discovery postings with no skip and no application: those with
+    these ids, or those whose stored gaps or key requirements contain `gap_text`
+    (ignoring case). Each with its company, title, fit and whether it was alerted."""
+    rows = conn.execute(
+        "SELECT p.id, c.name AS company, p.title, p.fit, p.alerted_at, p.gaps, "
+        "p.key_requirements FROM postings p JOIN companies c ON c.id = p.company_id "
+        "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "ORDER BY p.id"
+    ).fetchall()
+    wanted = set(posting_ids)
+    needle = gap_text.casefold() if gap_text else None
+    return [
+        row
+        for row in rows
+        if int(row["id"]) in wanted
+        or (
+            needle is not None
+            and needle in f"{row['gaps'] or ''}\n{row['key_requirements'] or ''}".casefold()
+        )
+    ]
+
+
+def mark_for_rescore(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> int:
+    """Forget the resume these scores were made with, so the next watch run re-scores
+    them (`watch._RESCORE_SQL`). The score, fit and alert stay until then."""
+    count = 0
+    for posting_id in posting_ids:
+        count += conn.execute(
+            "UPDATE postings SET scored_resume_sha256 = NULL WHERE id = ? "
+            "AND llm_output IS NOT NULL",
+            (posting_id,),
+        ).rowcount
+    return count
+
+
 def set_posting_score(
     conn: sqlite3.Connection,
     posting_id: int,
