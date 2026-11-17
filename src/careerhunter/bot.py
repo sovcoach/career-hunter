@@ -208,7 +208,8 @@ HELP = (
     "(or /log <link> to be asked; add | Company | Title if the page doesn't show them). "
     "Paste the job description on the lines after it, or send its PDF, HTML or text "
     "file with the /log line as the caption\n"
-    "/status <ref> <status>: update an application, or /status to choose\n"
+    "/status <ref> <status> [YYYY-MM-DD]: update an application (dated today unless a "
+    "date is given), or /status to choose\n"
     "/activity <type> [YYYY-MM-DD] <description>: a recruiter call, agency "
     "registration and so on\n"
     "/recent: your latest applications\n"
@@ -1380,15 +1381,21 @@ class Bot:
                 ]
                 self._keyboard(search, "Which application?", buttons, STEP_TTL)
                 return
-            if len(parts) != 2:
-                raise Refusal("Send: /status <ref> <status>, or just /status to choose.")
+            if len(parts) not in (2, 3):
+                raise Refusal(
+                    "Send: /status <ref> <status> [YYYY-MM-DD], or just /status to choose."
+                )
             ref, status = parts[0].lower(), enums.normalize(parts[1])
             if status not in LATER_STATUSES:
                 raise Refusal("The status must be one of: " + ", ".join(LATER_STATUSES))
             application_id = self._resolve_ref(search, ref)
         if application_id is None:
             raise Refusal("I don't know that reference. Send /recent for current ones.")
-        self._finish_status(application_id, status)
+        day = None
+        if len(parts) == 3:
+            dating = parse_date(parts[2], self._today(self._config()))
+            day = dt.date.fromisoformat(str(dating.day))
+        self._finish_status(application_id, status, day)
 
     def _cmd_activity(self, rest: str) -> None:
         kind_text, _, remainder = rest.partition(" ")
@@ -1936,18 +1943,26 @@ class Bot:
                 raise Refusal("That skip isn't in search.db any more.")
         self.send(f"Skipped: {posting.company} — {posting.title}.")
 
-    def _finish_status(self, application_id: int, status: str) -> None:
+    def _finish_status(self, application_id: int, status: str, day: dt.date | None = None) -> None:
+        """Record a status, dated `day`, or today (the configured date) without one."""
         if status not in LATER_STATUSES:
             raise Refusal("That status isn't recognized.")
         doc = self._config()
+        today = self._today(doc)
         with self._writable(doc) as (search, active):
             summary = search_store.application_summary(search, application_id)
             if summary is None:
                 raise Refusal("That application isn't in search.db any more.")
+            dated = day or today
+            try:
+                ledger.check_status_date(search, summary["correlation_id"], dated, today)
+            except ledger.StatusDateError as exc:
+                raise Refusal(str(exc)) from None
             ledger.record_status(
-                search, active, summary["correlation_id"], status, self._today(doc).isoformat()
+                search, active, summary["correlation_id"], status, dated.isoformat()
             )
-        self.send(f"{summary['company']} — {summary['title']}: {_words(status)}.")
+        when = "" if day is None else f" ({day.isoformat()})"
+        self.send(f"{summary['company']} — {summary['title']}: {_words(status)}{when}.")
 
     def _finish_activity(self, kind: str, description: str, dating: Dating) -> None:
         if kind not in enums.ACTIVITY_TYPES:

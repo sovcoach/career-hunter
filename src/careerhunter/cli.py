@@ -39,6 +39,7 @@ from careerhunter import (
     discover,
     embed,
     embed_eval,
+    enums,
     jobdesc,
     lanes,
     ledger,
@@ -557,6 +558,66 @@ def cmd_jd(datadir: DataDir, args: argparse.Namespace) -> int:
         print(f"Marked: {name} ({where}): job description unavailable ({explanation}).")
     else:
         print(f"Already marked: {name} ({where}): {explanation}. Nothing changed.")
+    return EXIT_OK
+
+
+def cmd_status(datadir: DataDir, args: argparse.Namespace) -> int:
+    """`status`: record one application's status, dated `--on` (today by default), in
+    both layers through `ledger.record_status`, as the bot's /status does. The
+    application is picked by `--id` (its search.db id), by `--url`, or by `--company`
+    and `--title`, with `--applied` when more than one matches. `--dry-run` says what
+    would be written and writes nothing."""
+    status = enums.normalize(args.status)
+    if status not in enums.STATUSES or status == "applied":
+        later = [s for s in enums.STATUSES if s != "applied"]
+        _err(f"error: the status must be one of: {', '.join(later)}")
+        return EXIT_ERROR
+    by_names = args.company is not None or args.title is not None or args.applied is not None
+    picks = sum((args.id is not None, args.url is not None, by_names))
+    if picks != 1 or (by_names and (args.company is None or args.title is None)):
+        _err("error: give --id, or --url, or --company and --title (and --applied if needed)")
+        return EXIT_ERROR
+    if not datadir.config_path.is_file():
+        _err("error: config.yaml is missing, so nothing was recorded")
+        return EXIT_ERROR
+    today = config_today(load_config(datadir.config_path))
+    day = args.on or today
+    with _writable(datadir) as w:
+        found = search_store.stored_applications(w.search)
+        if args.id is not None:
+            matches = [a for a in found if a.application_id == args.id]
+        elif args.url is not None:
+            wanted = urls.canonical(args.url)
+            matches = [a for a in found if a.url is not None and urls.canonical(a.url) == wanted]
+        else:
+            matches = [
+                a
+                for a in found
+                if a.company.casefold() == args.company.strip().casefold()
+                and a.title.casefold() == args.title.strip().casefold()
+                and (
+                    args.applied is None
+                    or args.applied.isoformat() in (a.dating.day, a.dating.week_of)
+                )
+            ]
+        if len(matches) != 1:
+            many = f"{len(matches)} applications match" if matches else "no application matches"
+            _err(f"error: {many}; nothing was recorded")
+            return EXIT_ERROR
+        (target,) = matches
+        try:
+            ledger.check_status_date(w.search, target.correlation_id, day, today)
+        except ledger.StatusDateError as exc:
+            _err(f"error: {exc} Nothing was recorded.")
+            return EXIT_ERROR
+        to_ei = w.active is not None and target.ei_claim == w.active.claim.label
+        where = f"search.db and EI claim {target.ei_claim}" if to_ei else "search.db only"
+        line = f"{_app_text(target)}: {status} on {day.isoformat()}, in {where}"
+        if args.dry_run:
+            print(f"dry run: nothing is written. Would record {line}.")
+            return EXIT_OK
+        ledger.record_status(w.search, w.active, target.correlation_id, status, day.isoformat())
+    print(f"Recorded {line}.")
     return EXIT_OK
 
 
@@ -2291,6 +2352,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--date", type=_date, metavar="YYYY-MM-DD", help="the day applied, or its week's Monday"
     )
     p = sub.add_parser(
+        "status",
+        help="record an application's status, dated today or --on a day, in both layers",
+    )
+    p.add_argument("status", help="the new status, e.g. rejected or interview_scheduled")
+    p.add_argument(
+        "--on", type=_date, metavar="YYYY-MM-DD", help="the status date (default: today)"
+    )
+    p.add_argument("--id", type=int, help="the application's id in search.db")
+    p.add_argument("--url", help="the application's job ad link")
+    p.add_argument("--company", help="the employer, with --title")
+    p.add_argument("--title", help="the role, with --company")
+    p.add_argument(
+        "--applied",
+        type=_date,
+        metavar="YYYY-MM-DD",
+        help="with --company and --title: the day applied, or its week's Monday",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="say what would be written; write nothing"
+    )
+    p = sub.add_parser(
         "report",
         help="join one claim's EI record to search.db, read-only, into a private report",
     )
@@ -2381,6 +2463,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "export": cmd_export,
     "log": cmd_log,
     "jd": cmd_jd,
+    "status": cmd_status,
     "report": cmd_report,
     "claim": cmd_claim,
     "secret": cmd_secret,

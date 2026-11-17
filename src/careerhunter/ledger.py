@@ -33,6 +33,7 @@ does not open an EI file.
 
 from __future__ import annotations
 
+import datetime as dt
 import secrets
 import sqlite3
 from collections.abc import Iterator, Mapping
@@ -202,6 +203,28 @@ def record_status(
                 )
             ei_store.add_status(to_ei.conn, ei_id, status, status_date)
     return to_ei is not None
+
+
+class StatusDateError(ValueError):
+    """A status date that can't be recorded. The message is fixed and user-facing."""
+
+
+def check_status_date(
+    search: sqlite3.Connection, correlation_id: str, day: dt.date, today: dt.date
+) -> None:
+    """Refuse a status dated after `today` (the configured date) or before the day the
+    application was made (its week's Monday for a week-dated one)."""
+    if day > today:
+        raise StatusDateError("That date is in the future, so it can't be recorded.")
+    row = search.execute(
+        "SELECT date_applied, week_of FROM applications WHERE correlation_id = ?",
+        (correlation_id,),
+    ).fetchone()
+    applied = None if row is None else (row["date_applied"] or row["week_of"])
+    if applied is not None and day.isoformat() < str(applied):
+        raise StatusDateError(
+            f"That date is before the application ({applied}), so it can't be recorded."
+        )
 
 
 def record_discovery_decision(

@@ -941,6 +941,44 @@ def test_bad_status_requests(env: Env, command: str, message: str) -> None:
     assert env.counts()["ei.status_history"] == 1
 
 
+def test_a_dated_status_lands_in_both_layers_with_its_date(env: Env) -> None:
+    apply(env, "Yesterday")  # applied 2026-10-27; today is 2026-10-28
+    env.say("/status a1 assessment_requested 2026-10-27")
+    assert env.api.texts()[-1] == (
+        "Example Robotics — Synthetic Analyst: assessment requested (2026-10-27)."
+    )
+    e, s = env.ei(), env.search()
+    assert e is not None
+    rows = e.execute("SELECT status, status_date FROM status_history ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("applied", "2026-10-27"),
+        ("assessment_requested", "2026-10-27"),
+    ]
+    decided = s.execute("SELECT status_date FROM decision_history ORDER BY id DESC").fetchone()
+    assert decided[0] == "2026-10-27"
+    assert ledger.reconcile(s, {ACTIVE.label: e}) == []
+    e.close()
+    s.close()
+
+
+@pytest.mark.parametrize(
+    ("date", "message"),
+    [
+        ("2026-10-29", "That date is in the future"),
+        ("2026-10-26", "That date is before the application (2026-10-27)"),
+        ("2026-13-01", "isn't a real date"),
+        ("27/10/2026", "Please send the date as YYYY-MM-DD"),
+    ],
+)
+def test_a_status_date_that_cannot_be_recorded_is_refused(
+    env: Env, date: str, message: str
+) -> None:
+    apply(env, "Yesterday")
+    env.say(f"/status a1 rejected {date}")
+    assert message in env.api.texts()[-1]
+    assert env.counts()["ei.status_history"] == 1
+
+
 def test_status_by_buttons(env: Env) -> None:
     apply(env)
     env.say("/status")
