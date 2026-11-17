@@ -175,7 +175,8 @@ REFUSALS_TO_GIVE_UP = 3
 
 LOG_USAGE = (
     "Send: /log <link> | method | date, or just /log <link>. "
-    "Add | Company | Title when the page doesn't show them."
+    "Add | Company | Title when the page doesn't show them. For example: "
+    "/log https://jobs.example.com/123 | company_site | 2026-11-10"
 )
 LINKEDIN_REFUSAL = (
     "LinkedIn links are never fetched, so give the company and title: "
@@ -532,6 +533,29 @@ class _Stitch:
     title: str | None
     parts: list[str]
     last: dt.datetime
+
+
+def _log_format_problem(url: str, extra: list[str]) -> str | None:
+    """What is wrong with how a /log line is laid out, in words, or None. Nothing typed
+    is echoed back: only counts and positions."""
+    if not url:
+        return "The link is missing."
+    words = len(url.split()) - 1
+    if words:
+        return (
+            f"The link is followed by {words} more word{'s' if words != 1 else ''} with no | "
+            "between them, so I can't tell the link from the rest. Put | between the fields."
+        )
+    empty = [n for n, part in enumerate(extra, start=1) if not part]
+    if empty:
+        return f"Field {empty[0]} after the link is empty."
+    if len(extra) not in (0, 2, 4):
+        count = f"{len(extra)} field{'s' if len(extra) != 1 else ''}"
+        return (
+            f"I found {count} after the link. /log takes none, two (method and date), or "
+            "four (method, date, company and title)."
+        )
+    return None
 
 
 def _log_fields(raw: object) -> dict[str, str]:
@@ -1267,8 +1291,9 @@ class Bot:
         """
         parts = [p.strip() for p in rest.split("|")]
         url, extra = parts[0], parts[1:]
-        if not url or len(extra) not in (0, 2, 4) or any(not p for p in extra):
-            raise Refusal(LOG_USAGE)
+        problem = _log_format_problem(url, extra)
+        if problem is not None:
+            raise Refusal(f"{problem} {LOG_USAGE}")
         if len(url) > selfsourced.MAX_URL or len(" ".join(extra)) > MAX_TEXT:
             raise Refusal("That's too long.")
         if (body is not None or document is not None) and not extra:

@@ -525,8 +525,16 @@ def test_another_level_logged_has_no_earlier_line(env: Env) -> None:
         (f"/log {AD_URL} | carrier pigeon | today", "The method must be one of"),
         (f"/log {AD_URL} | email | 2026-10-29", "in the future"),
         (f"/log {AD_URL} | email | 2026-07-01", "outside the active EI claim"),
-        (f"/log {AD_URL} | email", "Send: /log <link> | method | date"),
-        (f"/log {AD_URL} | email | today | Only Company", "Send: /log <link> | method | date"),
+        (f"/log {AD_URL} | email", "I found 1 field after the link. /log takes none, two"),
+        (f"/log {AD_URL} | email | today | Only Company", "I found 3 fields after the link."),
+        (f"/log {AD_URL} | | today", "Field 1 after the link is empty."),
+        (
+            f"/log {AD_URL} email 2026-10-21",
+            "The link is followed by 2 more words with no | between them",
+        ),
+        (f"/log {AD_URL} email", "The link is followed by 1 more word with no |"),
+        ("/log | email | today", "The link is missing."),
+        (f"/log {AD_URL} email 2026-10-21", "Send: /log <link> | method | date"),
     ],
 )
 def test_a_refused_log_writes_nothing(env: Env, command: str, message: str) -> None:
