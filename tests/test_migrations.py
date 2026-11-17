@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 30)), "ei_record": [1, 2, 3]}[track]
+    expected = {"search": list(range(1, 31)), "ei_record": [1, 2, 3, 4]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1073,3 +1073,95 @@ def test_trigger_counts_on_a_fresh_file(fresh: sqlite3.Connection, track: str) -
     """The counts ARCHITECTURE states for a fresh file."""
     found = fresh.execute("SELECT count(*) FROM sqlite_master WHERE type = 'trigger'").fetchone()
     assert found[0] == {"search": 9, "ei_record": 41}[track]
+
+
+# --- EI 0004 and search 0030: assessment_requested and position_closed ----------------------
+
+
+def test_ei_0004_keeps_every_status_row_and_the_records_rules(tmp_path: Path) -> None:
+    ei = db.load_migrations("ei_record")
+    conn = db.connect(tmp_path / "ei.db")
+    try:
+        db.migrate(conn, "ei_record", ei[:3])
+        conn.execute(
+            "INSERT INTO claim (id, label, start_date) VALUES (1, '2026-27', '2026-09-01')"
+        )
+        conn.execute(
+            "INSERT INTO applications (correlation_id, employer, role, date_applied, "
+            "date_precision, method) VALUES (?, 'Example Robotics', 'Analyst', '2026-09-02', "
+            "'exact', 'email')",
+            (f"{1:032x}",),
+        )
+        for status, day, stamp in (
+            ("applied", "2026-09-02", "2026-09-02T10:00:00Z"),
+            ("screening", None, "2026-09-05T11:00:00Z"),
+        ):
+            conn.execute(
+                "INSERT INTO status_history (application_id, status, status_date, recorded_at) "
+                "VALUES (1, ?, ?, ?)",
+                (status, day, stamp),
+            )
+        before = conn.execute("SELECT * FROM status_history ORDER BY id").fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO status_history (application_id, status, status_date) "
+                "VALUES (1, 'position_closed', '2026-09-09')"
+            )
+        assert db.migrate(conn, "ei_record") == [4]
+        assert conn.execute("SELECT * FROM status_history ORDER BY id").fetchall() == before
+        for status in ("assessment_requested", "position_closed"):
+            conn.execute(
+                "INSERT INTO status_history (application_id, status, status_date) "
+                "VALUES (1, ?, '2026-09-09')",
+                (status,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO status_history (application_id, status) VALUES (1, 'ghosted')"
+            )
+        with pytest.raises(sqlite3.DatabaseError, match="deletes are disabled"):
+            conn.execute("DELETE FROM status_history WHERE id = 1")
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            conn.execute("UPDATE status_history SET status = 'offer' WHERE id = 1")
+        conn.execute("UPDATE claim SET end_date = '2026-11-30', sealed_at = '2026-12-01T00:00:00Z'")
+        with pytest.raises(sqlite3.DatabaseError, match="sealed"):
+            conn.execute("INSERT INTO status_history (application_id, status) VALUES (1, 'offer')")
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(status_history)")}
+        assert "ix_status_history_application" in indexes
+    finally:
+        conn.close()
+
+
+def test_search_0030_keeps_every_decision_row(tmp_path: Path) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:29])
+        conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (1, 'Analyst', '2026-09-01', 'manual')"
+        )
+        conn.execute(
+            "INSERT INTO applications (correlation_id, posting_id, date_applied, date_precision, "
+            "method) VALUES (?, 1, '2026-09-02', 'exact', 'email')",
+            (f"{1:032x}",),
+        )
+        conn.execute(
+            "INSERT INTO decision_history (application_id, status, status_date, note, "
+            "recorded_at) VALUES (1, 'applied', '2026-09-02', 'synthetic note', "
+            "'2026-09-02T10:00:00Z')"
+        )
+        before = conn.execute("SELECT * FROM decision_history").fetchall()
+        assert db.migrate(conn, "search") == [30]
+        assert conn.execute("SELECT * FROM decision_history").fetchall() == before
+        conn.execute(
+            "INSERT INTO decision_history (application_id, status, status_date) "
+            "VALUES (1, 'assessment_requested', '2026-09-09')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO decision_history (application_id, status) VALUES (1, 'ghosted')"
+            )
+    finally:
+        conn.close()

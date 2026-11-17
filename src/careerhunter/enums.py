@@ -38,6 +38,7 @@ METHODS = (
 STATUSES = (
     "applied",
     "screening",
+    "assessment_requested",  # the employer asked for an assessment (EI 0004, search 0030)
     "assessment_submitted",
     "interview_scheduled",
     "offer",
@@ -45,6 +46,7 @@ STATUSES = (
     "rejected",
     "no_response",
     "withdrawn",
+    "position_closed",  # closed or filled without a decision on this application
 )
 ACTIVITY_TYPES = (
     "recruiter_contact",

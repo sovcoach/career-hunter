@@ -1081,6 +1081,7 @@ def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 # A status that means the employer answered: screening and later, a rejection included.
 RESPONSE_STATUSES = (
     "screening",
+    "assessment_requested",
     "assessment_submitted",
     "interview_scheduled",
     "offer",
@@ -1088,7 +1089,7 @@ RESPONSE_STATUSES = (
     "rejected",
 )
 # A status that ends an application one way or another.
-OUTCOME_STATUSES = ("offer", "hired", "rejected", "no_response", "withdrawn")
+OUTCOME_STATUSES = ("offer", "hired", "rejected", "no_response", "withdrawn", "position_closed")
 WEEK_COUNTS = ("alerts", "applied", "skipped", "responses", "outcomes")
 
 
