@@ -502,6 +502,11 @@ def _has(haystack: str, needle: str) -> bool:
     return bool(folded) and folded in _fold(haystack)
 
 
+def mentions(text: str, term: str) -> bool:
+    """True when `term` appears in `text`, matched as the hard gates match (folded)."""
+    return _has(text, term)
+
+
 def _any(haystack: str, needle: object) -> bool:
     return any(_has(haystack, item) for item in _strings(needle))
 

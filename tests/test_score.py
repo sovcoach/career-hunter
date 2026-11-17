@@ -92,7 +92,8 @@ def test_the_prompt_uses_only_the_rubric_and_the_posting() -> None:
     assert result.excluded is False
     text = seen["body"].decode()
     assert seen["url"] == DEFAULT_URL.encode()
-    assert "operations" in text and "Canada" in text and "Senior" in text
+    assert "operations" in text and "Canada" in text
+    assert "hard_gates" not in text and "Senior" not in text  # the gates ran already
     assert "A synthetic posting." in text
     assert "DO-NOT-LEAK-NOTES" not in text
     assert "DO-NOT-LEAK-WEIGHTS" not in text
@@ -480,7 +481,7 @@ def test_the_run_budget_can_end_scoring_sooner(monkeypatch: pytest.MonkeyPatch) 
     assert [timeout for *_rest, timeout in server.opened] == [40.0]
 
 
-def test_the_prompt_shows_the_seniority_option() -> None:
+def test_the_prompt_never_carries_the_hard_gates() -> None:
     seen: dict[str, bytes] = {}
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
@@ -489,11 +490,86 @@ def test_the_prompt_shows_the_seniority_option() -> None:
 
     config = {
         **RUBRIC,
-        "hard_gates": {"seniority_words": ["Senior"], "seniority_in_description": True},
+        "hard_gates": {
+            "seniority_words": ["Senior"],
+            "seniority_in_description": True,
+            "required_languages": ["Examplish"],
+            "credentials": ["Example Licence"],
+        },
     }
     assert score_posting(posting(), config, transport=transport) is not None
     prompt = json.loads(json.loads(seen["body"])["messages"][1]["content"])
-    assert prompt["hard_gates"]["seniority_in_description"] is True
+    assert "hard_gates" not in prompt
+    assert "Examplish" not in seen["body"].decode()
+    assert "Example Licence" not in seen["body"].decode()
+
+
+# --- an avoided language the posting never states (ADR-027) --------------------------------
+
+LANGUAGES = {**RUBRIC, "hard_gates": {"required_languages": ["Examplish", "français"]}}
+PHANTOM = {
+    "gaps": [
+        {"name": "Examplish language proficiency", "kind": "core", "type": "language"},
+        {"name": "Forklift licence", "kind": "minor"},
+    ],
+    "requirements": ["Examplish language required", "Forklift licence", "Remote in Canada"],
+}
+
+
+def _languages(description: str) -> Score:
+    result = score_posting(
+        PostingText(
+            "Example Robotics",
+            "Operations Coordinator",
+            "Example City",
+            work_model="remote",
+            description=description,
+        ),
+        LANGUAGES,
+        transport=lambda url, body: reply(json.dumps(PHANTOM)),
+    )
+    assert result is not None
+    return result
+
+
+def test_a_gap_and_a_requirement_naming_an_unstated_avoided_language_are_dropped() -> None:
+    result = _languages("A synthetic posting about scheduling.")
+    assert json.loads(result.gaps) == [{"name": "Forklift licence", "kind": "minor"}]
+    assert result.tier == "strong"  # one minor gap, not one core and one minor
+    assert result.key_requirements == ("Remote in Canada",)  # the licence names a gap
+
+
+def test_a_language_the_posting_states_is_kept() -> None:
+    result = _languages("Fluency in Examplish is required for this synthetic role.")
+    assert [gap["name"] for gap in json.loads(result.gaps)] == [
+        "Examplish language proficiency",
+        "Forklift licence",
+    ]
+    assert result.tier == "possible"
+    assert "Examplish language required" in result.key_requirements
+
+
+def test_the_guard_folds_accents_and_case_like_the_filter() -> None:
+    phantom = {"gaps": [{"name": "FRANÇAIS courant", "kind": "core"}], "requirements": []}
+    result = score_posting(
+        posting(), LANGUAGES, transport=lambda url, body: reply(json.dumps(phantom))
+    )
+    assert result is not None and result.gaps == "[]"
+    stated = PostingText("Example Robotics", "Coordinator", "Example City", description="Français")
+    kept = score_posting(stated, LANGUAGES, transport=lambda url, body: reply(json.dumps(phantom)))
+    assert kept is not None and json.loads(kept.gaps)[0]["name"] == "FRANÇAIS courant"
+
+
+def test_a_more_than_three_list_still_gives_three_after_the_guard() -> None:
+    reply_body = {
+        "gaps": [],
+        "requirements": ["Examplish fluency", "Forklift licence", "Weekend shifts", "Class 5"],
+    }
+    result = score_posting(
+        posting(), LANGUAGES, transport=lambda url, body: reply(json.dumps(reply_body))
+    )
+    assert result is not None
+    assert result.key_requirements == ("Forklift licence", "Weekend shifts", "Class 5")
 
 
 # --- the resume in the prompt, and D-A1 ------------------------------------------------------
