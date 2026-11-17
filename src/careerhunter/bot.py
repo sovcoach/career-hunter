@@ -24,7 +24,9 @@ fit word (`Fit: High`, `Medium` or `Low`), the number of gaps, the schedule flag
 words, up to three key requirements the model took from the posting, and the link.
 /log records a self-sourced application at once (#34) and replies with the company,
 the title and a reference; it sends no alert. Status words and references are sent
-too. A discovery row sends the suggested name and the reduced URL only. A
+too. A discovery candidate is one message (batch M): the company name its board gave
+(or the suggested name), the ATS, the reduced board URL, and up to three of the
+postings found on it that passed the gates, each as title, location and link. A
 watchlist agency with no separate employer stored is labelled " (agency)". Never
 notes, 0-10 fit ratings, gap names, model text, vectors, snippets, queries, EI
 record details or claim labels.
@@ -86,6 +88,7 @@ from careerhunter.claims import ActiveClaim, ClaimError, Verdict, check_dating
 from careerhunter.config import (
     ConfigError,
     alerts_max_per_poll,
+    discovery_candidates_per_day,
     health_failure_runs,
     load_config,
     telegram_chat_id,
@@ -117,8 +120,15 @@ POLL_TIMEOUT = 50
 TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 REF_SHAPE = re.compile(r"a[1-9][0-9]{0,6}")
 ALERT_TTL = dt.timedelta(days=7)
-DISCOVERY_EACH = 5
-DISCOVERY_DIGEST = 8
+# The ATS names a discovery candidate is shown with.
+ATS_NAMES = {
+    "greenhouse": "Greenhouse",
+    "lever": "Lever",
+    "ashby": "Ashby",
+    "smartrecruiters": "SmartRecruiters",
+    "bamboohr": "BambooHR",
+    "workday": "Workday",
+}
 STEP_TTL = dt.timedelta(days=1)
 REF_TTL = dt.timedelta(days=7)
 MAX_UPLOAD = 20 * 1024 * 1024
@@ -1020,47 +1030,53 @@ class Bot:
             log.warning("weekly digest failed (%s); left for the next poll", type(exc).__name__)
 
     def send_pending_discovery(self) -> None:
-        """Send pending discovery rows that are due. Name and URL only.
+        """Send discovery candidates that are due, one message each (batch M).
 
-        Five or fewer are one message each. More than five are one digest of at
-        most eight, and the rest wait for a later poll. ``notified_at`` is set
-        only after Telegram accepts the message. Each row of a digest has its own
-        Approve and Reject tokens, so one tap leaves the other rows' buttons live (#41).
+        Due: pending boards never sent that have a linked posting still unskipped, up
+        to `discovery.max_candidates_per_day` in one configured day. Each is sent once;
+        ``notified_at`` and ``notified_on`` are set only after Telegram accepts it.
         Nothing is sent while config.yaml can't be read, like the watcher alerts.
         """
-        if self._alert_config() is None:
+        doc = self._alert_config()
+        if doc is None:
             return
-        cutoff = _utc(self.clock() - ALERT_TTL)
+        today = self._today(doc).isoformat()
         try:
             with self._search() as search:
-                rows = discovery.due(search, notified_before=cutoff)
+                rows = discovery.due(search, today=today, per_day=discovery_candidates_per_day(doc))
         except (OSError, sqlite3.Error) as exc:
             log.warning("pending discovery could not be read (%s)", type(exc).__name__)
             return
-        if len(rows) <= DISCOVERY_EACH:
-            batches: list[list[discovery.Queued]] = [[row] for row in rows]
-        else:
-            batches = [list(rows[:DISCOVERY_DIGEST])]
-        for batch in batches:
+        for row in rows:
             try:
                 with self._search() as search:
-                    self._send_discovery(search, batch)
+                    self._send_discovery(search, row, today)
             except (TelegramError, OSError, sqlite3.Error) as exc:
                 log.warning(
                     "discovery send failed (%s); left for the next poll", type(exc).__name__
                 )
+                return
 
-    def _send_discovery(self, search: sqlite3.Connection, rows: list[discovery.Queued]) -> None:
-        text = "\n\n".join(f"{row.suggested_name}\n{row.url}" for row in rows)
+    def _send_discovery(
+        self, search: sqlite3.Connection, candidate: discovery.Sendable, today: str
+    ) -> None:
+        row = candidate.row
+        ats = ATS_NAMES.get(row.ats_type or "", row.ats_type or "ATS")
+        lines = [f"Company to watch? {candidate.name}", f"{ats} board: {row.url}", ""]
+        lines.append("Found on it, passing your gates:")
+        for found in candidate.postings:
+            where = f" — {found.location}" if found.location else ""
+            lines.append(f"• {found.title}{where}")
+            if found.url:
+                lines.append(f"  {found.url}")
+        payload = {"candidate_id": row.id}
         buttons = [
-            [
-                ("Approve", "discover_approve", {"candidate_id": row.id}),
-                ("Reject", "discover_reject", {"candidate_id": row.id}),
-            ]
-            for row in rows
+            [("Approve", "discover_approve", payload), ("Reject", "discover_reject", payload)],
+            [("Reject with reason…", "discover_reject_reason", payload)],
         ]
-        self._keyboard(search, text, buttons, ALERT_TTL, per_row=True)
-        discovery.mark_notified(search, [row.id for row in rows], self._now())
+        self._keyboard(search, "\n".join(lines), buttons, ALERT_TTL)
+        with db.transaction(search):
+            discovery.mark_notified(search, [row.id], self._now(), today)
 
     # --- entry point -------------------------------------------------------------------
 
@@ -1612,6 +1628,17 @@ class Bot:
         elif action in ("discover_approve", "discover_reject"):
             decision = "approve" if action == "discover_approve" else "reject"
             self._finish_discovery(p.get("candidate_id"), decision)
+        elif action == "discover_reject_reason":
+            # The rejection is recorded first, so no later Telegram failure loses it;
+            # the reply then adds the reason.
+            name = self._finish_discovery(p.get("candidate_id"), "reject", reply=False)
+            with self._search() as search:
+                self._prompt(
+                    search,
+                    f"Rejected: {name}. Reply with the reason, in a few words.",
+                    "reject_reason",
+                    {"candidate_id": p.get("candidate_id")},
+                )
         elif action == "activity_date":
             if p.get("choice") == "other":
                 with self._search() as search:
@@ -1669,6 +1696,8 @@ class Bot:
                 if not reason or len(reason) > MAX_TEXT:
                     raise Refusal("Please reply with a short reason.")
                 self._finish_typed_skip(payload, reason)
+            elif kind == "reject_reason":
+                self._finish_reject_reason(payload, text)
             elif kind == "snapshot" and payload.get("jd") is True:
                 self._attach_jd(message, str(payload["correlation_id"]))
             elif kind == "snapshot":
@@ -1682,14 +1711,29 @@ class Bot:
 
     # --- the writes --------------------------------------------------------------------
 
-    def _finish_discovery(self, candidate_id: object, decision: str) -> None:
-        """The same approve or reject as the CLI. search.db only."""
+    def _finish_discovery(self, candidate_id: object, decision: str, *, reply: bool = True) -> str:
+        """The same approve or reject as the CLI. search.db only. Returns the name."""
         if isinstance(candidate_id, bool) or not isinstance(candidate_id, int) or candidate_id < 1:
             raise discovery.DiscoverError("not a candidate")
         with self._search() as search:
             row = ledger.record_discovery_decision(search, candidate_id, decision)
-        word = "Approved" if decision == "approve" else "Rejected"
-        self.send(f"{word}: {row.suggested_name}\n{row.url}")
+        if reply:
+            word = "Approved" if decision == "approve" else "Rejected"
+            self.send(f"{word}: {row.suggested_name}\n{row.url}")
+        return row.suggested_name
+
+    def _finish_reject_reason(self, payload: Mapping[str, Any], reason: str) -> None:
+        candidate_id = payload.get("candidate_id")
+        if isinstance(candidate_id, bool) or not isinstance(candidate_id, int):
+            raise Refusal("That candidate isn't recognized.")
+        try:
+            with self._search() as search:
+                saved = discovery.set_reject_reason(search, candidate_id, reason)
+        except discovery.DiscoverError:
+            raise Refusal("Please reply with a short reason.") from None
+        if not saved:
+            raise Refusal("That rejection already has a reason, or isn't there any more.")
+        self.send("Reason saved.")
 
     def _finish_apply(self, posting_id: int, method: str, dating: Dating) -> None:
         if method not in enums.METHODS:

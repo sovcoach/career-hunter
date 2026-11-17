@@ -190,6 +190,26 @@ def test_discovery_queries_per_run_is_checked(value: object) -> None:
     assert discovery_queries_per_run(doc) == 12
 
 
+@pytest.mark.parametrize("value", [0, 21, "3", True, 1.5, None])
+def test_discovery_candidates_per_day_is_checked(value: object) -> None:
+    from careerhunter.config import discovery_candidates_per_day
+
+    doc = example()
+    doc["discovery"]["max_candidates_per_day"] = value  # type: ignore[index]
+    assert any("discovery.max_candidates_per_day" in p for p in validate_config(doc))
+    assert discovery_candidates_per_day(doc) == 3
+
+
+def test_discovery_candidates_per_day_is_read() -> None:
+    from careerhunter.config import discovery_candidates_per_day
+
+    doc = example()
+    assert discovery_candidates_per_day(doc) == 3
+    doc["discovery"]["max_candidates_per_day"] = 20  # type: ignore[index]
+    assert validate_config(doc) == []
+    assert discovery_candidates_per_day(doc) == 20
+
+
 def test_discovery_queries_per_run_is_read() -> None:
     from careerhunter.config import discovery_queries_per_run
 

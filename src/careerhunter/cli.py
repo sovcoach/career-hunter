@@ -1320,6 +1320,9 @@ def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
     """
     action = args.discover_action
     candidate_id = args.candidate_id
+    if args.reason is not None and action != "reject":
+        _err("error: --reason goes with discover reject only")
+        return EXIT_ERROR
     if action in ("approve", "reject"):
         if not isinstance(candidate_id, int):
             _err(f"error: discover {action} needs a candidate id")
@@ -1330,7 +1333,7 @@ def cmd_discover(datadir: DataDir, args: argparse.Namespace) -> int:
     if action == "clear-backoff":
         return _discover_clear_backoff(datadir)
     if action != "run":
-        return _discover_by_hand(datadir, action, candidate_id)
+        return _discover_by_hand(datadir, action, candidate_id, args.reason)
     try:
         log = RunLog(datadir.logs / "discover.log")
     except RunLogError as exc:
@@ -1394,7 +1397,9 @@ def _discover_run(datadir: DataDir, log: RunLog) -> int:
     return EXIT_OK
 
 
-def _discover_by_hand(datadir: DataDir, action: str, candidate_id: int | None) -> int:
+def _discover_by_hand(
+    datadir: DataDir, action: str, candidate_id: int | None, reason: str | None = None
+) -> int:
     """List, approve or reject. Interactive: no log file."""
     if not datadir.config_path.is_file():
         _err("error: config.yaml is missing")
@@ -1406,7 +1411,7 @@ def _discover_by_hand(datadir: DataDir, action: str, candidate_id: int | None) -
     try:
         db.migrate(conn, "search")
         try:
-            rows = _discover_rows(conn, action, candidate_id)
+            rows = _discover_rows(conn, action, candidate_id, reason)
         except discover.DiscoverError as exc:
             _err(f"error: {exc}")
             return EXIT_ERROR
@@ -1440,12 +1445,12 @@ def _discover_clear_backoff(datadir: DataDir) -> int:
 
 
 def _discover_rows(
-    conn: sqlite3.Connection, action: str, candidate_id: int | None
+    conn: sqlite3.Connection, action: str, candidate_id: int | None, reason: str | None = None
 ) -> Sequence[discover.Queued]:
     if action == "approve" and isinstance(candidate_id, int):
         return (discover.approve(conn, candidate_id),)
     if action == "reject" and isinstance(candidate_id, int):
-        return (discover.reject(conn, candidate_id),)
+        return (discover.reject(conn, candidate_id, reason),)
     return discover.pending(conn)
 
 
@@ -2331,6 +2336,9 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         type=int,
         help="the pending row id for approve or reject",
+    )
+    discover_parser.add_argument(
+        "--reason", help="with reject: why, in a few words (kept in search.db)"
     )
     sub.add_parser(
         "scout-prompt",
