@@ -184,6 +184,9 @@ discovery:
   interval_minutes: 1440
   queries_per_run: 12
   query_delay_seconds: 5
+  # The bot sends at most this many discovery candidates a day (1 to 20), each
+  # with the postings found on it that passed your gates.
+  max_candidates_per_day: 3
 
 # EI claims. career-hunter keeps one EI job-search record file per claim,
 # ei_record_<label>.db. Set the active claim here: it is never worked out for you.

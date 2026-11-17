@@ -19,18 +19,20 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 011 | Claude Code permission rules as a guard-rail | Accepted (Phase 1); amended (local merges); amended (web merges) |
 | 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1); amended by 021; amended (local merges); amended (web merges) |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1); amended (Phase 2) |
-| 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5); amended (#34); amended by 024 |
+| 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5); amended (#34); amended by 024; amended (batch M) |
 | 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39, #41, #34, #42, #43); amended by 024 |
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2); amended (#30) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2); amended by 024 |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
 | 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023; amended (#39, #42, #44) |
-| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30); amended (#40, #41); amended (#42); amended (0.5.1) |
+| 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30); amended (#40, #41); amended (#42); amended (0.5.1); amended (batch M) |
 | 021 | The public repo is MIT | Accepted (Phase 5) |
-| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32, #35, #36, #40, #41, #42); amended by 025 |
+| 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32, #35, #36, #40, #41, #42); amended by 025; amended by 027 |
 | 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37); amended (#38, #43, #44) |
 | 024 | Each application keeps its job description | Accepted (0.5.0); amended (0.5.1) |
 | 025 | LM Studio needs an API token, and the chat model may be a reasoning model | Accepted (0.5.1) |
+| 026 | The scorer takes the operator's own criteria from a file in the data folder | Accepted (0.6.0) |
+| 027 | Every posting is gated on its full description before it is scored | Accepted (batch M) |
 
 ---
 
@@ -364,6 +366,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
   The EI schema enforces the same rule with triggers. In `seed`, an out-of-claim application is refused by default, because it is usually a typo. `--route-out-of-claim-to-search` sends such applications to `search.db` only and lists each one. Activities outside the claim are always refused.
 - **The status pipeline is shared by both layers:** `applied`, `screening`, `assessment_submitted`, `interview_scheduled`, `offer`, `hired` (offer accepted), `rejected`, `no_response`, `withdrawn`. EI status rows carry no notes; notes stay in `search.db`.
+
+> **Amended (batch M).** Two statuses the employer reports join the pipeline: `assessment_requested` (an assessment was asked for, before one is submitted) and `position_closed` (the position was closed or filled without a decision on the application). EI migration 0004 and search migration 0030 rebuild the status tables for the new CHECK and copy every row as it was; the EI table's no-delete, no-update and sealed triggers are created again. A status may carry its own date (`/status <ref> <status> YYYY-MM-DD`, `careerhunter status --on`), never in the future and never before the application.
 - **Sealing is explicit, never automatic.** `careerhunter claim seal <label>`:
   - prints what it will do;
   - requires the label to be typed again;
@@ -612,6 +616,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A daily run still sends at most 12 site-restricted queries. A shorter interval, down to 60 minutes, sends that set more often.
 - A discovery message leaves the suggested name and the URL on Telegram's servers. The snippet and the query do not.
 
+> **Amended (batch M).** A queued board keeps the company name its confirming reply gave (`display_name`). Each posting a pass finds that is recorded with no skip is linked to its board's pending candidate (search migration 0028, `discovery_candidate_postings`). The bot sends a candidate once, as its own message with up to three of those postings, and only while one is still unskipped, at most `discovery.max_candidates_per_day` a day; the digest and the re-send after the buttons expire are gone. A rejection may carry the operator's reason (`reject_reason`; search migration 0029 lets the bot ask for it). Boards are still queued on confirmation, not when a posting passes: a confirmed board that is not kept would be confirmed again on every pass and use up `CONFIRM_PER_PASS`.
+
 ## ADR-021: The public repo is MIT
 
 **Context.**
@@ -798,3 +804,25 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 **Trade-offs.**
 - A mistake in the file (wrong permissions, too long) stops scoring until it is fixed, though the bot and `doctor` say so at once.
 - Postings scored before an edit keep the gaps they were given.
+
+## ADR-027: Every posting is gated on its full description before it is scored
+
+**Context.**
+- `hard_gates` went into every scoring request beside the posting. With `required_languages` (languages a posting must not require) in that JSON, the local model reported those languages as the posting's own requirement: about two scored postings in five carried a core gap and a key requirement for a language their text never stated, and most of them were alerted.
+- A posting held by the run budget, and every re-score, went to the model on its stored fields, after a recheck that sees only the title. A gate that matches only in the description never ran on it again, and the model had no text to contradict the gate lists.
+
+**Decision.**
+- **The scorer never sees the gate lists.** `filters.decide` applies every gate before a posting is scored, so the request carries no `hard_gates`. As a guard, a gap or key requirement that names a `required_languages` term is dropped unless the posting text sent contains it, matched as the filter matches.
+- **No score without the description.** Just before each scoring call the posting is gated again with every check on its full description: the one this run's board read gave it, or one read again from its board. Greenhouse, Lever, SmartRecruiters, BambooHR and Workday have a single-posting endpoint; an Ashby board is read once per run and kept in memory.
+- **What can't be read is not scored.** A posting its board no longer has (404, 410, or not on its Ashby board) is skipped as `gone`; one with neither a usable key nor a link as `no_reference`. A fetch error, HTTP 429 (which blocks that host for the run) or another status leaves it for the next run, unscored.
+- **Still not stored.** The description is held in memory for the decision, the call and the embedding, as ADR-019 says.
+- **Re-scoring on request.** `careerhunter rescore` (by posting id, or by text in the stored gaps or key requirements) forgets the resume hash of chosen scores, so the next run re-scores them through this gate. Only postings with no skip and no application.
+
+**Alternatives.**
+- Explaining the gate lists to the model. Rejected: the gates already ran, and a local model may still misread them.
+- Storing descriptions. Rejected: ADR-019 keeps them out of `search.db`.
+- Scoring on stored fields when the board can't be read. Rejected: that is how the false gaps were made.
+
+**Trade-offs.**
+- One more request per held or re-scored posting (one per Ashby board), inside the run budget.
+- A posting whose board stays unreachable waits unscored, counted as held by `doctor`.
