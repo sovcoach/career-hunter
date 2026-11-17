@@ -17,9 +17,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - The scorer no longer sees `hard_gates`, and every posting is gated on its full description just before it is scored, read again from its board when this run's read didn't give it (ADR-027). A posting its board no longer has is skipped as `gone`; one that can't be read waits, unscored.
 - A discovery candidate is one message: the company name its board gave, the ATS, the board link, and up to three of the postings found on it that passed your gates, each with title, location and link. It is sent once, and only while one of those postings is unskipped.
-- Travel never skips a posting. With `allow_travel_outside: false`, a posting is skipped as `office_days_elsewhere` only when its description asks for regular office days outside your `onsite_hybrid` places.
+- Travel never skips a posting (offsites, retreats, conferences, client visits, required travel). A posting whose description asks for regular office days outside your `onsite_hybrid` places is always skipped as `office_days_elsewhere`.
 - `/log` says exactly what is wrong with how a line is laid out (words after the link with no `|`, an empty field, the wrong number of fields) and shows an example.
 - `search.db` moves from schema version 27 to 30, and the EI record from 3 to 4.
+
+### Removed
+- `search.location_rules.allow_travel_outside`. A `config.yaml` that still has it is refused with a message naming the line to delete; see "Upgrading from 0.6.0 to 0.7.0" in `docs/SETUP.md`.
 
 ### Fixed
 - A language in `hard_gates.required_languages` came back from the scorer as the posting's own requirement, as a core gap and a key requirement in the alert, for postings that never stated it.

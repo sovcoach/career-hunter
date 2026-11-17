@@ -20,13 +20,14 @@ match `search.location_rules.onsite_hybrid`, remote must match `remote`. An infe
 remote posting may match either list, because "Example City or Remote" can be
 either. A list that is unset or empty does not constrain its work models.
 
-Travel never skips a posting. With `allow_travel_outside: false`, a posting is skipped
-as `office_days_elsewhere` when its description asks for regular office days (a
-sentence with an office word and a cadence: "2 days a week in the office", "on-site
-once a month", "weekly in person") that are not shown to be in an `onsite_hybrid`
-place: the sentence names none, and the posting is not an on-site or hybrid one whose
-own location is one. "Up to 25% travel" or "occasional visits to head office" has no
-cadence and never skips.
+Travel never skips a posting: offsites, retreats, conferences, client or customer
+visits, required travel. A posting is skipped as `office_days_elsewhere` when its
+description asks for regular office days (a sentence with an office word and a
+cadence: "2 days a week in the office", "on-site once a month", "weekly in person")
+that are not shown to be in an `onsite_hybrid` place: the sentence names none, and the
+posting is not an on-site or hybrid one whose own location is one. "Up to 25% travel"
+or "occasional visits to head office" has no cadence and never skips. The rule is always
+on whenever `onsite_hybrid` is set; there is no setting for it.
 
 With `search.location_rules` set, a posting with blank location text and no work
 model from the board is skipped as `empty_location`. A work model from the board
@@ -402,7 +403,7 @@ def _location(posting: PostingText, rules: Mapping[str, Any]) -> str | None:
         return "empty_location"
     if not blank and not _place_allowed(posting, rules):
         return "location_rule"
-    if rules.get("allow_travel_outside") is False and _office_days_elsewhere(posting, rules):
+    if _office_days_elsewhere(posting, rules):
         return "office_days_elsewhere"
     return None
 

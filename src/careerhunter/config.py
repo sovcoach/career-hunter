@@ -357,13 +357,17 @@ def _validate_lanes(lanes: Any, problems: list[str]) -> None:
 
 def _validate_location_rules(rules: Any, problems: list[str]) -> None:
     where = "search.location_rules"
+    if "allow_travel_outside" in rules:
+        problems.append(
+            f"{where}.allow_travel_outside is no longer a setting: delete that line from "
+            "config.yaml (after a backup). Travel never skips a posting, and regular office "
+            "days outside onsite_hybrid always do"
+        )
     extra = set(rules) - {"onsite_hybrid", "remote", "allow_travel_outside"}
     if extra:
         problems.append(f"{where} has unknown keys: {sorted(extra)}")
     _optional_str_list(rules, "onsite_hybrid", where, problems)
     _optional_str_list(rules, "remote", where, problems)
-    if not isinstance(rules.get("allow_travel_outside", True), bool):
-        problems.append(f"{where}.allow_travel_outside must be true or false")
 
 
 def _validate_gap_tiers(rubric: Any, problems: list[str]) -> None:

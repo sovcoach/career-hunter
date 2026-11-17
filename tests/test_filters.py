@@ -218,13 +218,7 @@ def test_two_different_units_in_a_sentence_with_none_attached_count_for_nothing(
 
 def test_location_rules_and_role_filters() -> None:
     config = {
-        "search": {
-            "location_rules": {
-                "onsite_hybrid": ["Example City"],
-                "remote": ["Canada"],
-                "allow_travel_outside": False,
-            }
-        }
+        "search": {"location_rules": {"onsite_hybrid": ["Example City"], "remote": ["Canada"]}}
     }
     assert verdict("Coordinator", location="Canada", config=config).reason is None
     assert verdict("Coordinator", location="Example City", config=config).reason == "location_rule"
@@ -728,11 +722,7 @@ def test_a_recheck_skips_a_stored_empty_location_once_rules_are_set(
 
 PLACES = {
     "search": {
-        "location_rules": {
-            "onsite_hybrid": ["Example City", "Sampleton"],
-            "remote": ["Canada"],
-            "allow_travel_outside": False,
-        }
+        "location_rules": {"onsite_hybrid": ["Example City", "Sampleton"], "remote": ["Canada"]}
     }
 }
 
@@ -754,6 +744,9 @@ def _office(description: str, *, location: str = "Remote, Canada", work_model: s
         "Travel up to 50% of the time is required, mostly to client sites.",  # required travel
         "You must be willing to travel to head office quarterly.",
         "Our office is in Example Town, and the team meets there each quarter.",
+        "Visit clients in Example Town and across the region as needed.",  # client visits
+        "Join the whole company at our annual offsite in Example Town each spring.",
+        "Attend two industry conferences and a team retreat every year.",
     ],
 )
 def test_travel_never_skips_a_posting(description: str) -> None:
@@ -767,6 +760,7 @@ def test_travel_never_skips_a_posting(description: str) -> None:
         "Hybrid: in the office two days per week, at our headquarters in Example Town.",
         "You will be on-site once a month.",
         "Expect to work in person every Tuesday.",
+        "Commute to our Example Town office 1 to 3 days a week.",
     ],
 )
 def test_regular_office_days_outside_the_approved_places_skip(description: str) -> None:
@@ -792,21 +786,3 @@ def test_a_hybrid_posting_here_with_weekly_days_at_a_named_office_elsewhere_skip
         "Two days a week at our Example Town office.", location="Example City", work_model="hybrid"
     )
     assert reason == "office_days_elsewhere"
-
-
-def test_office_days_elsewhere_are_kept_when_allow_travel_outside_is_true() -> None:
-    allowed = {
-        "search": {
-            "location_rules": {**PLACES["search"]["location_rules"], "allow_travel_outside": True}
-        }  # type: ignore[index]
-    }
-    assert (
-        verdict(
-            "Coordinator",
-            location="Remote, Canada",
-            work_model="remote",
-            description="This role works 3 days a week in our Example Town office.",
-            config=allowed,
-        ).reason
-        is None
-    )
