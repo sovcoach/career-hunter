@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -23,19 +24,48 @@ from tests.fakes import use_example_watchlist
 DAY = "2026-11-01"
 
 
-class Scripted:
-    """A fetcher that never opens a socket. An unknown URL fails the test."""
+# The description a board still listing a stored posting gives it when it is read
+# again before scoring (ADR-027). Synthetic.
+STILL_LISTED = "Synthetic description, read again from the board before scoring."
+_SINGLE = re.compile(
+    r"^https://(?:api\.lever\.co/v0/postings/(?P<lever>[^/]+)/(?P<lid>[^/?]+)\?mode=json"
+    r"|boards-api\.greenhouse\.io/v1/boards/(?P<gh>[^/]+)/jobs/(?P<gid>\d+))$"
+)
 
-    def __init__(self, mapping: dict[str, Fetched | Exception]) -> None:
+
+class Scripted:
+    """A fetcher that never opens a socket. An unknown URL fails the test.
+
+    With `on_board`, every Lever or Greenhouse single-posting request not in the
+    mapping is answered too: the board still lists that posting, with STILL_LISTED as
+    its description (the read before scoring, ADR-027).
+    """
+
+    def __init__(self, mapping: dict[str, Fetched | Exception], *, on_board: bool = False) -> None:
         self.mapping = mapping
+        self.on_board = on_board
         self.calls: list[str] = []
 
     def __call__(self, url: str) -> Fetched:
         self.calls.append(url)
+        single = _SINGLE.match(url) if self.on_board and url not in self.mapping else None
+        if single is not None:
+            if single["lever"]:
+                return fetched(
+                    {"id": single["lid"], "text": "Listed", "descriptionPlain": STILL_LISTED}
+                )
+            return fetched({"id": int(single["gid"]), "title": "Listed", "content": STILL_LISTED})
         found = self.mapping[url]
         if isinstance(found, Exception):
             raise found
         return found
+
+
+class OnBoard(Scripted):
+    """Scripted with `on_board`: every stored Lever or Greenhouse posting is still listed."""
+
+    def __init__(self, mapping: dict[str, Fetched | Exception]) -> None:
+        super().__init__(mapping, on_board=True)
 
 
 def url(ats: str, slug: str) -> str:
@@ -1453,7 +1483,7 @@ def test_a_scoring_row_that_raises_is_isolated(search: sqlite3.Connection) -> No
             raise RuntimeError("synthetic")
         return Score(llm_output="kept", gaps="[]", tier="strong")
 
-    lines = w.run(search, [], today=DAY, fetcher=Scripted({}), scorer=scorer)
+    lines = w.run(search, [], today=DAY, fetcher=OnBoard({}), scorer=scorer)
     assert "watch: Example B: RuntimeError; continuing" in lines
     scored = {row["company"]: row["llm_output"] for row in postings(search)}
     assert scored == {"Example A": "kept", "Example B": None}
@@ -1810,8 +1840,9 @@ class Timed(Scripted):
         *,
         cost: float = 0.0,
         costs: dict[str, float] | None = None,
+        on_board: bool = False,
     ) -> None:
-        super().__init__(mapping)
+        super().__init__(mapping, on_board=on_board)
         self.clock = clock
         self.cost = cost
         self.costs = costs or {}
@@ -2032,7 +2063,13 @@ def test_scoring_waiting_rows_stops_when_the_budget_runs_out(
         clock.advance(120)
         return Score(llm_output="kept", gaps="[]", tier="strong")
 
-    fetcher = Timed(three_boards().mapping, clock, cost=2)
+    # The boards cost 2 minutes each; reading a stored posting again before it is
+    # scored (ADR-027) costs nothing here, so the scorer alone uses up the budget.
+    reads = {
+        f"https://boards-api.greenhouse.io/v1/boards/{name.lower().replace(' ', '')}/jobs/1001": 0.0
+        for name in NAMES
+    }
+    fetcher = Timed(three_boards().mapping, clock, cost=2, costs=reads, on_board=True)
     lines = w.run(
         search,
         entries(*NAMES),

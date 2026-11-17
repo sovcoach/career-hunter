@@ -306,7 +306,7 @@ def test_a_later_run_scores_waiting_rows_after_the_fetch(search: sqlite3.Connect
 
     def second(text: PostingText) -> Score:
         order.append("score")
-        assert text.description is None
+        assert text.description == "Needs French."  # met on its board again this run
         return Score(
             llm_output="raw",
             gaps='[{"name":"a","kind":"core"},{"name":"b","kind":"core"},{"name":"c","kind":"minor"}]',
