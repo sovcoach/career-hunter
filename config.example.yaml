@@ -51,7 +51,9 @@ search:
   location_rules:
     onsite_hybrid: ["Example City"]  # on-site and hybrid only here
     remote: [Canada]                    # fully remote only within these regions
-    allow_travel_outside: false         # refuse roles needing office days elsewhere
+    # false: skip a role whose description asks for regular office days (e.g. "2 days a
+    # week in the office") outside the onsite_hybrid places. Travel never skips a role.
+    allow_travel_outside: false
   # Optional. After `careerhunter resume import <file>`, set this to
   # resume/current.txt (no other value is used) so scoring and embeddings read your
   # resume. Null leaves the resume out of scoring and skips embeddings.

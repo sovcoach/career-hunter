@@ -20,6 +20,14 @@ match `search.location_rules.onsite_hybrid`, remote must match `remote`. An infe
 remote posting may match either list, because "Example City or Remote" can be
 either. A list that is unset or empty does not constrain its work models.
 
+Travel never skips a posting. With `allow_travel_outside: false`, a posting is skipped
+as `office_days_elsewhere` when its description asks for regular office days (a
+sentence with an office word and a cadence: "2 days a week in the office", "on-site
+once a month", "weekly in person") that are not shown to be in an `onsite_hybrid`
+place: the sentence names none, and the posting is not an on-site or hybrid one whose
+own location is one. "Up to 25% travel" or "occasional visits to head office" has no
+cadence and never skips.
+
 With `search.location_rules` set, a posting with blank location text and no work
 model from the board is skipped as `empty_location`. A work model from the board
 stands in for the location: such a posting is not skipped as empty, and with no text
@@ -111,6 +119,20 @@ _NOT_PAY = r"(?:bonus(?:es)?|signing|sign[- ]on|relocation|equity|stock|rsus?|op
 _NOT_PAY_BEFORE = re.compile(rf"\b{_NOT_PAY}\b", re.IGNORECASE)
 _NOT_PAY_AFTER = re.compile(
     rf"\s*(?:(?:annual|one[- ]time|target|cash|performance)\s+)?{_NOT_PAY}\b", re.IGNORECASE
+)
+# Regular office days (`_office_days_elsewhere`): an office word and a cadence in one
+# sentence. A named office ("our Example Town office", "office in ...") is another place
+# than the posting's own location unless the sentence names an approved one.
+_OFFICE_WORD = re.compile(r"\b(?:office|on[- ]?site|in[- ]person|in[- ]office)\b", re.IGNORECASE)
+_CADENCE = re.compile(
+    r"\b(?:\d+|one|two|three|four|five|once|twice)\s*\+?\s*(?:days?\s+|times?\s+)?"
+    r"(?:a|per|each|every|/)\s*(?:week|wk|month)\b"
+    r"|\b(?:weekly|every\s+week|each\s+week)\b"
+    r"|\bevery\s+(?:monday|tuesday|wednesday|thursday|friday)\b",
+    re.IGNORECASE,
+)
+_NAMED_OFFICE = re.compile(
+    r"\b(?:our|the)\s+[A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*)*\s+office\b|\boffices?\s+(?:in|at)\s+[A-Z]"
 )
 # Where the words before a figure stop belonging to it.
 _CLAUSE_BREAK = re.compile(r"[,;(+]|\bplus\b|\band\b", re.IGNORECASE)
@@ -380,8 +402,8 @@ def _location(posting: PostingText, rules: Mapping[str, Any]) -> str | None:
         return "empty_location"
     if not blank and not _place_allowed(posting, rules):
         return "location_rule"
-    if rules.get("allow_travel_outside") is False and _outside_travel(posting, rules):
-        return "location_rule"
+    if rules.get("allow_travel_outside") is False and _office_days_elsewhere(posting, rules):
+        return "office_days_elsewhere"
     return None
 
 
@@ -412,11 +434,22 @@ def _role_work_model(posting: PostingText) -> str | None:
     return "remote" if inferred_remote(posting.location) else None
 
 
-def _outside_travel(posting: PostingText, rules: Mapping[str, Any]) -> bool:
-    if not _has(_body(posting), "travel") or not posting.location.strip():
+def _office_days_elsewhere(posting: PostingText, rules: Mapping[str, Any]) -> bool:
+    """Regular office days the description asks for, not shown to be in an approved
+    on-site or hybrid place. Travel alone never counts."""
+    places = _strings(rules.get("onsite_hybrid"))
+    if not places or not posting.description:
         return False
-    allowed = _strings(rules.get("onsite_hybrid")) + _strings(rules.get("remote"))
-    return bool(allowed) and not _any(posting.location, allowed)
+    office_here = _role_work_model(posting) != "remote" and _any(posting.location, places)
+    for sentence in _SENTENCE.split(posting.description):
+        if not (_OFFICE_WORD.search(sentence) and _CADENCE.search(sentence)):
+            continue
+        if _any(sentence, places):
+            continue  # the office days are in an approved place
+        if office_here and not _NAMED_OFFICE.search(sentence):
+            continue  # "the office" is the posting's own, approved location
+        return True
+    return False
 
 
 def _role(posting: PostingText, filters: Mapping[str, Any] | None) -> str | None:
