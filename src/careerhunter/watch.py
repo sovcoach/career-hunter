@@ -130,6 +130,7 @@ from typing import Any, Literal, NamedTuple, NoReturn, Self, SupportsIndex
 
 from careerhunter import ats as ats_boards
 from careerhunter import db, filters, lanes, search_store
+from careerhunter import discover as discovery
 from careerhunter.ats import (
     BoardHTTPError,
     BoardParseError,
@@ -423,6 +424,8 @@ def run(
             scorer,
             embedder,
         )
+        with _isolated(conn, lines, "discovery links", state.hook):
+            _link_discovered(conn, state, found)
     counts = {"fetched": 0, "failed": 0, "left": 0}
     for item in _by_last_attempt(conn, _with_discovery_boards(conn, watchlist)):
         entry = _entry(item)
@@ -918,6 +921,26 @@ def _record_discovered(
                     embedder,
                     source="discovery",
                 )
+
+
+def _link_discovered(conn: sqlite3.Connection, state: _State, found: Pass) -> None:
+    """Link each posting a discovery pass found that is stored with no skip to its
+    board's pending candidate, so the bot can send that candidate with it."""
+    linked = 0
+    for ref in found.postings:
+        with db.transaction(conn):
+            posting_id = search_store.posting_id_for(
+                conn, ats_boards.posting_key(ref), ats_boards.posting_url(ref)
+            )
+            if posting_id is None or search_store.posting_has_skip(conn, posting_id):
+                continue
+            candidate = discovery.candidate_for(conn, ref.board)
+            if candidate is not None and candidate[1] == "pending":
+                linked += discovery.link(conn, candidate[0], posting_id)
+    if linked:
+        state.lines.append(
+            f"discover: {linked} postings that passed the gates linked to candidates"
+        )
 
 
 def _fetch_posting(

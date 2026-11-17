@@ -288,6 +288,33 @@ def classify(url: str, career_hosts: Sequence[str]) -> Hit | None:
     return Hit("career", f"https://{host}{path}", None, None, host)
 
 
+def candidate_for(conn: sqlite3.Connection, board: Board) -> tuple[int, str] | None:
+    """The queue row for this board, whatever its status: its id and status."""
+    key = _board_key(board.ats, board.slug, board.host, board.site)
+    for row in conn.execute(
+        "SELECT id, status, ats_type, ats_slug, ats_host, ats_site FROM discovery_candidates "
+        "WHERE kind = 'board' AND ats_type = ? AND ats_slug IS NOT NULL",
+        (board.ats,),
+    ):
+        found = _board_key(
+            str(row["ats_type"]), str(row["ats_slug"]), row["ats_host"], row["ats_site"]
+        )
+        if found == key:
+            return int(row["id"]), str(row["status"])
+    return None
+
+
+def link(conn: sqlite3.Connection, candidate_id: int, posting_id: int) -> bool:
+    """Link a posting that passed the gates to its board's candidate. False when it was
+    linked already."""
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO discovery_candidate_postings (candidate_id, posting_id) "
+        "VALUES (?, ?)",
+        (candidate_id, posting_id),
+    )
+    return cur.rowcount == 1
+
+
 def format_row(row: Queued) -> str:
     """id, kind, suggested name, ATS type, and the slug or career URL."""
     ats = row.ats_type if row.ats_type else "-"
@@ -377,9 +404,14 @@ def run(
 
     The queue (#41): a board hit is queued only after `confirm` (one board-API request)
     says it exists, and never when it, or a company name the confirming reply gives,
-    is in `exclusions.companies`. A board that does not exist is stored as `gone` and
+    is in `exclusions.companies`. The first name that reply gives is kept as the
+    candidate's `display_name`. A board that does not exist is stored as `gone` and
     never queued again. Career pages are not queued: `discovery.career_hosts` only adds
     `site:` hosts. Without `confirm`, no board is queued.
+
+    A queued board is not sent yet: the watch run links each posting found on it that
+    is recorded with no skip (`link`), and the bot sends a candidate only while one of
+    its linked postings is still unskipped (`due`).
     """
     clock = now or _utc_now
     base = _configured_url(config)
@@ -442,13 +474,14 @@ def run(
     stored = _store(
         conn,
         config,
-        accepted,
+        [hit for hit, _name in accepted],
         today,
         career_hosts,
         cursor=after,
         gone=gone,
         stamp=_stamp(clock()),
         suspended=engines,
+        names={_hit_key(hit): name for hit, name in accepted if name},
     )
     return Outcome(
         None, tuple(stored), tuple(postings.values()), (*_suspended_notes(engines), *notes)
@@ -484,7 +517,7 @@ def _confirmed(
     exclusions: Mapping[str, Any],
     *,
     start: int = 0,
-) -> tuple[list[Hit], list[Hit], list[str]]:
+) -> tuple[list[tuple[Hit, str | None]], list[Hit], list[str]]:
     """The new boards to queue and the gone ones to record, with a note for each other.
 
     Boards already watched or in the queue (pending, approved, rejected or gone) and
@@ -497,7 +530,7 @@ def _confirmed(
     watched = _watched_boards(config)
     known = _known_boards(conn)
     excluded = _excluded_names(exclusions)
-    accepted: list[Hit] = []
+    accepted: list[tuple[Hit, str | None]] = []  # with the name the board's reply gave
     gone: list[Hit] = []
     notes: list[str] = []
     asked = 0
@@ -537,7 +570,8 @@ def _confirmed(
         elif answer.exists is None:
             notes.append(f"{who}: no postings to confirm it; not queued")
         else:
-            accepted.append(hit)
+            named = next((n.strip() for n in answer.names if n.strip()), None)
+            accepted.append((hit, named[:200] if named else None))
     return accepted, gone, notes
 
 
@@ -958,6 +992,7 @@ def _store(
     gone: Sequence[Hit] = (),
     stamp: str | None = None,
     suspended: Sequence[str] = (),
+    names: Mapping[tuple[str, ...], str] | None = None,
 ) -> list[Queued]:
     """Insert new pending rows, and `gone` rows for boards that do not exist.
 
@@ -1016,8 +1051,8 @@ def _store(
                 known_careers.add(hit.url)
             cur = conn.execute(
                 "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, ats_host, "
-                "ats_site, suggested_name, status, first_seen) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                "ats_site, suggested_name, status, first_seen, display_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (
                     hit.kind,
                     hit.url,
@@ -1027,6 +1062,7 @@ def _store(
                     hit.ats_site,
                     hit.suggested_name,
                     today,
+                    (names or {}).get(_hit_key(hit)),
                 ),
             )
             stored.append(

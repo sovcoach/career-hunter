@@ -398,6 +398,14 @@ def set_ats_key(conn: sqlite3.Connection, posting_id: int, key: str) -> bool:
     return cur.rowcount == 1
 
 
+def posting_id_for(conn: sqlite3.Connection, key: str, url: str | None) -> int | None:
+    """The stored posting with this ATS identity, or else with this exact URL."""
+    row = conn.execute("SELECT id FROM postings WHERE ats_key = ?", (key,)).fetchone()
+    if row is None and url:
+        row = conn.execute("SELECT id FROM postings WHERE url = ?", (url,)).fetchone()
+    return None if row is None else int(row[0])
+
+
 def posting_url_known(conn: sqlite3.Connection, url: str) -> bool:
     """Whether a posting with this exact URL is stored, from any source."""
     return conn.execute("SELECT 1 FROM postings WHERE url = ?", (url,)).fetchone() is not None
