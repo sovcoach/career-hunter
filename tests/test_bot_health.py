@@ -179,3 +179,12 @@ def test_an_unauthorized_outage_says_so(env: Env) -> None:
         "0 postings are waiting to be scored."
     )
     assert "unreachable" not in text
+
+
+def test_a_timeout_outage_says_so(env: Env) -> None:
+    _fail(env, "lm_studio", 3, "timeout")
+    env.bot.send_health()
+    assert _health_texts(env) == [
+        "Health: LM Studio has failed 3 runs in a row: timeout, every scoring call took "
+        "longer than scoring.timeout_seconds. 0 postings are waiting to be scored."
+    ]

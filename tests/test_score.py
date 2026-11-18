@@ -435,7 +435,9 @@ def test_a_model_that_stops_answering_is_not_asked_again_this_run(
     )
     assert len(postings(search)) == 2
     assert len(calls) == 1
-    assert sum("left unscored (model unreachable)" in line for line in lines) == 1
+    assert (
+        sum("left unscored (model unreachable: RemoteDisconnected)" in line for line in lines) == 1
+    )
     assert sum("left for the next run (model unreachable)" in line for line in lines) == 1
     assert all(row["llm_output"] is None for row in postings(search))
     # The posting the failure happened on keeps its place for the next run.

@@ -111,8 +111,16 @@ from search.db at that moment. A run that crashes, is
 killed or stops on a database error never finishes its row, so its counts stay null.
 
 A model that does not answer (ScoreError) stops all scoring for the rest of the run;
-the posting it happened on keeps its place, and one line counts what is left. A reply
-that does not parse leaves that posting as it was, behind the others next time.
+the posting it happened on keeps its place, and one line counts what is left. The line
+names the exception's class, from a fixed list. A call that timed out (kind `timeout`)
+is about that posting only: the run carries on with the next one, and the posting keeps
+this attempt's stamp, so it goes behind the others. After TIMEOUTS_TO_SET_ASIDE
+timeouts in a row (search migration 0034) it is set aside and not sent again until
+`careerhunter rescore --set-aside`; any answered call clears the count. A run whose
+scoring calls, two or more, all timed out records an `lm_studio` failure of kind
+`timeout`, so the health alert counts it like an outage; a run in which any call was
+answered records none for its timeouts. A reply that does not parse leaves that
+posting as it was, behind the others next time.
 
 A criteria veto (ADR-028) whose quote checked out skips the posting with reason
 `criteria: N. <words>` and records the call as `vetoed`; its stored score, fit and gaps
@@ -138,7 +146,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple, NoReturn, Self, SupportsIndex
 
 from careerhunter import ats as ats_boards
-from careerhunter import db, filters, lanes, search_store
+from careerhunter import db, filters, lanes, loopback, search_store
 from careerhunter import discover as discovery
 from careerhunter.ats import (
     BoardHTTPError,
@@ -180,6 +188,11 @@ BOARD_MAX_BYTES = ats_boards.BOARD_MAX_BYTES
 # Replies for one posting that did not parse before the watcher stops sending it to the
 # model (search migration 0023). The same count as the bot's Telegram refusals.
 PARSE_FAILURES_TO_GIVE_UP = 3
+# Scoring calls for one posting that timed out in a row before the watcher sets it aside
+# (search migration 0034), until `careerhunter rescore --set-aside`.
+TIMEOUTS_TO_SET_ASIDE = 2
+# A run whose scoring calls all timed out records an lm_studio failure from this many.
+TIMEOUT_RUN_CALLS = 2
 # Inline scoring of new postings stops once less than this is left of the budget.
 SCORE_RESERVE = 240.0
 _LEFT = "run budget reached; left for the next run"
@@ -245,6 +258,7 @@ class _State:
     model_down: bool = False
     model_failure: str = "unreachable"  # or "unauthorized": LM Studio refused the token
     scorer_answered: bool = False  # the scorer replied at least once, parsed or not
+    timed_out: int = 0  # scoring calls this run that reached scoring.timeout_seconds
     budget_cut: bool = False  # the budget left something for the next run
     # In memory only: re-scores queued from fetched boards, and new postings the
     # reserve left for the passes after the boards. Never written anywhere.
@@ -280,6 +294,10 @@ class _State:
         if self.model_failure == "unauthorized":
             return "model unauthorized: LM Studio refused the API token"
         return "model unreachable"
+
+    def all_timed_out(self) -> bool:
+        """TIMEOUT_RUN_CALLS or more scoring calls this run, and every one timed out."""
+        return not self.scorer_answered and self.timed_out >= TIMEOUT_RUN_CALLS
 
     def left_by_budget(self, line: str) -> None:
         """Log what the budget left for the next run, and remember that it did."""
@@ -569,6 +587,8 @@ def _finish_run(
             search_store.record_component(
                 conn, "lm_studio", failed=state.model_failure, stamp=stamp
             )
+        elif state.all_timed_out():
+            search_store.record_component(conn, "lm_studio", failed="timeout", stamp=stamp)
         elif state.scorer_answered:
             search_store.record_component(conn, "lm_studio", failed=None, stamp=stamp)
         if state.criteria_failure is not None:
@@ -1304,7 +1324,8 @@ def _recheck_one(
 # and new arrivals can't push it back forever. Both stamps are UTC to the second. The
 # re-score passes keep never-tried first, then the oldest attempt, then the oldest
 # posting. A posting given up after PARSE_FAILURES_TO_GIVE_UP replies that did not
-# parse (search migration 0023) is in neither.
+# parse (search migration 0023), or set aside after TIMEOUTS_TO_SET_ASIDE timeouts in a
+# row (0034), is in neither.
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
     "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site "
@@ -1313,6 +1334,8 @@ _NEVER_SCORED_SQL = (
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM score_parse_failures f "
     "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
+    "AND NOT EXISTS (SELECT 1 FROM score_timeouts t "
+    "WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL) "
     "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
@@ -1325,6 +1348,8 @@ _RESCORE_SQL = (
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM score_parse_failures f "
     "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
+    "AND NOT EXISTS (SELECT 1 FROM score_timeouts t "
+    "WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL) "
     "ORDER BY p.score_attempted_at IS NOT NULL, p.score_attempted_at, p.first_seen, p.id"
 )
 _NEEDS_RESCORE_SQL = (
@@ -1557,8 +1582,10 @@ def _attempt(
 
     The attempt is stamped first, in its own transaction. A model that does not answer
     gives the stamp back and stops scoring for the run; a budget that ran out during
-    the call gives it back too. A reply that does not parse keeps the stamp, so the
-    posting goes behind the others, and leaves the stored score as it was.
+    the call gives it back too. A call that timed out keeps the stamp, so the posting
+    goes behind the others, and is counted (set aside after TIMEOUTS_TO_SET_ASIDE in a
+    row); scoring carries on. A reply that does not parse keeps the stamp too, and
+    leaves the stored score as it was.
     """
     lines = state.lines
     state.attempted.add(posting_id)
@@ -1588,18 +1615,28 @@ def _attempt(
         result = scorer(posting)
     except (ScoreError, OSError) as exc:
         cut = state.out_of_time()
+        kind = getattr(exc, "kind", "unreachable")
+        kept = "; old score kept" if rescore else ""
+        if not cut and kind == "timeout":
+            _timed_out(conn, state, posting_id, exc, timed, _line(name, ats, title), kept)
+            return
         with db.transaction(conn):
             search_store.set_score_attempted_at(conn, posting_id, previous)
-            timed("budget" if cut else getattr(exc, "kind", "unreachable"))
+            timed("budget" if cut else kind)
         if cut:
             state.left_by_budget(
                 _line(name, ats, f"{title} left for the next run (run budget reached)")
             )
         else:
             state.model_down = True
-            state.model_failure = getattr(exc, "kind", "unreachable")
-            kept = "; old score kept" if rescore else ""
-            lines.append(_line(name, ats, f"{title} left unscored ({state.model_state()}){kept}"))
+            state.model_failure = kind
+            lines.append(
+                _line(
+                    name,
+                    ats,
+                    f"{title} left unscored ({state.model_state()}{_type_of(exc)}){kept}",
+                )
+            )
         return
     state.scorer_answered = True
     if result is not None and result.vetoed and result.veto is not None:
@@ -1608,6 +1645,7 @@ def _attempt(
         with db.transaction(conn):
             timed("vetoed")
             search_store.clear_parse_failures(conn, posting_id)
+            search_store.clear_timeouts(conn, posting_id)
             if not search_store.posting_has_skip(conn, posting_id):
                 skip_id = search_store.insert_skip(conn, posting_id, today, result.veto.skip)
                 if search_store.posting_alerted(conn, posting_id):
@@ -1617,6 +1655,7 @@ def _attempt(
         kept = "; old score kept" if rescore else ""
         with db.transaction(conn):
             timed("unparseable")
+            search_store.clear_timeouts(conn, posting_id)
             gave_up = search_store.record_parse_failure(
                 conn, posting_id, _iso(state.now()), give_up_after=PARSE_FAILURES_TO_GIVE_UP
             )
@@ -1663,6 +1702,7 @@ def _attempt(
                 run_id=state.run_id,
             )
             search_store.clear_parse_failures(conn, posting_id)
+            search_store.clear_timeouts(conn, posting_id)
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):
                 search_store.insert_skip(conn, posting_id, today, "gap_tier")
         if result.veto is not None and result.veto.rejected is not None:
@@ -1682,6 +1722,44 @@ def _attempt(
     reason = embedder.attach(posting_id, posting)
     if reason is not None:
         lines.append(miss_line(posting_id, reason))
+
+
+def _type_of(exc: BaseException) -> str:
+    """`: <class>` for a log line, from the scorer's fixed list of names, or nothing."""
+    name = getattr(exc, "type_name", None)
+    if name is None and not isinstance(exc, ScoreError):
+        name = type(exc).__name__ if type(exc).__name__ in loopback.TYPE_NAMES else "other"
+    return "" if name is None else f": {name}"
+
+
+def _timed_out(
+    conn: sqlite3.Connection,
+    state: _State,
+    posting_id: int,
+    exc: BaseException,
+    timed: Callable[[str], None],
+    who: str,
+    kept: str,
+) -> None:
+    """A call that reached scoring.timeout_seconds. The attempt's stamp stays, so the
+    posting goes to the back; the timeout is counted, and the posting is set aside after
+    TIMEOUTS_TO_SET_ASIDE in a row. Scoring carries on with the next posting."""
+    state.timed_out += 1
+    with db.transaction(conn):
+        timed("timeout")
+        set_aside = search_store.record_timeout(
+            conn, posting_id, _iso(state.now()), set_aside_after=TIMEOUTS_TO_SET_ASIDE
+        )
+    seconds = f"{state.score_timeout:g}"
+    line = f"{who} left unscored (model took longer than {seconds} s{_type_of(exc)}){kept}"
+    if set_aside:
+        line += (
+            f"; set aside after {TIMEOUTS_TO_SET_ASIDE} timeouts in a row, not tried again "
+            "until careerhunter rescore --set-aside"
+        )
+    else:
+        line += "; moved to the back of the queue"
+    state.lines.append(line)
 
 
 def _lower_fit(fit: str, cap: str) -> str:
