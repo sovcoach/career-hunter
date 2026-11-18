@@ -147,6 +147,7 @@ from careerhunter.ats import board_url as board_url  # the tests build list URLs
 from careerhunter.config import (
     max_posting_age_days,
     off_lane_min_fit,
+    scoring_run_minutes,
     scoring_timeout_seconds,
     tier_fits,
 )
@@ -169,7 +170,7 @@ Scorer = Callable[[PostingText], Score | None]
 OnCrash = Callable[[str, Exception], None]
 Tally = Literal["fetched", "failed", "left"]
 
-RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
+RUN_BUDGET = 600.0  # seconds for the boards, from the run's start (and discovery before)
 # All of one board's replies together (ats.py). The CLI also caps each request with it.
 BOARD_MAX_BYTES = ats_boards.BOARD_MAX_BYTES
 # Replies for one posting that did not parse before the watcher stops sending it to the
@@ -246,6 +247,10 @@ class _State:
     queued: dict[int, PostingText] = field(default_factory=dict)
     held_new: dict[int, PostingText] = field(default_factory=dict)
     score_timeout: float = 120.0  # scoring.timeout_seconds: a call needs this much budget
+    # The boards' own budget (RUN_BUDGET from the start), when the run's `budget` is
+    # longer (scoring.run_minutes). Once the boards are done, `budget` alone counts.
+    boards: Deadline | None = None
+    after_boards: bool = False
     criteria_failure: str | None = None  # why the criteria file held scoring this run
     criteria_ok: bool = False  # scoring was not held for the criteria file
     # Each watchlist company's role filters, by folded name, for the gate before scoring.
@@ -256,8 +261,15 @@ class _State:
     # Stored postings met on their board this run, with the description it sent.
     met: dict[int, PostingText] = field(default_factory=dict)
 
+    def _deadline(self) -> Deadline | None:
+        """The budget that counts now: the boards' until they are done, then the run's."""
+        if self.boards is None or self.after_boards:
+            return self.budget
+        return self.boards
+
     def out_of_time(self) -> bool:
-        return self.budget is not None and self.budget.expired()
+        deadline = self._deadline()
+        return deadline is not None and deadline.expired()
 
     def model_state(self) -> str:
         """How a model that stopped answering is named in a line."""
@@ -271,12 +283,14 @@ class _State:
         self.lines.append(line)
 
     def in_reserve(self) -> bool:
-        return self.budget is not None and self.budget.remaining() < SCORE_RESERVE
+        deadline = self._deadline()
+        return deadline is not None and deadline.remaining() < SCORE_RESERVE
 
     def short_for_a_call(self) -> bool:
         """Less of the budget is left than one scoring call may take, so a call is not
         started: the budget would cut it short and waste the model's work."""
-        return self.budget is not None and self.budget.remaining() < self.score_timeout
+        deadline = self._deadline()
+        return deadline is not None and deadline.remaining() < self.score_timeout
 
     @property
     def resume_sha256(self) -> str | None:
@@ -350,6 +364,7 @@ def run(
     on_crash: OnCrash | None = None,
     emit: Callable[[str], None] | None = None,
     budget: Deadline | None = None,
+    boards_budget: Deadline | None = None,
     now: Callable[[], dt.datetime] | None = None,
     resume: Resume | None = None,
     resume_problem: str | None = None,
@@ -367,6 +382,10 @@ def run(
 
     Each log line is handed to `emit` as it happens; the same lines are returned.
     `budget` bounds the whole run; the caller also gives it to each client it builds.
+    `boards_budget`, when given, bounds discovery and the boards (RUN_BUDGET from the
+    start); the embedding refresh, the recheck and the scoring passes after them run
+    on `budget` (`scoring.run_minutes`, see `run_seconds`). A board already being
+    fetched when the boards' budget ends is finished, not cut.
     `criteria_problem` is the fixed reason (a key of `criteria.REASONS`) a configured
     criteria file could not be used; then nothing is scored, and the `criteria`
     component records it so the bot can say why.
@@ -388,6 +407,7 @@ def run(
         max_age=max_posting_age_days(rules),
         today=today,
         score_timeout=float(scoring_timeout_seconds(rules)),
+        boards=boards_budget,
     )
     lines = state.lines
     with db.transaction(conn):
@@ -456,6 +476,7 @@ def run(
             tally = "failed"
         if tally is not None:
             counts[tally] += 1
+    state.after_boards = True  # from here on, the run's own budget counts
     if embedder.enabled():
         if state.out_of_time():
             state.left_by_budget(f"watch: embedding refresh: {_LEFT}")
@@ -491,6 +512,12 @@ def run(
 
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+def run_seconds(config: Mapping[str, Any] | None) -> float:
+    """How long a watch run may take in all: `scoring.run_minutes`, and never less than
+    the boards' RUN_BUDGET."""
+    return max(RUN_BUDGET, 60.0 * scoring_run_minutes(config))
 
 
 def _finish_run(

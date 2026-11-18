@@ -110,7 +110,7 @@ from careerhunter.telegram import (
     TelegramRejected,
     redact,
 )
-from careerhunter.watch import RUN_BUDGET
+from careerhunter.watch import run_seconds
 
 log = logging.getLogger("careerhunter.bot")
 # The /log reply when config.yaml can't be read. No path and no content.
@@ -305,9 +305,15 @@ def _fit_label(raw: object) -> str:
 # code units; each message also stays at ten rows, twenty buttons.
 TEXT_LIMIT = 4096
 ROWS_PER_MESSAGE = 10
-# A run not finished this long after it started was killed or crashed. Twice the run
-# budget, so a slow run that is still going is never cut in half.
-STALE_RUN = dt.timedelta(seconds=2 * RUN_BUDGET)
+
+
+def stale_run(doc: Mapping[str, Any] | None) -> dt.timedelta:
+    """A run not finished this long after it started was killed or crashed. Twice the
+    run's whole budget (scoring.run_minutes), so a slow run still going is never cut in
+    half."""
+    return dt.timedelta(seconds=2 * run_seconds(doc))
+
+
 _CAPS = {"company": 80, "title": 120, "location": 80, "lane": 60, "requirement": 60}
 MAX_URL = 1000
 _SCHEDULE_WORDS = {"on_call": "on call", "over_weekend_limit": "weekend days over your limit"}
@@ -793,7 +799,7 @@ class Bot:
         Which postings: scored watcher and discovery postings with a fit, no skip and no
         alert, in ``lanes.alert_order`` (off-lane below ``search.off_lane_min_fit`` and postings
         not yet lane-checked stay pending). A run's postings wait until that run has
-        finished, or started more than STALE_RUN ago (killed or crashed), so a run is
+        finished, or started more than `stale_run` ago (killed or crashed), so a run is
         never sent half-scored and a dead one never blocks its postings. Postings with
         no run (scored before search migration 0011) go first, then runs oldest first,
         so a later run cannot push an earlier run's postings back. At most
@@ -828,7 +834,7 @@ class Bot:
     ) -> list[list[lanes.Ordered]]:
         """This poll's digests: one per run, runs in order, at most the cap in all."""
         by_id = {alert.posting_id: alert for alert in pending}
-        stale_before = _utc(self.clock() - STALE_RUN)
+        stale_before = _utc(self.clock() - stale_run(doc))
         groups: dict[tuple[int, int], list[lanes.Ordered]] = {}
         refused: list[tuple[tuple[int, int], lanes.Ordered]] = []
         behind = self._refused_now()

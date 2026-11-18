@@ -1270,8 +1270,10 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
     if datadir.exclusions_path.is_file():
         exclusions = load_exclusions(datadir.exclusions_path)
 
-    # One budget for the whole run, shared by every client the run calls.
-    budget = Deadline(watch.RUN_BUDGET)
+    # One budget for the whole run, shared by every client the run calls
+    # (scoring.run_minutes), and the boards' own: discovery and the boards stop at it.
+    budget = Deadline(watch.run_seconds(doc))
+    boards_budget = Deadline(watch.RUN_BUDGET)
     token = _model_token(log.note)
 
     def on_crash(who: str, exc: Exception) -> None:
@@ -1332,10 +1334,11 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
             on_crash=on_crash,
             emit=log.append,
             budget=budget,
+            boards_budget=boards_budget,
             resume=loaded,
             resume_problem=problem,
             criteria_problem=criteria_problem,
-            discovery=partial(_discovery_pass, datadir, doc, exclusions, budget),
+            discovery=partial(_discovery_pass, datadir, doc, exclusions, boards_budget),
         )
     except (sqlite3.Error, db.MigrationError) as exc:
         _rollback(conn)
@@ -1761,9 +1764,11 @@ def _record_discover_success(datadir: DataDir) -> None:
     _record_success(datadir, "discover.success")
 
 
-# A watch run still unfinished this long after it started did not finish: it crashed,
-# was killed, or stopped on an error. The budget plus five minutes for the slowest call.
-_RUN_GRACE = dt.timedelta(seconds=watch.RUN_BUDGET + 300)
+def _run_grace(config_doc: dict[str, Any] | None) -> dt.timedelta:
+    """A watch run still unfinished this long after it started did not finish: it
+    crashed, was killed, or stopped on an error. The run's whole budget
+    (scoring.run_minutes) plus five minutes for the slowest call."""
+    return dt.timedelta(seconds=watch.run_seconds(config_doc) + 300)
 
 
 def _doctor_criteria(report: _Report, datadir: DataDir, config_doc: dict[str, Any] | None) -> None:
@@ -1810,7 +1815,12 @@ def _doctor_lanes(report: _Report, config_doc: dict[str, Any] | None) -> None:
     report.line("lanes", "OK", f"{count}; off-lane postings alert at {minimum} fit or better")
 
 
-def _doctor_watch_runs(report: _Report, search: sqlite3.Connection, now: dt.datetime) -> None:
+def _doctor_watch_runs(
+    report: _Report,
+    search: sqlite3.Connection,
+    now: dt.datetime,
+    config_doc: dict[str, Any] | None = None,
+) -> None:
     """The last watch run: unfinished for too long is BAD; held counts from the last finish."""
     latest = search.execute("SELECT * FROM watch_runs ORDER BY id DESC LIMIT 1").fetchone()
     if latest is None:
@@ -1820,7 +1830,7 @@ def _doctor_watch_runs(report: _Report, search: sqlite3.Connection, now: dt.date
         started = dt.datetime.fromisoformat(str(latest["started_at"]))
         age = now - started
         minutes = max(0, int(age.total_seconds() // 60))
-        if age > _RUN_GRACE:
+        if age > _run_grace(config_doc):
             report.line(
                 "watch run",
                 "BAD",
@@ -1863,7 +1873,9 @@ def _ago(now: dt.datetime, stamp: str) -> str:
     return f"{minutes} min ago"
 
 
-def _unproductive_watch_runs(search: sqlite3.Connection, now: dt.datetime) -> int:
+def _unproductive_watch_runs(
+    search: sqlite3.Connection, now: dt.datetime, config_doc: dict[str, Any] | None = None
+) -> int:
     """Watch runs in a row, newest first, that did no useful work (#42).
 
     A finished run with `useful` 0 counts, and so does a run unfinished past its grace:
@@ -1876,7 +1888,7 @@ def _unproductive_watch_runs(search: sqlite3.Connection, now: dt.datetime) -> in
         "SELECT started_at, finished_at, useful FROM watch_runs ORDER BY id DESC"
     ):
         if row["finished_at"] is None:
-            if now - dt.datetime.fromisoformat(str(row["started_at"])) > _RUN_GRACE:
+            if now - dt.datetime.fromisoformat(str(row["started_at"])) > _run_grace(config_doc):
                 count += 1
             continue
         if row["useful"] != 0:
@@ -1950,7 +1962,7 @@ def _doctor_usefulness(
     limit = health_unproductive_runs(config_doc)
     last = search.execute("SELECT max(finished_at) FROM watch_runs WHERE useful = 1").fetchone()[0]
     when = f"last useful run {_ago(now, str(last))}" if last else "no useful run recorded yet"
-    streak = _unproductive_watch_runs(search, now)
+    streak = _unproductive_watch_runs(search, now, config_doc)
     if streak >= limit:
         report.line(
             "watch useful",
@@ -2272,7 +2284,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
     _doctor_criteria(report, datadir, config_doc)
     _doctor_lanes(report, config_doc)
     if search is not None:
-        _doctor_watch_runs(report, search, now)
+        _doctor_watch_runs(report, search, now, config_doc)
         _doctor_score_calls(report, search, config_doc, now)
         _doctor_criteria_vetoes(report, search, config_doc, now)
         _doctor_usefulness(report, search, config_doc, now)
