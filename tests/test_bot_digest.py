@@ -229,15 +229,22 @@ def test_a_run_still_going_waits_and_a_dead_one_is_sent_later(env: Env, keep_uma
     assert _digests(env) == []
     assert _alerted(env) == {"Coordinator": None}
     # Never finished: killed or crashed. After twice the budget it no longer holds rows.
-    env.clock.now = started + botmod.STALE_RUN
+    env.clock.now = started + botmod.stale_run(None) - dt.timedelta(seconds=1)
+    assert _poll(env) == 0
+    assert _digests(env) == []  # a 20-minute run (the default) is still well inside
+    env.clock.now = started + botmod.stale_run(None)
     assert _poll(env) == 0
     assert _heads(env) == ["Example Org — Coordinator"]
 
 
-def test_the_stale_window_is_longer_than_a_run() -> None:
+def test_the_stale_window_is_twice_the_whole_run() -> None:
     from careerhunter import watch
 
-    assert botmod.STALE_RUN.total_seconds() >= 2 * watch.RUN_BUDGET
+    assert botmod.stale_run(None).total_seconds() == 2 * 20 * 60
+    assert botmod.stale_run({"scoring": {"run_minutes": 45}}).total_seconds() == 2 * 45 * 60
+    assert botmod.stale_run({"scoring": {"run_minutes": 10}}).total_seconds() == (
+        2 * watch.RUN_BUDGET
+    )
 
 
 def test_unchecked_lanes_and_low_off_lane_rows_stay_held(env: Env, keep_umask: None) -> None:

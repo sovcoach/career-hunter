@@ -41,6 +41,22 @@ repeats COPY_RUN characters of the resume is dropped. Duplicates go, and at most
 are kept. A `requirements` field that is missing or the wrong shape gives none. It
 never makes the reply unparseable: the score stands either way.
 
+Criteria vetoes (ADR-028). When the operator's criteria file is in use, its numbered
+rules go in the request, and the model may answer with a veto: a rule number and a
+quote copied from the posting that shows the match. The quote is checked here, never
+trusted: after `normalized` it must be at least MIN_QUOTE characters and appear in the
+title and description sent in this call, and the rule must exist. A veto that passes
+is returned as `Score.veto`. One that fails is a rejected veto with a fixed reason
+(REJECTED), and the posting is scored from the same reply's gaps, with no second call.
+A veto is never honoured when no criteria were sent. The quote is never stored, logged
+or returned: a reply with a veto is stored as its canonical gaps, as with a resume.
+
+Caps work the same way. A cap rule names a fit level; the reply's `cap` names the rule
+and quotes the posting, checked as a veto's quote is, and the rule must be a cap rule.
+A cap that passes is `Score.cap`, with the level, and the watcher stores the lower of
+the tier's fit and that level. One that fails is rejected and the score stands. A veto
+that passes wins over a cap. A reply with a cap is stored as canonical gaps too.
+
 Reasoning models. The chat model may think before it answers. Its thinking is removed
 before anything is parsed or stored (`strip_reasoning`), and a reply whose thinking
 never closes does not parse. The body may be up to MAX_REPLY bytes, since the thinking
@@ -49,6 +65,7 @@ can be long; at most MAX_OUTPUT characters of what is left are stored.
 
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import json
 import re
@@ -60,6 +77,7 @@ from typing import Any
 
 from careerhunter import loopback
 from careerhunter.config import DEFAULT_CHAT_MODEL, chat_model
+from careerhunter.criteria import Criteria
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText, mentions
 from careerhunter.resume import Resume
@@ -92,11 +110,28 @@ _THINK_BLOCK = re.compile(rf"<({_THINK_TAGS})>.*?</\1\s*>", re.IGNORECASE | re.D
 _THINK_OPEN = re.compile(rf"<(?:{_THINK_TAGS})>", re.IGNORECASE)
 _THINK_CLOSE = re.compile(rf"</(?:{_THINK_TAGS})\s*>", re.IGNORECASE)
 Transport = Callable[[str, bytes], tuple[int, bytes]]
+MAX_QUOTE = 200  # what the model is asked for; a longer quote is still checked
+MIN_QUOTE = 8  # characters after `normalized`: shorter shows no match
+# The fixed reasons a veto is not honoured, by key.
+REJECTED = {
+    "not-found": "quote not found",
+    "too-short": "quote too short",
+    "unknown-rule": "unknown rule",
+}
 # Added to the system prompt when the operator's criteria file is sent.
 CRITERIA_INSTRUCTION = (
-    " criteria, when present, are the candidate's own stated preferences, in their words: "
-    "weigh them when deciding whether a gap is minor or core. They are not requirements "
-    "of the posting, and never list them as gaps or requirements."
+    " criteria, when present, are numbered rules in the candidate's own words, each of "
+    'kind "veto" (postings the candidate won\'t take) or "cap" (postings whose fit is '
+    "at most the rule's cap level). If this posting clearly meets a veto rule, add "
+    '"veto":{"rule":N,"quote":"..."} to the object; if it clearly meets a cap rule, add '
+    '"cap":{"rule":N,"quote":"..."}. N is that rule\'s number, and quote is copied '
+    f"exactly from the posting's title or description, at most {MAX_QUOTE} characters, "
+    "and shows the match. Apply each rule exactly as written: whatever the rule names "
+    "counts, a preference, a nice-to-have or an asset included when the rule names it; "
+    "an exception the rule itself allows that the posting states, or the allowed side "
+    "of a limit the rule sets, is not a match. Without a clear match, leave veto and cap "
+    "out. Criteria are not requirements of the posting: never list them as gaps or "
+    "requirements."
 )
 
 
@@ -113,9 +148,37 @@ class ScoreError(Exception):
         self.kind = kind
 
 
+VETO_WORDS = 6  # words of the rule in the skip reason
+
+
+@dataclass(frozen=True)
+class Veto:
+    """A veto in the reply. `rejected` is a key of REJECTED when it was not honoured;
+    `rule` is the rule number named, when the reply named one as a number. `skip` is
+    the skip reason for an honoured one, built from the criteria file, never the reply:
+    `criteria: N. <the rule's first VETO_WORDS words>`."""
+
+    rule: int | None
+    rejected: str | None = None
+    skip: str = dataclasses.field(default="", compare=False)
+
+
+@dataclass(frozen=True)
+class Cap:
+    """A cap in the reply. `rejected` is a key of REJECTED when it was not applied;
+    `level` is the cap rule's fit level (from the file) for one that was."""
+
+    rule: int | None
+    rejected: str | None = None
+    level: str | None = None
+
+
 @dataclass(frozen=True)
 class Score:
-    """Parsed learning fields. `tier` is None when the gap count excludes the posting."""
+    """Parsed learning fields. `tier` is None when the gap count excludes the posting.
+
+    With an honoured veto (`veto.rejected` None), the posting is skipped for that rule
+    and the other fields are not used. A rejected veto leaves the score as scored."""
 
     llm_output: str
     gaps: str
@@ -123,6 +186,21 @@ class Score:
     excluded: bool = False
     resume_sha256: str | None = None  # the resume this score was made with
     key_requirements: tuple[str, ...] = ()  # checked phrases from the posting, at most 3
+    veto: Veto | None = None
+    cap: Cap | None = None
+
+    @property
+    def vetoed(self) -> bool:
+        """True when a criteria rule vetoed the posting and the quote checked out."""
+        return self.veto is not None and self.veto.rejected is None
+
+    @property
+    def capped(self) -> str | None:
+        """The fit level a checked cap holds the posting to, or None. No cap applies
+        to a vetoed posting."""
+        if self.vetoed or self.cap is None or self.cap.rejected is not None:
+            return None
+        return self.cap.level
 
 
 @dataclass(frozen=True)
@@ -229,16 +307,18 @@ def score_posting(
     transport: Transport | None = None,
     resume: Resume | None = None,
     examples: Sequence[Example] = (),
-    criteria: str | None = None,
+    criteria: Criteria | None = None,
 ) -> Score | None:
     """The score, or None when the reply does not parse.
 
-    `criteria` is the text of the operator's criteria file (search.criteria_file),
-    sent as the candidate's own stated criteria; None sends no criteria at all.
+    `criteria` is the operator's criteria file (search.criteria_file): its numbered
+    rules are sent, and a veto in the reply is checked against them and the posting
+    text. None sends no criteria at all, and a veto is then ignored.
 
     `examples` are postings the operator labelled (#43): each goes in the request only,
-    as its title, lane, gap count and label. Not the company, the description, a cosine
-    or a note. The one being scored (same company and title) is left out.
+    as its title, lane, gap count and label, and an operator skip's reason. Not the
+    company, the description, a cosine or a note. The one being scored (same company
+    and title) is left out.
 
     Raises ScoreError when the model does not answer. None leaves the posting unscored.
     The caller does not alert it.
@@ -272,11 +352,15 @@ def score_posting(
     ]
     if resume is not None and _copies_resume(parsed, resume.text):
         return None
+    veto = None if criteria is None else _veto(content, posting, criteria)
+    cap = None if criteria is None else _cap(content, posting, criteria)
     counted, tier, excluded = _apply_tiers(parsed, rubric)
-    if tier is None and not excluded:
+    if tier is None and not excluded and not (veto is not None and veto.rejected is None):
         return None
-    # D-A1: with a resume in the prompt, the reply itself is never stored.
-    stored = content[:MAX_OUTPUT] if resume is None else canonical_gaps(parsed)
+    # D-A1: with a resume in the prompt, the reply itself is never stored. Nor is a
+    # reply with a veto or a cap, so its quote is never kept (ADR-028).
+    plain = resume is None and veto is None and cap is None
+    stored = content[:MAX_OUTPUT] if plain else canonical_gaps(parsed)
     return Score(
         llm_output=stored,
         gaps=json.dumps([_gap_dict(gap) for gap in counted], separators=(",", ":")),
@@ -290,7 +374,57 @@ def score_posting(
             )
             if not unstated_language(phrase, posting, config)
         )[:MAX_REQUIREMENTS],
+        veto=veto,
+        cap=cap,
     )
+
+
+def _grounded(
+    content: str, key: str, posting: PostingText, criteria: Criteria
+) -> tuple[int | None, str | None] | None:
+    """The rule number the reply's `key` ("veto" or "cap") names and why it was not
+    honoured (a key of REJECTED), or None when the reply has none. The rule must be of
+    that kind; the quote must be MIN_QUOTE characters or more and appear in the title
+    and description sent. The quote itself is not kept."""
+    raw = _json_object(content)
+    item = raw.get(key) if isinstance(raw, dict) else None
+    if item is None:
+        return None
+    rule = item.get("rule") if isinstance(item, dict) else None
+    number = rule if isinstance(rule, int) and not isinstance(rule, bool) else None
+    if number is None or criteria.rule(number, key) is None:
+        return number, "unknown-rule"
+    quote = item.get("quote")
+    needle = normalized(_CONTROL.sub(" ", quote)) if isinstance(quote, str) else ""
+    if len(needle) < MIN_QUOTE:
+        return number, "too-short"
+    sent = normalized("\n".join(part for part in (posting.title, posting.description) if part))
+    if needle not in sent:
+        return number, "not-found"
+    return number, None
+
+
+def _veto(content: str, posting: PostingText, criteria: Criteria) -> Veto | None:
+    """The reply's veto, checked; None when the reply has none."""
+    found = _grounded(content, "veto", posting, criteria)
+    if found is None:
+        return None
+    number, rejected = found
+    if rejected is not None or number is None:
+        return Veto(number, rejected)
+    words = " ".join(criteria.rules[number - 1].text.split()[:VETO_WORDS])
+    return Veto(number, skip=f"criteria: {number}. {words}")
+
+
+def _cap(content: str, posting: PostingText, criteria: Criteria) -> Cap | None:
+    """The reply's cap, checked; None when the reply has none."""
+    found = _grounded(content, "cap", posting, criteria)
+    if found is None:
+        return None
+    number, rejected = found
+    if rejected is not None or number is None:
+        return Cap(number, rejected)
+    return Cap(number, level=criteria.rules[number - 1].cap)
 
 
 def strip_reasoning(content: str) -> str | None:
@@ -348,7 +482,7 @@ def _request_body(
     config: Mapping[str, Any],
     resume: Resume | None = None,
     examples: Sequence[Example] = (),
-    criteria: str | None = None,
+    criteria: Criteria | None = None,
 ) -> bytes:
     view: dict[str, Any] = {
         "lanes": _section(config, "search", "lanes"),
@@ -366,6 +500,7 @@ def _request_body(
         view["resume"] = resume.text
     shown = [
         {"title": ex.title, "lane": ex.lane, "gaps": ex.gap_count, "label": ex.label}
+        | ({"reason": ex.reason} if ex.reason else {})
         for ex in examples
         if (ex.company.casefold(), ex.title.casefold())
         != (posting.company.casefold(), posting.title.casefold())
@@ -373,7 +508,11 @@ def _request_body(
     if shown:
         view["labelled_examples"] = shown
     if criteria is not None:
-        view["criteria"] = criteria
+        view["criteria"] = [
+            {"rule": rule.number, "kind": rule.kind, "text": rule.text}
+            | ({"cap": rule.cap} if rule.cap else {})
+            for rule in criteria.rules
+        ]
     payload = {
         "model": chat_model(config),
         "temperature": 0,
@@ -391,7 +530,8 @@ def _request_body(
                     "whether or not they are gaps. No prose. "
                     "labelled_examples, when present, are other postings and what the "
                     "candidate decided about them (applied and its latest status, or "
-                    "skipped); use them only to calibrate, never as requirements."
+                    "skipped, with the candidate's reason when given); use them only to "
+                    "calibrate, never as requirements."
                     + (CRITERIA_INSTRUCTION if criteria is not None else "")
                 ),
             },

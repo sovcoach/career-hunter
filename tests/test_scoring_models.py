@@ -42,7 +42,12 @@ def _posting() -> PostingText:
 
 def test_the_template_leaves_both_ids_unset_and_valid() -> None:
     doc = _example()
-    assert doc["scoring"] == {"chat_model": None, "embedding_model": None, "timeout_seconds": None}
+    assert doc["scoring"] == {
+        "chat_model": None,
+        "embedding_model": None,
+        "timeout_seconds": None,
+        "run_minutes": None,
+    }
     assert validate_config(doc) == []
     assert chat_model(doc) == DEFAULT_CHAT_MODEL == "local-model"
     assert embedding_model(doc) is None  # embeddings off

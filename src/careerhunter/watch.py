@@ -113,6 +113,15 @@ killed or stops on a database error never finishes its row, so its counts stay n
 A model that does not answer (ScoreError) stops all scoring for the rest of the run;
 the posting it happened on keeps its place, and one line counts what is left. A reply
 that does not parse leaves that posting as it was, behind the others next time.
+
+A criteria veto (ADR-028) whose quote checked out skips the posting with reason
+`criteria: N. <words>` and records the call as `vetoed`; its stored score, fit and gaps
+stay as they were, and nothing from the reply is stored. A posting already alerted
+also gets a `withdrawals` row, for the bot to say so. A rejected veto is scored as
+usual and recorded as `veto_rejected`. A checked cap stores the lower of the tier's fit
+and the cap's level, adds `cap_rule` to `scout_metadata`, and is recorded as `capped`;
+a rejected cap is scored as usual and recorded as `cap_rejected`. A cap sends nothing,
+even for a posting already alerted. No log line carries the quote.
 """
 
 from __future__ import annotations
@@ -141,6 +150,7 @@ from careerhunter.ats import board_url as board_url  # the tests build list URLs
 from careerhunter.config import (
     max_posting_age_days,
     off_lane_min_fit,
+    scoring_run_minutes,
     scoring_timeout_seconds,
     tier_fits,
 )
@@ -149,12 +159,13 @@ from careerhunter.deadline import Deadline
 from careerhunter.discover import Pass
 from careerhunter.discover import posting as discovered_posting
 from careerhunter.embed import Embedder, miss_line
+from careerhunter.enums import FIT_LEVELS
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout, FetchTooLarge
 from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
 from careerhunter.resume import Resume
 from careerhunter.runlog import RunLogError
-from careerhunter.score import Score, ScoreError
+from careerhunter.score import REJECTED, Score, ScoreError
 
 Fetcher = Callable[[str], Fetched]
 Poster = ats_boards.Poster
@@ -163,7 +174,7 @@ Scorer = Callable[[PostingText], Score | None]
 OnCrash = Callable[[str, Exception], None]
 Tally = Literal["fetched", "failed", "left"]
 
-RUN_BUDGET = 600.0  # seconds for one watch run: the boards first, then the other passes
+RUN_BUDGET = 600.0  # seconds for the boards, from the run's start (and discovery before)
 # All of one board's replies together (ats.py). The CLI also caps each request with it.
 BOARD_MAX_BYTES = ats_boards.BOARD_MAX_BYTES
 # Replies for one posting that did not parse before the watcher stops sending it to the
@@ -240,6 +251,10 @@ class _State:
     queued: dict[int, PostingText] = field(default_factory=dict)
     held_new: dict[int, PostingText] = field(default_factory=dict)
     score_timeout: float = 120.0  # scoring.timeout_seconds: a call needs this much budget
+    # The boards' own budget (RUN_BUDGET from the start), when the run's `budget` is
+    # longer (scoring.run_minutes). Once the boards are done, `budget` alone counts.
+    boards: Deadline | None = None
+    after_boards: bool = False
     criteria_failure: str | None = None  # why the criteria file held scoring this run
     criteria_ok: bool = False  # scoring was not held for the criteria file
     # Each watchlist company's role filters, by folded name, for the gate before scoring.
@@ -250,8 +265,15 @@ class _State:
     # Stored postings met on their board this run, with the description it sent.
     met: dict[int, PostingText] = field(default_factory=dict)
 
+    def _deadline(self) -> Deadline | None:
+        """The budget that counts now: the boards' until they are done, then the run's."""
+        if self.boards is None or self.after_boards:
+            return self.budget
+        return self.boards
+
     def out_of_time(self) -> bool:
-        return self.budget is not None and self.budget.expired()
+        deadline = self._deadline()
+        return deadline is not None and deadline.expired()
 
     def model_state(self) -> str:
         """How a model that stopped answering is named in a line."""
@@ -265,12 +287,14 @@ class _State:
         self.lines.append(line)
 
     def in_reserve(self) -> bool:
-        return self.budget is not None and self.budget.remaining() < SCORE_RESERVE
+        deadline = self._deadline()
+        return deadline is not None and deadline.remaining() < SCORE_RESERVE
 
     def short_for_a_call(self) -> bool:
         """Less of the budget is left than one scoring call may take, so a call is not
         started: the budget would cut it short and waste the model's work."""
-        return self.budget is not None and self.budget.remaining() < self.score_timeout
+        deadline = self._deadline()
+        return deadline is not None and deadline.remaining() < self.score_timeout
 
     @property
     def resume_sha256(self) -> str | None:
@@ -344,6 +368,7 @@ def run(
     on_crash: OnCrash | None = None,
     emit: Callable[[str], None] | None = None,
     budget: Deadline | None = None,
+    boards_budget: Deadline | None = None,
     now: Callable[[], dt.datetime] | None = None,
     resume: Resume | None = None,
     resume_problem: str | None = None,
@@ -361,6 +386,10 @@ def run(
 
     Each log line is handed to `emit` as it happens; the same lines are returned.
     `budget` bounds the whole run; the caller also gives it to each client it builds.
+    `boards_budget`, when given, bounds discovery and the boards (RUN_BUDGET from the
+    start); the embedding refresh, the recheck and the scoring passes after them run
+    on `budget` (`scoring.run_minutes`, see `run_seconds`). A board already being
+    fetched when the boards' budget ends is finished, not cut.
     `criteria_problem` is the fixed reason (a key of `criteria.REASONS`) a configured
     criteria file could not be used; then nothing is scored, and the `criteria`
     component records it so the bot can say why.
@@ -382,6 +411,7 @@ def run(
         max_age=max_posting_age_days(rules),
         today=today,
         score_timeout=float(scoring_timeout_seconds(rules)),
+        boards=boards_budget,
     )
     lines = state.lines
     with db.transaction(conn):
@@ -450,6 +480,7 @@ def run(
             tally = "failed"
         if tally is not None:
             counts[tally] += 1
+    state.after_boards = True  # from here on, the run's own budget counts
     if embedder.enabled():
         if state.out_of_time():
             state.left_by_budget(f"watch: embedding refresh: {_LEFT}")
@@ -485,6 +516,12 @@ def run(
 
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+def run_seconds(config: Mapping[str, Any] | None) -> float:
+    """How long a watch run may take in all: `scoring.run_minutes`, and never less than
+    the boards' RUN_BUDGET."""
+    return max(RUN_BUDGET, 60.0 * scoring_run_minutes(config))
 
 
 def _finish_run(
@@ -782,7 +819,9 @@ def _watch_one(
         return "left"
     key = board.key
     previous = _stamp_attempt(conn, key, state.now())
+    began = state.monotonic()
     outcome = _fetch_jobs(conn, state, blocked, name, board, host, client)
+    fetch_seconds = state.monotonic() - began
     if isinstance(outcome, _Left):
         _restore_attempt(conn, key, previous)
         return "left"
@@ -812,6 +851,7 @@ def _watch_one(
         today,
         scorer,
         embedder,
+        fetch_seconds=fetch_seconds,
     )
     for note in outcome.read.notes:
         lines.append(_line(name, ats, note))
@@ -1042,7 +1082,12 @@ def _record_jobs(
     scorer: Scorer | None,
     embedder: Embedder,
     source: str = "watcher",
+    *,
+    fetch_seconds: float | None = None,
 ) -> None:
+    """Record a board's jobs, then one line: new, already recorded, and, when it took a
+    second or more, how long the board's fetch and parse took (`fetch_seconds`, on the
+    run's monotonic clock; inline scoring is not counted: score_calls times each call)."""
     lines = state.lines
     new = 0
     existing = 0
@@ -1165,7 +1210,12 @@ def _record_jobs(
             )
             continue
         _attempt(conn, state, posting_id, seen, scorer, today, name, ats, embedder)
-    lines.append(_line(name, ats, f"{new} new, {existing} already recorded"))
+    took = (
+        f" (fetched in {fetch_seconds:.0f} s)"
+        if fetch_seconds is not None and fetch_seconds >= 1
+        else ""
+    )
+    lines.append(_line(name, ats, f"{new} new, {existing} already recorded{took}"))
 
 
 def _recheck(
@@ -1552,7 +1602,18 @@ def _attempt(
             lines.append(_line(name, ats, f"{title} left unscored ({state.model_state()}){kept}"))
         return
     state.scorer_answered = True
-    if result is None:
+    if result is not None and result.vetoed and result.veto is not None:
+        # A criteria rule vetoed it (ADR-028): skipped, never alerted; the stored score,
+        # fit and gaps stay as they were. An alerted one is withdrawn by the bot.
+        with db.transaction(conn):
+            timed("vetoed")
+            search_store.clear_parse_failures(conn, posting_id)
+            if not search_store.posting_has_skip(conn, posting_id):
+                skip_id = search_store.insert_skip(conn, posting_id, today, result.veto.skip)
+                if search_store.posting_alerted(conn, posting_id):
+                    search_store.insert_withdrawal(conn, skip_id)
+        lines.append(_line(name, ats, f"{title} skipped (criteria {result.veto.rule})"))
+    elif result is None:
         kept = "; old score kept" if rescore else ""
         with db.transaction(conn):
             timed("unparseable")
@@ -1571,10 +1632,25 @@ def _attempt(
         else:
             lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
     else:
-        metadata = None if result.tier is None else json.dumps({"tier": result.tier})
+        cap = result.cap
+        level = result.capped
+        stored_meta: dict[str, Any] = {"tier": result.tier}
+        if level is not None and cap is not None:
+            stored_meta["cap_rule"] = cap.rule
+        metadata = None if result.tier is None else json.dumps(stored_meta)
         fit = None if result.tier is None else state.fits.get(result.tier)
+        if fit is not None and level is not None:
+            fit = _lower_fit(fit, level)
+        if level is not None:
+            outcome = "capped"
+        elif result.veto is not None:
+            outcome = "veto_rejected"
+        elif cap is not None:
+            outcome = "cap_rejected"
+        else:
+            outcome = "scored"
         with db.transaction(conn):
-            timed("scored")
+            timed(outcome)
             search_store.set_posting_score(
                 conn,
                 posting_id,
@@ -1589,6 +1665,16 @@ def _attempt(
             search_store.clear_parse_failures(conn, posting_id)
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):
                 search_store.insert_skip(conn, posting_id, today, "gap_tier")
+        if result.veto is not None and result.veto.rejected is not None:
+            why = REJECTED[result.veto.rejected]
+            rule = "" if result.veto.rule is None else f", rule {result.veto.rule}"
+            lines.append(_line(name, ats, f"{title} veto rejected ({why}{rule}); scored"))
+        if cap is not None and level is not None:
+            lines.append(_line(name, ats, f"{title} capped at {level} (criteria {cap.rule})"))
+        elif cap is not None and cap.rejected is not None:
+            why = REJECTED[cap.rejected]
+            rule = "" if cap.rule is None else f", rule {cap.rule}"
+            lines.append(_line(name, ats, f"{title} cap rejected ({why}{rule}); scored"))
         if result.excluded:
             lines.append(_line(name, ats, f"{title} skipped (gap_tier)"))
         elif rescore:
@@ -1596,6 +1682,13 @@ def _attempt(
     reason = embedder.attach(posting_id, posting)
     if reason is not None:
         lines.append(miss_line(posting_id, reason))
+
+
+def _lower_fit(fit: str, cap: str) -> str:
+    """The lower of a tier's fit and a cap's level; a fit not on the scale is kept."""
+    if fit not in FIT_LEVELS or cap not in FIT_LEVELS:
+        return fit
+    return min(fit, cap, key=FIT_LEVELS.index)
 
 
 def _scored(conn: sqlite3.Connection, posting_id: int) -> bool:

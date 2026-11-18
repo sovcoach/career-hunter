@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -758,8 +759,29 @@ def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
     return [(int(row["id"]), str(row["title"])) for row in rows]
 
 
-SCORE_OUTCOMES = ("scored", "unparseable", "unreachable", "unauthorized", "budget")
-ANSWERED_OUTCOMES = ("scored", "unparseable")  # the model replied, parsed or not
+# `vetoed` and `veto_rejected` (search migration 0032): a criteria veto that was
+# honoured, or one whose quote did not check out, so the posting was scored. `capped`
+# and `cap_rejected` (0033) are the same for a cap rule.
+SCORE_OUTCOMES = (
+    "scored",
+    "unparseable",
+    "unreachable",
+    "unauthorized",
+    "budget",
+    "vetoed",
+    "veto_rejected",
+    "capped",
+    "cap_rejected",
+)
+# The model replied, parsed or not.
+ANSWERED_OUTCOMES = (
+    "scored",
+    "unparseable",
+    "vetoed",
+    "veto_rejected",
+    "capped",
+    "cap_rejected",
+)
 
 
 def record_score_call(
@@ -793,6 +815,26 @@ def score_call_stats(conn: sqlite3.Connection, since: str) -> ScoreCallStats:
     ).fetchall()
     answered = tuple(sorted(int(r[0]) for r in rows if r[1] in ANSWERED_OUTCOMES))
     return ScoreCallStats(answered, len(rows) - len(answered))
+
+
+@dataclass(frozen=True)
+class VetoCounts:
+    vetoed: int
+    rejected: int
+    capped: int = 0
+    cap_rejected: int = 0
+
+
+def veto_counts(conn: sqlite3.Connection, since: str) -> VetoCounts:
+    """Scoring calls since a moment that were vetoed or capped, or whose veto or cap was
+    rejected."""
+    row = conn.execute(
+        "SELECT coalesce(sum(outcome = 'vetoed'), 0), coalesce(sum(outcome = 'veto_rejected'), 0), "
+        "coalesce(sum(outcome = 'capped'), 0), coalesce(sum(outcome = 'cap_rejected'), 0) "
+        "FROM score_calls WHERE started_at >= ?",
+        (since,),
+    ).fetchone()
+    return VetoCounts(int(row[0]), int(row[1]), int(row[2]), int(row[3]))
 
 
 def start_watch_run(conn: sqlite3.Connection, started_at: str) -> int:
@@ -1191,6 +1233,26 @@ class Example:
     lane: str | None  # the lane name, "off-lane", or None when not checked
     gap_count: int | None
     label: str  # "skipped", or the application's latest status
+    reason: str | None = None  # an operator skip's reason, cleaned and capped
+
+
+MAX_EXAMPLE_REASON = 200
+
+
+def example_reason(text: str | None) -> str | None:
+    """A skip reason as an example carries it: control characters gone, whitespace
+    collapsed, at most MAX_EXAMPLE_REASON characters cut at a word with "…"."""
+    if text is None:
+        return None
+    cleaned = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", " ", text).split())
+    if not cleaned:
+        return None
+    if len(cleaned) <= MAX_EXAMPLE_REASON:
+        return cleaned
+    cut = cleaned[: MAX_EXAMPLE_REASON - 1]
+    if " " in cut:
+        cut = cut[: cut.rindex(" ")]
+    return cut.rstrip(" ,;:-") + "…"
 
 
 def labelled_examples(conn: sqlite3.Connection, limit: int) -> list[Example]:
@@ -1198,26 +1260,28 @@ def labelled_examples(conn: sqlite3.Connection, limit: int) -> list[Example]:
 
     Labels come only from the operator: an application (its latest status, `applied` or
     later, from the bot or the CLI) or a skip they chose with the Skipped button. The
-    system never predicts one, and a watcher skip is not a label.
+    system never predicts one, and a watcher skip is not a label: neither is a criteria
+    veto, which is the watcher's. An operator skip carries its reason (`example_reason`).
     """
     if limit < 1:
         return []
     rows = conn.execute(
         """
         WITH labels AS (
-            SELECT a.posting_id, d.status AS label, d.recorded_at AS at, d.id AS seq, 1 AS kind
+            SELECT a.posting_id, d.status AS label, d.recorded_at AS at, d.id AS seq, 1 AS kind,
+                   NULL AS reason
             FROM decision_history d JOIN applications a ON a.id = d.application_id
             UNION ALL
-            SELECT s.posting_id, 'skipped', s.created_at, s.id, 0
+            SELECT s.posting_id, 'skipped', s.created_at, s.id, 0, s.reason
             FROM skips s WHERE s.by_operator = 1
         ),
         latest AS (
-            SELECT posting_id, label, at,
+            SELECT posting_id, label, at, reason,
                    row_number() OVER (PARTITION BY posting_id ORDER BY at DESC, kind DESC,
                                       seq DESC) AS n
             FROM labels
         )
-        SELECT c.name AS company, p.title, p.lane, p.lane_checked, l.label,
+        SELECT c.name AS company, p.title, p.lane, p.lane_checked, l.label, l.reason,
                CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
                     THEN json_array_length(p.gaps) END AS gap_count
         FROM latest l
@@ -1236,6 +1300,7 @@ def labelled_examples(conn: sqlite3.Connection, limit: int) -> list[Example]:
             lane=str(row["lane"]) if row["lane"] else ("off-lane" if row["lane_checked"] else None),
             gap_count=None if row["gap_count"] is None else int(row["gap_count"]),
             label=str(row["label"]),
+            reason=example_reason(row["reason"]),
         )
         for row in rows
     ]
@@ -1256,6 +1321,45 @@ def insert_skip(
         (posting_id, date, reason, int(by_operator)),
     )
     return int(cur.lastrowid or 0)
+
+
+def posting_alerted(conn: sqlite3.Connection, posting_id: int) -> bool:
+    """Whether an alert for this posting was sent."""
+    row = conn.execute("SELECT alerted_at FROM postings WHERE id = ?", (posting_id,)).fetchone()
+    return row is not None and row[0] is not None
+
+
+def insert_withdrawal(conn: sqlite3.Connection, skip_id: int) -> None:
+    """A criteria veto skip of an alerted posting, for the bot to say it is withdrawn
+    (search migration 0032). Unsent until `mark_withdrawals_sent`."""
+    conn.execute("INSERT OR IGNORE INTO withdrawals (skip_id) VALUES (?)", (skip_id,))
+
+
+@dataclass(frozen=True)
+class Withdrawal:
+    skip_id: int
+    company: str
+    title: str
+    reason: str  # the skip reason: `criteria: N. <words>`
+
+
+def pending_withdrawals(conn: sqlite3.Connection, limit: int) -> list[Withdrawal]:
+    """Unsent withdrawals, oldest first, at most `limit`."""
+    rows = conn.execute(
+        "SELECT w.skip_id, c.name, p.title, s.reason FROM withdrawals w "
+        "JOIN skips s ON s.id = w.skip_id JOIN postings p ON p.id = s.posting_id "
+        "JOIN companies c ON c.id = p.company_id WHERE w.sent_at IS NULL "
+        "ORDER BY w.skip_id LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [Withdrawal(int(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows]
+
+
+def mark_withdrawals_sent(conn: sqlite3.Connection, skip_ids: Sequence[int], at: str) -> None:
+    conn.executemany(
+        "UPDATE withdrawals SET sent_at = ? WHERE skip_id = ? AND sent_at IS NULL",
+        [(at, skip_id) for skip_id in skip_ids],
+    )
 
 
 def has_operator_skip(conn: sqlite3.Connection, posting_id: int) -> bool:

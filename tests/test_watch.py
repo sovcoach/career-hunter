@@ -2179,4 +2179,22 @@ def test_the_command_gives_one_budget_to_every_client(
     assert seen["fetcher"].keywords["budget"] is budget
     assert seen["embed_transport"].keywords["budget"] is budget
     assert seen["score_transport"].keywords["budget"] is budget
-    assert budget.remaining() <= w.RUN_BUDGET
+    # The example config leaves scoring.run_minutes unset: 20 minutes in all, and the
+    # boards (and discovery before them) keep their own ten.
+    assert w.RUN_BUDGET < budget.remaining() <= 20 * 60
+    boards = seen["boards_budget"]
+    assert isinstance(boards, Deadline) and boards.remaining() <= w.RUN_BUDGET
+    assert seen["discovery"].args[-1] is boards
+
+
+def test_each_board_line_says_how_long_its_fetch_took(search: sqlite3.Connection) -> None:
+    from tests.fakes import FakeClock
+
+    clock = FakeClock()
+    costs = {board("Example A"): 41 / 60, board("Example B"): 0.4 / 60}
+    fetcher = Timed(three_boards().mapping, clock, costs=costs)
+    lines = w.run(search, entries(*NAMES), today=DAY, fetcher=fetcher, monotonic=clock)
+    [line_a] = [line for line in lines if line.startswith("watch: Example A (greenhouse): ")]
+    assert line_a.endswith("already recorded (fetched in 41 s)")
+    [line_b] = [line for line in lines if line.startswith("watch: Example B (greenhouse): ")]
+    assert line_b.endswith("already recorded")  # under a second: no duration

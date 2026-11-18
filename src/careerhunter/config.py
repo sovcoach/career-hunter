@@ -107,14 +107,24 @@ HEALTH_KEYS = ("unproductive_runs", "failure_runs")
 # local server. The URLs are loopback constants in score.py and embed.py, never config.
 DEFAULT_CHAT_MODEL = "local-model"
 MODEL_KEYS = ("chat_model", "embedding_model")
-SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds")
+SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds", "run_minutes")
 MAX_MODEL_ID = 200
 # scoring.timeout_seconds: the most one scoring call may take. A reasoning model thinks
 # before it answers, and the request does not stream. The upper bound leaves room in
-# the 600-second watch run for the boards and one call.
+# the boards' 600 seconds for one call.
 DEFAULT_SCORE_TIMEOUT_SECONDS = 300
 MIN_SCORE_TIMEOUT_SECONDS = 60
 MAX_SCORE_TIMEOUT_SECONDS = 540
+# scoring.run_minutes: how long a watch run may go on, counted from its start. The
+# boards keep their ten minutes (watch.RUN_BUDGET); the scoring passes then run until
+# this many minutes from the start. A set value must be under
+# schedule.watcher_interval_minutes, so a run ends before the next is due. Unset, it is
+# 20, or RUN_MINUTES_GAP less than a shorter interval (10 at the shortest, 15). 10 is
+# the old single budget.
+DEFAULT_RUN_MINUTES = 20
+MIN_RUN_MINUTES = 10
+MAX_RUN_MINUTES = 50
+RUN_MINUTES_GAP = 5
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _CAREER_HOST = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -707,6 +717,7 @@ def validate_config(doc: Any) -> list[str]:
     _validate_health(doc.get("health"), problems)
     _validate_learning(doc.get("learning"), problems)
     _validate_scoring(doc.get("scoring"), problems)
+    _validate_run_minutes(doc, problems)
     _validate_discovery(doc.get("discovery"), problems)
     problems.extend(validate_section(doc.get("ei")))
     return problems
@@ -824,6 +835,36 @@ def scoring_timeout_seconds(doc: Mapping[str, Any] | None) -> int:
     if _int(value) and MIN_SCORE_TIMEOUT_SECONDS <= value <= MAX_SCORE_TIMEOUT_SECONDS:
         return int(value)
     return DEFAULT_SCORE_TIMEOUT_SECONDS
+
+
+def scoring_run_minutes(doc: Mapping[str, Any] | None) -> int:
+    """How many minutes from a watch run's start it may go on: scoring.run_minutes when
+    it is usable (from 10 to 50, under the watch interval), else 20, or RUN_MINUTES_GAP
+    less than a shorter watch interval."""
+    interval = watch_interval_minutes(dict(doc) if isinstance(doc, Mapping) else None)
+    section = doc.get("scoring") if isinstance(doc, Mapping) else None
+    value = section.get("run_minutes") if isinstance(section, Mapping) else None
+    if _int(value) and MIN_RUN_MINUTES <= value <= MAX_RUN_MINUTES and value < interval:
+        return int(value)
+    return max(MIN_RUN_MINUTES, min(DEFAULT_RUN_MINUTES, interval - RUN_MINUTES_GAP))
+
+
+def _validate_run_minutes(doc: dict[str, Any], problems: list[str]) -> None:
+    """scoring.run_minutes, when set, is from 10 to 50 and under the watch interval."""
+    section = doc.get("scoring")
+    value = section.get("run_minutes") if isinstance(section, dict) else None
+    if value is None:
+        return
+    if not _int(value) or not MIN_RUN_MINUTES <= value <= MAX_RUN_MINUTES:
+        problems.append(
+            f"scoring.run_minutes must be an integer from {MIN_RUN_MINUTES} to {MAX_RUN_MINUTES}"
+        )
+        return
+    interval = watch_interval_minutes(doc)
+    if value >= interval:
+        problems.append(
+            f"scoring.run_minutes must be less than schedule.watcher_interval_minutes ({interval})"
+        )
 
 
 def embedding_model(doc: Mapping[str, Any] | None) -> str | None:

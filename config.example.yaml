@@ -55,10 +55,15 @@ search:
   # resume/current.txt (no other value is used) so scoring and embeddings read your
   # resume. Null leaves the resume out of scoring and skips embeddings.
   resume: null
-  # Optional. A text file in the data folder with your own scoring criteria in plain
-  # words (e.g. criteria.md), sent with each scoring call; the model weighs them when
-  # it marks a gap minor or core. At most 4,000 characters, owner-only (chmod 600).
-  # A file that can't be used holds scoring until fixed. Null sends no criteria.
+  # Optional. A text file in the data folder with your own criteria (e.g.
+  # criteria.md), sent with each scoring call: one rule per line, numbered in order,
+  # each with its kind: "1. veto: ..." or "2. cap medium: ..." (cap low, medium or
+  # high); blank lines and lines starting with # are ignored. A posting the model
+  # shows meets a veto rule, quoting the posting, is skipped for that rule (an alerted
+  # one is withdrawn in Telegram); one that meets a cap rule has its fit lowered to
+  # at most that level.
+  # At most 20 rules of 300 characters, 4,000 characters in all, owner-only (chmod
+  # 600). A file that can't be used, prose included, holds scoring until fixed.
   criteria_file: null
 
 # Hard gates: a posting failing any of these is skipped, with the reason recorded.
@@ -114,11 +119,17 @@ fit_rubric:
 # token is a secret, never set here: careerhunter secret set lm_studio_token.
 # timeout_seconds is the most one scoring call may take: an integer from 60 to 540,
 # 300 if unset or null. A reasoning model thinks before it answers, so allow for that.
-# A call starts only while at least this much of the 600-second watch run is left.
+# A call starts only while at least this much of the watch run is left.
+# run_minutes is how long a watch run may go on, counted from its start: an integer
+# from 10 to 50, under schedule.watcher_interval_minutes. Unset or null, it is 20, or
+# 5 less than a shorter interval. Discovery and the boards keep the first 10 minutes;
+# the scoring passes after them run until run_minutes. 10 gives the old single
+# 10-minute run.
 scoring:
   chat_model: null             # e.g. example-chat-model
   embedding_model: null        # e.g. example-embedding-model
   timeout_seconds: null        # e.g. 300
+  run_minutes: null            # e.g. 20
 
 schedule:
   # A zone name (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); UTC if unset.

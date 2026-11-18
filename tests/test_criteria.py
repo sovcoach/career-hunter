@@ -28,7 +28,16 @@ from tests.test_score import RUBRIC
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, url
 
 env = test_bot.env  # the bot fixture, shared with test_bot
-SYNTHETIC = "Prefers synthetic operations roles; a missing forklift licence is minor."
+SYNTHETIC = (
+    "1. veto: No synthetic night-shift roles at an example depot.\n"
+    "2. cap medium: A synthetic contract whose only stated path is an extension."
+)
+RULES = (
+    criteria.Rule(1, "No synthetic night-shift roles at an example depot."),
+    criteria.Rule(
+        2, "A synthetic contract whose only stated path is an extension.", "cap", "medium"
+    ),
+)
 
 
 def _doc(value: object = "criteria.md") -> dict[str, Any]:
@@ -55,7 +64,87 @@ def test_unset_means_no_criteria(datadir: DataDir) -> None:
 def test_a_file_in_the_data_folder_is_read(datadir: DataDir) -> None:
     _write(datadir.root, f"\n{SYNTHETIC}\n\n")
     found = criteria.load(datadir.root, _doc())
-    assert found == criteria.Criteria(SYNTHETIC, len(SYNTHETIC))
+    assert found == criteria.Criteria(SYNTHETIC, len(SYNTHETIC), RULES)
+    assert found.rule(2) == RULES[1] == found.rule(2, "cap")
+    assert found.rule(2, "veto") is None and found.rule(1, "cap") is None
+    assert found.rule(0) is None and found.rule(3) is None
+    assert (found.count("veto"), found.count("cap")) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("line", "kind", "cap"),
+    [
+        ("1. veto: No synthetic night shifts.", "veto", None),
+        ("1. VETO : No synthetic night shifts.", "veto", None),
+        ("1. cap low: No synthetic night shifts.", "cap", "low"),
+        ("1. Cap  High:No synthetic night shifts.", "cap", "high"),
+    ],
+)
+def test_each_kind_parses(datadir: DataDir, line: str, kind: str, cap: str | None) -> None:
+    _write(datadir.root, line)
+    found = criteria.load(datadir.root, _doc())
+    assert found is not None
+    assert found.rules == (criteria.Rule(1, "No synthetic night shifts.", kind, cap),)
+
+
+def test_comments_blank_lines_and_spacing_are_ignored(datadir: DataDir) -> None:
+    _write(
+        datadir.root,
+        "# Synthetic criteria\n\n1.   veto:  No synthetic night-shift roles  at an example depot.\n"
+        "   \n# a note\n  2. cap medium: A synthetic contract whose only stated path is an "
+        "extension.\n",
+    )
+    found = criteria.load(datadir.root, _doc())
+    assert found is not None and found.rules == RULES
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        ("Prefers synthetic operations roles; a short contract is a no.", "not-numbered"),
+        ("1. veto: No synthetic night shifts.\nand nothing at the example depot", "not-numbered"),
+        ("- No synthetic night shifts.", "not-numbered"),
+        ("1.No synthetic night shifts.", "not-numbered"),
+        ("1. ", "not-numbered"),
+        ("1. veto: No synthetic night shifts.\n3. veto: No example depot.", "out-of-order"),
+        ("2. veto: No synthetic night shifts.", "out-of-order"),
+        ("1. veto: No synthetic night shifts.\n1. veto: No example depot.", "out-of-order"),
+        ("1. veto: " + "x" * (criteria.MAX_RULE + 1), "rule-too-long"),
+        (
+            "\n".join(
+                f"{n}. veto: No synthetic rule {n}." for n in range(1, criteria.MAX_RULES + 2)
+            ),
+            "too-many-rules",
+        ),
+        ("1. No synthetic night shifts.", "no-kind"),
+        ("1. cap: No synthetic night shifts.", "no-kind"),
+        ("1. cap huge: No synthetic night shifts.", "no-kind"),
+        ("1. veto No synthetic night shifts.", "no-kind"),
+        ("1. veto:", "no-kind"),
+        ("1. veto: fine\n2. skip: No synthetic night shifts.", "no-kind"),
+        ("# only a comment\n\n", "empty"),
+    ],
+)
+def test_a_file_that_is_not_numbered_rules_is_refused(
+    datadir: DataDir, content: str, reason: str
+) -> None:
+    _write(datadir.root, content)
+    with pytest.raises(criteria.CriteriaError) as caught:
+        criteria.load(datadir.root, _doc())
+    assert caught.value.reason == reason
+    assert str(caught.value) == criteria.REASONS[reason]  # fixed text, never the file's
+
+
+def test_the_rule_caps_are_inclusive(datadir: DataDir) -> None:
+    _write(datadir.root, "1. veto: " + "y" * criteria.MAX_RULE)
+    found = criteria.load(datadir.root, _doc())
+    assert found is not None and len(found.rules[0].text) == criteria.MAX_RULE
+    _write(
+        datadir.root,
+        "\n".join(f"{n}. veto: No rule {n}." for n in range(1, criteria.MAX_RULES + 1)),
+    )
+    found = criteria.load(datadir.root, _doc())
+    assert found is not None and len(found.rules) == criteria.MAX_RULES
 
 
 def test_a_symlink_that_stays_inside_is_followed(datadir: DataDir) -> None:
@@ -102,7 +191,10 @@ def test_a_file_that_cannot_be_used_is_refused(
 
 
 def test_the_cap_is_inclusive_and_the_size_is_known(datadir: DataDir) -> None:
-    _write(datadir.root, "y" * criteria.MAX_CHARS)
+    rules = "\n".join(f"{n}. veto: " + "y" * 190 for n in range(1, 21))
+    text = rules[: criteria.MAX_CHARS - 1] + "y"
+    assert len(text) == criteria.MAX_CHARS
+    _write(datadir.root, text)
     found = criteria.load(datadir.root, _doc())
     assert found is not None and found.chars == criteria.MAX_CHARS
     _write(datadir.root, "y" * (criteria.MAX_CHARS + 5))
@@ -149,7 +241,7 @@ def test_config_accepts_a_relative_path_or_null() -> None:
 # --- the scoring request -------------------------------------------------------------------
 
 
-def _request(stated: str | None) -> dict[str, Any]:
+def _request(stated: criteria.Criteria | None) -> dict[str, Any]:
     seen: list[bytes] = []
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
@@ -168,12 +260,16 @@ def test_unset_criteria_add_nothing_to_the_request() -> None:
     assert "criteria" not in body["messages"][0]["content"]
 
 
-def test_criteria_go_in_the_request_with_the_instruction() -> None:
-    body = _request(SYNTHETIC)
-    assert json.loads(body["messages"][1]["content"])["criteria"] == SYNTHETIC
+def test_criteria_go_in_the_request_as_numbered_rules_with_the_instruction() -> None:
+    body = _request(criteria.Criteria(SYNTHETIC, len(SYNTHETIC), RULES))
+    assert json.loads(body["messages"][1]["content"])["criteria"] == [
+        {"rule": 1, "kind": "veto", "text": RULES[0].text},
+        {"rule": 2, "kind": "cap", "text": RULES[1].text, "cap": "medium"},
+    ]
     system = body["messages"][0]["content"]
     assert system.endswith(score.CRITERIA_INSTRUCTION)
-    assert "minor or core" in score.CRITERIA_INSTRUCTION
+    assert '"veto":{"rule":N,"quote":"..."}' in score.CRITERIA_INSTRUCTION
+    assert "minor or core" not in score.CRITERIA_INSTRUCTION
 
 
 # --- the watcher ---------------------------------------------------------------------------
@@ -261,7 +357,8 @@ def test_doctor_reports_unset_set_and_over_the_cap(
     )
     _write(datadir.root, SYNTHETIC)
     assert _doctor(datadir, _doc(), capsys) == (
-        f"criteria        OK  {len(SYNTHETIC)} of 4,000 characters; sent with each scoring call"
+        f"criteria        OK  2 rules (1 veto, 1 cap), {len(SYNTHETIC)} of 4,000 characters; "
+        "sent with each scoring call"
     )
     _write(datadir.root, "z" * 4_100)
     assert _doctor(datadir, _doc(), capsys) == (
@@ -339,7 +436,7 @@ def _set_criteria(root: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("mode", "problem", "sent"), [(0o600, None, SYNTHETIC), (0o644, "loose", None)]
+    ("mode", "problem", "sent"), [(0o600, None, RULES), (0o644, "loose", None)]
 )
 def test_watch_sends_the_criteria_or_holds_scoring(
     inited: Path,
@@ -347,7 +444,7 @@ def test_watch_sends_the_criteria_or_holds_scoring(
     monkeypatch: pytest.MonkeyPatch,
     mode: int,
     problem: str | None,
-    sent: str | None,
+    sent: tuple[criteria.Rule, ...] | None,
 ) -> None:
     _set_criteria(inited)
     _write(inited, SYNTHETIC, mode=mode)
@@ -359,7 +456,8 @@ def test_watch_sends_the_criteria_or_holds_scoring(
         return []
 
     def local_score(posting: object, config: object, **kwargs: Any) -> Score:
-        seen["criteria"] = kwargs["criteria"]
+        stated = kwargs["criteria"]
+        seen["criteria"] = None if stated is None else stated.rules
         return Score(llm_output="{}", gaps="[]", tier="strong")
 
     monkeypatch.setattr(cli.watch, "run", run)

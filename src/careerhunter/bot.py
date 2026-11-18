@@ -110,7 +110,7 @@ from careerhunter.telegram import (
     TelegramRejected,
     redact,
 )
-from careerhunter.watch import RUN_BUDGET
+from careerhunter.watch import run_seconds
 
 log = logging.getLogger("careerhunter.bot")
 # The /log reply when config.yaml can't be read. No path and no content.
@@ -305,9 +305,15 @@ def _fit_label(raw: object) -> str:
 # code units; each message also stays at ten rows, twenty buttons.
 TEXT_LIMIT = 4096
 ROWS_PER_MESSAGE = 10
-# A run not finished this long after it started was killed or crashed. Twice the run
-# budget, so a slow run that is still going is never cut in half.
-STALE_RUN = dt.timedelta(seconds=2 * RUN_BUDGET)
+
+
+def stale_run(doc: Mapping[str, Any] | None) -> dt.timedelta:
+    """A run not finished this long after it started was killed or crashed. Twice the
+    run's whole budget (scoring.run_minutes), so a slow run still going is never cut in
+    half."""
+    return dt.timedelta(seconds=2 * run_seconds(doc))
+
+
 _CAPS = {"company": 80, "title": 120, "location": 80, "lane": 60, "requirement": 60}
 MAX_URL = 1000
 _SCHEDULE_WORDS = {"on_call": "on call", "over_weekend_limit": "weekend days over your limit"}
@@ -447,6 +453,17 @@ def _waiting(held: int | None) -> str:
     if held == 1:
         return "1 posting is waiting to be scored."
     return f"{held} postings are waiting to be scored."
+
+
+WITHDRAWALS_PER_MESSAGE = 10
+
+
+def _withdrawn_text(items: list[search_store.Withdrawal]) -> str:
+    """The withdrawn message: one line for one posting, else a heading and a line each."""
+    lines = [f"{item.company} — {item.title}, {item.reason}" for item in items]
+    if len(lines) == 1:
+        return f"withdrawn: {lines[0]}"
+    return "\n".join(["withdrawn (criteria):", *lines])
 
 
 def _criteria_text(held: int | None, kind: str | None) -> str:
@@ -782,7 +799,7 @@ class Bot:
         Which postings: scored watcher and discovery postings with a fit, no skip and no
         alert, in ``lanes.alert_order`` (off-lane below ``search.off_lane_min_fit`` and postings
         not yet lane-checked stay pending). A run's postings wait until that run has
-        finished, or started more than STALE_RUN ago (killed or crashed), so a run is
+        finished, or started more than `stale_run` ago (killed or crashed), so a run is
         never sent half-scored and a dead one never blocks its postings. Postings with
         no run (scored before search migration 0011) go first, then runs oldest first,
         so a later run cannot push an earlier run's postings back. At most
@@ -817,7 +834,7 @@ class Bot:
     ) -> list[list[lanes.Ordered]]:
         """This poll's digests: one per run, runs in order, at most the cap in all."""
         by_id = {alert.posting_id: alert for alert in pending}
-        stale_before = _utc(self.clock() - STALE_RUN)
+        stale_before = _utc(self.clock() - stale_run(doc))
         groups: dict[tuple[int, int], list[lanes.Ordered]] = {}
         refused: list[tuple[tuple[int, int], lanes.Ordered]] = []
         behind = self._refused_now()
@@ -1021,6 +1038,37 @@ class Bot:
                     "health message failed (%s); left for the next poll", type(exc).__name__
                 )
                 return
+
+    def send_withdrawals(self) -> None:
+        """One message for alerted postings a criteria rule withdrew (ADR-028).
+
+        A re-score that vetoes a posting already alerted leaves a `withdrawals` row. Each
+        poll sends the unsent ones as a single message, oldest first and at most
+        WITHDRAWALS_PER_MESSAGE of them; the rest go next poll. One reads
+        `withdrawn: <company> — <title>, criteria: N. <words>`; several read
+        `withdrawn (criteria):` and one line each. Company, title and the skip reason
+        only: never the quote or the description. `sent_at` is set only after Telegram
+        accepts the message, so a failed send goes again next poll. Nothing is sent
+        while config.yaml can't be read.
+        """
+        if self._alert_config() is None:
+            return
+        try:
+            with self._search() as search:
+                pending = search_store.pending_withdrawals(search, WITHDRAWALS_PER_MESSAGE)
+        except (OSError, sqlite3.Error) as exc:
+            log.warning("withdrawals could not be read (%s)", type(exc).__name__)
+            return
+        if not pending:
+            return
+        try:
+            self.send(_withdrawn_text(pending))
+            with self._search() as search, db.transaction(search):
+                search_store.mark_withdrawals_sent(
+                    search, [item.skip_id for item in pending], self._now()
+                )
+        except (TelegramError, OSError, sqlite3.Error) as exc:
+            log.warning("withdrawn message failed (%s); left for the next poll", type(exc).__name__)
 
     def send_weekly_digest(self) -> None:
         """Counts by lane for the past week, once a week (#43).
@@ -2183,6 +2231,7 @@ def run(
         bot.tick()
         bot.heartbeat()
         bot.send_pending_alerts()
+        bot.send_withdrawals()
         bot.send_pending_discovery()
         bot.send_health()
         bot.send_weekly_digest()
