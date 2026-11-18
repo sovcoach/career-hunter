@@ -197,7 +197,7 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | How many missing requirements still count, and the fit each tier means | `fit_rubric.gap_tiers` (every tier needs `fit: low`, `medium` or `high`) |
 | The lowest fit at which a title outside every lane still alerts | `search.off_lane_min_fit` (default `high`) |
 | Your resume, for scoring and a similarity score that `embed-eval` reads (see "Import your resume") | `search.resume: resume/current.txt` |
-| Preferences in your own words, which the scorer weighs when it marks a gap minor or core (see "Your scoring criteria") | `search.criteria_file: criteria.md` |
+| Postings you won't take, as numbered rules in your own words: a posting that meets one is skipped (see "Your scoring criteria") | `search.criteria_file: criteria.md` |
 | Languages, credentials, shifts, pay, seniority (in the title, or also the description), and a minimum salary | `hard_gates` |
 | A cap on weekend days | `schedule_limits` |
 | Which roles to keep at one company | that company's `role_filters` |
@@ -274,7 +274,7 @@ Each is text of 1 to 200 characters, with no control characters and no spaces at
 
    It is sent as a Bearer header on every scoring and embedding call, and never printed or logged. `doctor` asks LM Studio for its model list with it: `LM Studio OK` when it is accepted, `BAD unauthorized` when LM Studio refuses it (store it again), and `BAD unreachable` when the server isn't running. A refused token is never reported as unreachable, in the watch log or in the bot's health message either.
 
-**Reasoning models.** A chat model that thinks before it answers works: its thinking (`<think>…</think>` and the like) is removed before the reply is read, and never stored. Because a reasoning model takes longer, one scoring call may take up to `scoring.timeout_seconds` (60 to 540, default 300). Each call's duration is recorded, and `doctor`'s `scoring calls` line shows the median and the longest answered call of the last 14 days beside the timeout, such as `scoring calls   OK  12 answered in 14 days: median 118 s, max 166 s (timeout 200 s)`. It warns when the longest reaches 90% of the timeout: raise the timeout, or use a faster model. A call starts only while that much of the 600-second watch run is left, so the budget never cuts one short. A reply that doesn't parse leaves the posting unscored for the next run; after 3 such replies for one posting, it is given up and never sent to the model again, and `doctor`'s `bot refusals` line counts it.
+**Reasoning models.** A chat model that thinks before it answers works: its thinking (`<think>…</think>` and the like) is removed before the reply is read, and never stored. Because a reasoning model takes longer, one scoring call may take up to `scoring.timeout_seconds` (60 to 540, default 300). Each call's duration is recorded, and `doctor`'s `scoring calls` line shows the median and the longest answered call of the last 14 days beside the timeout, such as `scoring calls   OK  12 answered in 14 days: median 118 s, max 166 s (timeout 200 s)`. It warns when the longest reaches 90% of the timeout: raise the timeout, or use a faster model. A call starts only while that much of the watch run is left, so the budget never cuts one short. Discovery and the boards have the first 10 minutes of a run; the scoring after them goes on until `scoring.run_minutes` from the start (10 to 50, under `schedule.watcher_interval_minutes`; unset, 20, or 5 less than a shorter interval). With a slow model, a longer run scores more postings: at about 160 seconds a call and boards that take about 3.5 minutes, a 20-minute run scores four or five. Each board's log line says how long its fetch took when that was a second or more, such as `(fetched in 41 s)`. A reply that doesn't parse leaves the posting unscored for the next run; after 3 such replies for one posting, it is given up and never sent to the model again, and `doctor`'s `bot refusals` line counts it.
 
 **Choosing models for your Mac's memory.** On a Mac with Apple silicon, the models share memory with everything else. A model's size on disk is roughly the memory it needs once loaded, plus some for the prompt. Leave at least a third of the memory for macOS and your other apps. As a guide, for chat models stored at 4-bit quantization:
 
@@ -311,7 +311,7 @@ Don't edit `resume/current.txt` by hand. If it no longer matches what was import
 
 ### Your scoring criteria
 
-Some preferences don't fit a field: which kind of role you'd take a gap for, or which missing requirement you can pick up quickly. Write them in plain words in a text file in the data folder, and the scorer sends them with each posting as your own stated criteria. The model is told to weigh them when it decides whether a gap is minor or core, and never to treat them as requirements of the posting.
+Some postings you won't take can't be caught by a field or a gate word: a short contract with no path to a permanent role, say, written a dozen different ways. Write each as a numbered rule in a text file in the data folder. The scorer sends the rules with each posting, and a posting the model shows meets a rule is skipped for that rule (ADR-028).
 
 1. Create the file, owner-only:
 
@@ -319,7 +319,14 @@ Some preferences don't fit a field: which kind of role you'd take a gap for, or 
    touch "$CAREERHUNTER_DATA_DIR/criteria.md" && chmod 600 "$CAREERHUNTER_DATA_DIR/criteria.md"
    ```
 
-2. Write your criteria in it, for example: `Prefers operations roles at small companies; a missing forklift licence is minor.`
+2. Write one rule per line, numbered 1, 2, 3 in order. Each says what you won't take, with any exception the rule allows. Blank lines and lines starting with `#` are ignored. For example:
+
+   ```text
+   # Postings I won't take
+   1. No night-shift roles at a warehouse.
+   2. No contract under 6 months unless a path to permanent is stated.
+   ```
+
 3. Set this in `config.yaml`:
 
    ```yaml
@@ -327,16 +334,21 @@ Some preferences don't fit a field: which kind of role you'd take a gap for, or 
      criteria_file: criteria.md
    ```
 
-The path is relative to the data folder and must stay inside it, even through a symlink. The file must be UTF-8 text that only you can read, and at most 4,000 characters. Only this file is read: other notes in the data folder never reach the scorer. Leave the key out, or set it to `null`, to send no criteria.
+The path is relative to the data folder and must stay inside it, even through a symlink. The file must be UTF-8 text that only you can read: at most 20 rules, each at most 300 characters, and 4,000 characters in all. Only this file is read: other notes in the data folder never reach the scorer. Leave the key out, or set it to `null`, to send no criteria.
 
-If the file can't be used (missing, readable by others, empty, not UTF-8, or over the cap), the watch run holds scoring and logs `watch: scoring: criteria file not usable (<reason>); left for the next run`. The bot tells you why after the first run it holds, and again when scoring resumes. `doctor` shows it too:
+**How a rule skips a posting.** When the model finds that a posting meets a rule, it names the rule and quotes the words in the posting that show it. The quote is checked against the title and description that were sent, ignoring case and spacing. If the words are there, the posting is skipped with the reason `criteria: 2. No contract under 6 months unless` (the rule's number and first six words) and never alerted. The log says `watch: <company>: '<title>' skipped (criteria 2)`. If the quote isn't in the posting, is too short, or names a rule the file doesn't have, the veto is rejected and the posting is scored as usual: `veto rejected (quote not found, rule 2); scored`. The quote itself is never stored or logged. Something the rule allows is not a match: a skill wanted only as an asset, or an exception the rule names that the posting states.
+
+If a re-score skips a posting that was already alerted, the bot tells you once, in one message per poll for all of them: `withdrawn: Example Robotics — Synthetic Analyst, criteria: 2. No contract under 6 months unless`.
+
+If the file can't be used (missing, readable by others, empty, not UTF-8, over a cap, or not numbered rules, such as a file still in plain prose), the watch run holds scoring and logs `watch: scoring: criteria file not usable (<reason>); left for the next run`. The bot tells you why after the first run it holds, and again when scoring resumes. `doctor` shows it too, and counts the vetoes of the last 14 days:
 
 ```text
-criteria        OK  1,240 of 4,000 characters; sent with each scoring call
-criteria        WARN over the 4,000-character cap (4,100 characters); scoring is held
+criteria        OK  2 rules, 193 of 4,000 characters; sent with each scoring call
+criteria        BAD a line is not a numbered rule (write one rule per line as 1. …); scoring is held
+criteria vetoes OK  3 vetoed, 1 rejected in 14 days
 ```
 
-Editing the file doesn't re-score anything: postings already scored keep their gaps, and the new text applies from the next posting scored.
+Editing the file doesn't re-score anything: postings already scored keep their score, and the new rules apply from the next posting scored. Use `careerhunter rescore` to apply them to postings already alerted.
 
 ### Refresh the scout prompt
 
@@ -733,7 +745,7 @@ Off-lane: 1 alerts, 0 applied, 1 skipped, 0 responses, 0 outcomes
 All lanes: 3 alerts, 1 applied, 2 skipped, 2 responses, 2 outcomes
 ```
 
-The bot also tells you when something stops working. After `health.failure_runs` watch runs in a row (default 3) in which the local model, SearXNG, or every board failed, it sends one message, such as `Health: LM Studio has failed 3 runs in a row. 4 postings are waiting to be scored.`, and when that part works again, one more: `Health: LM Studio is working again.` It sends nothing more about the same outage in between. A criteria file that holds scoring (see "Your scoring criteria") is told after the first run, with the reason, and again when scoring resumes.
+The bot also tells you when something stops working. After `health.failure_runs` watch runs in a row (default 3) in which the local model, SearXNG, or every board failed, it sends one message, such as `Health: LM Studio has failed 3 runs in a row. 4 postings are waiting to be scored.`, and when that part works again, one more: `Health: LM Studio is working again.` It sends nothing more about the same outage in between. A criteria file that holds scoring (see "Your scoring criteria") is told after the first run, with the reason, and again when scoring resumes. An alerted posting that a criteria rule later skips is told once, in a `withdrawn:` message.
 
 ---
 
@@ -869,6 +881,37 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    The output is the two `installed …` lines in Step 10c. Run `doctor` once more to see the services running.
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
+
+## Upgrading from 0.7.0 to 0.8.0
+
+Follow the nine steps above with the tag `v0.8.0` (`git checkout v0.8.0` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 4:** if you use `search.criteria_file`, rewrite the file as numbered rules, one per line (see "Your scoring criteria"). A file still in prose is refused, and scoring holds until it is rewritten. With the services stopped and the data folder backed up (steps 1 and 2), keep a copy of the old file next to the backup, then write each criterion as `1. …`, `2. …`, and keep it owner-only. Without a criteria file, nothing has to change. Two things are new and optional: `scoring.run_minutes` (default 20) and the `withdrawn:` message.
+- **Step 5:** `doctor` exits 1, because `search.db` is two migrations behind:
+
+  ```text
+  search.db       BAD schema version 30, expected 32; run: careerhunter migrate
+  ```
+
+  The claim's record is already at schema version 4. A criteria file still in prose also shows `criteria        BAD a line is not a numbered rule (write one rule per line as 1. …); scoring is held`.
+- **Step 6:** `migrate` applies two migrations to `search.db` and none to the claim's record. Migration 0031 rebuilds `component_health` and 0032 rebuilds `score_calls`, each copying every row as it was, and 0032 adds the `withdrawals` table:
+
+  ```text
+  search.db: applied [31, 32]; schema version 32
+  ei_record_2026-27.db: applied nothing; schema version 4
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+- **Step 7:** skip it.
+- **Step 8:** these lines show the upgrade took:
+
+  ```text
+  search.db       OK  schema version 32
+  criteria        OK  2 rules, 193 of 4,000 characters; sent with each scoring call
+  criteria vetoes OK  0 vetoed, 0 rejected in 14 days
+  ```
+
+  Without a criteria file, the two criteria lines show `--`.
 
 ## Upgrading from 0.6.0 to 0.7.0
 
