@@ -1287,3 +1287,36 @@ def test_search_0033_keeps_every_health_row_and_takes_no_kind(tmp_path: Path) ->
         )
     finally:
         conn.close()
+
+
+def test_search_0033_copies_every_score_call_and_takes_the_cap_outcomes(tmp_path: Path) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:32])
+        conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (1, 'Analyst', '2026-09-01', 'manual')"
+        )
+        conn.execute("INSERT INTO watch_runs (started_at) VALUES ('2026-09-01T10:00:00Z')")
+        insert = (
+            "INSERT INTO score_calls (id, run_id, posting_id, started_at, finished_at, "
+            "duration_ms, outcome) VALUES (?, 1, 1, '2026-09-01T10:00:00Z', "
+            "'2026-09-01T10:02:00Z', 1, ?)"
+        )
+        for ident, outcome in ((4, "vetoed"), (8, "veto_rejected"), (9, "scored")):
+            conn.execute(insert, (ident, outcome))
+        before = conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(insert, (20, "capped"))
+        assert db.migrate(conn, "search") == [33]
+        assert conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall() == before
+        conn.execute(insert, (20, "capped"))
+        conn.execute(insert, (21, "cap_rejected"))
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(insert, (22, "lowered"))
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(score_calls)")}
+        assert "ix_score_calls_started" in indexes
+    finally:
+        conn.close()

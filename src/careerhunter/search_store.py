@@ -760,7 +760,8 @@ def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
 
 
 # `vetoed` and `veto_rejected` (search migration 0032): a criteria veto that was
-# honoured, or one whose quote did not check out, so the posting was scored.
+# honoured, or one whose quote did not check out, so the posting was scored. `capped`
+# and `cap_rejected` (0033) are the same for a cap rule.
 SCORE_OUTCOMES = (
     "scored",
     "unparseable",
@@ -769,9 +770,18 @@ SCORE_OUTCOMES = (
     "budget",
     "vetoed",
     "veto_rejected",
+    "capped",
+    "cap_rejected",
 )
 # The model replied, parsed or not.
-ANSWERED_OUTCOMES = ("scored", "unparseable", "vetoed", "veto_rejected")
+ANSWERED_OUTCOMES = (
+    "scored",
+    "unparseable",
+    "vetoed",
+    "veto_rejected",
+    "capped",
+    "cap_rejected",
+)
 
 
 def record_score_call(

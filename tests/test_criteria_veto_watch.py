@@ -3,10 +3,11 @@ for a posting already alerted. Synthetic boards, postings and replies only."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from careerhunter import search_store
-from careerhunter.score import Score, Veto
+from careerhunter.score import Cap, Score, Veto
 from tests.test_rescore import NEW, OLD, Recorder, board, lever, row, run, seed
 
 SLUG = "examplerobotics"
@@ -133,3 +134,99 @@ def test_withdrawals_are_marked_sent_once(search: sqlite3.Connection) -> None:
     assert search.execute("SELECT sent_at FROM withdrawals").fetchone()[0] == (
         "2026-11-02T10:00:00Z"
     )
+
+
+# --- caps (ADR-028) ------------------------------------------------------------------------
+
+FITS = {
+    "fit_rubric": {
+        "gap_tiers": {
+            "tiers": [
+                {"name": "strong", "max_gaps": 1, "fit": "high"},
+                {"name": "weak", "max_gaps": 3, "fit": "low"},
+            ]
+        }
+    }
+}
+
+
+def _capped(tier: str, level: str = "medium") -> Score:
+    return Score(llm_output="{}", gaps="[]", tier=tier, cap=Cap(3, level=level))
+
+
+def _stored(conn: sqlite3.Connection, title: str) -> tuple[str | None, dict[str, object]]:
+    found = conn.execute(
+        "SELECT fit, scout_metadata FROM postings WHERE title = ?", (title,)
+    ).fetchone()
+    return found[0], json.loads(found[1])
+
+
+def test_a_cap_lowers_a_high_fit_and_keeps_a_lower_one(search: sqlite3.Connection) -> None:
+    scorer = Recorder()
+    scorer.replies["Coordinator"] = _capped("strong")
+    scorer.replies["Planner"] = _capped("weak")
+    lines = run(
+        search,
+        _boards(("r1", "Coordinator"), ("r2", "Planner")),
+        (SLUG,),
+        scorer=scorer,
+        resume=OLD,
+        config=FITS,
+    )
+    assert _stored(search, "Coordinator") == ("medium", {"tier": "strong", "cap_rule": 3})
+    assert _stored(search, "Planner") == ("low", {"tier": "weak", "cap_rule": 3})
+    assert _logged(lines, ": 'Coordinator' capped at medium (criteria 3)")
+    assert _outcomes(search) == ["capped", "capped"]
+    assert _skips(search) == []
+
+
+def test_a_cap_on_an_alerted_re_score_lowers_the_fit_and_withdraws_nothing(
+    search: sqlite3.Connection,
+) -> None:
+    seed(search, SLUG, ("r1", "Coordinator"), resume=OLD)
+    search.execute("UPDATE postings SET alerted_at = '2026-11-01T10:00:00Z', fit = 'high'")
+    search.commit()
+    scorer = Recorder()
+    scorer.replies["Coordinator"] = _capped("strong")
+    run(
+        search,
+        _boards(("r1", "Coordinator")),
+        (SLUG,),
+        scorer=scorer,
+        resume=NEW,
+        config=FITS,
+    )
+    assert _stored(search, "Coordinator")[0] == "medium"
+    assert search.execute("SELECT count(*) FROM withdrawals").fetchone()[0] == 0
+    assert _skips(search) == []
+
+
+def test_a_rejected_cap_scores_as_usual(search: sqlite3.Connection) -> None:
+    scorer = Recorder()
+    scorer.replies["Coordinator"] = Score(
+        llm_output="{}", gaps="[]", tier="strong", cap=Cap(3, "not-found")
+    )
+    lines = run(
+        search, _boards(("r1", "Coordinator")), (SLUG,), scorer=scorer, resume=OLD, config=FITS
+    )
+    assert _stored(search, "Coordinator") == ("high", {"tier": "strong"})
+    assert _outcomes(search) == ["cap_rejected"]
+    assert _logged(lines, ": 'Coordinator' cap rejected (quote not found, rule 3); scored")
+
+
+def test_a_veto_beats_a_cap_in_the_watcher(search: sqlite3.Connection) -> None:
+    scorer = Recorder()
+    scorer.replies["Coordinator"] = Score(
+        llm_output="{}", gaps="[]", tier="strong", veto=Veto(2, skip=SKIP), cap=Cap(3, level="low")
+    )
+    run(search, _boards(("r1", "Coordinator")), (SLUG,), scorer=scorer, resume=OLD, config=FITS)
+    assert _skips(search) == [("Coordinator", SKIP, 0)]
+    assert _outcomes(search) == ["vetoed"]
+
+
+def test_cap_calls_count_as_answered(search: sqlite3.Connection) -> None:
+    scorer = Recorder()
+    scorer.replies["Coordinator"] = _capped("strong")
+    run(search, _boards(("r1", "Coordinator")), (SLUG,), scorer=scorer, resume=OLD, config=FITS)
+    stats = search_store.score_call_stats(search, "2000-01-01T00:00:00Z")
+    assert (len(stats.answered_ms), stats.not_answered) == (1, 0)

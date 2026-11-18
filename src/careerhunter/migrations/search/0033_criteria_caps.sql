@@ -2,9 +2,12 @@
 --
 -- Each rule in the criteria file now starts with its kind: `veto:` or `cap low:`,
 -- `cap medium:` or `cap high:`. A rule without a valid kind holds scoring like any
--- unusable file, so `component_health.last_failure` gains `no-kind`. SQLite can't
--- change a CHECK in place, so the table is rebuilt with the same columns and every
--- row copied as it was. No path and no file text is stored.
+-- unusable file, so `component_health.last_failure` gains `no-kind`. A cap rule lowers
+-- a posting's fit to at most its level, grounded by a quote like a veto, so
+-- `score_calls.outcome` gains `capped` and `cap_rejected`. SQLite can't change a CHECK
+-- in place, so both tables are rebuilt with the same columns, every row copied as it
+-- was (score_calls with its id), and score_calls' index created again. No path, quote
+-- or file text is stored.
 -- EI files are not changed by this migration.
 
 CREATE TABLE component_health_new (
@@ -32,3 +35,28 @@ FROM component_health;
 DROP TABLE component_health;
 
 ALTER TABLE component_health_new RENAME TO component_health;
+
+CREATE TABLE score_calls_new (
+    id          INTEGER PRIMARY KEY,
+    run_id      INTEGER NOT NULL REFERENCES watch_runs (id),
+    posting_id  INTEGER NOT NULL REFERENCES postings (id),
+    started_at  TEXT    NOT NULL CHECK (started_at GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'),
+    finished_at TEXT    NOT NULL CHECK (finished_at GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'),
+    duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+    outcome     TEXT    NOT NULL CHECK (outcome IN
+        ('scored', 'unparseable', 'unreachable', 'unauthorized', 'budget', 'vetoed',
+         'veto_rejected', 'capped', 'cap_rejected'))
+);
+
+INSERT INTO score_calls_new
+    (id, run_id, posting_id, started_at, finished_at, duration_ms, outcome)
+SELECT id, run_id, posting_id, started_at, finished_at, duration_ms, outcome
+FROM score_calls;
+
+DROP TABLE score_calls;
+
+ALTER TABLE score_calls_new RENAME TO score_calls;
+
+CREATE INDEX ix_score_calls_started ON score_calls (started_at);

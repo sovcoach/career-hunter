@@ -118,7 +118,10 @@ A criteria veto (ADR-028) whose quote checked out skips the posting with reason
 `criteria: N. <words>` and records the call as `vetoed`; its stored score, fit and gaps
 stay as they were, and nothing from the reply is stored. A posting already alerted
 also gets a `withdrawals` row, for the bot to say so. A rejected veto is scored as
-usual and recorded as `veto_rejected`. No log line carries the quote.
+usual and recorded as `veto_rejected`. A checked cap stores the lower of the tier's fit
+and the cap's level, adds `cap_rule` to `scout_metadata`, and is recorded as `capped`;
+a rejected cap is scored as usual and recorded as `cap_rejected`. A cap sends nothing,
+even for a posting already alerted. No log line carries the quote.
 """
 
 from __future__ import annotations
@@ -156,6 +159,7 @@ from careerhunter.deadline import Deadline
 from careerhunter.discover import Pass
 from careerhunter.discover import posting as discovered_posting
 from careerhunter.embed import Embedder, miss_line
+from careerhunter.enums import FIT_LEVELS
 from careerhunter.fetch import Fetched, FetchError, FetchTimeout, FetchTooLarge
 from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
@@ -1628,10 +1632,25 @@ def _attempt(
         else:
             lines.append(_line(name, ats, f"{title} left unscored (unparseable reply){kept}"))
     else:
-        metadata = None if result.tier is None else json.dumps({"tier": result.tier})
+        cap = result.cap
+        level = result.capped
+        stored_meta: dict[str, Any] = {"tier": result.tier}
+        if level is not None and cap is not None:
+            stored_meta["cap_rule"] = cap.rule
+        metadata = None if result.tier is None else json.dumps(stored_meta)
         fit = None if result.tier is None else state.fits.get(result.tier)
+        if fit is not None and level is not None:
+            fit = _lower_fit(fit, level)
+        if level is not None:
+            outcome = "capped"
+        elif result.veto is not None:
+            outcome = "veto_rejected"
+        elif cap is not None:
+            outcome = "cap_rejected"
+        else:
+            outcome = "scored"
         with db.transaction(conn):
-            timed("scored" if result.veto is None else "veto_rejected")
+            timed(outcome)
             search_store.set_posting_score(
                 conn,
                 posting_id,
@@ -1650,6 +1669,12 @@ def _attempt(
             why = REJECTED[result.veto.rejected]
             rule = "" if result.veto.rule is None else f", rule {result.veto.rule}"
             lines.append(_line(name, ats, f"{title} veto rejected ({why}{rule}); scored"))
+        if cap is not None and level is not None:
+            lines.append(_line(name, ats, f"{title} capped at {level} (criteria {cap.rule})"))
+        elif cap is not None and cap.rejected is not None:
+            why = REJECTED[cap.rejected]
+            rule = "" if cap.rule is None else f", rule {cap.rule}"
+            lines.append(_line(name, ats, f"{title} cap rejected ({why}{rule}); scored"))
         if result.excluded:
             lines.append(_line(name, ats, f"{title} skipped (gap_tier)"))
         elif rescore:
@@ -1657,6 +1682,13 @@ def _attempt(
     reason = embedder.attach(posting_id, posting)
     if reason is not None:
         lines.append(miss_line(posting_id, reason))
+
+
+def _lower_fit(fit: str, cap: str) -> str:
+    """The lower of a tier's fit and a cap's level; a fit not on the scale is kept."""
+    if fit not in FIT_LEVELS or cap not in FIT_LEVELS:
+        return fit
+    return min(fit, cap, key=FIT_LEVELS.index)
 
 
 def _scored(conn: sqlite3.Connection, posting_id: int) -> bool:
