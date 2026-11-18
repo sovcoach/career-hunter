@@ -1791,7 +1791,11 @@ def _doctor_criteria(report: _Report, datadir: DataDir, config_doc: dict[str, An
             report.line("criteria", "BAD", f"{exc}; scoring is held")
         return
     if found is not None:
-        rules = plural(len(found.rules), "rule", "rules")
+        rules = (
+            f"{plural(len(found.rules), 'rule', 'rules')} "
+            f"({plural(found.count('veto'), 'veto', 'vetoes')}, "
+            f"{plural(found.count('cap'), 'cap', 'caps')})"
+        )
         report.line(
             "criteria",
             "OK",

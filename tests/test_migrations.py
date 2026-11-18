@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 33)), "ei_record": [1, 2, 3, 4]}[track]
+    expected = {"search": list(range(1, 34)), "ei_record": [1, 2, 3, 4]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1231,7 +1231,7 @@ def test_search_0032_copies_every_score_call_and_takes_the_veto_outcomes(tmp_pat
                 "duration_ms, outcome) VALUES (1, 1, '2026-09-01T10:00:00Z', "
                 "'2026-09-01T10:00:01Z', 1, 'vetoed')"
             )
-        assert db.migrate(conn, "search") == [32]
+        assert db.migrate(conn, "search", search[:32]) == [32]
         assert conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall() == before
         for outcome in ("vetoed", "veto_rejected"):
             conn.execute(
@@ -1257,5 +1257,33 @@ def test_search_0032_copies_every_score_call_and_takes_the_veto_outcomes(tmp_pat
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("UPDATE withdrawals SET sent_at = 'yesterday'")
         conn.execute("UPDATE withdrawals SET sent_at = '2026-09-02T10:00:00Z'")
+    finally:
+        conn.close()
+
+
+# --- search 0033: criteria rules have a kind ------------------------------------------------
+
+
+def test_search_0033_keeps_every_health_row_and_takes_no_kind(tmp_path: Path) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:32])
+        conn.execute(
+            "UPDATE component_health SET failures = 1, last_failure = 'not-numbered', held = 2, "
+            "updated_at = '2026-11-18T10:00:00Z' WHERE component = 'criteria'"
+        )
+        before = conn.execute("SELECT * FROM component_health ORDER BY component").fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE component_health SET last_failure = 'no-kind' WHERE component = 'criteria'"
+            )
+        assert db.migrate(conn, "search") == [33]
+        assert conn.execute("SELECT * FROM component_health ORDER BY component").fetchall() == (
+            before
+        )
+        conn.execute(
+            "UPDATE component_health SET last_failure = 'no-kind' WHERE component = 'criteria'"
+        )
     finally:
         conn.close()

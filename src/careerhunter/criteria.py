@@ -1,16 +1,21 @@
 """The operator's scoring criteria: numbered rules, from a file in the data folder.
 
 `search.criteria_file` names a text file relative to the data folder (for example
-`criteria.md`). It holds one rule per line, written `1. …`, numbered 1, 2, 3 in order.
-Blank lines and lines that start with `#` are ignored. Each rule describes postings the
-candidate won't take, and each is a veto (ADR-028): the rules go in the scoring request,
-and a posting the model shows meets one, with a quote from the posting that the code
-checks, is skipped with reason `criteria: N. <the rule's first words>`. Unset means no
-criteria are sent.
+`criteria.md`). It holds one rule per line, numbered 1, 2, 3 in order, each with its
+kind (ADR-028):
 
-A line that is not a numbered rule, numbers out of order, a rule over MAX_RULE
-characters or more than MAX_RULES rules make the file unusable, so a file still
-written as prose is refused rather than read as one rule.
+    1. veto: No night-shift roles at a warehouse.
+    2. cap medium: A contract whose only stated path is a possible extension.
+
+Blank lines and lines that start with `#` are ignored. The rules go in the scoring
+request. A posting the model shows meets a veto rule, with a quote from the posting
+that the code checks, is skipped with reason `criteria: N. <the rule's first words>`.
+A cap rule (`cap low`, `cap medium` or `cap high`, a fit level) lowers the posting's
+fit to at most that level and never skips it. Unset means no criteria are sent.
+
+A line that is not a numbered rule, numbers out of order, a rule with no valid kind, a
+rule over MAX_RULE characters or more than MAX_RULES rules make the file unusable, so a
+file still written as prose, or as rules without kinds, is refused rather than guessed.
 
 The file is read only when it is inside the data folder once every symlink is
 resolved, is a regular file readable by its owner only, is UTF-8, and is not empty
@@ -38,6 +43,8 @@ MAX_RULE = 300
 MAX_RULES = 20
 CONFIG_KEY = "search.criteria_file"
 _RULE = re.compile(r"(\d{1,3})\.\s+(\S.*)")
+_KIND = re.compile(r"(veto|cap\s+(low|medium|high))\s*:\s*(\S.*)", re.IGNORECASE)
+KINDS = ("veto", "cap")
 
 REASONS = {
     "outside": "the path is outside the data folder",
@@ -51,6 +58,7 @@ REASONS = {
     "out-of-order": "the rules are not numbered 1, 2, 3 in order",
     "rule-too-long": f"a rule is over {MAX_RULE} characters",
     "too-many-rules": f"it has more than {MAX_RULES} rules",
+    "no-kind": "a rule has no kind (start each rule with veto: or cap low|medium|high:)",
 }
 
 
@@ -66,8 +74,12 @@ class CriteriaError(Exception):
 
 @dataclass(frozen=True)
 class Rule:
+    """One numbered rule: its text after the kind, the kind, and a cap's fit level."""
+
     number: int
     text: str
+    kind: str = "veto"
+    cap: str | None = None  # "low", "medium" or "high" for a cap rule
 
 
 @dataclass(frozen=True)
@@ -76,11 +88,17 @@ class Criteria:
     chars: int
     rules: tuple[Rule, ...] = ()
 
-    def rule(self, number: int) -> Rule | None:
-        """Rule `number`, or None when the file has no such rule."""
+    def rule(self, number: int, kind: str | None = None) -> Rule | None:
+        """Rule `number`, or None when the file has no such rule, or (with `kind`) when
+        rule `number` is of another kind."""
         if 1 <= number <= len(self.rules):
-            return self.rules[number - 1]
+            found = self.rules[number - 1]
+            if kind is None or found.kind == kind:
+                return found
         return None
+
+    def count(self, kind: str) -> int:
+        return sum(rule.kind == kind for rule in self.rules)
 
 
 def configured_value(config: Mapping[str, Any] | None) -> str | None:
@@ -154,7 +172,8 @@ def load(root: Path, config: Mapping[str, Any] | None) -> Criteria | None:
 
 def parse_rules(text: str) -> tuple[Rule, ...]:
     """The numbered rules in `text`. Raises CriteriaError when a line is not one, the
-    numbers are not 1, 2, 3 in order, a rule is too long, or there are too many."""
+    numbers are not 1, 2, 3 in order, a rule has no valid kind, a rule is too long, or
+    there are too many."""
     rules: list[Rule] = []
     for line in text.splitlines():
         line = line.strip()
@@ -165,10 +184,14 @@ def parse_rules(text: str) -> tuple[Rule, ...]:
             raise CriteriaError("not-numbered", chars=len(text))
         if int(match.group(1)) != len(rules) + 1:
             raise CriteriaError("out-of-order", chars=len(text))
-        body = " ".join(match.group(2).split())
+        kind = _KIND.fullmatch(" ".join(match.group(2).split()))
+        if kind is None:
+            raise CriteriaError("no-kind", chars=len(text))
+        body = kind.group(3)
         if len(body) > MAX_RULE:
             raise CriteriaError("rule-too-long", chars=len(text))
-        rules.append(Rule(len(rules) + 1, body))
+        cap = kind.group(2).casefold() if kind.group(2) else None
+        rules.append(Rule(len(rules) + 1, body, "cap" if cap else "veto", cap))
         if len(rules) > MAX_RULES:
             raise CriteriaError("too-many-rules", chars=len(text))
     if not rules:

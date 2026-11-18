@@ -357,7 +357,7 @@ def _veto(content: str, posting: PostingText, criteria: Criteria) -> Veto | None
         return None
     rule = item.get("rule") if isinstance(item, dict) else None
     number = rule if isinstance(rule, int) and not isinstance(rule, bool) else None
-    if number is None or criteria.rule(number) is None:
+    if number is None or criteria.rule(number, "veto") is None:
         return Veto(number, "unknown-rule")
     quote = item.get("quote")
     needle = normalized(_CONTROL.sub(" ", quote)) if isinstance(quote, str) else ""
@@ -451,7 +451,11 @@ def _request_body(
     if shown:
         view["labelled_examples"] = shown
     if criteria is not None:
-        view["criteria"] = [{"rule": rule.number, "text": rule.text} for rule in criteria.rules]
+        view["criteria"] = [
+            {"rule": rule.number, "kind": rule.kind, "text": rule.text}
+            | ({"cap": rule.cap} if rule.cap else {})
+            for rule in criteria.rules
+        ]
     payload = {
         "model": chat_model(config),
         "temperature": 0,

@@ -56,10 +56,12 @@ search:
   # resume. Null leaves the resume out of scoring and skips embeddings.
   resume: null
   # Optional. A text file in the data folder with your own criteria (e.g.
-  # criteria.md), sent with each scoring call: one rule per line, numbered "1. ...",
-  # "2. ..." in order, each describing postings you won't take; blank lines and lines
-  # starting with # are ignored. A posting the model shows meets a rule, quoting the
-  # posting, is skipped for that rule, and an alerted one is withdrawn in Telegram.
+  # criteria.md), sent with each scoring call: one rule per line, numbered in order,
+  # each with its kind: "1. veto: ..." or "2. cap medium: ..." (cap low, medium or
+  # high); blank lines and lines starting with # are ignored. A posting the model
+  # shows meets a veto rule, quoting the posting, is skipped for that rule (an alerted
+  # one is withdrawn in Telegram); one that meets a cap rule has its fit lowered to
+  # at most that level.
   # At most 20 rules of 300 characters, 4,000 characters in all, owner-only (chmod
   # 600). A file that can't be used, prose included, holds scoring until fixed.
   criteria_file: null

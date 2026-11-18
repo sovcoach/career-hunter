@@ -29,12 +29,14 @@ from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, ur
 
 env = test_bot.env  # the bot fixture, shared with test_bot
 SYNTHETIC = (
-    "1. No synthetic night-shift roles at an example depot.\n"
-    "2. No contract under 12 months unless a path to permanent is stated."
+    "1. veto: No synthetic night-shift roles at an example depot.\n"
+    "2. cap medium: A synthetic contract whose only stated path is an extension."
 )
 RULES = (
     criteria.Rule(1, "No synthetic night-shift roles at an example depot."),
-    criteria.Rule(2, "No contract under 12 months unless a path to permanent is stated."),
+    criteria.Rule(
+        2, "A synthetic contract whose only stated path is an extension.", "cap", "medium"
+    ),
 )
 
 
@@ -63,15 +65,34 @@ def test_a_file_in_the_data_folder_is_read(datadir: DataDir) -> None:
     _write(datadir.root, f"\n{SYNTHETIC}\n\n")
     found = criteria.load(datadir.root, _doc())
     assert found == criteria.Criteria(SYNTHETIC, len(SYNTHETIC), RULES)
-    assert found.rule(2) == RULES[1]
+    assert found.rule(2) == RULES[1] == found.rule(2, "cap")
+    assert found.rule(2, "veto") is None and found.rule(1, "cap") is None
     assert found.rule(0) is None and found.rule(3) is None
+    assert (found.count("veto"), found.count("cap")) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("line", "kind", "cap"),
+    [
+        ("1. veto: No synthetic night shifts.", "veto", None),
+        ("1. VETO : No synthetic night shifts.", "veto", None),
+        ("1. cap low: No synthetic night shifts.", "cap", "low"),
+        ("1. Cap  High:No synthetic night shifts.", "cap", "high"),
+    ],
+)
+def test_each_kind_parses(datadir: DataDir, line: str, kind: str, cap: str | None) -> None:
+    _write(datadir.root, line)
+    found = criteria.load(datadir.root, _doc())
+    assert found is not None
+    assert found.rules == (criteria.Rule(1, "No synthetic night shifts.", kind, cap),)
 
 
 def test_comments_blank_lines_and_spacing_are_ignored(datadir: DataDir) -> None:
     _write(
         datadir.root,
-        "# Synthetic criteria\n\n1.   No synthetic night-shift roles  at an example depot.\n"
-        "   \n# a note\n  2. No contract under 12 months unless a path to permanent is stated.\n",
+        "# Synthetic criteria\n\n1.   veto:  No synthetic night-shift roles  at an example depot.\n"
+        "   \n# a note\n  2. cap medium: A synthetic contract whose only stated path is an "
+        "extension.\n",
     )
     found = criteria.load(datadir.root, _doc())
     assert found is not None and found.rules == RULES
@@ -81,18 +102,26 @@ def test_comments_blank_lines_and_spacing_are_ignored(datadir: DataDir) -> None:
     ("content", "reason"),
     [
         ("Prefers synthetic operations roles; a short contract is a no.", "not-numbered"),
-        ("1. No synthetic night shifts.\nand nothing at the example depot", "not-numbered"),
+        ("1. veto: No synthetic night shifts.\nand nothing at the example depot", "not-numbered"),
         ("- No synthetic night shifts.", "not-numbered"),
         ("1.No synthetic night shifts.", "not-numbered"),
         ("1. ", "not-numbered"),
-        ("1. No synthetic night shifts.\n3. No example depot.", "out-of-order"),
-        ("2. No synthetic night shifts.", "out-of-order"),
-        ("1. No synthetic night shifts.\n1. No example depot.", "out-of-order"),
-        ("1. " + "x" * (criteria.MAX_RULE + 1), "rule-too-long"),
+        ("1. veto: No synthetic night shifts.\n3. veto: No example depot.", "out-of-order"),
+        ("2. veto: No synthetic night shifts.", "out-of-order"),
+        ("1. veto: No synthetic night shifts.\n1. veto: No example depot.", "out-of-order"),
+        ("1. veto: " + "x" * (criteria.MAX_RULE + 1), "rule-too-long"),
         (
-            "\n".join(f"{n}. No synthetic rule {n}." for n in range(1, criteria.MAX_RULES + 2)),
+            "\n".join(
+                f"{n}. veto: No synthetic rule {n}." for n in range(1, criteria.MAX_RULES + 2)
+            ),
             "too-many-rules",
         ),
+        ("1. No synthetic night shifts.", "no-kind"),
+        ("1. cap: No synthetic night shifts.", "no-kind"),
+        ("1. cap huge: No synthetic night shifts.", "no-kind"),
+        ("1. veto No synthetic night shifts.", "no-kind"),
+        ("1. veto:", "no-kind"),
+        ("1. veto: fine\n2. skip: No synthetic night shifts.", "no-kind"),
         ("# only a comment\n\n", "empty"),
     ],
 )
@@ -107,10 +136,13 @@ def test_a_file_that_is_not_numbered_rules_is_refused(
 
 
 def test_the_rule_caps_are_inclusive(datadir: DataDir) -> None:
-    _write(datadir.root, "1. " + "y" * criteria.MAX_RULE)
+    _write(datadir.root, "1. veto: " + "y" * criteria.MAX_RULE)
     found = criteria.load(datadir.root, _doc())
     assert found is not None and len(found.rules[0].text) == criteria.MAX_RULE
-    _write(datadir.root, "\n".join(f"{n}. No rule {n}." for n in range(1, criteria.MAX_RULES + 1)))
+    _write(
+        datadir.root,
+        "\n".join(f"{n}. veto: No rule {n}." for n in range(1, criteria.MAX_RULES + 1)),
+    )
     found = criteria.load(datadir.root, _doc())
     assert found is not None and len(found.rules) == criteria.MAX_RULES
 
@@ -159,7 +191,7 @@ def test_a_file_that_cannot_be_used_is_refused(
 
 
 def test_the_cap_is_inclusive_and_the_size_is_known(datadir: DataDir) -> None:
-    rules = "\n".join(f"{n}. " + "y" * 196 for n in range(1, 21))
+    rules = "\n".join(f"{n}. veto: " + "y" * 190 for n in range(1, 21))
     text = rules[: criteria.MAX_CHARS - 1] + "y"
     assert len(text) == criteria.MAX_CHARS
     _write(datadir.root, text)
@@ -231,8 +263,8 @@ def test_unset_criteria_add_nothing_to_the_request() -> None:
 def test_criteria_go_in_the_request_as_numbered_rules_with_the_instruction() -> None:
     body = _request(criteria.Criteria(SYNTHETIC, len(SYNTHETIC), RULES))
     assert json.loads(body["messages"][1]["content"])["criteria"] == [
-        {"rule": 1, "text": RULES[0].text},
-        {"rule": 2, "text": RULES[1].text},
+        {"rule": 1, "kind": "veto", "text": RULES[0].text},
+        {"rule": 2, "kind": "cap", "text": RULES[1].text, "cap": "medium"},
     ]
     system = body["messages"][0]["content"]
     assert system.endswith(score.CRITERIA_INSTRUCTION)
@@ -325,7 +357,7 @@ def test_doctor_reports_unset_set_and_over_the_cap(
     )
     _write(datadir.root, SYNTHETIC)
     assert _doctor(datadir, _doc(), capsys) == (
-        f"criteria        OK  2 rules, {len(SYNTHETIC)} of 4,000 characters; "
+        f"criteria        OK  2 rules (1 veto, 1 cap), {len(SYNTHETIC)} of 4,000 characters; "
         "sent with each scoring call"
     )
     _write(datadir.root, "z" * 4_100)

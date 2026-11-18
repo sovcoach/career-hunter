@@ -162,7 +162,7 @@ created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 32
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 33
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -411,7 +411,7 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 32
+search.db: applied nothing; schema version 33
 ei_record_2026-27.db: created; schema version 4
 EI claim 2026-27 (from 2026-08-02)
 ```
@@ -430,7 +430,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 32
+search.db       OK  schema version 33
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -887,17 +887,17 @@ If something goes wrong before step 6 finishes, nothing in the data folder has c
 Follow the nine steps above with the tag `v0.8.0` (`git checkout v0.8.0` in the release checkout, then `uv sync --locked`). These steps differ:
 
 - **Step 4:** if you use `search.criteria_file`, rewrite the file as numbered rules, one per line (see "Your scoring criteria"). A file still in prose is refused, and scoring holds until it is rewritten. With the services stopped and the data folder backed up (steps 1 and 2), keep a copy of the old file next to the backup, then write each criterion as `1. …`, `2. …`, and keep it owner-only. Without a criteria file, nothing has to change. Two things are new and optional: `scoring.run_minutes` (default 20) and the `withdrawn:` message.
-- **Step 5:** `doctor` exits 1, because `search.db` is two migrations behind:
+- **Step 5:** `doctor` exits 1, because `search.db` is three migrations behind:
 
   ```text
-  search.db       BAD schema version 30, expected 32; run: careerhunter migrate
+  search.db       BAD schema version 30, expected 33; run: careerhunter migrate
   ```
 
   The claim's record is already at schema version 4. A criteria file still in prose also shows `criteria        BAD a line is not a numbered rule (write one rule per line as 1. …); scoring is held`.
-- **Step 6:** `migrate` applies two migrations to `search.db` and none to the claim's record. Migration 0031 rebuilds `component_health` and 0032 rebuilds `score_calls`, each copying every row as it was, and 0032 adds the `withdrawals` table:
+- **Step 6:** `migrate` applies three migrations to `search.db` and none to the claim's record. Migrations 0031 and 0033 rebuild `component_health` and 0032 rebuilds `score_calls`, each copying every row as it was, and 0032 adds the `withdrawals` table:
 
   ```text
-  search.db: applied [31, 32]; schema version 32
+  search.db: applied [31, 32, 33]; schema version 33
   ei_record_2026-27.db: applied nothing; schema version 4
   EI claim 2026-27 (from 2026-08-02)
   ```
@@ -906,7 +906,7 @@ Follow the nine steps above with the tag `v0.8.0` (`git checkout v0.8.0` in the 
 - **Step 8:** these lines show the upgrade took:
 
   ```text
-  search.db       OK  schema version 32
+  search.db       OK  schema version 33
   criteria        OK  2 rules, 193 of 4,000 characters; sent with each scoring call
   criteria vetoes OK  0 vetoed, 0 rejected in 14 days
   ```
@@ -1088,7 +1088,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 32` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 33` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |

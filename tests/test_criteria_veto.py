@@ -19,8 +19,9 @@ from careerhunter.score import Score, Veto, score_posting
 from tests.test_score import RUBRIC
 
 TEXT = (
-    "1. No French or bilingual requirement, stated in any wording.\n"
-    "2. No contract or term under 12 months unless a path to permanent or extension is stated."
+    "1. veto: No French or bilingual requirement, stated in any wording.\n"
+    "2. veto: No contract or term under 12 months unless a path to permanent or extension "
+    "is stated."
 )
 RULES = criteria.Criteria(TEXT, len(TEXT), criteria.parse_rules(TEXT))
 GAPS = [{"name": "Forklift licence", "kind": "minor"}]
@@ -189,8 +190,8 @@ def test_the_request_has_numbered_rules_and_no_gate_lists() -> None:
     )
     view = json.loads(seen[0]["messages"][1]["content"])
     assert view["criteria"] == [
-        {"rule": 1, "text": RULES.rules[0].text},
-        {"rule": 2, "text": RULES.rules[1].text},
+        {"rule": 1, "kind": "veto", "text": RULES.rules[0].text},
+        {"rule": 2, "kind": "veto", "text": RULES.rules[1].text},
     ]
     assert "hard_gates" not in view and "synthetic-lang" not in json.dumps(seen[0])
 
@@ -201,3 +202,11 @@ def test_the_instruction_names_what_is_not_a_match() -> None:
         assert words in text
     assert f"at most {scoring.MAX_QUOTE} characters" in text
     assert "never list them as gaps or requirements" in text
+
+
+def test_a_veto_naming_a_cap_rule_is_rejected() -> None:
+    text = "1. cap medium: A synthetic contract whose only stated path is an extension."
+    stated = criteria.Criteria(text, len(text), criteria.parse_rules(text))
+    posting = _posting("A 3-month contract, full-time hours.")
+    result = _score(posting, {"rule": 1, "quote": "3-month contract"}, stated=stated)
+    assert result is not None and result.veto == Veto(1, "unknown-rule")
