@@ -449,6 +449,17 @@ def _waiting(held: int | None) -> str:
     return f"{held} postings are waiting to be scored."
 
 
+WITHDRAWALS_PER_MESSAGE = 10
+
+
+def _withdrawn_text(items: list[search_store.Withdrawal]) -> str:
+    """The withdrawn message: one line for one posting, else a heading and a line each."""
+    lines = [f"{item.company} — {item.title}, {item.reason}" for item in items]
+    if len(lines) == 1:
+        return f"withdrawn: {lines[0]}"
+    return "\n".join(["withdrawn (criteria):", *lines])
+
+
 def _criteria_text(held: int | None, kind: str | None) -> str:
     """Why scoring is held for the criteria file: its fixed reason, never its path or text."""
     why = CRITERIA_REASONS.get(kind or "", "it can't be used")
@@ -1021,6 +1032,37 @@ class Bot:
                     "health message failed (%s); left for the next poll", type(exc).__name__
                 )
                 return
+
+    def send_withdrawals(self) -> None:
+        """One message for alerted postings a criteria rule withdrew (ADR-028).
+
+        A re-score that vetoes a posting already alerted leaves a `withdrawals` row. Each
+        poll sends the unsent ones as a single message, oldest first and at most
+        WITHDRAWALS_PER_MESSAGE of them; the rest go next poll. One reads
+        `withdrawn: <company> — <title>, criteria: N. <words>`; several read
+        `withdrawn (criteria):` and one line each. Company, title and the skip reason
+        only: never the quote or the description. `sent_at` is set only after Telegram
+        accepts the message, so a failed send goes again next poll. Nothing is sent
+        while config.yaml can't be read.
+        """
+        if self._alert_config() is None:
+            return
+        try:
+            with self._search() as search:
+                pending = search_store.pending_withdrawals(search, WITHDRAWALS_PER_MESSAGE)
+        except (OSError, sqlite3.Error) as exc:
+            log.warning("withdrawals could not be read (%s)", type(exc).__name__)
+            return
+        if not pending:
+            return
+        try:
+            self.send(_withdrawn_text(pending))
+            with self._search() as search, db.transaction(search):
+                search_store.mark_withdrawals_sent(
+                    search, [item.skip_id for item in pending], self._now()
+                )
+        except (TelegramError, OSError, sqlite3.Error) as exc:
+            log.warning("withdrawn message failed (%s); left for the next poll", type(exc).__name__)
 
     def send_weekly_digest(self) -> None:
         """Counts by lane for the past week, once a week (#43).
@@ -2183,6 +2225,7 @@ def run(
         bot.tick()
         bot.heartbeat()
         bot.send_pending_alerts()
+        bot.send_withdrawals()
         bot.send_pending_discovery()
         bot.send_health()
         bot.send_weekly_digest()
