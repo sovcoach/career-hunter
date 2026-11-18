@@ -464,12 +464,13 @@ def test_a_reply_whose_headers_arrive_at_100_seconds_is_scored(
     assert [a.cancels for a in loopback_watchdog.armed] == [1]
 
 
-def test_a_reply_whose_headers_arrive_at_121_seconds_is_a_miss(
+def test_a_reply_whose_headers_arrive_at_121_seconds_is_a_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server, _clock = _model(monkeypatch, header_cost=121.0)
-    with pytest.raises(ScoreError, match="could not be reached"):
+    with pytest.raises(ScoreError, match="took longer than the timeout") as caught:
         score_posting(posting(), RUBRIC)
+    assert caught.value.kind == "timeout"
     assert server.reads == 0  # the body was never read
     assert server.closes == 1
 

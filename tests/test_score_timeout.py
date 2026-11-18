@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,11 @@ import yaml
 from careerhunter import cli, loopback, score
 from careerhunter import watch as w
 from careerhunter.config import scoring_timeout_seconds, validate_config
+from careerhunter.filters import PostingText
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.score import Score
 from tests.fakes import FakeClock, FakeServer, Reply, use_example_watchlist
+from tests.test_score import RUBRIC, reply
 from tests.test_watch import DAY, NAMES, Timed, entries, minutes, postings, three_boards
 
 ROOT = Path(__file__).parents[1]
@@ -121,3 +124,90 @@ def test_watch_gives_the_scorer_the_configured_timeout(
     monkeypatch.setattr(cli, "score_posting", local_score)
     assert cli.main(["watch"], probe=probe) == cli.EXIT_OK
     assert seen == {"timeout": 420}
+
+
+# A call that reached its time limit is a timeout, told apart from a server not answering.
+
+
+def _transport_error(monkeypatch: pytest.MonkeyPatch, reply: Reply) -> score.ScoreError:
+    monkeypatch.setattr(loopback, "LoopbackConnection", FakeServer(reply))
+    with pytest.raises(score.ScoreError) as caught:
+        score.default_transport(score.DEFAULT_URL, b"{}", timeout=300.0)
+    return caught.value
+
+
+def test_a_reply_later_than_the_timeout_is_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(loopback, "_clock", clock)
+    error = _transport_error(monkeypatch, Reply(clock=clock, header_cost=300.5))
+    assert (error.kind, error.type_name) == ("timeout", "DeadlineExceeded")
+    assert str(error) == "the local model took longer than the timeout"
+
+
+def test_the_watchdog_firing_is_a_timeout(
+    monkeypatch: pytest.MonkeyPatch, loopback_watchdog: Any
+) -> None:
+    reply = Reply(error=ConnectionResetError(), before_error=loopback_watchdog.fire_all)
+    error = _transport_error(monkeypatch, reply)
+    assert (error.kind, error.type_name) == ("timeout", "ConnectionResetError")
+
+
+@pytest.mark.parametrize(
+    ("raised", "name"),
+    [(ConnectionRefusedError(), "ConnectionRefusedError"), (OSError("x"), "OSError")],
+    ids=["refused", "oserror"],
+)
+def test_a_server_not_answering_is_unreachable_with_its_type(
+    monkeypatch: pytest.MonkeyPatch, raised: BaseException, name: str
+) -> None:
+    error = _transport_error(monkeypatch, Reply(error=raised, error_at="request"))
+    assert (error.kind, error.type_name) == ("unreachable", name)
+    assert str(error) == "the local model could not be reached"
+
+
+POSTING = PostingText(company="Example Robotics", title="Analyst", location="Remote")
+
+
+def _scored(transport: Any) -> score.ScoreError:
+    with pytest.raises(score.ScoreError) as caught:
+        score.score_posting(POSTING, RUBRIC, transport=transport)
+    return caught.value
+
+
+def _raising(exc: BaseException) -> Any:
+    def send(_url: str, _payload: bytes) -> tuple[int, bytes]:
+        raise exc
+
+    return send
+
+
+def test_score_posting_keeps_the_transport_kind() -> None:
+    timed = score.ScoreError(score.TIMED_OUT, kind="timeout", type_name="TimeoutError")
+    error = _scored(_raising(timed))
+    assert (error.kind, error.type_name) == ("timeout", "TimeoutError")
+
+
+@pytest.mark.parametrize(
+    ("raised", "kind", "name"),
+    [
+        (TimeoutError(), "timeout", "TimeoutError"),
+        (ConnectionRefusedError(), "unreachable", "ConnectionRefusedError"),
+        (http.client.RemoteDisconnected("x"), "unreachable", "RemoteDisconnected"),
+        (PermissionError(), "unreachable", "other"),
+    ],
+    ids=["timeout", "refused", "disconnected", "unlisted"],
+)
+def test_score_posting_names_a_raised_error(raised: BaseException, kind: str, name: str) -> None:
+    error = _scored(_raising(raised))
+    assert (error.kind, error.type_name) == (kind, name)
+
+
+def test_a_status_is_unreachable_or_unauthorized_with_no_type() -> None:
+    error = _scored(lambda _u, _p: reply("{}", status=500))
+    assert (error.kind, error.type_name) == ("unreachable", None)
+    error = _scored(lambda _u, _p: reply("{}", status=401))
+    assert (error.kind, error.type_name) == ("unauthorized", None)
+
+
+def test_an_unknown_kind_is_unreachable() -> None:
+    assert score.ScoreError("x", kind="slow").kind == "unreachable"
