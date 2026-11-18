@@ -1292,11 +1292,10 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
         except resume.ResumeError as exc:
             problem = str(exc)
         # The criteria file, read once per run like the resume (search.criteria_file).
-        stated: str | None = None
+        stated: criteria.Criteria | None = None
         criteria_problem: str | None = None
         try:
-            found = criteria.load(datadir.root, doc)
-            stated = None if found is None else found.text
+            stated = criteria.load(datadir.root, doc)
         except criteria.CriteriaError as exc:
             criteria_problem = exc.reason
 

@@ -209,7 +209,7 @@ def test_config_accepts_a_relative_path_or_null() -> None:
 # --- the scoring request -------------------------------------------------------------------
 
 
-def _request(stated: str | None) -> dict[str, Any]:
+def _request(stated: criteria.Criteria | None) -> dict[str, Any]:
     seen: list[bytes] = []
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
@@ -228,12 +228,16 @@ def test_unset_criteria_add_nothing_to_the_request() -> None:
     assert "criteria" not in body["messages"][0]["content"]
 
 
-def test_criteria_go_in_the_request_with_the_instruction() -> None:
-    body = _request(SYNTHETIC)
-    assert json.loads(body["messages"][1]["content"])["criteria"] == SYNTHETIC
+def test_criteria_go_in_the_request_as_numbered_rules_with_the_instruction() -> None:
+    body = _request(criteria.Criteria(SYNTHETIC, len(SYNTHETIC), RULES))
+    assert json.loads(body["messages"][1]["content"])["criteria"] == [
+        {"rule": 1, "text": RULES[0].text},
+        {"rule": 2, "text": RULES[1].text},
+    ]
     system = body["messages"][0]["content"]
     assert system.endswith(score.CRITERIA_INSTRUCTION)
-    assert "minor or core" in score.CRITERIA_INSTRUCTION
+    assert '"veto":{"rule":N,"quote":"..."}' in score.CRITERIA_INSTRUCTION
+    assert "minor or core" not in score.CRITERIA_INSTRUCTION
 
 
 # --- the watcher ---------------------------------------------------------------------------
@@ -400,7 +404,7 @@ def _set_criteria(root: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("mode", "problem", "sent"), [(0o600, None, SYNTHETIC), (0o644, "loose", None)]
+    ("mode", "problem", "sent"), [(0o600, None, RULES), (0o644, "loose", None)]
 )
 def test_watch_sends_the_criteria_or_holds_scoring(
     inited: Path,
@@ -408,7 +412,7 @@ def test_watch_sends_the_criteria_or_holds_scoring(
     monkeypatch: pytest.MonkeyPatch,
     mode: int,
     problem: str | None,
-    sent: str | None,
+    sent: tuple[criteria.Rule, ...] | None,
 ) -> None:
     _set_criteria(inited)
     _write(inited, SYNTHETIC, mode=mode)
@@ -420,7 +424,8 @@ def test_watch_sends_the_criteria_or_holds_scoring(
         return []
 
     def local_score(posting: object, config: object, **kwargs: Any) -> Score:
-        seen["criteria"] = kwargs["criteria"]
+        stated = kwargs["criteria"]
+        seen["criteria"] = None if stated is None else stated.rules
         return Score(llm_output="{}", gaps="[]", tier="strong")
 
     monkeypatch.setattr(cli.watch, "run", run)
