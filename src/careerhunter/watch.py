@@ -113,6 +113,12 @@ killed or stops on a database error never finishes its row, so its counts stay n
 A model that does not answer (ScoreError) stops all scoring for the rest of the run;
 the posting it happened on keeps its place, and one line counts what is left. A reply
 that does not parse leaves that posting as it was, behind the others next time.
+
+A criteria veto (ADR-028) whose quote checked out skips the posting with reason
+`criteria: N. <words>` and records the call as `vetoed`; its stored score, fit and gaps
+stay as they were, and nothing from the reply is stored. A posting already alerted
+also gets a `withdrawals` row, for the bot to say so. A rejected veto is scored as
+usual and recorded as `veto_rejected`. No log line carries the quote.
 """
 
 from __future__ import annotations
@@ -154,7 +160,7 @@ from careerhunter.filters import PostingText
 from careerhunter.models import Dating, Posting
 from careerhunter.resume import Resume
 from careerhunter.runlog import RunLogError
-from careerhunter.score import Score, ScoreError
+from careerhunter.score import REJECTED, Score, ScoreError
 
 Fetcher = Callable[[str], Fetched]
 Poster = ats_boards.Poster
@@ -1552,7 +1558,18 @@ def _attempt(
             lines.append(_line(name, ats, f"{title} left unscored ({state.model_state()}){kept}"))
         return
     state.scorer_answered = True
-    if result is None:
+    if result is not None and result.vetoed and result.veto is not None:
+        # A criteria rule vetoed it (ADR-028): skipped, never alerted; the stored score,
+        # fit and gaps stay as they were. An alerted one is withdrawn by the bot.
+        with db.transaction(conn):
+            timed("vetoed")
+            search_store.clear_parse_failures(conn, posting_id)
+            if not search_store.posting_has_skip(conn, posting_id):
+                skip_id = search_store.insert_skip(conn, posting_id, today, result.veto.skip)
+                if search_store.posting_alerted(conn, posting_id):
+                    search_store.insert_withdrawal(conn, skip_id)
+        lines.append(_line(name, ats, f"{title} skipped (criteria {result.veto.rule})"))
+    elif result is None:
         kept = "; old score kept" if rescore else ""
         with db.transaction(conn):
             timed("unparseable")
@@ -1574,7 +1591,7 @@ def _attempt(
         metadata = None if result.tier is None else json.dumps({"tier": result.tier})
         fit = None if result.tier is None else state.fits.get(result.tier)
         with db.transaction(conn):
-            timed("scored")
+            timed("scored" if result.veto is None else "veto_rejected")
             search_store.set_posting_score(
                 conn,
                 posting_id,
@@ -1589,6 +1606,10 @@ def _attempt(
             search_store.clear_parse_failures(conn, posting_id)
             if result.excluded and not search_store.posting_has_skip(conn, posting_id):
                 search_store.insert_skip(conn, posting_id, today, "gap_tier")
+        if result.veto is not None and result.veto.rejected is not None:
+            why = REJECTED[result.veto.rejected]
+            rule = "" if result.veto.rule is None else f", rule {result.veto.rule}"
+            lines.append(_line(name, ats, f"{title} veto rejected ({why}{rule}); scored"))
         if result.excluded:
             lines.append(_line(name, ats, f"{title} skipped (gap_tier)"))
         elif rescore:

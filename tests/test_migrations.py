@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 32)), "ei_record": [1, 2, 3, 4]}[track]
+    expected = {"search": list(range(1, 33)), "ei_record": [1, 2, 3, 4]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1186,7 +1186,7 @@ def test_search_0031_keeps_every_health_row_and_takes_the_new_reasons(tmp_path: 
                 "UPDATE component_health SET last_failure = 'not-numbered' "
                 "WHERE component = 'criteria'"
             )
-        assert db.migrate(conn, "search") == [31]
+        assert db.migrate(conn, "search", search[:31]) == [31]
         assert conn.execute("SELECT * FROM component_health ORDER BY component").fetchall() == (
             before
         )
@@ -1199,5 +1199,63 @@ def test_search_0031_keeps_every_health_row_and_takes_the_new_reasons(tmp_path: 
             conn.execute(
                 "UPDATE component_health SET last_failure = 'prose' WHERE component = 'criteria'"
             )
+    finally:
+        conn.close()
+
+
+# --- search 0032: criteria vetoes and withdrawals -----------------------------------------
+
+
+def test_search_0032_copies_every_score_call_and_takes_the_veto_outcomes(tmp_path: Path) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:31])
+        conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (1, 'Analyst', '2026-09-01', 'manual')"
+        )
+        conn.execute("INSERT INTO watch_runs (started_at) VALUES ('2026-09-01T10:00:00Z')")
+        for ident, outcome in ((3, "scored"), (7, "unparseable"), (9, "budget")):
+            conn.execute(
+                "INSERT INTO score_calls (id, run_id, posting_id, started_at, finished_at, "
+                "duration_ms, outcome) VALUES (?, 1, 1, '2026-09-01T10:00:00Z', "
+                "'2026-09-01T10:02:00Z', 120000, ?)",
+                (ident, outcome),
+            )
+        before = conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO score_calls (run_id, posting_id, started_at, finished_at, "
+                "duration_ms, outcome) VALUES (1, 1, '2026-09-01T10:00:00Z', "
+                "'2026-09-01T10:00:01Z', 1, 'vetoed')"
+            )
+        assert db.migrate(conn, "search") == [32]
+        assert conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall() == before
+        for outcome in ("vetoed", "veto_rejected"):
+            conn.execute(
+                "INSERT INTO score_calls (run_id, posting_id, started_at, finished_at, "
+                "duration_ms, outcome) VALUES (1, 1, '2026-09-01T11:00:00Z', "
+                "'2026-09-01T11:00:01Z', 1, ?)",
+                (outcome,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO score_calls (run_id, posting_id, started_at, finished_at, "
+                "duration_ms, outcome) VALUES (1, 1, '2026-09-01T11:00:00Z', "
+                "'2026-09-01T11:00:01Z', 1, 'withdrawn')"
+            )
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(score_calls)")}
+        assert "ix_score_calls_started" in indexes
+        conn.execute(
+            "INSERT INTO skips (posting_id, date, reason) VALUES (1, '2026-09-02', 'criteria: 1.')"
+        )
+        conn.execute("INSERT INTO withdrawals (skip_id) VALUES (1)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO withdrawals (skip_id) VALUES (1)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE withdrawals SET sent_at = 'yesterday'")
+        conn.execute("UPDATE withdrawals SET sent_at = '2026-09-02T10:00:00Z'")
     finally:
         conn.close()

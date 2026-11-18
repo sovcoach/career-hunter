@@ -59,6 +59,7 @@ can be long; at most MAX_OUTPUT characters of what is left are stored.
 
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import json
 import re
@@ -138,13 +139,19 @@ class ScoreError(Exception):
         self.kind = kind
 
 
+VETO_WORDS = 6  # words of the rule in the skip reason
+
+
 @dataclass(frozen=True)
 class Veto:
     """A veto in the reply. `rejected` is a key of REJECTED when it was not honoured;
-    `rule` is the rule number named, when the reply named one as a number."""
+    `rule` is the rule number named, when the reply named one as a number. `skip` is
+    the skip reason for an honoured one, built from the criteria file, never the reply:
+    `criteria: N. <the rule's first VETO_WORDS words>`."""
 
     rule: int | None
     rejected: str | None = None
+    skip: str = dataclasses.field(default="", compare=False)
 
 
 @dataclass(frozen=True)
@@ -358,7 +365,8 @@ def _veto(content: str, posting: PostingText, criteria: Criteria) -> Veto | None
     sent = normalized("\n".join(part for part in (posting.title, posting.description) if part))
     if needle not in sent:
         return Veto(number, "not-found")
-    return Veto(number)
+    words = " ".join(criteria.rules[number - 1].text.split()[:VETO_WORDS])
+    return Veto(number, skip=f"criteria: {number}. {words}")
 
 
 def strip_reasoning(content: str) -> str | None:

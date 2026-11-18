@@ -3,8 +3,10 @@
 `search.criteria_file` names a text file relative to the data folder (for example
 `criteria.md`). It holds one rule per line, written `1. …`, numbered 1, 2, 3 in order.
 Blank lines and lines that start with `#` are ignored. Each rule describes postings the
-candidate won't take, and the rules go in the scoring request. Unset means no criteria
-are sent.
+candidate won't take, and each is a veto (ADR-028): the rules go in the scoring request,
+and a posting the model shows meets one, with a quote from the posting that the code
+checks, is skipped with reason `criteria: N. <the rule's first words>`. Unset means no
+criteria are sent.
 
 A line that is not a numbered rule, numbers out of order, a rule over MAX_RULE
 characters or more than MAX_RULES rules make the file unusable, so a file still

@@ -758,8 +758,19 @@ def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
     return [(int(row["id"]), str(row["title"])) for row in rows]
 
 
-SCORE_OUTCOMES = ("scored", "unparseable", "unreachable", "unauthorized", "budget")
-ANSWERED_OUTCOMES = ("scored", "unparseable")  # the model replied, parsed or not
+# `vetoed` and `veto_rejected` (search migration 0032): a criteria veto that was
+# honoured, or one whose quote did not check out, so the posting was scored.
+SCORE_OUTCOMES = (
+    "scored",
+    "unparseable",
+    "unreachable",
+    "unauthorized",
+    "budget",
+    "vetoed",
+    "veto_rejected",
+)
+# The model replied, parsed or not.
+ANSWERED_OUTCOMES = ("scored", "unparseable", "vetoed", "veto_rejected")
 
 
 def record_score_call(
@@ -1256,6 +1267,45 @@ def insert_skip(
         (posting_id, date, reason, int(by_operator)),
     )
     return int(cur.lastrowid or 0)
+
+
+def posting_alerted(conn: sqlite3.Connection, posting_id: int) -> bool:
+    """Whether an alert for this posting was sent."""
+    row = conn.execute("SELECT alerted_at FROM postings WHERE id = ?", (posting_id,)).fetchone()
+    return row is not None and row[0] is not None
+
+
+def insert_withdrawal(conn: sqlite3.Connection, skip_id: int) -> None:
+    """A criteria veto skip of an alerted posting, for the bot to say it is withdrawn
+    (search migration 0032). Unsent until `mark_withdrawals_sent`."""
+    conn.execute("INSERT OR IGNORE INTO withdrawals (skip_id) VALUES (?)", (skip_id,))
+
+
+@dataclass(frozen=True)
+class Withdrawal:
+    skip_id: int
+    company: str
+    title: str
+    reason: str  # the skip reason: `criteria: N. <words>`
+
+
+def pending_withdrawals(conn: sqlite3.Connection, limit: int) -> list[Withdrawal]:
+    """Unsent withdrawals, oldest first, at most `limit`."""
+    rows = conn.execute(
+        "SELECT w.skip_id, c.name, p.title, s.reason FROM withdrawals w "
+        "JOIN skips s ON s.id = w.skip_id JOIN postings p ON p.id = s.posting_id "
+        "JOIN companies c ON c.id = p.company_id WHERE w.sent_at IS NULL "
+        "ORDER BY w.skip_id LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [Withdrawal(int(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows]
+
+
+def mark_withdrawals_sent(conn: sqlite3.Connection, skip_ids: Sequence[int], at: str) -> None:
+    conn.executemany(
+        "UPDATE withdrawals SET sent_at = ? WHERE skip_id = ? AND sent_at IS NULL",
+        [(at, skip_id) for skip_id in skip_ids],
+    )
 
 
 def has_operator_skip(conn: sqlite3.Connection, posting_id: int) -> bool:
