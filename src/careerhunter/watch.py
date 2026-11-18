@@ -788,7 +788,9 @@ def _watch_one(
         return "left"
     key = board.key
     previous = _stamp_attempt(conn, key, state.now())
+    began = state.monotonic()
     outcome = _fetch_jobs(conn, state, blocked, name, board, host, client)
+    fetch_seconds = state.monotonic() - began
     if isinstance(outcome, _Left):
         _restore_attempt(conn, key, previous)
         return "left"
@@ -818,6 +820,7 @@ def _watch_one(
         today,
         scorer,
         embedder,
+        fetch_seconds=fetch_seconds,
     )
     for note in outcome.read.notes:
         lines.append(_line(name, ats, note))
@@ -1048,7 +1051,12 @@ def _record_jobs(
     scorer: Scorer | None,
     embedder: Embedder,
     source: str = "watcher",
+    *,
+    fetch_seconds: float | None = None,
 ) -> None:
+    """Record a board's jobs, then one line: new, already recorded, and, when it took a
+    second or more, how long the board's fetch and parse took (`fetch_seconds`, on the
+    run's monotonic clock; inline scoring is not counted: score_calls times each call)."""
     lines = state.lines
     new = 0
     existing = 0
@@ -1171,7 +1179,12 @@ def _record_jobs(
             )
             continue
         _attempt(conn, state, posting_id, seen, scorer, today, name, ats, embedder)
-    lines.append(_line(name, ats, f"{new} new, {existing} already recorded"))
+    took = (
+        f" (fetched in {fetch_seconds:.0f} s)"
+        if fetch_seconds is not None and fetch_seconds >= 1
+        else ""
+    )
+    lines.append(_line(name, ats, f"{new} new, {existing} already recorded{took}"))
 
 
 def _recheck(
