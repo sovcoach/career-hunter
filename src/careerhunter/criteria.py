@@ -1,9 +1,14 @@
-"""The operator's scoring criteria in plain language, from a file in the data folder.
+"""The operator's scoring criteria: numbered rules, from a file in the data folder.
 
 `search.criteria_file` names a text file relative to the data folder (for example
-`criteria.md`). Its text goes in the scoring request as the candidate's own stated
-criteria, which the model is told to weigh when it marks a gap minor or core. Unset
-means no criteria are sent.
+`criteria.md`). It holds one rule per line, written `1. …`, numbered 1, 2, 3 in order.
+Blank lines and lines that start with `#` are ignored. Each rule describes postings the
+candidate won't take, and the rules go in the scoring request. Unset means no criteria
+are sent.
+
+A line that is not a numbered rule, numbers out of order, a rule over MAX_RULE
+characters or more than MAX_RULES rules make the file unusable, so a file still
+written as prose is refused rather than read as one rule.
 
 The file is read only when it is inside the data folder once every symlink is
 resolved, is a regular file readable by its owner only, is UTF-8, and is not empty
@@ -17,6 +22,7 @@ A change to the file does not re-score postings already scored.
 from __future__ import annotations
 
 import os
+import re
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -26,7 +32,10 @@ from typing import Any
 MAX_CHARS = 4_000
 MAX_BYTES = MAX_CHARS * 4  # UTF-8 needs at most 4 bytes a character
 MAX_PATH = 200
+MAX_RULE = 300
+MAX_RULES = 20
 CONFIG_KEY = "search.criteria_file"
+_RULE = re.compile(r"(\d{1,3})\.\s+(\S.*)")
 
 REASONS = {
     "outside": "the path is outside the data folder",
@@ -36,6 +45,10 @@ REASONS = {
     "not-utf8": "it is not UTF-8 text",
     "too-long": f"it is over the {MAX_CHARS:,}-character cap",
     "empty": "it is empty",
+    "not-numbered": "a line is not a numbered rule (write one rule per line as 1. …)",
+    "out-of-order": "the rules are not numbered 1, 2, 3 in order",
+    "rule-too-long": f"a rule is over {MAX_RULE} characters",
+    "too-many-rules": f"it has more than {MAX_RULES} rules",
 }
 
 
@@ -50,9 +63,22 @@ class CriteriaError(Exception):
 
 
 @dataclass(frozen=True)
+class Rule:
+    number: int
+    text: str
+
+
+@dataclass(frozen=True)
 class Criteria:
     text: str
     chars: int
+    rules: tuple[Rule, ...] = ()
+
+    def rule(self, number: int) -> Rule | None:
+        """Rule `number`, or None when the file has no such rule."""
+        if 1 <= number <= len(self.rules):
+            return self.rules[number - 1]
+        return None
 
 
 def configured_value(config: Mapping[str, Any] | None) -> str | None:
@@ -121,7 +147,31 @@ def load(root: Path, config: Mapping[str, Any] | None) -> Criteria | None:
         raise CriteriaError("empty", chars=0)
     if len(text) > MAX_CHARS:
         raise CriteriaError("too-long", chars=len(text))
-    return Criteria(text, len(text))
+    return Criteria(text, len(text), parse_rules(text))
+
+
+def parse_rules(text: str) -> tuple[Rule, ...]:
+    """The numbered rules in `text`. Raises CriteriaError when a line is not one, the
+    numbers are not 1, 2, 3 in order, a rule is too long, or there are too many."""
+    rules: list[Rule] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _RULE.fullmatch(line)
+        if match is None:
+            raise CriteriaError("not-numbered", chars=len(text))
+        if int(match.group(1)) != len(rules) + 1:
+            raise CriteriaError("out-of-order", chars=len(text))
+        body = " ".join(match.group(2).split())
+        if len(body) > MAX_RULE:
+            raise CriteriaError("rule-too-long", chars=len(text))
+        rules.append(Rule(len(rules) + 1, body))
+        if len(rules) > MAX_RULES:
+            raise CriteriaError("too-many-rules", chars=len(text))
+    if not rules:
+        raise CriteriaError("empty", chars=len(text))
+    return tuple(rules)
 
 
 def _read(fd: int) -> bytes:

@@ -1787,10 +1787,12 @@ def _doctor_criteria(report: _Report, datadir: DataDir, config_doc: dict[str, An
             report.line("criteria", "BAD", f"{exc}; scoring is held")
         return
     if found is not None:
+        rules = plural(len(found.rules), "rule", "rules")
         report.line(
             "criteria",
             "OK",
-            f"{found.chars:,} of {criteria.MAX_CHARS:,} characters; sent with each scoring call",
+            f"{rules}, {found.chars:,} of {criteria.MAX_CHARS:,} characters; "
+            "sent with each scoring call",
         )
 
 

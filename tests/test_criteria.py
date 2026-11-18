@@ -28,7 +28,14 @@ from tests.test_score import RUBRIC
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, url
 
 env = test_bot.env  # the bot fixture, shared with test_bot
-SYNTHETIC = "Prefers synthetic operations roles; a missing forklift licence is minor."
+SYNTHETIC = (
+    "1. No synthetic night-shift roles at an example depot.\n"
+    "2. No contract under 12 months unless a path to permanent is stated."
+)
+RULES = (
+    criteria.Rule(1, "No synthetic night-shift roles at an example depot."),
+    criteria.Rule(2, "No contract under 12 months unless a path to permanent is stated."),
+)
 
 
 def _doc(value: object = "criteria.md") -> dict[str, Any]:
@@ -55,7 +62,57 @@ def test_unset_means_no_criteria(datadir: DataDir) -> None:
 def test_a_file_in_the_data_folder_is_read(datadir: DataDir) -> None:
     _write(datadir.root, f"\n{SYNTHETIC}\n\n")
     found = criteria.load(datadir.root, _doc())
-    assert found == criteria.Criteria(SYNTHETIC, len(SYNTHETIC))
+    assert found == criteria.Criteria(SYNTHETIC, len(SYNTHETIC), RULES)
+    assert found.rule(2) == RULES[1]
+    assert found.rule(0) is None and found.rule(3) is None
+
+
+def test_comments_blank_lines_and_spacing_are_ignored(datadir: DataDir) -> None:
+    _write(
+        datadir.root,
+        "# Synthetic criteria\n\n1.   No synthetic night-shift roles  at an example depot.\n"
+        "   \n# a note\n  2. No contract under 12 months unless a path to permanent is stated.\n",
+    )
+    found = criteria.load(datadir.root, _doc())
+    assert found is not None and found.rules == RULES
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        ("Prefers synthetic operations roles; a short contract is a no.", "not-numbered"),
+        ("1. No synthetic night shifts.\nand nothing at the example depot", "not-numbered"),
+        ("- No synthetic night shifts.", "not-numbered"),
+        ("1.No synthetic night shifts.", "not-numbered"),
+        ("1. ", "not-numbered"),
+        ("1. No synthetic night shifts.\n3. No example depot.", "out-of-order"),
+        ("2. No synthetic night shifts.", "out-of-order"),
+        ("1. No synthetic night shifts.\n1. No example depot.", "out-of-order"),
+        ("1. " + "x" * (criteria.MAX_RULE + 1), "rule-too-long"),
+        (
+            "\n".join(f"{n}. No synthetic rule {n}." for n in range(1, criteria.MAX_RULES + 2)),
+            "too-many-rules",
+        ),
+        ("# only a comment\n\n", "empty"),
+    ],
+)
+def test_a_file_that_is_not_numbered_rules_is_refused(
+    datadir: DataDir, content: str, reason: str
+) -> None:
+    _write(datadir.root, content)
+    with pytest.raises(criteria.CriteriaError) as caught:
+        criteria.load(datadir.root, _doc())
+    assert caught.value.reason == reason
+    assert str(caught.value) == criteria.REASONS[reason]  # fixed text, never the file's
+
+
+def test_the_rule_caps_are_inclusive(datadir: DataDir) -> None:
+    _write(datadir.root, "1. " + "y" * criteria.MAX_RULE)
+    found = criteria.load(datadir.root, _doc())
+    assert found is not None and len(found.rules[0].text) == criteria.MAX_RULE
+    _write(datadir.root, "\n".join(f"{n}. No rule {n}." for n in range(1, criteria.MAX_RULES + 1)))
+    found = criteria.load(datadir.root, _doc())
+    assert found is not None and len(found.rules) == criteria.MAX_RULES
 
 
 def test_a_symlink_that_stays_inside_is_followed(datadir: DataDir) -> None:
@@ -102,7 +159,10 @@ def test_a_file_that_cannot_be_used_is_refused(
 
 
 def test_the_cap_is_inclusive_and_the_size_is_known(datadir: DataDir) -> None:
-    _write(datadir.root, "y" * criteria.MAX_CHARS)
+    rules = "\n".join(f"{n}. " + "y" * 196 for n in range(1, 21))
+    text = rules[: criteria.MAX_CHARS - 1] + "y"
+    assert len(text) == criteria.MAX_CHARS
+    _write(datadir.root, text)
     found = criteria.load(datadir.root, _doc())
     assert found is not None and found.chars == criteria.MAX_CHARS
     _write(datadir.root, "y" * (criteria.MAX_CHARS + 5))
@@ -261,7 +321,8 @@ def test_doctor_reports_unset_set_and_over_the_cap(
     )
     _write(datadir.root, SYNTHETIC)
     assert _doctor(datadir, _doc(), capsys) == (
-        f"criteria        OK  {len(SYNTHETIC)} of 4,000 characters; sent with each scoring call"
+        f"criteria        OK  2 rules, {len(SYNTHETIC)} of 4,000 characters; "
+        "sent with each scoring call"
     )
     _write(datadir.root, "z" * 4_100)
     assert _doctor(datadir, _doc(), capsys) == (
