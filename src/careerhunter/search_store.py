@@ -821,16 +821,20 @@ def score_call_stats(conn: sqlite3.Connection, since: str) -> ScoreCallStats:
 class VetoCounts:
     vetoed: int
     rejected: int
+    capped: int = 0
+    cap_rejected: int = 0
 
 
 def veto_counts(conn: sqlite3.Connection, since: str) -> VetoCounts:
-    """Scoring calls since a moment that were vetoed, or whose veto was rejected."""
+    """Scoring calls since a moment that were vetoed or capped, or whose veto or cap was
+    rejected."""
     row = conn.execute(
-        "SELECT coalesce(sum(outcome = 'vetoed'), 0), coalesce(sum(outcome = 'veto_rejected'), 0) "
+        "SELECT coalesce(sum(outcome = 'vetoed'), 0), coalesce(sum(outcome = 'veto_rejected'), 0), "
+        "coalesce(sum(outcome = 'capped'), 0), coalesce(sum(outcome = 'cap_rejected'), 0) "
         "FROM score_calls WHERE started_at >= ?",
         (since,),
     ).fetchone()
-    return VetoCounts(int(row[0]), int(row[1]))
+    return VetoCounts(int(row[0]), int(row[1]), int(row[2]), int(row[3]))
 
 
 def start_watch_run(conn: sqlite3.Connection, started_at: str) -> int:

@@ -1942,8 +1942,9 @@ def _doctor_criteria_vetoes(
     config_doc: dict[str, Any] | None,
     now: dt.datetime,
 ) -> None:
-    """Criteria vetoes honoured and rejected in the window (ADR-028), from score_calls.
-    `--` when no criteria file is set. Counts only: no rule text, quote or posting."""
+    """Criteria vetoes and caps, applied and rejected, in the window (ADR-028), from
+    score_calls. `--` when no criteria file is set. Counts only: no rule text, quote or
+    posting."""
     if criteria.configured_value(config_doc) is None:
         report.line("criteria vetoes", "--", "no criteria file")
         return
@@ -1952,7 +1953,8 @@ def _doctor_criteria_vetoes(
     report.line(
         "criteria vetoes",
         "OK",
-        f"{counts.vetoed} vetoed, {counts.rejected} rejected in {SCORE_CALL_DAYS} days",
+        f"{counts.vetoed} vetoed, {counts.rejected} rejected; {counts.capped} capped, "
+        f"{counts.cap_rejected} rejected in {SCORE_CALL_DAYS} days",
     )
 
 

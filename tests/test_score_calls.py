@@ -225,11 +225,18 @@ def test_doctor_counts_vetoes_and_rejected_vetoes_in_the_window(
             ("2026-10-31T11:00:00Z", 95_000, "vetoed"),
             ("2026-10-31T12:00:00Z", 99_000, "veto_rejected"),
             ("2026-10-31T13:00:00Z", 99_000, "scored"),
+            ("2026-10-31T14:00:00Z", 99_000, "capped"),
+            ("2026-10-31T15:00:00Z", 99_000, "capped"),
+            ("2026-10-31T16:00:00Z", 99_000, "capped"),
+            ("2026-10-31T17:00:00Z", 99_000, "cap_rejected"),
+            ("2026-10-02T10:00:00Z", 99_000, "capped"),  # older than 14 days
             ("2026-10-01T10:00:00Z", 99_000, "vetoed"),  # older than 14 days
         ],
     )
     doc = {"search": {"criteria_file": "criteria.md"}}
-    assert _vetoes(search, capsys, doc) == "criteria vetoes OK  2 vetoed, 1 rejected in 14 days"
+    assert _vetoes(search, capsys, doc) == (
+        "criteria vetoes OK  2 vetoed, 1 rejected; 3 capped, 1 rejected in 14 days"
+    )
 
 
 def test_doctor_shows_none_with_no_criteria_file(
@@ -237,4 +244,6 @@ def test_doctor_shows_none_with_no_criteria_file(
 ) -> None:
     assert _vetoes(search, capsys, None) == "criteria vetoes --  no criteria file"
     doc = {"search": {"criteria_file": "criteria.md"}}
-    assert _vetoes(search, capsys, doc) == "criteria vetoes OK  0 vetoed, 0 rejected in 14 days"
+    assert _vetoes(search, capsys, doc) == (
+        "criteria vetoes OK  0 vetoed, 0 rejected; 0 capped, 0 rejected in 14 days"
+    )
