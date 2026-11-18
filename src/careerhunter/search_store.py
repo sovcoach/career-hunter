@@ -807,6 +807,22 @@ def score_call_stats(conn: sqlite3.Connection, since: str) -> ScoreCallStats:
     return ScoreCallStats(answered, len(rows) - len(answered))
 
 
+@dataclass(frozen=True)
+class VetoCounts:
+    vetoed: int
+    rejected: int
+
+
+def veto_counts(conn: sqlite3.Connection, since: str) -> VetoCounts:
+    """Scoring calls since a moment that were vetoed, or whose veto was rejected."""
+    row = conn.execute(
+        "SELECT coalesce(sum(outcome = 'vetoed'), 0), coalesce(sum(outcome = 'veto_rejected'), 0) "
+        "FROM score_calls WHERE started_at >= ?",
+        (since,),
+    ).fetchone()
+    return VetoCounts(int(row[0]), int(row[1]))
+
+
 def start_watch_run(conn: sqlite3.Connection, started_at: str) -> int:
     """A new, unfinished `watch_runs` row. Its counts stay null until it finishes."""
     cur = conn.execute("INSERT INTO watch_runs (started_at) VALUES (?)", (started_at,))

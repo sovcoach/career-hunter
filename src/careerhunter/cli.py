@@ -1920,6 +1920,26 @@ def _doctor_score_calls(
         report.line("scoring calls", "OK", detail)
 
 
+def _doctor_criteria_vetoes(
+    report: _Report,
+    search: sqlite3.Connection,
+    config_doc: dict[str, Any] | None,
+    now: dt.datetime,
+) -> None:
+    """Criteria vetoes honoured and rejected in the window (ADR-028), from score_calls.
+    `--` when no criteria file is set. Counts only: no rule text, quote or posting."""
+    if criteria.configured_value(config_doc) is None:
+        report.line("criteria vetoes", "--", "no criteria file")
+        return
+    since = (now - dt.timedelta(days=SCORE_CALL_DAYS)).astimezone(dt.UTC)
+    counts = search_store.veto_counts(search, since.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    report.line(
+        "criteria vetoes",
+        "OK",
+        f"{counts.vetoed} vetoed, {counts.rejected} rejected in {SCORE_CALL_DAYS} days",
+    )
+
+
 def _doctor_usefulness(
     report: _Report,
     search: sqlite3.Connection,
@@ -2254,6 +2274,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
     if search is not None:
         _doctor_watch_runs(report, search, now)
         _doctor_score_calls(report, search, config_doc, now)
+        _doctor_criteria_vetoes(report, search, config_doc, now)
         _doctor_usefulness(report, search, config_doc, now)
         _doctor_discovery_backoff(report, search, config_doc, now)
         _doctor_components(report, search, config_doc)
