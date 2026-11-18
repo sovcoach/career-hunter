@@ -108,4 +108,88 @@ def test_nothing_to_pick_is_an_error(
     scored: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert cli.main(["rescore"], probe=probe) == cli.EXIT_ERROR
-    assert capsys.readouterr().err == "error: give --posting, or --gap\n"
+    assert capsys.readouterr().err == "error: give --posting, --gap or --set-aside\n"
+
+
+# --- set-aside postings (search migration 0034) ---------------------------------------------
+
+
+def _set_aside(path: Path, title: str) -> int:
+    conn = db.connect(path / "search.db")
+    try:
+        (posting_id,) = conn.execute("SELECT id FROM postings WHERE title = ?", (title,)).fetchone()
+        with db.transaction(conn):
+            for stamp in ("2026-11-01T10:00:00Z", "2026-11-01T11:00:00Z"):
+                search_store.record_timeout(conn, int(posting_id), stamp, set_aside_after=2)
+        return int(posting_id)
+    finally:
+        conn.close()
+
+
+def _aside(path: Path) -> int:
+    conn = db.connect_read_only(path / "search.db")
+    try:
+        return search_store.set_aside_count(conn)
+    finally:
+        conn.close()
+
+
+def test_set_aside_lists_and_a_dry_run_writes_nothing(
+    scored: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ident = _set_aside(scored, "Clean")
+    assert cli.main(["rescore", "--set-aside", "--dry-run"], probe=probe) == cli.EXIT_OK
+    assert capsys.readouterr().out == (
+        f"{ident:5} Examplea — Clean: set aside after timeouts, fit None, not alerted\n"
+        "dry run: nothing is written. 1 set-aside posting would be released.\n"
+    )
+    assert _aside(scored) == 1
+
+
+def test_set_aside_releases_them_for_the_next_run(
+    scored: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_aside(scored, "Clean")
+    assert cli.main(["rescore", "--set-aside"], probe=probe) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert out.endswith("1 set-aside posting released; the next watch run sends it again.\n")
+    assert "postings queued" not in out
+    assert _aside(scored) == 0
+    assert _hashes(scored)["Clean"] == OLD.sha256  # releasing does not queue a re-score
+
+
+def test_set_aside_with_none_says_so(
+    scored: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["rescore", "--set-aside"], probe=probe) == cli.EXIT_OK
+    assert capsys.readouterr().out == (
+        "0 set-aside postings released; the next watch run sends them again.\n"
+    )
+
+
+def test_a_posting_id_that_is_set_aside_is_released_and_queued(
+    scored: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ident = _set_aside(scored, "Clean")
+    assert cli.main(["rescore", "--posting", str(ident)], probe=probe) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "1 postings queued" in out and "1 set-aside posting released" in out
+    assert _aside(scored) == 0
+    assert _hashes(scored)["Clean"] is None
+
+
+def test_an_unscored_posting_set_aside_is_released_by_its_id(
+    scored: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    conn = db.connect(scored / "search.db")
+    try:
+        with db.transaction(conn):
+            conn.execute("UPDATE postings SET llm_output = NULL WHERE title = 'Phantom'")
+    finally:
+        conn.close()
+    ident = _set_aside(scored, "Phantom")
+    assert cli.main(["rescore", "--posting", str(ident)], probe=probe) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "not queued" not in out
+    assert "0 postings queued" in out and "1 set-aside posting released" in out
+    assert _aside(scored) == 0
