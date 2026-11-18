@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -1202,6 +1203,26 @@ class Example:
     lane: str | None  # the lane name, "off-lane", or None when not checked
     gap_count: int | None
     label: str  # "skipped", or the application's latest status
+    reason: str | None = None  # an operator skip's reason, cleaned and capped
+
+
+MAX_EXAMPLE_REASON = 200
+
+
+def example_reason(text: str | None) -> str | None:
+    """A skip reason as an example carries it: control characters gone, whitespace
+    collapsed, at most MAX_EXAMPLE_REASON characters cut at a word with "…"."""
+    if text is None:
+        return None
+    cleaned = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", " ", text).split())
+    if not cleaned:
+        return None
+    if len(cleaned) <= MAX_EXAMPLE_REASON:
+        return cleaned
+    cut = cleaned[: MAX_EXAMPLE_REASON - 1]
+    if " " in cut:
+        cut = cut[: cut.rindex(" ")]
+    return cut.rstrip(" ,;:-") + "…"
 
 
 def labelled_examples(conn: sqlite3.Connection, limit: int) -> list[Example]:
@@ -1209,26 +1230,28 @@ def labelled_examples(conn: sqlite3.Connection, limit: int) -> list[Example]:
 
     Labels come only from the operator: an application (its latest status, `applied` or
     later, from the bot or the CLI) or a skip they chose with the Skipped button. The
-    system never predicts one, and a watcher skip is not a label.
+    system never predicts one, and a watcher skip is not a label: neither is a criteria
+    veto, which is the watcher's. An operator skip carries its reason (`example_reason`).
     """
     if limit < 1:
         return []
     rows = conn.execute(
         """
         WITH labels AS (
-            SELECT a.posting_id, d.status AS label, d.recorded_at AS at, d.id AS seq, 1 AS kind
+            SELECT a.posting_id, d.status AS label, d.recorded_at AS at, d.id AS seq, 1 AS kind,
+                   NULL AS reason
             FROM decision_history d JOIN applications a ON a.id = d.application_id
             UNION ALL
-            SELECT s.posting_id, 'skipped', s.created_at, s.id, 0
+            SELECT s.posting_id, 'skipped', s.created_at, s.id, 0, s.reason
             FROM skips s WHERE s.by_operator = 1
         ),
         latest AS (
-            SELECT posting_id, label, at,
+            SELECT posting_id, label, at, reason,
                    row_number() OVER (PARTITION BY posting_id ORDER BY at DESC, kind DESC,
                                       seq DESC) AS n
             FROM labels
         )
-        SELECT c.name AS company, p.title, p.lane, p.lane_checked, l.label,
+        SELECT c.name AS company, p.title, p.lane, p.lane_checked, l.label, l.reason,
                CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
                     THEN json_array_length(p.gaps) END AS gap_count
         FROM latest l
@@ -1247,6 +1270,7 @@ def labelled_examples(conn: sqlite3.Connection, limit: int) -> list[Example]:
             lane=str(row["lane"]) if row["lane"] else ("off-lane" if row["lane_checked"] else None),
             gap_count=None if row["gap_count"] is None else int(row["gap_count"]),
             label=str(row["label"]),
+            reason=example_reason(row["reason"]),
         )
         for row in rows
     ]

@@ -201,3 +201,56 @@ def test_labelled_examples_default_to_five_and_zero_sends_none() -> None:
     assert learning_labelled_examples({}) == 5
     assert learning_labelled_examples({"learning": {"labelled_examples": 0}}) == 0
     assert learning_labelled_examples({"learning": {"labelled_examples": 20}}) == 20
+
+
+# --- the operator's skip reasons go with their examples -----------------------------------
+
+
+def _skip_with(search: sqlite3.Connection, title: str, reason: str, *, by_operator: bool) -> None:
+    posting_id = _posting(search, title)
+    with search:
+        search_store.insert_skip(search, posting_id, DAY, reason, by_operator=by_operator)
+
+
+def test_an_operator_skip_sends_its_reason(search: sqlite3.Connection) -> None:
+    _skip_with(search, "Skipped Role", "Synthetic: the depot is too far", by_operator=True)
+    _apply(search, "Applied Role", "screening")
+    view = _sent(search_store.labelled_examples(search, 5))
+    by_title = {item["title"]: item for item in view["labelled_examples"]}
+    assert by_title["Skipped Role"] == {
+        "title": "Skipped Role",
+        "lane": "operations",
+        "gaps": 2,
+        "label": "skipped",
+        "reason": "Synthetic: the depot is too far",
+    }
+    assert "reason" not in by_title["Applied Role"]  # applications carry none
+
+
+def test_a_long_reason_is_cut_at_a_word_and_control_characters_go(
+    search: sqlite3.Connection,
+) -> None:
+    long = "Synthetic\x00reason\n\twith   spacing " + "word " * 80
+    _skip_with(search, "Skipped Role", long, by_operator=True)
+    [example] = search_store.labelled_examples(search, 5)
+    assert example.reason is not None
+    assert len(example.reason) <= search_store.MAX_EXAMPLE_REASON
+    assert example.reason.startswith("Synthetic reason with spacing word")
+    assert example.reason.endswith("word…")
+    assert not any(ord(ch) < 32 for ch in example.reason)
+
+
+def test_reason_edges() -> None:
+    assert search_store.example_reason(None) is None
+    assert search_store.example_reason(" \x01\n ") is None
+    exact = "x" * search_store.MAX_EXAMPLE_REASON
+    assert search_store.example_reason(exact) == exact
+    unbroken = "y" * 300
+    cut = search_store.example_reason(unbroken)
+    assert cut == "y" * (search_store.MAX_EXAMPLE_REASON - 1) + "…"
+
+
+def test_watcher_and_veto_skips_are_not_examples(search: sqlite3.Connection) -> None:
+    _skip_with(search, "Gated Role", "seniority", by_operator=False)
+    _skip_with(search, "Vetoed Role", "criteria: 2. No contract or term", by_operator=False)
+    assert search_store.labelled_examples(search, 5) == []

@@ -288,8 +288,9 @@ def score_posting(
     text. None sends no criteria at all, and a veto is then ignored.
 
     `examples` are postings the operator labelled (#43): each goes in the request only,
-    as its title, lane, gap count and label. Not the company, the description, a cosine
-    or a note. The one being scored (same company and title) is left out.
+    as its title, lane, gap count and label, and an operator skip's reason. Not the
+    company, the description, a cosine or a note. The one being scored (same company
+    and title) is left out.
 
     Raises ScoreError when the model does not answer. None leaves the posting unscored.
     The caller does not alert it.
@@ -442,6 +443,7 @@ def _request_body(
         view["resume"] = resume.text
     shown = [
         {"title": ex.title, "lane": ex.lane, "gaps": ex.gap_count, "label": ex.label}
+        | ({"reason": ex.reason} if ex.reason else {})
         for ex in examples
         if (ex.company.casefold(), ex.title.casefold())
         != (posting.company.casefold(), posting.title.casefold())
@@ -467,7 +469,8 @@ def _request_body(
                     "whether or not they are gaps. No prose. "
                     "labelled_examples, when present, are other postings and what the "
                     "candidate decided about them (applied and its latest status, or "
-                    "skipped); use them only to calibrate, never as requirements."
+                    "skipped, with the candidate's reason when given); use them only to "
+                    "calibrate, never as requirements."
                     + (CRITERIA_INSTRUCTION if criteria is not None else "")
                 ),
             },
