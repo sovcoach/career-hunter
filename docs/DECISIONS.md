@@ -33,7 +33,7 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 025 | LM Studio needs an API token, and the chat model may be a reasoning model | Accepted (0.5.1); amended (batch N) |
 | 026 | The scorer takes the operator's own criteria from a file in the data folder | Accepted (0.6.0); amended by 028 |
 | 027 | Every posting is gated on its full description before it is scored | Accepted (batch M) |
-| 028 | A criteria rule is a veto, grounded by a quote the code checks | Accepted (batch N) |
+| 028 | A criteria rule is a veto, grounded by a quote the code checks | Accepted (batch N); amended (caps) |
 
 ---
 
@@ -833,6 +833,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A posting whose board stays unreachable waits unscored, counted as held by `doctor`.
 
 ## ADR-028: A criteria rule is a veto, grounded by a quote the code checks
+
+> **Amended: a rule is a veto or a cap (batch N).** Some postings are worth seeing, but not at the top: a contract whose only stated path is a possible extension, say. So each rule now starts with its kind, `N. veto: …` or `N. cap low|medium|high: …`, and a numbered line without a valid kind is refused (`no-kind`, search migration 0033), so nothing is guessed. A cap's level is a fit level, the scale alerts and `off_lane_min_fit` use. The reply may carry `"cap": {"rule": N, "quote": …}`, checked exactly as a veto is, and the rule must be a cap rule (a veto must name a veto rule). A checked cap stores the lower of the tier's fit and the cap's level, keeps the tier in `scout_metadata` with `cap_rule`, and is recorded as `capped`; a rejected one leaves the score as scored and is `cap_rejected` (migration 0033 rebuilds `score_calls`). A checked veto wins over a cap. A cap never skips a posting and sends nothing, even when a re-score lowers the fit of a posting already alerted. A reply with a cap is stored as canonical gaps, like one with a veto. The instruction no longer says an asset is never a match: it says to apply each rule exactly as written, so a rule that names a preference or an asset covers it, and only an exception the rule allows, or the allowed side of a limit it sets, is not a match. `doctor`'s `criteria vetoes` line counts caps too. *Alternatives:* a cap on the tier name, rejected because tier names are free text per config and fits are the fixed scale alerts use; a note in Telegram when a cap lowers an alerted posting, left out because the posting stays alerted and worth a look.
 
 **Context.**
 - The criteria file (ADR-026) reached every scoring request, but the prompt told the model only to weigh it when deciding whether a gap is minor or core, and never to list it as a gap. A posting that plainly broke a criterion (a short contract, say) isn't missing a qualification, so the model had nowhere to put it. A re-scored posting that did so came back in the top tier.

@@ -8,17 +8,18 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- Criteria vetoes (ADR-028). Each numbered rule in the criteria file describes postings you won't take. When the scorer shows a posting meets one, quoting the posting, the quote is checked against the text that was sent and the posting is skipped as `criteria: N. <the rule's first words>`, never alerted. A veto whose quote isn't in the posting, is too short or names an unknown rule is rejected, and the posting is scored as usual. The quote is never stored or logged.
+- Criteria vetoes (ADR-028). Each `veto:` rule in the criteria file describes postings you won't take. When the scorer shows a posting meets one, quoting the posting, the quote is checked against the text that was sent and the posting is skipped as `criteria: N. <the rule's first words>`, never alerted. A veto whose quote isn't in the posting, is too short or names an unknown rule is rejected, and the posting is scored as usual. The quote is never stored or logged.
+- Criteria caps: a rule written `N. cap medium: …` (or `cap low`, `cap high`) holds a posting it matches to at most that fit, grounded by a quote the same way, and never skips it. A checked veto wins over a cap; a re-score that caps an alerted posting lowers its stored fit and sends nothing.
 - A `withdrawn:` message in Telegram, once per poll for all of them, when a re-score vetoes a posting that was already alerted (search migration 0032).
 - `scoring.run_minutes` (10 to 50, under the watch interval; default 20, or 5 less than a shorter interval): discovery and the boards keep the first 10 minutes of a watch run, and scoring goes on until this many minutes from the start. With a slow model a run now scores four or five postings instead of one.
-- `doctor` shows `criteria vetoes` (vetoed and rejected in 14 days), and the `criteria` line counts the rules.
+- `doctor` shows `criteria vetoes` (vetoed, capped and rejected in 14 days), and the `criteria` line counts the rules of each kind.
 - Each board's watch log line says how long its fetch took when that was a second or more.
 
 ### Changed
-- `criteria.md` is numbered rules, one per line (`1. …`, at most 20 of 300 characters); blank lines and `#` lines are ignored. A file still in prose is refused and holds scoring until it is rewritten (search migration 0031); see "Upgrading from 0.7.0 to 0.8.0" in `docs/SETUP.md`. The scorer no longer weighs criteria as minor or core gaps.
+- `criteria.md` is numbered rules, one per line, each with its kind (`1. veto: …`, `2. cap medium: …`; at most 20 of 300 characters); blank lines and `#` lines are ignored. A file still in prose, or with a rule that has no kind, is refused and holds scoring until it is rewritten (search migrations 0031 and 0033); see "Upgrading from 0.7.0 to 0.8.0" in `docs/SETUP.md`. The scorer no longer weighs criteria as minor or core gaps, and applies each rule as written: a rule that names an asset or a preference covers it.
 - The operator's skip reasons go with their labelled examples, cut to 200 characters.
 - The bot waits for an unfinished watch run for twice `scoring.run_minutes`, and `doctor` reports one as BAD after `scoring.run_minutes` plus five minutes.
-- `search.db` moves from schema version 30 to 32; the EI record stays at 4.
+- `search.db` moves from schema version 30 to 33; the EI record stays at 4.
 
 ## [0.7.0] - 2026-11-17
 

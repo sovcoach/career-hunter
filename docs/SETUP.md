@@ -197,7 +197,7 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 | How many missing requirements still count, and the fit each tier means | `fit_rubric.gap_tiers` (every tier needs `fit: low`, `medium` or `high`) |
 | The lowest fit at which a title outside every lane still alerts | `search.off_lane_min_fit` (default `high`) |
 | Your resume, for scoring and a similarity score that `embed-eval` reads (see "Import your resume") | `search.resume: resume/current.txt` |
-| Postings you won't take, as numbered rules in your own words: a posting that meets one is skipped (see "Your scoring criteria") | `search.criteria_file: criteria.md` |
+| Postings you won't take, or whose fit you'd hold down, as numbered rules in your own words: a posting that meets a veto rule is skipped, and one that meets a cap rule is held to its fit (see "Your scoring criteria") | `search.criteria_file: criteria.md` |
 | Languages, credentials, shifts, pay, seniority (in the title, or also the description), and a minimum salary | `hard_gates` |
 | A cap on weekend days | `schedule_limits` |
 | Which roles to keep at one company | that company's `role_filters` |
@@ -311,7 +311,7 @@ Don't edit `resume/current.txt` by hand. If it no longer matches what was import
 
 ### Your scoring criteria
 
-Some postings you won't take can't be caught by a field or a gate word: a short contract with no path to a permanent role, say, written a dozen different ways. Write each as a numbered rule in a text file in the data folder. The scorer sends the rules with each posting, and a posting the model shows meets a rule is skipped for that rule (ADR-028).
+Some postings you won't take can't be caught by a field or a gate word: a short contract with no path to a permanent role, say, written a dozen different ways. Write each as a numbered rule in a text file in the data folder. Each rule is a **veto** (a posting that meets it is skipped) or a **cap** (a posting that meets it keeps its score, but its fit is held to at most the level the rule names). The scorer sends the rules with each posting (ADR-028).
 
 1. Create the file, owner-only:
 
@@ -319,12 +319,13 @@ Some postings you won't take can't be caught by a field or a gate word: a short 
    touch "$CAREERHUNTER_DATA_DIR/criteria.md" && chmod 600 "$CAREERHUNTER_DATA_DIR/criteria.md"
    ```
 
-2. Write one rule per line, numbered 1, 2, 3 in order. Each says what you won't take, with any exception the rule allows. Blank lines and lines starting with `#` are ignored. For example:
+2. Write one rule per line, numbered 1, 2, 3 in order, each starting with its kind: `veto:`, or `cap low:`, `cap medium:` or `cap high:` (a fit level). Say exactly what the rule covers, with any exception it allows: the model applies it as written, so a rule that names a preference or an asset covers those too. Blank lines and lines starting with `#` are ignored. For example:
 
    ```text
-   # Postings I won't take
-   1. No night-shift roles at a warehouse.
-   2. No contract under 6 months unless a path to permanent is stated.
+   # Postings I won't take, and postings I'd hold down
+   1. veto: No night-shift roles at a warehouse.
+   2. veto: No contract under 6 months unless a path to permanent is stated.
+   3. cap medium: A role that needs a car for daily site visits.
    ```
 
 3. Set this in `config.yaml`:
@@ -336,16 +337,18 @@ Some postings you won't take can't be caught by a field or a gate word: a short 
 
 The path is relative to the data folder and must stay inside it, even through a symlink. The file must be UTF-8 text that only you can read: at most 20 rules, each at most 300 characters, and 4,000 characters in all. Only this file is read: other notes in the data folder never reach the scorer. Leave the key out, or set it to `null`, to send no criteria.
 
-**How a rule skips a posting.** When the model finds that a posting meets a rule, it names the rule and quotes the words in the posting that show it. The quote is checked against the title and description that were sent, ignoring case and spacing. If the words are there, the posting is skipped with the reason `criteria: 2. No contract under 6 months unless` (the rule's number and first six words) and never alerted. The log says `watch: <company>: '<title>' skipped (criteria 2)`. If the quote isn't in the posting, is too short, or names a rule the file doesn't have, the veto is rejected and the posting is scored as usual: `veto rejected (quote not found, rule 2); scored`. The quote itself is never stored or logged. Something the rule allows is not a match: a skill wanted only as an asset, or an exception the rule names that the posting states.
+**How a rule skips a posting.** When the model finds that a posting meets a rule, it names the rule and quotes the words in the posting that show it. The quote is checked against the title and description that were sent, ignoring case and spacing. If the words are there, the posting is skipped with the reason `criteria: 2. No contract under 6 months unless` (the rule's number and first six words) and never alerted. The log says `watch: <company>: '<title>' skipped (criteria 2)`. If the quote isn't in the posting, is too short, or names a rule the file doesn't have, the veto is rejected and the posting is scored as usual: `veto rejected (quote not found, rule 2); scored`. The quote itself is never stored or logged. Something the rule allows is not a match: an exception the rule names that the posting states, or the allowed side of a limit it sets.
+
+**How a cap holds a posting down.** A cap rule is checked the same way: the model quotes the posting, and the quote must be in the text that was sent. If it is, the posting is scored as usual and its fit is stored as the lower of its tier's fit and the cap's level, so a `high` posting under `cap medium` is stored, and alerted, as `medium`. The log says `capped at medium (criteria 3)`. A cap never skips a posting and sends no message, even when a re-score lowers the fit of a posting already alerted. A cap whose quote doesn't check out is rejected and the posting keeps its fit: `cap rejected (quote not found, rule 3); scored`. When a posting meets a veto rule and a cap rule, the veto wins.
 
 If a re-score skips a posting that was already alerted, the bot tells you once, in one message per poll for all of them: `withdrawn: Example Robotics — Synthetic Analyst, criteria: 2. No contract under 6 months unless`.
 
-If the file can't be used (missing, readable by others, empty, not UTF-8, over a cap, or not numbered rules, such as a file still in plain prose), the watch run holds scoring and logs `watch: scoring: criteria file not usable (<reason>); left for the next run`. The bot tells you why after the first run it holds, and again when scoring resumes. `doctor` shows it too, and counts the vetoes of the last 14 days:
+If the file can't be used (missing, readable by others, empty, not UTF-8, over a size cap, not numbered rules such as a file still in plain prose, or a rule without its kind), the watch run holds scoring and logs `watch: scoring: criteria file not usable (<reason>); left for the next run`. The bot tells you why after the first run it holds, and again when scoring resumes. `doctor` shows it too, and counts the vetoes and caps of the last 14 days:
 
 ```text
-criteria        OK  2 rules, 193 of 4,000 characters; sent with each scoring call
-criteria        BAD a line is not a numbered rule (write one rule per line as 1. …); scoring is held
-criteria vetoes OK  3 vetoed, 1 rejected in 14 days
+criteria        OK  3 rules (2 vetoes, 1 cap), 214 of 4,000 characters; sent with each scoring call
+criteria        BAD a rule has no kind (start each rule with veto: or cap low|medium|high:); scoring is held
+criteria vetoes OK  3 vetoed, 1 rejected; 2 capped, 0 rejected in 14 days
 ```
 
 Editing the file doesn't re-score anything: postings already scored keep their score, and the new rules apply from the next posting scored. Use `careerhunter rescore` to apply them to postings already alerted.
@@ -886,15 +889,15 @@ If something goes wrong before step 6 finishes, nothing in the data folder has c
 
 Follow the nine steps above with the tag `v0.8.0` (`git checkout v0.8.0` in the release checkout, then `uv sync --locked`). These steps differ:
 
-- **Step 4:** if you use `search.criteria_file`, rewrite the file as numbered rules, one per line (see "Your scoring criteria"). A file still in prose is refused, and scoring holds until it is rewritten. With the services stopped and the data folder backed up (steps 1 and 2), keep a copy of the old file next to the backup, then write each criterion as `1. …`, `2. …`, and keep it owner-only. Without a criteria file, nothing has to change. Two things are new and optional: `scoring.run_minutes` (default 20) and the `withdrawn:` message.
+- **Step 4:** if you use `search.criteria_file`, rewrite the file as numbered rules, one per line, each with its kind (see "Your scoring criteria"). A file still in prose, or with a rule that has no kind, is refused, and scoring holds until it is rewritten. With the services stopped and the data folder backed up (steps 1 and 2), keep a copy of the old file next to the backup, then write each criterion as `1. veto: …` or `2. cap medium: …`, and keep it owner-only. Without a criteria file, nothing has to change. Two things are new and optional: `scoring.run_minutes` (default 20) and the `withdrawn:` message.
 - **Step 5:** `doctor` exits 1, because `search.db` is three migrations behind:
 
   ```text
   search.db       BAD schema version 30, expected 33; run: careerhunter migrate
   ```
 
-  The claim's record is already at schema version 4. A criteria file still in prose also shows `criteria        BAD a line is not a numbered rule (write one rule per line as 1. …); scoring is held`.
-- **Step 6:** `migrate` applies three migrations to `search.db` and none to the claim's record. Migrations 0031 and 0033 rebuild `component_health` and 0032 rebuilds `score_calls`, each copying every row as it was, and 0032 adds the `withdrawals` table:
+  The claim's record is already at schema version 4. A criteria file still in prose also shows `criteria        BAD a line is not a numbered rule (write one rule per line as 1. …); scoring is held`, and one with rules but no kinds shows `BAD a rule has no kind …`.
+- **Step 6:** `migrate` applies three migrations to `search.db` and none to the claim's record. Migrations 0031 and 0033 rebuild `component_health`, and 0032 and 0033 rebuild `score_calls`, each copying every row as it was; 0032 adds the `withdrawals` table:
 
   ```text
   search.db: applied [31, 32, 33]; schema version 33
@@ -907,8 +910,8 @@ Follow the nine steps above with the tag `v0.8.0` (`git checkout v0.8.0` in the 
 
   ```text
   search.db       OK  schema version 33
-  criteria        OK  2 rules, 193 of 4,000 characters; sent with each scoring call
-  criteria vetoes OK  0 vetoed, 0 rejected in 14 days
+  criteria        OK  3 rules (2 vetoes, 1 cap), 214 of 4,000 characters; sent with each scoring call
+  criteria vetoes OK  0 vetoed, 0 rejected; 0 capped, 0 rejected in 14 days
   ```
 
   Without a criteria file, the two criteria lines show `--`.
