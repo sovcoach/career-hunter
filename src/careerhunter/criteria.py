@@ -14,7 +14,8 @@ reason and in the bot's withdrawn message; it is not sent to the model.
 
 Blank lines and lines that start with `#` are ignored. The rules go in the scoring
 request. A posting the model shows meets a veto rule, with a quote from the posting
-that the code checks, is skipped with reason `criteria: N. <the rule's first words>`.
+that the code checks, is skipped with reason `criteria: N. <label>`, or without a label
+`criteria: N. <the rule's first words>`, ending in `…` when the rule goes on.
 A cap rule (`cap low`, `cap medium` or `cap high`, a fit level) lowers the posting's
 fit to at most that level and never skips it. Unset means no criteria are sent.
 
