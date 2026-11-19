@@ -7,13 +7,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-19
+
 ### Added
 - `ats_facets` on a Workday watchlist entry filters the board's list on the board itself, by facet and value names as the board shows them (such as `Work Region: Northland`), never by id. Each run maps the names to ids from the board's facets, looking inside facet groups, and reads the list filtered. A name not found is logged and the board is read unfiltered (search migration 0035). Nested facets have only been tested with fixtures.
 - `doctor` shows `workday facets`: a warning for each board with a name not found on its last read.
 
 ### Changed
 - A Workday board that reaches the page limit says how many pages its total fills: `page limit reached (25 of 61 pages)`.
-- `search.db` moves from schema version 34 to 35; the EI record stays at 4.
+- `search.db` moves from schema version 34 to 35; the EI record stays at 4. Its release checkout uses `v0.9.0`.
 
 ### Fixed
 - A SmartRecruiters or Workday list whose later page fails no longer throws away the pages read before it: they're recorded, with a note. HTTP 429 or a fetch error there stops the detail requests and fails the board (a 429 also blocks the host for the run); another status lets the details carry on.
@@ -328,7 +330,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/sovcoach/career-hunter/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/sovcoach/career-hunter/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/sovcoach/career-hunter/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/sovcoach/career-hunter/compare/v0.6.0...v0.7.0
