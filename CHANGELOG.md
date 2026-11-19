@@ -10,10 +10,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `careerhunter rescore --set-aside` releases the postings set aside after scoring timeouts so the next watch run tries them again; `--dry-run` lists them. `rescore --posting <id>` releases a set-aside posting too.
 - `doctor` shows `score timeouts` (postings set aside, with the command that releases them), and the `scoring calls` line counts timed-out calls on their own.
+- A criteria rule may carry a short label: `2. veto [short contract]: …`. A posting it vetoes is skipped as `criteria: 2. short contract`, and the withdrawn message names it the same way. The label is never sent to the model. Labels are optional; an empty, overlong or unclosed one makes the file unusable with the `no-kind` reason.
 
 ### Fixed
 - A scoring call that reaches `scoring.timeout_seconds` is a timeout, no longer labelled as the model being unreachable (search migration 0034). It no longer stops the run's scoring: the run goes on to the next posting, and the posting moves to the back of the queue instead of being tried first every run. After 2 timeouts in a row the posting is set aside. A run whose scoring calls, two or more, all timed out counts as an LM Studio failure for the health alert.
 - A scoring call that fails names the exception's type in the watch log, from a fixed list.
+- A veto's skip reason and withdrawn message no longer stop mid-phrase without a sign: a rule with no label is named by its first six words, ending in `…` when it goes on.
 
 ### Changed
 - `search.db` moves from schema version 33 to 34; the EI record stays at 4.
