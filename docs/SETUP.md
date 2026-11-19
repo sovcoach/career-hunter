@@ -162,7 +162,7 @@ created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 34
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 35
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -233,6 +233,30 @@ Every alert carries a fit: `Fit: High`, `Medium` or `Low`, from the `fit` of the
 `search.max_posting_age_days` (default 7) skips a posting the board says was posted more than that many days ago, as `too_old`. A board that gives no date uses the day the posting was first seen, and the watch log says so for that posting.
 
 A Workday board needs three values on its watchlist entry, all from its careers page address `https://<tenant>.<wdN>.myworkdayjobs.com/<site>`: `ats_slug` is the tenant, `ats_host` the `wdN` part and `ats_site` the site. A BambooHR board's `ats_slug` is the company's `bamboohr.com` subdomain, and a SmartRecruiters board's is the company identifier after `jobs.smartrecruiters.com/`.
+
+A Workday board can also be filtered on the board itself with `ats_facets`, so its list holds only the postings you'd keep and fits in fewer pages. Give each facet and value by the name the board shows in its search filters, never by an id:
+
+```yaml
+watchlist:
+  - name: Example Freight
+    ats_type: workday
+    ats_slug: examplefreight
+    ats_host: wd5
+    ats_site: External
+    ats_facets:
+      Work Region: Northland
+      Sites: [Harbour Point, Hillside]
+```
+
+Each facet takes one value name or a list of them (at most 10 facets and 50 values, each name 1 to 100 characters). Names match the board's own ignoring case and extra spaces. A value name the board uses more than once stands for all of them. `ats_facets` is for `ats_type: workday` entries only.
+
+Each run the watcher reads the board's unfiltered first page, looks up the ids of those names in its facets, and then reads the list with them applied, from the first page again. That's one extra request a run. When a name isn't found, because the board renamed it or no open posting has that value today (Workday leaves out values with no postings), the watch log says `watch: Example Freight (workday): ats_facets "Work Region: Eastland" not found; read unfiltered`, the board is read unfiltered as if it had no `ats_facets`, and `doctor` warns:
+
+```text
+workday facets  WARN Example Freight: "Work Region: Eastland" not found last run (renamed, or no open postings); read unfiltered
+```
+
+To see a board's facet names, look at the `facets` in the answer to the Workday check below: each has a `descriptor` (the facet's name) and `values`, each with its own `descriptor`. A facet can sit inside a group (a board's locations under a location group, for example), and the watcher looks inside groups too. Nested facets have only been tested with fixtures, not against a live board. If a board reaches the page limit, the watch log says how many pages its total fills, such as `page limit reached (25 of 61 pages)`.
 
 #### Check a new ATS board once by hand
 
@@ -416,7 +440,7 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 34
+search.db: applied nothing; schema version 35
 ei_record_2026-27.db: created; schema version 4
 EI claim 2026-27 (from 2026-08-02)
 ```
@@ -435,7 +459,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 34
+search.db       OK  schema version 35
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -444,6 +468,7 @@ watch useful    --  no useful run recorded yet
 bot alerts      OK  not held
 bot refusals    OK  no posting given up
 score timeouts  OK  none set aside
+workday facets  --  none set (ats_facets in a watchlist entry)
 claim 2026-27   OK  schema version 4
 claim 2026-27   OK  active, from 2026-08-02
 claim 2026-27   OK  0600
@@ -888,6 +913,36 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
 
+## Upgrading from 0.8.1 to 0.9.0
+
+Follow the nine steps above with the tag `v0.9.0` (`git checkout v0.9.0` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 4:** nothing has to change. `ats_facets` on a Workday watchlist entry is new and optional (see "Which setting the watcher reads"). If you add it, do so with the services stopped and the data folder backed up (steps 1 and 2).
+- **Step 5:** `doctor` exits 1, because `search.db` is one migration behind:
+
+  ```text
+  search.db       BAD schema version 34, expected 35; run: careerhunter migrate
+  ```
+
+  The claim's record is already at schema version 4.
+- **Step 6:** `migrate` applies one migration to `search.db` and none to the claim's record. Migration 0035 adds the `board_status` table, which holds each faceted Workday board's last facet result. No existing row changes:
+
+  ```text
+  search.db: applied [35]; schema version 35
+  ei_record_2026-27.db: applied nothing; schema version 4
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+- **Step 7:** skip it.
+- **Step 8:** these lines show the upgrade took:
+
+  ```text
+  search.db       OK  schema version 35
+  workday facets  --  none set (ats_facets in a watchlist entry)
+  ```
+
+  With `ats_facets` set, the `workday facets` line is OK, or a WARN per board with a name not found once the board has been read.
+
 ## Upgrading from 0.8.0 to 0.8.1
 
 Follow the nine steps above with the tag `v0.8.1` (`git checkout v0.8.1` in the release checkout, then `uv sync --locked`). These steps differ:
@@ -1124,7 +1179,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 34` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 35` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |
@@ -1135,6 +1190,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `watch: scoring: model unreachable; N postings left for the next run` | The local model stopped answering | Start the model server. The next run scores them |
 | `… left unscored (model took longer than N s …); moved to the back of the queue` | The model was still working on that posting when `scoring.timeout_seconds` ran out | Nothing to fix for one. The run went on, and the posting is tried again after the others. If `doctor`'s `scoring calls` line shows many timeouts, raise the timeout or use a faster model |
 | `score timeouts WARN N postings timed out 2 times in a row; set aside and not scored` | Those postings timed out on two runs in a row and are no longer sent to the model | Run `uv run careerhunter rescore --set-aside` to have the next run try them again, after raising `scoring.timeout_seconds` if they keep timing out |
+| `workday facets WARN <board>: "<facet>: <value>" not found last run …` | A name in that board's `ats_facets` wasn't in its facets on the last read, so the board was read unfiltered | Check the name against the board's search filters. If it was renamed, update `ats_facets`; if no posting has that value now, nothing to fix |
 | `config.yaml BAD … tiers need fit: low \| medium \| high; missing or not one of those on [...]` | A gap tier has no `fit`, or a value other than those three | Add `fit: low`, `medium` or `high` to each tier it names |
 | `watch held WARN … with no fit` | Postings were scored into a tier name that isn't in `fit_rubric.gap_tiers` any more | Put the tier back, or accept that they stay held. The next run fills in their fit once the name is back |
 | `watch run BAD the last run started N min ago and did not finish` | A watch run crashed, was stopped, or hit a database error | See `logs/watch.log`. Its counts are not used; the next finished run counts again |

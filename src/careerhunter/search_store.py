@@ -1130,6 +1130,50 @@ def release_set_aside(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> i
     return count
 
 
+@dataclass(frozen=True)
+class FacetStatus:
+    """A Workday board's `ats_facets` result from its last read (search migration 0035)."""
+
+    company: str
+    unmatched: tuple[str, ...]  # `<facet>: <value>`; empty when every name was found
+    checked_at: str
+
+
+def set_facet_status(
+    conn: sqlite3.Connection, company: str, unmatched: Sequence[str], checked_at: str
+) -> None:
+    """Record this read's facet result for the company's board, replacing the last one."""
+    conn.execute(
+        "INSERT INTO board_status (company_id, facet_status, unmatched, checked_at) "
+        "SELECT id, ?, ?, ? FROM companies WHERE name = ? "
+        "ON CONFLICT (company_id) DO UPDATE SET facet_status = excluded.facet_status, "
+        "unmatched = excluded.unmatched, checked_at = excluded.checked_at",
+        (
+            "unmatched" if unmatched else "matched",
+            json.dumps(list(unmatched), ensure_ascii=False),
+            checked_at,
+            company,
+        ),
+    )
+
+
+def clear_board_status(conn: sqlite3.Connection, company: str) -> None:
+    """Remove the company's board status: its board has no `ats_facets` now."""
+    conn.execute(
+        "DELETE FROM board_status WHERE company_id = (SELECT id FROM companies WHERE name = ?)",
+        (company,),
+    )
+
+
+def facet_statuses(conn: sqlite3.Connection) -> list[FacetStatus]:
+    """Every board's last facet result, by company name."""
+    rows = conn.execute(
+        "SELECT c.name, b.unmatched, b.checked_at FROM board_status b "
+        "JOIN companies c ON c.id = b.company_id ORDER BY c.name"
+    )
+    return [FacetStatus(str(row[0]), tuple(json.loads(row[1])), str(row[2])) for row in rows]
+
+
 def parse_given_up_count(conn: sqlite3.Connection) -> int:
     """Postings the watcher stopped scoring after too many replies that did not parse."""
     row = conn.execute("SELECT count(*) FROM score_parse_failures WHERE given_up_at IS NOT NULL")

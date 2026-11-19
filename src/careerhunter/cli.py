@@ -2175,6 +2175,45 @@ def _doctor_set_aside(report: _Report, search: sqlite3.Connection) -> None:
     )
 
 
+def _doctor_facets(
+    report: _Report, search: sqlite3.Connection, config_doc: dict[str, Any] | None
+) -> None:
+    """Workday boards whose `ats_facets` had a name not found on their last read (0035).
+    Only boards that still have `ats_facets` in config count; one not read yet is OK."""
+    if config_doc is None:
+        return
+    entries = config_doc.get("watchlist")
+    faceted = {
+        str(item["name"]).strip().casefold()
+        for item in (entries if isinstance(entries, list) else [])
+        if isinstance(item, dict)
+        and item.get("ats_type") == "workday"
+        and isinstance(item.get("name"), str)
+        and item.get("ats_facets")
+    }
+    if not faceted:
+        report.line("workday facets", "--", "none set (ats_facets in a watchlist entry)")
+        return
+    warned = False
+    for status in search_store.facet_statuses(search):
+        if status.company.casefold() not in faceted or not status.unmatched:
+            continue
+        warned = True
+        shown = ", ".join(f'"{item}"' for item in status.unmatched)
+        report.line(
+            "workday facets",
+            "WARN",
+            f"{status.company}: {shown} not found last run (renamed, or no open postings); "
+            "read unfiltered",
+        )
+    if not warned:
+        report.line(
+            "workday facets",
+            "OK",
+            f"{plural(len(faceted), 'board', 'boards')} with ats_facets; every name found last run",
+        )
+
+
 def _doctor_job_descriptions(report: _Report, search: sqlite3.Connection) -> None:
     """Applications with no job description (ADR-024). One marked unavailable, with why,
     is `--`, never a warning."""
@@ -2355,6 +2394,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
         _doctor_alert_hold(report, search)
         _doctor_refusals(report, search)
         _doctor_set_aside(report, search)
+        _doctor_facets(report, search, config_doc)
         _doctor_job_descriptions(report, search)
 
     records: dict[str, sqlite3.Connection] = {}

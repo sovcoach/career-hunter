@@ -7,6 +7,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `ats_facets` on a Workday watchlist entry filters the board's list on the board itself, by facet and value names as the board shows them (such as `Work Region: Northland`), never by id. Each run maps the names to ids from the board's facets, looking inside facet groups, and reads the list filtered. A name not found is logged and the board is read unfiltered (search migration 0035). Nested facets have only been tested with fixtures.
+- `doctor` shows `workday facets`: a warning for each board with a name not found on its last read.
+
+### Changed
+- A Workday board that reaches the page limit says how many pages its total fills: `page limit reached (25 of 61 pages)`.
+- `search.db` moves from schema version 34 to 35; the EI record stays at 4.
+
+### Fixed
+- A SmartRecruiters or Workday list whose later page fails no longer throws away the pages read before it: they're recorded, with a note. HTTP 429 or a fetch error there stops the detail requests and fails the board (a 429 also blocks the host for the run); another status lets the details carry on.
+
 ## [0.8.1] - 2026-11-18
 
 ### Added

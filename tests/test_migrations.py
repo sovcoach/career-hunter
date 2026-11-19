@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 35)), "ei_record": [1, 2, 3, 4]}[track]
+    expected = {"search": list(range(1, 36)), "ei_record": [1, 2, 3, 4]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1340,7 +1340,7 @@ def test_search_0034_keeps_every_health_row_and_takes_the_timeout_kind(tmp_path:
             conn.execute(
                 "UPDATE component_health SET last_failure = 'timeout' WHERE component = 'lm_studio'"
             )
-        assert db.migrate(conn, "search") == [34]
+        assert db.migrate(conn, "search", search[:34]) == [34]
         assert conn.execute("SELECT * FROM component_health ORDER BY component").fetchall() == (
             before
         )
@@ -1374,7 +1374,7 @@ def test_search_0034_copies_every_score_call_and_takes_the_timeout_outcome(
         before = conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall()
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(insert, (20, "timeout"))
-        assert db.migrate(conn, "search") == [34]
+        assert db.migrate(conn, "search", search[:34]) == [34]
         # An earlier `unreachable` keeps its outcome: nothing is relabelled.
         assert conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall() == before
         conn.execute(insert, (20, "timeout"))
@@ -1405,5 +1405,40 @@ def test_search_0034_starts_with_no_timeouts_and_checks_them(tmp_path: Path) -> 
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute(bad)
         conn.execute("INSERT INTO score_timeouts VALUES (1, 2, '2026-09-01T10:00:00Z', NULL)")
+    finally:
+        conn.close()
+
+
+# --- search 0035: a board's facet status -------------------------------------------------
+
+
+def test_search_0035_starts_with_no_board_status_and_checks_it(tmp_path: Path) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:34])
+        conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
+        companies = conn.execute("SELECT * FROM companies").fetchall()
+        assert db.migrate(conn, "search") == [35]
+        assert conn.execute("SELECT * FROM companies").fetchall() == companies
+        assert conn.execute("SELECT count(*) FROM board_status").fetchone()[0] == 0
+        insert = "INSERT INTO board_status VALUES (?, ?, ?, ?)"
+        stamp = "2026-09-01T10:00:00Z"
+        for bad in (
+            (1, "partly", "[]", stamp),
+            (1, "matched", '["Region: North"]', stamp),
+            (1, "unmatched", "[]", stamp),
+            (1, "unmatched", "{}", stamp),
+            (1, "unmatched", "not json", stamp),
+            (1, "matched", "[]", "yesterday"),
+            (99, "matched", "[]", stamp),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(insert, bad)
+        conn.execute(insert, (1, "matched", "[]", stamp))
+        conn.execute(
+            "UPDATE board_status SET facet_status = 'unmatched', unmatched = "
+            "'[\"Region: North\"]' WHERE company_id = 1"
+        )
     finally:
         conn.close()

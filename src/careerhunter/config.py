@@ -495,6 +495,58 @@ def _validate_workday_identity(item: dict[str, Any], where: str, problems: list[
         if not isinstance(value, str) or pattern.fullmatch(value) is None:
             shape = "wd and up to three digits" if key == "ats_host" else "one path segment"
             problems.append(f"{where}.{key} must be {shape}")
+    _validate_facets(item, where, problems)
+
+
+MAX_FACETS = 10  # facet names in one entry's ats_facets
+MAX_FACET_VALUES = 50  # value names under one facet
+MAX_FACET_NAME = 100  # characters in a facet or value name
+
+
+def _validate_facets(item: dict[str, Any], where: str, problems: list[str]) -> None:
+    """`ats_facets`: a Workday board's facet filter, as the names the board shows.
+
+    A mapping of facet name to one value name or a list of them, such as
+    `{"Work Region": ["Northland"]}`. Names only, never ids: the watcher looks the ids
+    up in the board's facets every run.
+    """
+    if "ats_facets" not in item:
+        return
+    key = f"{where}.ats_facets"
+    if item.get("ats_type") != "workday":
+        problems.append(f"{key} is for ats_type workday only")
+        return
+    value = item["ats_facets"]
+    if not isinstance(value, dict) or not value:
+        problems.append(f"{key} must map a facet name to a value name or a list of them")
+        return
+    if len(value) > MAX_FACETS:
+        problems.append(f"{key} has more than {MAX_FACETS} facets")
+    for facet, names in value.items():
+        if not _facet_name(facet):
+            problems.append(
+                f"{key} has a facet name that is not text of 1 to {MAX_FACET_NAME} characters"
+            )
+            continue
+        listed = [names] if isinstance(names, str) else names
+        if (
+            not isinstance(listed, list)
+            or not listed
+            or len(listed) > MAX_FACET_VALUES
+            or not all(_facet_name(name) for name in listed)
+        ):
+            problems.append(
+                f"{key}.{facet} must be a value name or a list of 1 to {MAX_FACET_VALUES}, "
+                f"each 1 to {MAX_FACET_NAME} characters"
+            )
+
+
+def _facet_name(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value.strip()) <= MAX_FACET_NAME
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
 
 
 def _validate_alerts(section: Any, problems: list[str]) -> None:

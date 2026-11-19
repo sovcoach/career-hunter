@@ -726,9 +726,113 @@ def test_workday_pages_stop_at_the_page_limit(search: sqlite3.Connection, monkey
     lines = wd_run(search, fetcher)
     assert len(stored(search)) == 2
     assert (
+        "watch: Example Robotics (workday): page limit reached (2 of 5 pages); later "
+        "postings left for the next run"
+    ) in lines
+
+
+def test_the_workday_page_limit_note_without_a_total_names_only_the_limit(
+    search: sqlite3.Connection, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(ats, "WORKDAY_PAGE", 1)
+    monkeypatch.setattr(ats, "MAX_PAGES", 2)
+    fetcher = Posted(
+        routes({f"{WD_BASE}{wd_path(n)}": wd_info("x") for n in (1, 2)}),
+        {0: fetched(wd_page([wd_row(1)])), 1: fetched(wd_page([wd_row(2)]))},
+    )
+    lines = wd_run(search, fetcher)
+    assert (
         "watch: Example Robotics (workday): page limit reached (2 pages); later postings "
         "left for the next run"
     ) in lines
+
+
+def test_a_workday_total_of_61_postings_fills_4_pages_of_20() -> None:
+    assert ats._pages(61, ats.WORKDAY_PAGE) == 4
+    assert ats._pages(60, ats.WORKDAY_PAGE) == 3
+    assert ats._pages(0, ats.WORKDAY_PAGE) is None
+    assert ats._pages(True, ats.WORKDAY_PAGE) is None
+    assert ats._page_limit(61) == (
+        "page limit reached (25 of 61 pages); later postings left for the next run"
+    )
+
+
+def test_a_workday_429_on_a_later_page_keeps_what_was_read_and_blocks_the_host(
+    search: sqlite3.Connection, monkeypatch: Any
+) -> None:
+    wd_run(search, workday_board("examplerobotics"))  # posting 1 is stored
+    assert len(stored(search)) == 1
+    monkeypatch.setattr(ats, "WORKDAY_PAGE", 1)
+    fetcher = Posted(
+        {},
+        {
+            0: fetched(wd_page([wd_row(1)], total=3)),
+            1: fetched(wd_page([wd_row(2)])),
+            2: fetched(status=429, body=b"", retry_after="30"),
+        },
+    )
+    lines = wd_run(search, fetcher)
+    who = "watch: Example Robotics (workday): "
+    assert f"{who}0 new, 1 already recorded" in lines  # pages 1 and 2 were read
+    assert (
+        f"{who}list stopped at offset 2 (HTTP 429); later postings left for the next run"
+    ) in lines
+    assert f"{who}1 postings left for the next run (details stopped: HTTP 429)" in lines
+    assert f"{who}list HTTP 429, retry-after 30; left for the next run" in lines
+    assert fetcher.calls == []  # no detail request after the stop
+    assert lines[-1] == "watch: 0 boards fetched, 1 failed, 0 left"
+    assert len(stored(search)) == 1
+
+
+def test_a_workday_server_error_on_a_later_page_still_reads_the_details(
+    search: sqlite3.Connection, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(ats, "WORKDAY_PAGE", 1)
+    fetcher = Posted(
+        routes({f"{WD_BASE}{wd_path(1)}": wd_info("x")}),
+        {0: fetched(wd_page([wd_row(1)], total=3)), 1: fetched(status=503, body=b"")},
+    )
+    lines = wd_run(search, fetcher)
+    assert len(stored(search)) == 1
+    assert (
+        "watch: Example Robotics (workday): list stopped at offset 1 (HTTP 503); later "
+        "postings left for the next run"
+    ) in lines
+    assert lines[-1] == "watch: 1 boards fetched, 0 failed, 0 left"
+
+
+def test_a_workday_429_on_the_first_page_still_records_nothing(
+    search: sqlite3.Connection,
+) -> None:
+    fetcher = Posted({}, {0: fetched(status=429, body=b"", retry_after="30")})
+    lines = wd_run(search, fetcher)
+    assert stored(search) == []
+    assert (
+        "watch: Example Robotics (workday): HTTP 429, retry-after 30; left for the next run"
+    ) in lines
+
+
+def test_a_smartrecruiters_fetch_error_on_a_later_page_stops_the_details(
+    search: sqlite3.Connection,
+) -> None:
+    board = {
+        sr_list(0): sr_page([sr_posting("744000000000001")], total=9),
+        sr_list(1): FetchFailed("couldn't fetch api.smartrecruiters.com: OSError"),
+    }
+    fetcher = Scripted(routes(board))
+    lines = w.run(search, [SR], today=DAY, fetcher=fetcher)
+    who = "watch: Example Robotics (smartrecruiters): "
+    assert (
+        f"{who}list stopped at offset 1 (FetchFailed); later postings left for the next run"
+    ) in lines
+    assert f"{who}1 postings left for the next run (details stopped: FetchFailed)" in lines
+    assert sr_detail("744000000000001") not in fetcher.calls
+    assert lines[-1] == "watch: 0 boards fetched, 1 failed, 0 left"
+
+
+def test_a_board_over_the_cap_on_a_later_page_still_raises() -> None:
+    with pytest.raises(FetchTooLarge):
+        ats._later_page_stop(FetchTooLarge("too big"), [], 20)
 
 
 def _wd_custom(path: str, title: str, where: str) -> dict[str, object]:
