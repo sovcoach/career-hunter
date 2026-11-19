@@ -7,6 +7,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-18
+
 ### Added
 - `careerhunter rescore --set-aside` releases the postings set aside after scoring timeouts so the next watch run tries them again; `--dry-run` lists them. `rescore --posting <id>` releases a set-aside posting too.
 - `doctor` shows `score timeouts` (postings set aside, with the command that releases them), and the `scoring calls` line counts timed-out calls on their own.
@@ -18,7 +20,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A veto's skip reason and withdrawn message no longer stop mid-phrase without a sign: a rule with no label is named by its first six words, ending in `…` when it goes on.
 
 ### Changed
-- `search.db` moves from schema version 33 to 34; the EI record stays at 4.
+- `search.db` moves from schema version 33 to 34; the EI record stays at 4. Its release checkout uses `v0.8.1`.
 
 ## [0.8.0] - 2026-11-18
 
@@ -315,7 +317,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/sovcoach/career-hunter/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/sovcoach/career-hunter/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/sovcoach/career-hunter/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/sovcoach/career-hunter/compare/v0.5.1...v0.6.0
