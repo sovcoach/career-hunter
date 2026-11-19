@@ -6,6 +6,11 @@ kind (ADR-028):
 
     1. veto: No night-shift roles at a warehouse.
     2. cap medium: A contract whose only stated path is a possible extension.
+    3. veto [no car]: No role that needs a car for daily site visits.
+
+A rule may carry a short label in square brackets after its kind, as in rule 3: at most
+MAX_LABEL characters, with no brackets inside. The label names the rule in the skip
+reason and in the bot's withdrawn message; it is not sent to the model.
 
 Blank lines and lines that start with `#` are ignored. The rules go in the scoring
 request. A posting the model shows meets a veto rule, with a quote from the posting
@@ -13,9 +18,11 @@ that the code checks, is skipped with reason `criteria: N. <the rule's first wor
 A cap rule (`cap low`, `cap medium` or `cap high`, a fit level) lowers the posting's
 fit to at most that level and never skips it. Unset means no criteria are sent.
 
-A line that is not a numbered rule, numbers out of order, a rule with no valid kind, a
-rule over MAX_RULE characters or more than MAX_RULES rules make the file unusable, so a
-file still written as prose, or as rules without kinds, is refused rather than guessed.
+A line that is not a numbered rule, numbers out of order, a rule with no valid kind or
+a bad label (`no-kind`: empty, over MAX_LABEL characters, not closed or holding a
+bracket), a rule over MAX_RULE characters or more than MAX_RULES rules make the file
+unusable, so a file still written as prose, or as rules without kinds, is refused
+rather than guessed.
 
 The file is read only when it is inside the data folder once every symlink is
 resolved, is a regular file readable by its owner only, is UTF-8, and is not empty
@@ -41,9 +48,10 @@ MAX_BYTES = MAX_CHARS * 4  # UTF-8 needs at most 4 bytes a character
 MAX_PATH = 200
 MAX_RULE = 300
 MAX_RULES = 20
+MAX_LABEL = 40
 CONFIG_KEY = "search.criteria_file"
 _RULE = re.compile(r"(\d{1,3})\.\s+(\S.*)")
-_KIND = re.compile(r"(veto|cap\s+(low|medium|high))\s*:\s*(\S.*)", re.IGNORECASE)
+_KIND = re.compile(r"(veto|cap\s+(low|medium|high))\s*(\[[^\]]*\]?)?\s*:\s*(\S.*)", re.IGNORECASE)
 KINDS = ("veto", "cap")
 
 REASONS = {
@@ -58,7 +66,8 @@ REASONS = {
     "out-of-order": "the rules are not numbered 1, 2, 3 in order",
     "rule-too-long": f"a rule is over {MAX_RULE} characters",
     "too-many-rules": f"it has more than {MAX_RULES} rules",
-    "no-kind": "a rule has no kind (start each rule with veto: or cap low|medium|high:)",
+    "no-kind": "a rule has no kind or a bad label (start each rule with veto: or "
+    "cap low|medium|high:, a label as veto [label]:)",
 }
 
 
@@ -74,12 +83,14 @@ class CriteriaError(Exception):
 
 @dataclass(frozen=True)
 class Rule:
-    """One numbered rule: its text after the kind, the kind, and a cap's fit level."""
+    """One numbered rule: its text after the kind, the kind, a cap's fit level, and
+    its label when the file gives one."""
 
     number: int
     text: str
     kind: str = "veto"
     cap: str | None = None  # "low", "medium" or "high" for a cap rule
+    label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -172,8 +183,8 @@ def load(root: Path, config: Mapping[str, Any] | None) -> Criteria | None:
 
 def parse_rules(text: str) -> tuple[Rule, ...]:
     """The numbered rules in `text`. Raises CriteriaError when a line is not one, the
-    numbers are not 1, 2, 3 in order, a rule has no valid kind, a rule is too long, or
-    there are too many."""
+    numbers are not 1, 2, 3 in order, a rule has no valid kind or a bad label, a rule is
+    too long, or there are too many."""
     rules: list[Rule] = []
     for line in text.splitlines():
         line = line.strip()
@@ -184,19 +195,32 @@ def parse_rules(text: str) -> tuple[Rule, ...]:
             raise CriteriaError("not-numbered", chars=len(text))
         if int(match.group(1)) != len(rules) + 1:
             raise CriteriaError("out-of-order", chars=len(text))
-        kind = _KIND.fullmatch(" ".join(match.group(2).split()))
+        rest = " ".join(match.group(2).split())
+        kind = _KIND.fullmatch(rest)
         if kind is None:
             raise CriteriaError("no-kind", chars=len(text))
-        body = kind.group(3)
+        label = _label(kind.group(3), len(text))
+        body = kind.group(4)
         if len(body) > MAX_RULE:
             raise CriteriaError("rule-too-long", chars=len(text))
         cap = kind.group(2).casefold() if kind.group(2) else None
-        rules.append(Rule(len(rules) + 1, body, "cap" if cap else "veto", cap))
+        rules.append(Rule(len(rules) + 1, body, "cap" if cap else "veto", cap, label))
         if len(rules) > MAX_RULES:
             raise CriteriaError("too-many-rules", chars=len(text))
     if not rules:
         raise CriteriaError("empty", chars=len(text))
     return tuple(rules)
+
+
+def _label(raw: str | None, chars: int) -> str | None:
+    """The label inside `[…]`, or None when the rule has none. Raises CriteriaError when
+    it is empty, too long, not closed or holds a bracket."""
+    if raw is None:
+        return None
+    inner = raw[1:-1].strip() if raw.endswith("]") else ""
+    if not inner or len(inner) > MAX_LABEL or "[" in inner:
+        raise CriteriaError("no-kind", chars=chars)
+    return inner
 
 
 def _read(fd: int) -> bytes:
