@@ -13,13 +13,15 @@ env = test_bot.env  # the bot fixture, shared with test_bot
 REASON = "criteria: 2. No contract or term under 12"
 
 
-def _withdraw(env: Env, title: str, company: str = "Example Robotics") -> None:
+def _withdraw(
+    env: Env, title: str, company: str = "Example Robotics", reason: str = REASON
+) -> None:
     """An alerted posting, then vetoed on a re-score: its skip and withdrawal rows."""
     posting_id = alerted(env, url=None, company=company, title=title)
     conn = db.connect(env.datadir.search_db_path)
     try:
         with db.transaction(conn):
-            skip_id = search_store.insert_skip(conn, posting_id, "2026-11-02", REASON)
+            skip_id = search_store.insert_skip(conn, posting_id, "2026-11-02", reason)
             search_store.insert_withdrawal(conn, skip_id)
     finally:
         conn.close()
@@ -34,6 +36,14 @@ def test_one_withdrawal_is_a_single_line(env: Env) -> None:
     env.bot.send_withdrawals()
     env.bot.send_withdrawals()
     assert _withdrawn(env) == [f"withdrawn: Example Robotics — Synthetic Coordinator, {REASON}"]
+
+
+def test_a_labelled_rule_is_named_by_its_label(env: Env) -> None:
+    _withdraw(env, "Synthetic Coordinator", reason="criteria: 2. contract, no path")
+    env.bot.send_withdrawals()
+    assert _withdrawn(env) == [
+        "withdrawn: Example Robotics — Synthetic Coordinator, criteria: 2. contract, no path"
+    ]
 
 
 def test_several_go_in_one_message(env: Env) -> None:

@@ -321,13 +321,13 @@ Some postings you won't take can't be caught by a field or a gate word: a short 
    touch "$CAREERHUNTER_DATA_DIR/criteria.md" && chmod 600 "$CAREERHUNTER_DATA_DIR/criteria.md"
    ```
 
-2. Write one rule per line, numbered 1, 2, 3 in order, each starting with its kind: `veto:`, or `cap low:`, `cap medium:` or `cap high:` (a fit level). Say exactly what the rule covers, with any exception it allows: the model applies it as written, so a rule that names a preference or an asset covers those too. Blank lines and lines starting with `#` are ignored. For example:
+2. Write one rule per line, numbered 1, 2, 3 in order, each starting with its kind: `veto:`, or `cap low:`, `cap medium:` or `cap high:` (a fit level). A rule may also carry a short label in square brackets before the colon, as in `2. veto [short contract]:`. The label names the rule in skip reasons and the withdrawn message, and is never sent to the model. Say exactly what the rule covers, with any exception it allows: the model applies it as written, so a rule that names a preference or an asset covers those too. Blank lines and lines starting with `#` are ignored. For example:
 
    ```text
    # Postings I won't take, and postings I'd hold down
    1. veto: No night-shift roles at a warehouse.
-   2. veto: No contract under 6 months unless a path to permanent is stated.
-   3. cap medium: A role that needs a car for daily site visits.
+   2. veto [short contract]: No contract under 6 months unless a path to permanent is stated.
+   3. cap medium [needs a car]: A role that needs a car for daily site visits.
    ```
 
 3. Set this in `config.yaml`:
@@ -337,19 +337,19 @@ Some postings you won't take can't be caught by a field or a gate word: a short 
      criteria_file: criteria.md
    ```
 
-The path is relative to the data folder and must stay inside it, even through a symlink. The file must be UTF-8 text that only you can read: at most 20 rules, each at most 300 characters, and 4,000 characters in all. Only this file is read: other notes in the data folder never reach the scorer. Leave the key out, or set it to `null`, to send no criteria.
+The path is relative to the data folder and must stay inside it, even through a symlink. The file must be UTF-8 text that only you can read: at most 20 rules, each at most 300 characters, and 4,000 characters in all. A label is 1 to 40 characters with no brackets inside; an empty, longer or unclosed one makes the file unusable, as a rule without its kind does. Only this file is read: other notes in the data folder never reach the scorer. Leave the key out, or set it to `null`, to send no criteria.
 
-**How a rule skips a posting.** When the model finds that a posting meets a rule, it names the rule and quotes the words in the posting that show it. The quote is checked against the title and description that were sent, ignoring case and spacing. If the words are there, the posting is skipped with the reason `criteria: 2. No contract under 6 months unless` (the rule's number and first six words) and never alerted. The log says `watch: <company>: '<title>' skipped (criteria 2)`. If the quote isn't in the posting, is too short, or names a rule the file doesn't have, the veto is rejected and the posting is scored as usual: `veto rejected (quote not found, rule 2); scored`. The quote itself is never stored or logged. Something the rule allows is not a match: an exception the rule names that the posting states, or the allowed side of a limit it sets.
+**How a rule skips a posting.** When the model finds that a posting meets a rule, it names the rule and quotes the words in the posting that show it. The quote is checked against the title and description that were sent, ignoring case and spacing. If the words are there, the posting is skipped with the reason `criteria: 2. short contract` (the rule's number and label) and never alerted. A rule without a label is named by its first six words, with `…` when it goes on: `criteria: 2. No contract under 6 months unless…`. The log says `watch: <company>: '<title>' skipped (criteria 2)`. If the quote isn't in the posting, is too short, or names a rule the file doesn't have, the veto is rejected and the posting is scored as usual: `veto rejected (quote not found, rule 2); scored`. The quote itself is never stored or logged. Something the rule allows is not a match: an exception the rule names that the posting states, or the allowed side of a limit it sets.
 
 **How a cap holds a posting down.** A cap rule is checked the same way: the model quotes the posting, and the quote must be in the text that was sent. If it is, the posting is scored as usual and its fit is stored as the lower of its tier's fit and the cap's level, so a `high` posting under `cap medium` is stored, and alerted, as `medium`. The log says `capped at medium (criteria 3)`. A cap never skips a posting and sends no message, even when a re-score lowers the fit of a posting already alerted. A cap whose quote doesn't check out is rejected and the posting keeps its fit: `cap rejected (quote not found, rule 3); scored`. When a posting meets a veto rule and a cap rule, the veto wins.
 
-If a re-score skips a posting that was already alerted, the bot tells you once, in one message per poll for all of them: `withdrawn: Example Robotics — Synthetic Analyst, criteria: 2. No contract under 6 months unless`.
+If a re-score skips a posting that was already alerted, the bot tells you once, in one message per poll for all of them: `withdrawn: Example Robotics — Synthetic Analyst, criteria: 2. short contract`.
 
-If the file can't be used (missing, readable by others, empty, not UTF-8, over a size cap, not numbered rules such as a file still in plain prose, or a rule without its kind), the watch run holds scoring and logs `watch: scoring: criteria file not usable (<reason>); left for the next run`. The bot tells you why after the first run it holds, and again when scoring resumes. `doctor` shows it too, and counts the vetoes and caps of the last 14 days:
+If the file can't be used (missing, readable by others, empty, not UTF-8, over a size cap, not numbered rules such as a file still in plain prose, or a rule without its kind or with a bad label), the watch run holds scoring and logs `watch: scoring: criteria file not usable (<reason>); left for the next run`. The bot tells you why after the first run it holds, and again when scoring resumes. `doctor` shows it too, and counts the vetoes and caps of the last 14 days:
 
 ```text
 criteria        OK  3 rules (2 vetoes, 1 cap), 214 of 4,000 characters; sent with each scoring call
-criteria        BAD a rule has no kind (start each rule with veto: or cap low|medium|high:); scoring is held
+criteria        BAD a rule has no kind or a bad label (start each rule with veto: or cap low|medium|high:, a label as veto [label]:); scoring is held
 criteria vetoes OK  3 vetoed, 1 rejected; 2 capped, 0 rejected in 14 days
 ```
 

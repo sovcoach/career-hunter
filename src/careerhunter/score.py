@@ -80,7 +80,7 @@ from typing import Any
 
 from careerhunter import loopback
 from careerhunter.config import DEFAULT_CHAT_MODEL, chat_model
-from careerhunter.criteria import Criteria
+from careerhunter.criteria import Criteria, Rule
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText, mentions
 from careerhunter.resume import Resume
@@ -180,7 +180,7 @@ def _transport_failure(exc: BaseException) -> ScoreError:
     return ScoreError(UNREACHED, type_name=type_name)
 
 
-VETO_WORDS = 6  # words of the rule in the skip reason
+VETO_WORDS = 6  # words of an unlabelled rule in the skip reason
 
 
 @dataclass(frozen=True)
@@ -188,7 +188,8 @@ class Veto:
     """A veto in the reply. `rejected` is a key of REJECTED when it was not honoured;
     `rule` is the rule number named, when the reply named one as a number. `skip` is
     the skip reason for an honoured one, built from the criteria file, never the reply:
-    `criteria: N. <the rule's first VETO_WORDS words>`."""
+    `criteria: N. <label>`, or for a rule with no label `criteria: N. <the rule's first
+    VETO_WORDS words>`, ending in `…` when the rule goes on."""
 
     rule: int | None
     rejected: str | None = None
@@ -445,8 +446,16 @@ def _veto(content: str, posting: PostingText, criteria: Criteria) -> Veto | None
     number, rejected = found
     if rejected is not None or number is None:
         return Veto(number, rejected)
-    words = " ".join(criteria.rules[number - 1].text.split()[:VETO_WORDS])
-    return Veto(number, skip=f"criteria: {number}. {words}")
+    return Veto(number, skip=f"criteria: {number}. {_rule_name(criteria.rules[number - 1])}")
+
+
+def _rule_name(rule: Rule) -> str:
+    """The rule's label, else its first VETO_WORDS words, with `…` when it goes on."""
+    if rule.label:
+        return rule.label
+    words = rule.text.split()
+    excerpt = " ".join(words[:VETO_WORDS])
+    return f"{excerpt}…" if len(words) > VETO_WORDS else excerpt
 
 
 def _cap(content: str, posting: PostingText, criteria: Criteria) -> Cap | None:

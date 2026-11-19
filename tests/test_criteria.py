@@ -87,6 +87,31 @@ def test_each_kind_parses(datadir: DataDir, line: str, kind: str, cap: str | Non
     assert found.rules == (criteria.Rule(1, "No synthetic night shifts.", kind, cap),)
 
 
+LONGEST = "x" * criteria.MAX_LABEL
+NIGHT = "No synthetic night shifts."
+
+
+@pytest.mark.parametrize(
+    ("line", "kind", "cap", "label", "text"),
+    [
+        (f"1. veto [night shift]: {NIGHT}", "veto", None, "night shift", NIGHT),
+        (f"1. veto[night shift]:{NIGHT}", "veto", None, "night shift", NIGHT),
+        (f"1. VETO  [  night   shift ] : {NIGHT}", "veto", None, "night shift", NIGHT),
+        (f"1. cap medium [depot, no path]: {NIGHT}", "cap", "medium", "depot, no path", NIGHT),
+        (f"1. veto [a: b]: {NIGHT}", "veto", None, "a: b", NIGHT),
+        (f"1. veto [{LONGEST}]: {NIGHT}", "veto", None, LONGEST, NIGHT),
+        (f"1. veto: [not a label] {NIGHT}", "veto", None, None, f"[not a label] {NIGHT}"),
+    ],
+)
+def test_a_rule_may_carry_a_label(
+    datadir: DataDir, line: str, kind: str, cap: str | None, label: str | None, text: str
+) -> None:
+    _write(datadir.root, line)
+    found = criteria.load(datadir.root, _doc())
+    assert found is not None
+    assert found.rules == (criteria.Rule(1, text, kind, cap, label),)
+
+
 def test_comments_blank_lines_and_spacing_are_ignored(datadir: DataDir) -> None:
     _write(
         datadir.root,
@@ -123,6 +148,13 @@ def test_comments_blank_lines_and_spacing_are_ignored(datadir: DataDir) -> None:
         ("1. veto:", "no-kind"),
         ("1. veto: fine\n2. skip: No synthetic night shifts.", "no-kind"),
         ("# only a comment\n\n", "empty"),
+        ("1. veto []: No synthetic night shifts.", "no-kind"),
+        ("1. veto [  ]: No synthetic night shifts.", "no-kind"),
+        ("1. veto [night shift: No synthetic night shifts.", "no-kind"),
+        ("1. veto [a [b]: No synthetic night shifts.", "no-kind"),
+        ("1. veto [a]b: No synthetic night shifts.", "no-kind"),
+        ("1. veto [" + "x" * (criteria.MAX_LABEL + 1) + "]: No synthetic shifts.", "no-kind"),
+        ("1. cap medium [night shift] No synthetic night shifts.", "no-kind"),
     ],
 )
 def test_a_file_that_is_not_numbered_rules_is_refused(
@@ -295,6 +327,18 @@ def _run(search: sqlite3.Connection, problem: str | None, calls: list[str]) -> l
 def _criteria_health(search: sqlite3.Connection) -> search_store.Health:
     [health] = [h for h in search_store.component_health(search) if h.component == "criteria"]
     return health
+
+
+@pytest.mark.parametrize("reason", sorted(criteria.REASONS))
+def test_every_reason_the_parser_gives_can_be_recorded(
+    search: sqlite3.Connection, reason: str
+) -> None:
+    """Each CriteriaError reason is on component_health's allowed list, so a file that
+    can't be used is always recorded and never breaks the run."""
+    calls: list[str] = []
+    _run(search, reason, calls)
+    assert calls == []
+    assert _criteria_health(search).last_failure == reason
 
 
 def test_a_bad_criteria_file_holds_scoring_and_is_recorded(search: sqlite3.Connection) -> None:

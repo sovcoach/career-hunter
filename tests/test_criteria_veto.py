@@ -79,6 +79,35 @@ def test_2_a_twelve_month_term_with_no_path_is_vetoed() -> None:
     assert result is not None and result.veto == Veto(2)
 
 
+def test_the_skip_reason_is_the_rules_first_words_marked_as_cut() -> None:
+    posting = _posting("A 12-month term position at a synthetic depot.")
+    result = _score(posting, {"rule": 2, "quote": "A 12-month term position"})
+    assert result is not None and result.veto is not None
+    assert result.veto.skip == "criteria: 2. No contract or term of any…"
+
+
+def test_a_short_rule_is_named_whole_with_no_mark() -> None:
+    text = "1. veto: No synthetic night shifts."
+    stated = criteria.Criteria(text, len(text), criteria.parse_rules(text))
+    posting = _posting("Synthetic night shifts at the example depot.")
+    result = _score(posting, {"rule": 1, "quote": "Synthetic night shifts"}, stated=stated)
+    assert result is not None and result.veto is not None
+    assert result.veto.skip == "criteria: 1. No synthetic night shifts."
+
+
+def test_a_labelled_rule_is_named_by_its_label() -> None:
+    text = TEXT.replace("2. veto:", "2. veto [contract, no path]:")
+    stated = criteria.Criteria(text, len(text), criteria.parse_rules(text))
+    seen: list[dict[str, Any]] = []
+    posting = _posting("A 12-month term position at a synthetic depot.")
+    result = _score(
+        posting, {"rule": 2, "quote": "A 12-month term position"}, stated=stated, seen=seen
+    )
+    assert result is not None and result.veto is not None
+    assert result.veto.skip == "criteria: 2. contract, no path"
+    assert "contract, no path" not in json.dumps(seen)  # the label is never sent
+
+
 def test_3_a_contract_with_a_path_to_permanent_is_neither_vetoed_nor_capped() -> None:
     result = _score(
         _posting("A 6-month contract with a stated path to a permanent role at the depot.")
