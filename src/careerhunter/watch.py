@@ -34,7 +34,10 @@ rest are logged and left out, to be read as new next run. A detail that answers 
 another status or a bad body leaves out that posting only. A fetch error or HTTP 429
 on a detail stops
 the board's details: what was read before is recorded, the board counts as failed (or
-as left, when the run budget ran out), and a 429 blocks that host for the run.
+as left, when the run budget ran out), and a 429 blocks that host for the run. A later list
+page of a SmartRecruiters or Workday board that fails keeps the pages read before it,
+with a note. A fetch error or HTTP 429 there stops the details the same way
+(`list HTTP 429, ...`); another status does not, and the board counts as fetched.
 
 One company's failure does not stop the run. An exception while handling one board, or
 one row of the recheck or scoring pass, or the embedding refresh, is rolled back and
@@ -875,7 +878,7 @@ def _watch_one(
     )
     for note in outcome.read.notes:
         lines.append(_line(name, ats, note))
-    return _details_tally(conn, state, blocked, name, ats, key, previous, outcome.read.stopped)
+    return _details_tally(conn, state, blocked, name, ats, key, previous, outcome.read)
 
 
 def _details_tally(
@@ -886,11 +889,13 @@ def _details_tally(
     ats: str,
     key: str,
     previous: str | None,
-    stopped: Exception | None,
+    read: ats_boards.BoardRead,
 ) -> Tally:
-    """A board whose detail requests all ran is fetched. Details stopped by the run
-    budget leave the board for the next run, first in line; any other stop fails it.
-    The postings read before the stop are recorded either way."""
+    """A board whose list pages and detail requests all ran is fetched. A later list page
+    or the details stopped by the run budget leave the board for the next run, first in
+    line; any other stop fails it. The postings read before the stop are recorded either
+    way."""
+    stopped = read.stopped
     if stopped is None:
         return "fetched"
     if isinstance(stopped, FetchTimeout) and state.out_of_time():
@@ -903,7 +908,7 @@ def _details_tally(
             _line(
                 name,
                 ats,
-                f"detail HTTP 429, retry-after {_retry(stopped.retry_after)}; "
+                f"{read.stopped_in} HTTP 429, retry-after {_retry(stopped.retry_after)}; "
                 "left for the next run",
             )
         )

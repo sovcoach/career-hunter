@@ -159,6 +159,7 @@ class BoardRead:
     jobs: list[Job | Skip]
     notes: list[str] = field(default_factory=list)
     stopped: Exception | None = None
+    stopped_in: str = "detail"  # "list" when a later list page stopped the read
 
 
 class Client:
@@ -483,8 +484,12 @@ def read(
 ) -> BoardRead:
     """Every job on one board this run.
 
-    A list request that fails raises: a fetch error as it is, a non-200 reply as
-    BoardHTTPError, a bad body as BoardParseError, and the board stores nothing. Detail
+    A first list request that fails raises: a fetch error as it is, a non-200 reply as
+    BoardHTTPError, a bad body as BoardParseError, and the board stores nothing. When a
+    later list page of a paged board (SmartRecruiters, Workday) answers with a fetch
+    error or a non-200 status, the pages read before it are kept, with a note. A fetch
+    error or HTTP 429 there stops the details too: see `BoardRead.stopped`, with
+    `stopped_in` "list". A bad body on any page still raises. Detail
     requests are made only for postings whose URL is not `known` and whose key is not
     `known_key` (a Workday posting retitled since it was stored has a new URL), at most
     `detail_limit` (DETAIL_LIMIT by default). A detail that answers with a non-200
@@ -502,9 +507,15 @@ def read(
         raise BoardParseError("not a board this module reads")
     limit = DETAIL_LIMIT if detail_limit is None else detail_limit
     if board.ats == "smartrecruiters":
-        stubs, notes = _smartrecruiters_list_pages(board.slug, client)
+        stubs, notes, stopped = _smartrecruiters_list_pages(board.slug, client)
         found = _with_details(
-            stubs, client, (known, known_key), too_old, limit, _smartrecruiters_detail
+            stubs,
+            client,
+            (known, known_key),
+            too_old,
+            limit,
+            _smartrecruiters_detail,
+            stopped=stopped,
         )
         found.notes[:0] = notes
         return found
@@ -512,8 +523,10 @@ def read(
         stubs = _bamboohr_list(board.slug, client.get_json(url))
         return _with_details(stubs, client, (known, known_key), too_old, limit, _bamboohr_detail)
     if board.ats == "workday":
-        stubs, notes = _workday_list_pages(board, url, client, today)
-        found = _with_details(stubs, client, (known, known_key), too_old, limit, _workday_detail)
+        stubs, notes, stopped = _workday_list_pages(board, url, client, today)
+        found = _with_details(
+            stubs, client, (known, known_key), too_old, limit, _workday_detail, stopped=stopped
+        )
         found.notes[:0] = notes
         return found
     return BoardRead(_parse(board.ats, board.slug, client.get_json(url)))
@@ -526,10 +539,16 @@ def _with_details(
     too_old: TooOld,
     limit: int,
     parse_detail: Callable[[Job, object], Job],
+    *,
+    stopped: Exception | None = None,
 ) -> BoardRead:
-    """Fill in each new posting's description from its detail request."""
+    """Fill in each new posting's description from its detail request.
+
+    `stopped` is the HTTP 429 or fetch error that stopped the list early: no detail
+    request is made, and every new posting is left for the next run.
+    """
     known, known_key = knowns
-    out = BoardRead([])
+    out = BoardRead([], stopped=stopped, stopped_in="detail" if stopped is None else "list")
     fetched = 0
     left = 0
     for item in stubs:
@@ -591,12 +610,37 @@ def _smartrecruiters_list(slug: str, offset: int) -> str:
     )
 
 
-def _smartrecruiters_list_pages(slug: str, client: Client) -> tuple[list[Job | Skip], list[str]]:
-    """Every page, by offset. The offset moves by the rows each page really gave."""
+Listed = tuple[list[Job | Skip], list[str], Exception | None]
+
+
+def _later_page_stop(exc: Exception, jobs: list[Job | Skip], offset: int) -> Listed:
+    """A later list page that answered with an error: the pages read before it are kept.
+
+    HTTP 429 or a fetch error also stops the details (the host is refusing or out of
+    reach); another status does not. Going over the byte budget always raises: a board
+    over the cap stores nothing.
+    """
+    if isinstance(exc, FetchTooLarge):
+        raise exc
+    note = f"list stopped at offset {offset} ({_kind(exc)}); later postings left for the next run"
+    stops = isinstance(exc, FetchError) or (isinstance(exc, BoardHTTPError) and exc.status == 429)
+    return jobs, [note], exc if stops else None
+
+
+def _smartrecruiters_list_pages(slug: str, client: Client) -> Listed:
+    """Every page, by offset. The offset moves by the rows each page really gave.
+
+    An error on a later page keeps the pages read before it (`_later_page_stop`).
+    """
     jobs: list[Job | Skip] = []
     offset = 0
-    for _page in range(MAX_PAGES):
-        data = client.get_json(_smartrecruiters_list(slug, offset))
+    for page in range(MAX_PAGES):
+        try:
+            data = client.get_json(_smartrecruiters_list(slug, offset))
+        except (FetchError, BoardHTTPError) as exc:
+            if page == 0:
+                raise
+            return _later_page_stop(exc, jobs, offset)
         content = data.get("content") if isinstance(data, dict) else None
         total = data.get("totalFound") if isinstance(data, dict) else None
         if not isinstance(content, list) or not isinstance(total, int) or not _count(total):
@@ -604,8 +648,12 @@ def _smartrecruiters_list_pages(slug: str, client: Client) -> tuple[list[Job | S
         jobs.extend(_smartrecruiters_job(item, slug) for item in content)
         offset += len(content)
         if not content or offset >= total:
-            return jobs, []
-    return jobs, [f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"]
+            return jobs, [], None
+    return (
+        jobs,
+        [f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"],
+        None,
+    )
 
 
 def _count(value: object) -> bool:
@@ -760,36 +808,48 @@ def _workday_base(board: Board) -> str:
     return f"https://{board.slug}.{board.host}.myworkdayjobs.com/wday/cxs/{board.slug}/{board.site}"
 
 
-def _workday_list_pages(
-    board: Board, url: str, client: Client, today: dt.date | None
-) -> tuple[list[Job | Skip], list[str]]:
+def _workday_list_pages(board: Board, url: str, client: Client, today: dt.date | None) -> Listed:
     """Every page, by offset, until a short page, a repeated page or the page limit.
 
     A page whose externalPaths are the previous page's, in order, means the board is
     ignoring the offset: paging stops there, what was read is kept, and a note says so,
-    the same as the page limit.
+    the same as the page limit. An error on a later page keeps the pages read before it
+    (`_later_page_stop`).
     """
     jobs: list[Job | Skip] = []
     offset = 0
     previous: list[object] | None = None
-    for _page in range(MAX_PAGES):
+    for page in range(MAX_PAGES):
         payload = {"appliedFacets": {}, "limit": WORKDAY_PAGE, "offset": offset, "searchText": ""}
-        data = client.post_json(url, payload)
+        try:
+            data = client.post_json(url, payload)
+        except (FetchError, BoardHTTPError) as exc:
+            if page == 0:
+                raise
+            return _later_page_stop(exc, jobs, offset)
         rows = data.get("jobPostings") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             raise BoardParseError("unexpected JSON shape")
         paths = [row.get("externalPath") if isinstance(row, dict) else None for row in rows]
         if rows and paths == previous:
-            return jobs, [
-                f"repeated page at offset {offset} (the same postings as the page before); "
-                "later postings left for the next run"
-            ]
+            return (
+                jobs,
+                [
+                    f"repeated page at offset {offset} (the same postings as the page before); "
+                    "later postings left for the next run"
+                ],
+                None,
+            )
         previous = paths
         jobs.extend(_workday_job(item, board, today) for item in rows)
         offset += len(rows)
         if len(rows) < WORKDAY_PAGE:
-            return jobs, []
-    return jobs, [f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"]
+            return jobs, [], None
+    return (
+        jobs,
+        [f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"],
+        None,
+    )
 
 
 def _workday_job(item: object, board: Board, today: dt.date | None) -> Job | Skip:
