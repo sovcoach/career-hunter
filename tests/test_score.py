@@ -435,7 +435,9 @@ def test_a_model_that_stops_answering_is_not_asked_again_this_run(
     )
     assert len(postings(search)) == 2
     assert len(calls) == 1
-    assert sum("left unscored (model unreachable)" in line for line in lines) == 1
+    assert (
+        sum("left unscored (model unreachable: RemoteDisconnected)" in line for line in lines) == 1
+    )
     assert sum("left for the next run (model unreachable)" in line for line in lines) == 1
     assert all(row["llm_output"] is None for row in postings(search))
     # The posting the failure happened on keeps its place for the next run.
@@ -464,12 +466,13 @@ def test_a_reply_whose_headers_arrive_at_100_seconds_is_scored(
     assert [a.cancels for a in loopback_watchdog.armed] == [1]
 
 
-def test_a_reply_whose_headers_arrive_at_121_seconds_is_a_miss(
+def test_a_reply_whose_headers_arrive_at_121_seconds_is_a_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server, _clock = _model(monkeypatch, header_cost=121.0)
-    with pytest.raises(ScoreError, match="could not be reached"):
+    with pytest.raises(ScoreError, match="took longer than the timeout") as caught:
         score_posting(posting(), RUBRIC)
+    assert caught.value.kind == "timeout"
     assert server.reads == 0  # the body was never read
     assert server.closes == 1
 

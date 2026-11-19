@@ -479,9 +479,15 @@ def _failure_text(name: str, failures: int, held: int | None, kind: str | None =
     """The one message for an outage: the component, the count, the postings held.
 
     An `unauthorized` failure says so, with the command that stores the token, so a
-    refused token is never read as a server that is down."""
+    refused token is never read as a server that is down. A `timeout` failure (every
+    scoring call of those runs took too long) says so too."""
     waiting = _waiting(held)
     runs = "1 run" if failures == 1 else f"{failures} runs"
+    if kind == "timeout":
+        return (
+            f"Health: {name} has failed {runs} in a row: timeout, every scoring call took "
+            f"longer than scoring.timeout_seconds. {waiting}"
+        )
     if kind == "unauthorized":
         return (
             f"Health: {name} has failed {runs} in a row: unauthorized, it refused the API "

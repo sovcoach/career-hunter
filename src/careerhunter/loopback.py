@@ -12,6 +12,14 @@ The scoring, embedding and SearXNG clients talk to loopback only. None of them i
 
 Redirects are not followed: a 3xx status is returned as it is. Every failure is one
 `LoopbackError` with a fixed message, so no URL, query or text reaches a log.
+
+The error says which failure ended the exchange, from fixed lists only: its `cause`
+is `timeout` (the deadline passed or the watchdog fired: the server may still be
+working), `refused` (nothing listens on the port), `reset` (the server dropped the
+connection) or `failed` (anything else); its `type_name` is the class name of the
+exception that was raised, when that name is in TYPE_NAMES, `DeadlineExceeded` for a
+deadline met between steps, `NotLoopback` for a lookup answer that is refused, and
+`other` for any other exception. No exception message is kept.
 """
 
 from __future__ import annotations
@@ -45,11 +53,60 @@ _clock: Clock = time.monotonic
 _resolver: Resolver = bounded_resolver()
 
 
-class LoopbackError(Exception):
-    """No usable reply from the local server."""
+CAUSES = ("timeout", "refused", "reset", "failed")
+# Exception class names a log may show. Any other is `other`.
+TYPE_NAMES = frozenset(
+    {
+        "BadStatusLine",
+        "BodyCutShort",
+        "BodyTooLarge",
+        "BrokenPipeError",
+        "ConnectionAbortedError",
+        "ConnectionRefusedError",
+        "ConnectionResetError",
+        "DeadlineExceeded",
+        "FetchError",
+        "FetchTimeout",
+        "IncompleteRead",
+        "NotLoopback",
+        "OSError",
+        "RemoteDisconnected",
+        "TimeoutError",
+        "ValueError",
+        "gaierror",
+    }
+)
+_RESET = (
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+    http.client.RemoteDisconnected,
+)
 
-    def __init__(self) -> None:
+
+class LoopbackError(Exception):
+    """No usable reply from the local server. `cause` is one of CAUSES and `type_name`
+    one of TYPE_NAMES or `other`; the message is fixed."""
+
+    def __init__(self, cause: str = "failed", type_name: str = "other") -> None:
         super().__init__("no usable reply from the local server")
+        self.cause = cause if cause in CAUSES else "failed"
+        self.type_name = type_name if type_name in TYPE_NAMES else "other"
+
+
+def _failure(exc: BaseException | None, *, timed_out: bool) -> LoopbackError:
+    """The error for `exc` (None: the deadline passed between steps). `timed_out` is
+    True when the watchdog fired or the deadline passed, whatever was raised after."""
+    name = "DeadlineExceeded" if exc is None else type(exc).__name__
+    if timed_out or exc is None or isinstance(exc, (DeadlineExceeded, TimeoutError)):
+        cause = "timeout"
+    elif isinstance(exc, ConnectionRefusedError):
+        cause = "refused"
+    elif isinstance(exc, _RESET):
+        cause = "reset"
+    else:
+        cause = "failed"
+    return LoopbackError(cause, name)
 
 
 class Response(Protocol):
@@ -100,19 +157,19 @@ def _address(host: str, port: int, limit: Deadline, per_op: float, resolver: Res
     except ValueError:
         try:
             answers = resolver(host, port, limit.cap(per_op))
-        except (FetchError, DeadlineExceeded):
-            raise LoopbackError from None
+        except (FetchError, DeadlineExceeded) as exc:
+            raise _failure(exc, timed_out=limit.expired()) from None
     if not answers:
-        raise LoopbackError
+        raise LoopbackError("failed", "NotLoopback")
     for answer in answers:
         try:
             ip = ipaddress.ip_address(answer.split("%", 1)[0])
         except ValueError:
-            raise LoopbackError from None
+            raise LoopbackError("failed", "NotLoopback") from None
         # Exactly 127.0.0.0/8 or ::1. Not is_loopback, which newer Pythons also grant to
         # an IPv4-mapped address such as ::ffff:127.0.0.1.
         if not (ip in _LOOPBACK_V4 or ip == _LOOPBACK_V6):
-            raise LoopbackError
+            raise LoopbackError("failed", "NotLoopback")
     return answers[0]
 
 
@@ -138,15 +195,15 @@ def exchange(
     address = _address(host, port, limit, per_op, resolver or _resolver)
     try:
         timeout = limit.cap(per_op)
-    except DeadlineExceeded:
-        raise LoopbackError from None
+    except DeadlineExceeded as exc:
+        raise _failure(exc, timed_out=True) from None
     conn = (connector or LoopbackConnection)(host, address, port, timeout)
     hop = Hop(conn)
     armed = (watchdog or _timer)(limit.remaining(), hop.fire)
     try:
         conn.request(method, path, body=body, headers=dict(headers))
         if hop.fired or limit.expired():
-            raise LoopbackError
+            raise _failure(None, timed_out=True)
         response = conn.getresponse()
         declared, chunked = framing(response.getheader, response.status)
         data = read_capped(
@@ -161,16 +218,16 @@ def exchange(
         # is complete. A body that ended at close cannot be checked, so after a fire or
         # past the deadline it may be cut short.
         if declared is None and not chunked and (hop.fired or limit.expired()):
-            raise LoopbackError
+            raise _failure(None, timed_out=True)
         return response.status, data
-    except (BodyTooLarge, BodyCutShort, DeadlineExceeded):
-        raise LoopbackError from None
+    except (BodyTooLarge, BodyCutShort, DeadlineExceeded) as exc:
+        raise _failure(exc, timed_out=hop.fired or limit.expired()) from None
     except ValueError as exc:
         # A read on a socket the watchdog shut can raise ValueError. Any other is a bug.
         if hop.fired or limit.expired():
-            raise LoopbackError from exc
+            raise _failure(exc, timed_out=True) from exc
         raise
     except (OSError, http.client.HTTPException) as exc:
-        raise LoopbackError from exc
+        raise _failure(exc, timed_out=hop.fired or limit.expired()) from exc
     finally:
         hop.close(armed)

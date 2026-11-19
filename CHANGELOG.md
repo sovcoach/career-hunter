@@ -7,6 +7,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `careerhunter rescore --set-aside` releases the postings set aside after scoring timeouts so the next watch run tries them again; `--dry-run` lists them. `rescore --posting <id>` releases a set-aside posting too.
+- `doctor` shows `score timeouts` (postings set aside, with the command that releases them), and the `scoring calls` line counts timed-out calls on their own.
+
+### Fixed
+- A scoring call that reaches `scoring.timeout_seconds` is a timeout, no longer labelled as the model being unreachable (search migration 0034). It no longer stops the run's scoring: the run goes on to the next posting, and the posting moves to the back of the queue instead of being tried first every run. After 2 timeouts in a row the posting is set aside. A run whose scoring calls, two or more, all timed out counts as an LM Studio failure for the health alert.
+- A scoring call that fails names the exception's type in the watch log, from a fixed list.
+
+### Changed
+- `search.db` moves from schema version 33 to 34; the EI record stays at 4.
+
 ## [0.8.0] - 2026-11-18
 
 ### Added

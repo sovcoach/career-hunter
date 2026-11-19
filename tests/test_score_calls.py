@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from careerhunter import cli, watch
+from careerhunter import cli, search_store, watch
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText
 from careerhunter.score import Score, ScoreError
@@ -202,6 +202,47 @@ def test_doctor_with_no_answered_call(
     _seed(search, [("2026-10-31T10:00:00Z", 5_000, "unreachable")])
     assert _doctor(search, capsys) == (
         "scoring calls   --  none answered in 14 days; 1 not answered"
+    )
+
+
+def test_doctor_counts_timeouts_beside_not_answered(
+    search: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed(
+        search,
+        [
+            ("2026-10-31T10:00:00Z", 120_000, "scored"),
+            ("2026-10-31T11:00:00Z", 300_006, "timeout"),
+            ("2026-10-31T12:00:00Z", 300_013, "timeout"),
+            ("2026-10-31T13:00:00Z", 2_000, "unreachable"),
+        ],
+    )
+    assert _doctor(search, capsys, timeout=300) == (
+        "scoring calls   OK  1 answered in 14 days: median 120 s, max 120 s "
+        "(timeout 300 s); 2 timed out; 1 not answered"
+    )
+
+
+def test_doctor_with_only_timeouts(
+    search: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed(search, [("2026-10-31T10:00:00Z", 300_006, "timeout")])
+    assert _doctor(search, capsys) == "scoring calls   --  none answered in 14 days; 1 timed out"
+
+
+def test_doctor_names_set_aside_postings_and_how_to_retry(
+    search: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli._doctor_set_aside(cli._Report(), search)
+    assert capsys.readouterr().out == "score timeouts  OK  none set aside\n"
+    _seed(search, [])
+    posting_id = int(search.execute("SELECT min(id) FROM postings").fetchone()[0])
+    for stamp in ("2026-10-31T10:00:00Z", "2026-10-31T11:00:00Z"):
+        search_store.record_timeout(search, posting_id, stamp, set_aside_after=2)
+    cli._doctor_set_aside(cli._Report(), search)
+    assert capsys.readouterr().out == (
+        "score timeouts  WARN 1 posting timed out 2 times in a row; set aside and not scored "
+        "(retry: careerhunter rescore --set-aside)\n"
     )
 
 

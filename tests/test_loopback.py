@@ -385,3 +385,94 @@ def test_a_body_of_unknown_length_ending_after_a_fire_is_a_miss(
 )
 def test_a_complete_body_is_returned_whole(headers: str, body: bytes, expected: bytes) -> None:
     assert exchange_wired(WireResponse(wire(headers, body))) == (200, expected)
+
+
+# Which failure ended the exchange: a cause and a class name from fixed lists only.
+
+
+def failure(server: FakeServer, clock: FakeClock | None = None, **kw: Any) -> Any:
+    with pytest.raises(loopback.LoopbackError) as caught:
+        call(server, clock, **kw)
+    return caught.value
+
+
+def test_a_drip_feed_past_the_deadline_is_a_timeout(loopback_watchdog: ManualWatchdog) -> None:
+    clock = FakeClock()
+    server = FakeServer(Reply(body=b"x" * 500, step=1, clock=clock, read_cost=1.0))
+    error = failure(server, clock, total=10.0)
+    assert (error.cause, error.type_name) == ("timeout", "DeadlineExceeded")
+
+
+def test_a_reply_that_comes_after_the_deadline_is_a_timeout(
+    loopback_watchdog: ManualWatchdog,
+) -> None:
+    clock = FakeClock()
+    server = FakeServer(Reply(clock=clock, header_cost=301.0))
+    error = failure(server, clock, total=300.0, per_op=300.0)
+    assert error.cause == "timeout"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [http.client.RemoteDisconnected("synthetic"), ConnectionResetError(), OSError("synthetic")],
+    ids=lambda e: type(e).__name__,
+)
+def test_any_error_after_the_watchdog_fired_is_a_timeout_with_its_real_type(
+    loopback_watchdog: ManualWatchdog, error: BaseException
+) -> None:
+    server = FakeServer(Reply(error=error, before_error=loopback_watchdog.fire_all))
+    caught = failure(server)
+    assert (caught.cause, caught.type_name) == ("timeout", type(error).__name__)
+
+
+def test_a_socket_timeout_is_a_timeout() -> None:
+    caught = failure(FakeServer(Reply(error=TimeoutError(), error_at="read")))
+    assert (caught.cause, caught.type_name) == ("timeout", "TimeoutError")
+
+
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [
+        (ConnectionRefusedError(), "refused"),
+        (ConnectionResetError(), "reset"),
+        (BrokenPipeError(), "reset"),
+        (http.client.RemoteDisconnected("synthetic"), "reset"),
+        (OSError("synthetic"), "failed"),
+        (http.client.IncompleteRead(b"par"), "failed"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else type(v).__name__,
+)
+def test_an_error_without_a_fire_keeps_its_cause_and_type(error: BaseException, cause: str) -> None:
+    caught = failure(FakeServer(Reply(error=error, error_at="request")))
+    assert (caught.cause, caught.type_name) == (cause, type(error).__name__)
+
+
+def test_a_body_over_the_cap_fails_and_is_no_timeout() -> None:
+    caught = failure(FakeServer(Reply(body=b"y" * 50, step=4)), max_bytes=10)
+    assert (caught.cause, caught.type_name) == ("failed", "BodyTooLarge")
+
+
+def test_an_unlisted_exception_type_is_other_and_no_message_is_kept() -> None:
+    class SecretError(OSError):
+        pass
+
+    caught = failure(FakeServer(Reply(error=SecretError("token abc"), error_at="request")))
+    assert (caught.cause, caught.type_name) == ("failed", "other")
+    assert str(caught) == "no usable reply from the local server"
+
+
+def test_a_non_loopback_answer_is_named_not_loopback() -> None:
+    with pytest.raises(loopback.LoopbackError) as caught:
+        via_localhost(FakeServer(Reply()), recording(["10.0.0.5"]))
+    assert (caught.value.cause, caught.value.type_name) == ("failed", "NotLoopback")
+
+
+def test_an_expired_budget_is_a_timeout() -> None:
+    clock = FakeClock()
+    caught = failure(FakeServer(Reply()), clock, budget=Deadline(0.0, clock))
+    assert caught.cause == "timeout"
+
+
+def test_an_unknown_cause_or_type_is_never_kept() -> None:
+    error = loopback.LoopbackError("whatever", "Mine")
+    assert (error.cause, error.type_name) == ("failed", "other")

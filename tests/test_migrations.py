@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 34)), "ei_record": [1, 2, 3, 4]}[track]
+    expected = {"search": list(range(1, 35)), "ei_record": [1, 2, 3, 4]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1278,7 +1278,7 @@ def test_search_0033_keeps_every_health_row_and_takes_no_kind(tmp_path: Path) ->
             conn.execute(
                 "UPDATE component_health SET last_failure = 'no-kind' WHERE component = 'criteria'"
             )
-        assert db.migrate(conn, "search") == [33]
+        assert db.migrate(conn, "search", search[:33]) == [33]
         assert conn.execute("SELECT * FROM component_health ORDER BY component").fetchall() == (
             before
         )
@@ -1310,7 +1310,7 @@ def test_search_0033_copies_every_score_call_and_takes_the_cap_outcomes(tmp_path
         before = conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall()
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(insert, (20, "capped"))
-        assert db.migrate(conn, "search") == [33]
+        assert db.migrate(conn, "search", search[:33]) == [33]
         assert conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall() == before
         conn.execute(insert, (20, "capped"))
         conn.execute(insert, (21, "cap_rejected"))
@@ -1318,5 +1318,92 @@ def test_search_0033_copies_every_score_call_and_takes_the_cap_outcomes(tmp_path
             conn.execute(insert, (22, "lowered"))
         indexes = {r[1] for r in conn.execute("PRAGMA index_list(score_calls)")}
         assert "ix_score_calls_started" in indexes
+    finally:
+        conn.close()
+
+
+# --- search 0034: a scoring call that ran out of time is a timeout ---------------------------
+
+
+def test_search_0034_keeps_every_health_row_and_takes_the_timeout_kind(tmp_path: Path) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:33])
+        conn.execute(
+            "UPDATE component_health SET failures = 2, last_failure = 'unreachable', held = 5, "
+            "updated_at = '2026-11-18T10:00:00Z', alerted_failures = 2 "
+            "WHERE component = 'lm_studio'"
+        )
+        before = conn.execute("SELECT * FROM component_health ORDER BY component").fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE component_health SET last_failure = 'timeout' WHERE component = 'lm_studio'"
+            )
+        assert db.migrate(conn, "search") == [34]
+        assert conn.execute("SELECT * FROM component_health ORDER BY component").fetchall() == (
+            before
+        )
+        conn.execute(
+            "UPDATE component_health SET last_failure = 'timeout' WHERE component = 'lm_studio'"
+        )
+    finally:
+        conn.close()
+
+
+def test_search_0034_copies_every_score_call_and_takes_the_timeout_outcome(
+    tmp_path: Path,
+) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:33])
+        conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (1, 'Analyst', '2026-09-01', 'manual')"
+        )
+        conn.execute("INSERT INTO watch_runs (started_at) VALUES ('2026-09-01T10:00:00Z')")
+        insert = (
+            "INSERT INTO score_calls (id, run_id, posting_id, started_at, finished_at, "
+            "duration_ms, outcome) VALUES (?, 1, 1, '2026-09-01T10:00:00Z', "
+            "'2026-09-01T10:05:00Z', 300006, ?)"
+        )
+        for ident, outcome in ((3, "unreachable"), (7, "capped"), (9, "scored")):
+            conn.execute(insert, (ident, outcome))
+        before = conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(insert, (20, "timeout"))
+        assert db.migrate(conn, "search") == [34]
+        # An earlier `unreachable` keeps its outcome: nothing is relabelled.
+        assert conn.execute("SELECT * FROM score_calls ORDER BY id").fetchall() == before
+        conn.execute(insert, (20, "timeout"))
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(insert, (21, "slow"))
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(score_calls)")}
+        assert "ix_score_calls_started" in indexes
+    finally:
+        conn.close()
+
+
+def test_search_0034_starts_with_no_timeouts_and_checks_them(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search")
+        assert conn.execute("SELECT count(*) FROM score_timeouts").fetchone()[0] == 0
+        conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (1, 'Analyst', '2026-09-01', 'manual')"
+        )
+        for bad in (
+            "INSERT INTO score_timeouts VALUES (1, 0, '2026-09-01T10:00:00Z', NULL)",
+            "INSERT INTO score_timeouts VALUES (1, 1, 'yesterday', NULL)",
+            "INSERT INTO score_timeouts VALUES (1, 1, '2026-09-01T10:00:00Z', 'soon')",
+            "INSERT INTO score_timeouts VALUES (99, 1, '2026-09-01T10:00:00Z', NULL)",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(bad)
+        conn.execute("INSERT INTO score_timeouts VALUES (1, 2, '2026-09-01T10:00:00Z', NULL)")
     finally:
         conn.close()

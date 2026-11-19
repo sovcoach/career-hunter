@@ -20,9 +20,12 @@ way the filter matches.
 
 Two kinds of failure are told apart. A server that cannot be reached, a timeout, a
 refused URL, or any HTTP status other than 200 (a redirect included) raises
-ScoreError: the model is not answering, and the caller stops asking it for the rest of
-the run. A 200 whose reply does not parse returns None: that posting stays unscored
-and is tried again on a later run.
+ScoreError: the model did not answer. Its `kind` says which: `timeout` when the call
+reached its time limit (the model may still have been working, on this posting only),
+`unauthorized` for a refused token, else `unreachable`; the watcher carries on after a
+timeout and stops asking the model for the rest of the run after the others. A 200
+whose reply does not parse returns None: that posting stays unscored and is tried
+again on a later run.
 
 While a resume is in use (D-A1), the stored model text is canonical JSON of the parsed
 gaps, never the reply itself. A reply is also treated as one that does not parse when
@@ -135,17 +138,46 @@ CRITERIA_INSTRUCTION = (
 )
 
 
+KINDS = ("unreachable", "unauthorized", "timeout")
+TIMED_OUT = "the local model took longer than the timeout"
+UNREACHED = "the local model could not be reached"
+
+
 class ScoreError(Exception):
     """The model did not answer: a refused URL, no connection, a timeout, or not HTTP 200.
 
     The message is fixed; it never carries the request, the reply or the token. `kind`
-    is `unauthorized` for a 401 or 403 (LM Studio refused the API token), else
-    `unreachable`.
+    is `timeout` when the call reached its time limit, `unauthorized` for a 401 or 403
+    (LM Studio refused the API token), else `unreachable`. `type_name` is the class name
+    of the exception behind it, from `loopback.TYPE_NAMES`, or None when there was none
+    (a refused URL or an HTTP status).
     """
 
-    def __init__(self, message: str, *, kind: str = "unreachable") -> None:
+    def __init__(
+        self, message: str, *, kind: str = "unreachable", type_name: str | None = None
+    ) -> None:
         super().__init__(message)
-        self.kind = kind
+        self.kind = kind if kind in KINDS else "unreachable"
+        self.type_name = type_name
+
+
+def _transport_failure(exc: BaseException) -> ScoreError:
+    """A ScoreError for what a transport raised. One the transport raised itself keeps
+    its kind and type; a socket timeout is a timeout; anything else is unreachable."""
+    if isinstance(exc, ScoreError):
+        return exc
+    if isinstance(exc, loopback.LoopbackError):
+        timed_out = exc.cause == "timeout"
+        return ScoreError(
+            TIMED_OUT if timed_out else UNREACHED,
+            kind="timeout" if timed_out else "unreachable",
+            type_name=exc.type_name,
+        )
+    name = type(exc).__name__
+    type_name = name if name in loopback.TYPE_NAMES else "other"
+    if isinstance(exc, TimeoutError):
+        return ScoreError(TIMED_OUT, kind="timeout", type_name=type_name)
+    return ScoreError(UNREACHED, type_name=type_name)
 
 
 VETO_WORDS = 6  # words of the rule in the skip reason
@@ -265,7 +297,7 @@ def default_transport(
             budget=budget,
         )
     except loopback.LoopbackError as exc:
-        raise ScoreError("the local model could not be reached") from exc
+        raise _transport_failure(exc) from exc
 
 
 MODELS_URL = "http://127.0.0.1:1234/v1/models"
@@ -320,8 +352,9 @@ def score_posting(
     company, the description, a cosine or a note. The one being scored (same company
     and title) is left out.
 
-    Raises ScoreError when the model does not answer. None leaves the posting unscored.
-    The caller does not alert it.
+    Raises ScoreError when the model does not answer, with kind `timeout` when the call
+    reached its time limit. None leaves the posting unscored. The caller does not alert
+    it.
     """
     rubric = _rubric(config)
     if rubric is None:
@@ -330,8 +363,8 @@ def score_posting(
     require_loopback(url)
     try:
         status, body = send(url, _request_body(posting, config, resume, examples, criteria))
-    except (ScoreError, OSError, http.client.HTTPException):
-        raise ScoreError("the local model could not be reached") from None
+    except (ScoreError, OSError, http.client.HTTPException) as exc:
+        raise _transport_failure(exc) from None
     if status in UNAUTHORIZED:
         raise ScoreError("the local model refused the API token", kind="unauthorized")
     if status != 200:

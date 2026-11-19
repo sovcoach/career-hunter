@@ -162,7 +162,7 @@ created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 33
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 34
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -276,6 +276,8 @@ Each is text of 1 to 200 characters, with no control characters and no spaces at
 
 **Reasoning models.** A chat model that thinks before it answers works: its thinking (`<think>…</think>` and the like) is removed before the reply is read, and never stored. Because a reasoning model takes longer, one scoring call may take up to `scoring.timeout_seconds` (60 to 540, default 300). Each call's duration is recorded, and `doctor`'s `scoring calls` line shows the median and the longest answered call of the last 14 days beside the timeout, such as `scoring calls   OK  12 answered in 14 days: median 118 s, max 166 s (timeout 200 s)`. It warns when the longest reaches 90% of the timeout: raise the timeout, or use a faster model. A call starts only while that much of the watch run is left, so the budget never cuts one short. Discovery and the boards have the first 10 minutes of a run; the scoring after them goes on until `scoring.run_minutes` from the start (10 to 50, under `schedule.watcher_interval_minutes`; unset, 20, or 5 less than a shorter interval). With a slow model, a longer run scores more postings: at about 160 seconds a call and boards that take about 3.5 minutes, a 20-minute run scores four or five. Each board's log line says how long its fetch took when that was a second or more, such as `(fetched in 41 s)`. A reply that doesn't parse leaves the posting unscored for the next run; after 3 such replies for one posting, it is given up and never sent to the model again, and `doctor`'s `bot refusals` line counts it.
 
+**A call that times out.** When a scoring call reaches `scoring.timeout_seconds` with no reply, the model may still have been working on that one posting, so the run goes on to the next posting. The log says `watch: <company>: '<title>' left unscored (model took longer than 300 s: DeadlineExceeded); moved to the back of the queue`, the call is counted as timed out in `doctor`'s `scoring calls` line (such as `…; 2 timed out`), and the posting waits behind the others for the next run. After 2 timeouts in a row for the same posting it is set aside and not sent again: the line ends `set aside after 2 timeouts in a row, not tried again until careerhunter rescore --set-aside`, and `doctor` shows `score timeouts  WARN 1 posting timed out 2 times in a row; set aside and not scored (retry: careerhunter rescore --set-aside)`. Run `uv run careerhunter rescore --set-aside` (add `--dry-run` to only list them) to have the next run try them again, or `rescore --posting <id>` for one. A call that is answered, parsed or not, clears the count. A run whose scoring calls, two or more, all timed out counts as an LM Studio failure, so the bot's health message comes after `health.failure_runs` such runs, as for a server that is down. There is no cap on how long a reply may be: cutting a reasoning model short only leaves a reply that doesn't parse.
+
 **Choosing models for your Mac's memory.** On a Mac with Apple silicon, the models share memory with everything else. A model's size on disk is roughly the memory it needs once loaded, plus some for the prompt. Leave at least a third of the memory for macOS and your other apps. As a guide, for chat models stored at 4-bit quantization:
 
 | Memory | Chat model size to look for |
@@ -286,7 +288,7 @@ Each is text of 1 to 200 characters, with no control characters and no spaces at
 
 An embedding model is much smaller, usually under 1 GB. A larger chat model usually lists gaps more carefully and takes longer per posting. A watch run has 600 seconds, and postings it doesn't reach are scored on the next run. If LM Studio can't load a model, pick a smaller one.
 
-If the chat model doesn't answer, the watch log says `watch: scoring: model unreachable; N postings left for the next run`, nothing is alerted until it answers, and after `health.failure_runs` runs in a row the bot tells you. Changing `scoring.chat_model` does not re-score anything by itself. Changing `scoring.embedding_model` does not re-embed stored postings: their stored vectors are compared with the new resume vector as they are, so stored cosines mix the two models until those postings are gone. A cosine never decides anything and is not sent.
+If the chat model doesn't answer at all (a refused connection, a dropped one, or an HTTP error), the posting's line names the error's type, such as `left unscored (model unreachable: ConnectionRefusedError)`, the watch log says `watch: scoring: model unreachable; N postings left for the next run`, nothing is alerted until it answers, and after `health.failure_runs` runs in a row the bot tells you. Changing `scoring.chat_model` does not re-score anything by itself. Changing `scoring.embedding_model` does not re-embed stored postings: their stored vectors are compared with the new resume vector as they are, so stored cosines mix the two models until those postings are gone. A cosine never decides anything and is not sent.
 
 ### Import your resume
 
@@ -414,7 +416,7 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 33
+search.db: applied nothing; schema version 34
 ei_record_2026-27.db: created; schema version 4
 EI claim 2026-27 (from 2026-08-02)
 ```
@@ -433,7 +435,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 33
+search.db       OK  schema version 34
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -441,6 +443,7 @@ watch run       --  none recorded yet
 watch useful    --  no useful run recorded yet
 bot alerts      OK  not held
 bot refusals    OK  no posting given up
+score timeouts  OK  none set aside
 claim 2026-27   OK  schema version 4
 claim 2026-27   OK  active, from 2026-08-02
 claim 2026-27   OK  0600
@@ -1091,7 +1094,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 33` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 34` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |
@@ -1100,6 +1103,8 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `resume WARN left by an interrupted or running import` | An import stopped part-way, or one is running now | Nothing to fix. The next import removes them |
 | `watch: scoring: resume not usable (…)` | The resume can't be used this run, for the reason shown | Run `uv run careerhunter doctor` and fix what it reports. Nothing is scored until then |
 | `watch: scoring: model unreachable; N postings left for the next run` | The local model stopped answering | Start the model server. The next run scores them |
+| `… left unscored (model took longer than N s …); moved to the back of the queue` | The model was still working on that posting when `scoring.timeout_seconds` ran out | Nothing to fix for one. The run went on, and the posting is tried again after the others. If `doctor`'s `scoring calls` line shows many timeouts, raise the timeout or use a faster model |
+| `score timeouts WARN N postings timed out 2 times in a row; set aside and not scored` | Those postings timed out on two runs in a row and are no longer sent to the model | Run `uv run careerhunter rescore --set-aside` to have the next run try them again, after raising `scoring.timeout_seconds` if they keep timing out |
 | `config.yaml BAD … tiers need fit: low \| medium \| high; missing or not one of those on [...]` | A gap tier has no `fit`, or a value other than those three | Add `fit: low`, `medium` or `high` to each tier it names |
 | `watch held WARN … with no fit` | Postings were scored into a tier name that isn't in `fit_rubric.gap_tiers` any more | Put the tier back, or accept that they stay held. The next run fills in their fit once the name is back |
 | `watch run BAD the last run started N min ago and did not finish` | A watch run crashed, was stopped, or hit a database error | See `logs/watch.log`. Its counts are not used; the next finished run counts again |

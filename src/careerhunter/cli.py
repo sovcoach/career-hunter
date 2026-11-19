@@ -626,9 +626,13 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
     their full description first (ADR-027). Only scored watcher or discovery postings
     with no skip and no application; picked by `--posting` ids or by `--gap` text in
     their stored gaps or key requirements. Prints each with its fit now. `--dry-run`
-    writes nothing."""
-    if not args.posting and not args.gap:
-        _err("error: give --posting, or --gap")
+    writes nothing.
+
+    `--set-aside` releases every posting the watcher set aside after scoring timeouts
+    in a row (search migration 0034), scored or not, so the next run sends it to the
+    model again; a `--posting` id that is set aside is released too."""
+    if not args.posting and not args.gap and not args.set_aside:
+        _err("error: give --posting, --gap or --set-aside")
         return EXIT_ERROR
     if not datadir.search_db_path.is_file():
         _err("error: search.db is missing; run careerhunter init")
@@ -636,23 +640,57 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
     conn = db.connect(datadir.search_db_path)
     try:
         db.migrate(conn, "search")
-        rows = search_store.rescore_candidates(conn, args.posting or (), args.gap)
-        missing = sorted(set(args.posting or ()) - {int(r["id"]) for r in rows})
+        picked = set(args.posting or ())
+        rows = (
+            search_store.rescore_candidates(conn, args.posting or (), args.gap)
+            if picked or args.gap
+            else []
+        )
+        aside = [
+            row
+            for row in search_store.set_aside_postings(conn)
+            if args.set_aside or int(row["id"]) in picked
+        ]
+        missing = sorted(picked - {int(r["id"]) for r in rows} - {int(r["id"]) for r in aside})
         for row in rows:
             alerted = "alerted" if row["alerted_at"] else "not alerted"
             print(
                 f"{int(row['id']):5} {row['company']} — {row['title']}: fit {row['fit']}, {alerted}"
             )
+        for row in aside:
+            alerted = "alerted" if row["alerted_at"] else "not alerted"
+            print(
+                f"{int(row['id']):5} {row['company']} — {row['title']}: set aside after "
+                f"timeouts, fit {row['fit']}, {alerted}"
+            )
         for posting_id in missing:
             print(f"{posting_id:5} not queued: not a scored posting without a skip or application")
+        releasing = bool(aside) or args.set_aside
         if args.dry_run:
-            print(f"dry run: nothing is written. {len(rows)} postings would be re-scored.")
+            would = []
+            if picked or args.gap:
+                would.append(f"{len(rows)} postings would be re-scored.")
+            if releasing:
+                would.append(
+                    f"{plural(len(aside), 'set-aside posting', 'set-aside postings')} "
+                    "would be released."
+                )
+            print(f"dry run: nothing is written. {' '.join(would)}")
             return EXIT_OK
         with db.transaction(conn):
             count = search_store.mark_for_rescore(conn, [int(r["id"]) for r in rows])
+            released = search_store.release_set_aside(conn, [int(r["id"]) for r in aside])
     finally:
         conn.close()
-    print(f"{count} postings queued; the next watch run re-scores them while a resume is in use.")
+    if picked or args.gap:
+        print(
+            f"{count} postings queued; the next watch run re-scores them while a resume is in use."
+        )
+    if releasing:
+        print(
+            f"{plural(released, 'set-aside posting', 'set-aside postings')} released; "
+            f"the next watch run sends {'it' if released == 1 else 'them'} again."
+        )
     return EXIT_OK if not missing else EXIT_ERROR
 
 
@@ -1916,9 +1954,10 @@ def _doctor_score_calls(
     since = (now - dt.timedelta(days=SCORE_CALL_DAYS)).astimezone(dt.UTC)
     stats = search_store.score_call_stats(search, since.strftime("%Y-%m-%dT%H:%M:%SZ"))
     timeout = scoring_timeout_seconds(config_doc)
-    missed = f"; {stats.not_answered} not answered" if stats.not_answered else ""
+    missed = f"; {stats.timed_out} timed out" if stats.timed_out else ""
+    missed += f"; {stats.not_answered} not answered" if stats.not_answered else ""
     if not stats.answered_ms:
-        if stats.not_answered:
+        if stats.not_answered or stats.timed_out:
             detail = f"none answered in {SCORE_CALL_DAYS} days{missed}"
         else:
             detail = f"no scoring call in {SCORE_CALL_DAYS} days"
@@ -2121,6 +2160,21 @@ def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
         report.line("bot refusals", "OK", "no posting given up")
 
 
+def _doctor_set_aside(report: _Report, search: sqlite3.Connection) -> None:
+    """Postings the watcher set aside after scoring timeouts in a row (0034), with the
+    command that releases them. Counts only."""
+    count = search_store.set_aside_count(search)
+    if not count:
+        report.line("score timeouts", "OK", "none set aside")
+        return
+    report.line(
+        "score timeouts",
+        "WARN",
+        f"{plural(count, 'posting', 'postings')} timed out {watch.TIMEOUTS_TO_SET_ASIDE} "
+        "times in a row; set aside and not scored (retry: careerhunter rescore --set-aside)",
+    )
+
+
 def _doctor_job_descriptions(report: _Report, search: sqlite3.Connection) -> None:
     """Applications with no job description (ADR-024). One marked unavailable, with why,
     is `--`, never a warning."""
@@ -2300,6 +2354,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
     if search is not None:
         _doctor_alert_hold(report, search)
         _doctor_refusals(report, search)
+        _doctor_set_aside(report, search)
         _doctor_job_descriptions(report, search)
 
     records: dict[str, sqlite3.Connection] = {}
@@ -2432,6 +2487,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--posting", type=int, action="append", metavar="ID", help="a posting id")
     p.add_argument("--gap", metavar="TEXT", help="postings whose stored gaps mention TEXT")
+    p.add_argument(
+        "--set-aside",
+        action="store_true",
+        help="release the postings set aside after scoring timeouts, to be tried again",
+    )
     p.add_argument("--dry-run", action="store_true", help="list them; write nothing")
     p = sub.add_parser(
         "status",

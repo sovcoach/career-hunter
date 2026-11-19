@@ -565,7 +565,9 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
         SELECT
           coalesce(sum(p.llm_output IS NULL AND NOT EXISTS (
             SELECT 1 FROM score_parse_failures f
-            WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL)), 0) AS unscored,
+            WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) AND NOT EXISTS (
+            SELECT 1 FROM score_timeouts t
+            WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL)), 0) AS unscored,
           coalesce(sum(p.llm_output IS NOT NULL AND p.fit IS NULL AND p.alerted_at IS NULL), 0)
             AS no_fit
         FROM postings p
@@ -599,6 +601,7 @@ FAILURE_KINDS = (
     "throttled",
     "failed",
     *CRITERIA_REASONS,
+    "timeout",  # search migration 0034: every scoring call of a run timed out
 )
 
 
@@ -761,7 +764,8 @@ def unchecked_lane_titles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
 
 # `vetoed` and `veto_rejected` (search migration 0032): a criteria veto that was
 # honoured, or one whose quote did not check out, so the posting was scored. `capped`
-# and `cap_rejected` (0033) are the same for a cap rule.
+# and `cap_rejected` (0033) are the same for a cap rule. `timeout` (0034): the call
+# reached scoring.timeout_seconds with no reply; `unreachable` is a server not answering.
 SCORE_OUTCOMES = (
     "scored",
     "unparseable",
@@ -772,6 +776,7 @@ SCORE_OUTCOMES = (
     "veto_rejected",
     "capped",
     "cap_rejected",
+    "timeout",
 )
 # The model replied, parsed or not.
 ANSWERED_OUTCOMES = (
@@ -803,10 +808,12 @@ def record_score_call(
 
 @dataclass(frozen=True)
 class ScoreCallStats:
-    """Scoring calls since a moment: durations of the answered ones, and the rest."""
+    """Scoring calls since a moment: durations of the answered ones, the ones that timed
+    out, and the rest (unreachable, unauthorized, budget)."""
 
     answered_ms: tuple[int, ...]
     not_answered: int
+    timed_out: int = 0
 
 
 def score_call_stats(conn: sqlite3.Connection, since: str) -> ScoreCallStats:
@@ -814,7 +821,8 @@ def score_call_stats(conn: sqlite3.Connection, since: str) -> ScoreCallStats:
         "SELECT duration_ms, outcome FROM score_calls WHERE started_at >= ?", (since,)
     ).fetchall()
     answered = tuple(sorted(int(r[0]) for r in rows if r[1] in ANSWERED_OUTCOMES))
-    return ScoreCallStats(answered, len(rows) - len(answered))
+    timed_out = sum(1 for r in rows if r[1] == "timeout")
+    return ScoreCallStats(answered, len(rows) - len(answered) - timed_out, timed_out)
 
 
 @dataclass(frozen=True)
@@ -1065,6 +1073,61 @@ def record_parse_failure(
 def clear_parse_failures(conn: sqlite3.Connection, posting_id: int) -> None:
     """A reply for the posting parsed: forget its failures."""
     conn.execute("DELETE FROM score_parse_failures WHERE posting_id = ?", (posting_id,))
+
+
+def record_timeout(
+    conn: sqlite3.Connection, posting_id: int, stamp: str, *, set_aside_after: int
+) -> bool:
+    """Count one scoring call for this posting that timed out (search migration 0034).
+    True when this one reached `set_aside_after` in a row, so the posting is now set
+    aside."""
+    conn.execute(
+        "INSERT INTO score_timeouts (posting_id, timeouts, last_timed_out_at) "
+        "VALUES (?, 1, ?) ON CONFLICT (posting_id) DO UPDATE SET timeouts = timeouts + 1, "
+        "last_timed_out_at = excluded.last_timed_out_at",
+        (posting_id, stamp),
+    )
+    cur = conn.execute(
+        "UPDATE score_timeouts SET set_aside_at = ? "
+        "WHERE posting_id = ? AND set_aside_at IS NULL AND timeouts >= ?",
+        (stamp, posting_id, set_aside_after),
+    )
+    return cur.rowcount == 1
+
+
+def clear_timeouts(conn: sqlite3.Connection, posting_id: int) -> None:
+    """A call for the posting was answered: its timeouts are no longer in a row."""
+    conn.execute("DELETE FROM score_timeouts WHERE posting_id = ?", (posting_id,))
+
+
+def set_aside_count(conn: sqlite3.Connection) -> int:
+    """Postings the watcher set aside after too many scoring timeouts in a row."""
+    row = conn.execute("SELECT count(*) FROM score_timeouts WHERE set_aside_at IS NOT NULL")
+    return int(row.fetchone()[0])
+
+
+def set_aside_postings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The postings set aside after timeouts, each with its company, title, fit and
+    whether it was alerted, by id."""
+    return conn.execute(
+        "SELECT p.id, c.name AS company, p.title, p.fit, p.alerted_at "
+        "FROM score_timeouts t JOIN postings p ON p.id = t.posting_id "
+        "JOIN companies c ON c.id = p.company_id "
+        "WHERE t.set_aside_at IS NOT NULL ORDER BY p.id"
+    ).fetchall()
+
+
+def release_set_aside(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> int:
+    """Clear these postings' timeouts, so the next watch run sends them to the model
+    again. How many were set aside."""
+    count = 0
+    for posting_id in posting_ids:
+        count += conn.execute(
+            "DELETE FROM score_timeouts WHERE posting_id = ? AND set_aside_at IS NOT NULL",
+            (posting_id,),
+        ).rowcount
+        conn.execute("DELETE FROM score_timeouts WHERE posting_id = ?", (posting_id,))
+    return count
 
 
 def parse_given_up_count(conn: sqlite3.Connection) -> int:
