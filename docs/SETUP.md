@@ -888,6 +888,36 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
 
+## Upgrading from 0.8.0 to 0.8.1
+
+Follow the nine steps above with the tag `v0.8.1` (`git checkout v0.8.1` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 4:** nothing has to change. Criteria labels are new and optional: with the services stopped and the data folder backed up (steps 1 and 2), you can give each rule a short label after its kind, such as `2. veto [short contract]: …`, so a veto's skip reason and the `withdrawn:` message name it (see "Your scoring criteria"). Keep a copy of the old file next to the backup and keep the file owner-only. A label must be 1 to 40 characters with no brackets inside; an empty, longer or unclosed one makes the file unusable, and `doctor` shows `criteria        BAD a rule has no kind or a bad label …`. A rule without a label still works, and its skip reason now ends in `…` when the rule goes on past six words.
+- **Step 5:** `doctor` exits 1, because `search.db` is one migration behind:
+
+  ```text
+  search.db       BAD schema version 33, expected 34; run: careerhunter migrate
+  ```
+
+  The claim's record is already at schema version 4.
+- **Step 6:** `migrate` applies one migration to `search.db` and none to the claim's record. Migration 0034 rebuilds `score_calls` and `component_health`, copying every row as it was, so a scoring call that times out is recorded as `timeout`, and adds the `score_timeouts` table:
+
+  ```text
+  search.db: applied [34]; schema version 34
+  ei_record_2026-27.db: applied nothing; schema version 4
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+- **Step 7:** skip it.
+- **Step 8:** these lines show the upgrade took:
+
+  ```text
+  search.db       OK  schema version 34
+  score timeouts  OK  none set aside
+  ```
+
+  With a criteria file, the `criteria` line reads as before, labels or not.
+
 ## Upgrading from 0.7.0 to 0.8.0
 
 Follow the nine steps above with the tag `v0.8.0` (`git checkout v0.8.0` in the release checkout, then `uv sync --locked`). These steps differ:
