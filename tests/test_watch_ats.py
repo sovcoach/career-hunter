@@ -726,9 +726,35 @@ def test_workday_pages_stop_at_the_page_limit(search: sqlite3.Connection, monkey
     lines = wd_run(search, fetcher)
     assert len(stored(search)) == 2
     assert (
+        "watch: Example Robotics (workday): page limit reached (2 of 5 pages); later "
+        "postings left for the next run"
+    ) in lines
+
+
+def test_the_workday_page_limit_note_without_a_total_names_only_the_limit(
+    search: sqlite3.Connection, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(ats, "WORKDAY_PAGE", 1)
+    monkeypatch.setattr(ats, "MAX_PAGES", 2)
+    fetcher = Posted(
+        routes({f"{WD_BASE}{wd_path(n)}": wd_info("x") for n in (1, 2)}),
+        {0: fetched(wd_page([wd_row(1)])), 1: fetched(wd_page([wd_row(2)]))},
+    )
+    lines = wd_run(search, fetcher)
+    assert (
         "watch: Example Robotics (workday): page limit reached (2 pages); later postings "
         "left for the next run"
     ) in lines
+
+
+def test_a_workday_total_of_61_postings_fills_4_pages_of_20() -> None:
+    assert ats._pages(61, ats.WORKDAY_PAGE) == 4
+    assert ats._pages(60, ats.WORKDAY_PAGE) == 3
+    assert ats._pages(0, ats.WORKDAY_PAGE) is None
+    assert ats._pages(True, ats.WORKDAY_PAGE) is None
+    assert ats._page_limit(61) == (
+        "page limit reached (25 of 61 pages); later postings left for the next run"
+    )
 
 
 def test_a_workday_429_on_a_later_page_keeps_what_was_read_and_blocks_the_host(

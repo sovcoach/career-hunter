@@ -674,11 +674,21 @@ def _smartrecruiters_list_pages(slug: str, client: Client) -> Listed:
         offset += len(content)
         if not content or offset >= total:
             return jobs, [], None
-    return (
-        jobs,
-        [f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"],
-        None,
-    )
+    return jobs, [_page_limit(None)], None
+
+
+def _pages(total: object, size: int) -> int | None:
+    """How many list pages the board's total fills, or None when it gives none."""
+    if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
+        return None
+    return -(-total // size)
+
+
+def _page_limit(pages: int | None) -> str:
+    """The note for a board read to MAX_PAGES, with the pages its total fills when known:
+    Workday's first page gives the total, and every Workday page holds WORKDAY_PAGE."""
+    shown = f"{MAX_PAGES} pages" if pages is None else f"{MAX_PAGES} of {pages} pages"
+    return f"page limit reached ({shown}); later postings left for the next run"
 
 
 def _count(value: object) -> bool:
@@ -866,6 +876,7 @@ def _workday_list_pages(
             first = None
     jobs: list[Job | Skip] = []
     offset = 0
+    pages: int | None = None
     previous: list[object] | None = None
     for page in range(MAX_PAGES):
         try:
@@ -888,12 +899,13 @@ def _workday_list_pages(
             )
             return (jobs, [note], None), check
         previous = paths
+        if page == 0:  # `total` is only filled in on the first page
+            pages = _pages(data.get("total") if isinstance(data, dict) else None, WORKDAY_PAGE)
         jobs.extend(_workday_job(item, board, today) for item in rows)
         offset += len(rows)
         if len(rows) < WORKDAY_PAGE:
             return (jobs, [], None), check
-    note = f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"
-    return (jobs, [note], None), check
+    return (jobs, [_page_limit(pages)], None), check
 
 
 # A facet's request key and a value's id, as the board sends them. Anything else in a
