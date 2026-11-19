@@ -104,10 +104,10 @@ pre-commit installed at .git/hooks/pre-commit
 
 The background services (Step 10c) must run from a **release checkout**: a second folder that holds one release tag and nothing else. `uv sync` installs career-hunter so that it runs whatever source is in its folder, and `careerhunter` applies any new database migration it finds there the next time it opens `search.db`. If the services ran from the folder above and you checked out an unreleased branch there, a running service could apply that branch's migration to your real `search.db`; once applied, a migration can't be changed, and every restart (a crash, a reboot) would run whatever branch was checked out.
 
-Make the release checkout next to the first one. This guide uses the tag `v0.8.0`; use the latest release tag:
+Make the release checkout next to the first one. This guide uses the tag `v0.8.1`; use the latest release tag:
 
 ```bash
-cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.8.0
+cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.8.1
 ```
 
 ```bash
@@ -887,6 +887,36 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    The output is the two `installed …` lines in Step 10c. Run `doctor` once more to see the services running.
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
+
+## Upgrading from 0.8.0 to 0.8.1
+
+Follow the nine steps above with the tag `v0.8.1` (`git checkout v0.8.1` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 4:** nothing has to change. Criteria labels are new and optional: with the services stopped and the data folder backed up (steps 1 and 2), you can give each rule a short label after its kind, such as `2. veto [short contract]: …`, so a veto's skip reason and the `withdrawn:` message name it (see "Your scoring criteria"). Keep a copy of the old file next to the backup and keep the file owner-only. A label must be 1 to 40 characters with no brackets inside; an empty, longer or unclosed one makes the file unusable, and `doctor` shows `criteria        BAD a rule has no kind or a bad label …`. A rule without a label still works, and its skip reason now ends in `…` when the rule goes on past six words.
+- **Step 5:** `doctor` exits 1, because `search.db` is one migration behind:
+
+  ```text
+  search.db       BAD schema version 33, expected 34; run: careerhunter migrate
+  ```
+
+  The claim's record is already at schema version 4.
+- **Step 6:** `migrate` applies one migration to `search.db` and none to the claim's record. Migration 0034 rebuilds `score_calls` and `component_health`, copying every row as it was, so a scoring call that times out is recorded as `timeout`, and adds the `score_timeouts` table:
+
+  ```text
+  search.db: applied [34]; schema version 34
+  ei_record_2026-27.db: applied nothing; schema version 4
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+- **Step 7:** skip it.
+- **Step 8:** these lines show the upgrade took:
+
+  ```text
+  search.db       OK  schema version 34
+  score timeouts  OK  none set aside
+  ```
+
+  With a criteria file, the `criteria` line reads as before, labels or not.
 
 ## Upgrading from 0.7.0 to 0.8.0
 
