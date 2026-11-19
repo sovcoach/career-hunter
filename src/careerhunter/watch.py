@@ -360,7 +360,7 @@ class _Aligned:
 
 
 class _Entry(NamedTuple):
-    """One watchlist entry. `host` and `site` are Workday's only."""
+    """One watchlist entry. `host`, `site` and `facets` are Workday's only."""
 
     name: str
     ats: str | None
@@ -368,6 +368,7 @@ class _Entry(NamedTuple):
     role_filters: Mapping[str, Any] | None
     host: str | None = None
     site: str | None = None
+    facets: ats_boards.Facets = ()
 
     def board(self) -> ats_boards.Board | None:
         if self.ats is None or not self.slug:
@@ -783,11 +784,28 @@ def _entry(item: object) -> _Entry | None:
         role_filters if isinstance(role_filters, dict) else None,
         _stripped(item.get("ats_host")),
         _stripped(item.get("ats_site")),
+        _facets(item.get("ats_facets")) if ats == "workday" else (),
     )
 
 
 def _stripped(value: object) -> str | None:
     return value.strip() if isinstance(value, str) else None
+
+
+def _facets(value: object) -> ats_boards.Facets:
+    """`ats_facets` as facet names, each with its value names (one name or a list).
+    config.yaml is validated before a run; anything else here is left out."""
+    if not isinstance(value, dict):
+        return ()
+    found: list[tuple[str, tuple[str, ...]]] = []
+    for facet, values in value.items():
+        names = [values] if isinstance(values, str) else values
+        if not isinstance(facet, str) or not facet.strip() or not isinstance(names, list):
+            continue
+        kept = tuple(name.strip() for name in names if isinstance(name, str) and name.strip())
+        if kept:
+            found.append((facet.strip(), kept))
+    return tuple(found)
 
 
 def _watch_one(
@@ -843,7 +861,7 @@ def _watch_one(
     key = board.key
     previous = _stamp_attempt(conn, key, state.now())
     began = state.monotonic()
-    outcome = _fetch_jobs(conn, state, blocked, name, board, host, client)
+    outcome = _fetch_jobs(conn, state, blocked, name, board, host, client, entry.facets)
     fetch_seconds = state.monotonic() - began
     if isinstance(outcome, _Left):
         _restore_attempt(conn, key, previous)
@@ -862,6 +880,8 @@ def _watch_one(
             )
         lines.append(_line(name, ats, f"stored ats identity disagrees ({shown}); skipped"))
         return "failed"
+    if ats == "workday":
+        _record_facets(conn, state, name, outcome.read.facets)
     _record_jobs(
         conn,
         state,
@@ -879,6 +899,23 @@ def _watch_one(
     for note in outcome.read.notes:
         lines.append(_line(name, ats, note))
     return _details_tally(conn, state, blocked, name, ats, key, previous, outcome.read)
+
+
+def _record_facets(
+    conn: sqlite3.Connection, state: _State, name: str, check: ats_boards.FacetCheck | None
+) -> None:
+    """Set or clear the board's facet status (search migration 0035) once its list has
+    been read: a board with `ats_facets` gets this run's result, with the names not
+    found and the time; a board without them has its row removed. A name not found is
+    logged too, and the board was read unfiltered."""
+    if check is not None and check.unmatched:
+        shown = ", ".join(f'"{item}"' for item in check.unmatched)
+        state.lines.append(_line(name, "workday", f"ats_facets {shown} not found; read unfiltered"))
+    with db.transaction(conn):
+        if check is None:
+            search_store.clear_board_status(conn, name)
+        else:
+            search_store.set_facet_status(conn, name, check.unmatched, _iso(state.now()))
 
 
 def _details_tally(
@@ -1039,10 +1076,12 @@ def _fetch_jobs(
     board: ats_boards.Board,
     host: str,
     client: ats_boards.Client,
+    facets: ats_boards.Facets = (),
 ) -> _Parsed | _Failed | _Left:
     """Read one board. A failed list, or one the run budget cut short, stores nothing.
 
-    A posting whose URL is stored already gets no detail request (`ats.read`).
+    A posting whose URL is stored already gets no detail request (`ats.read`). A Workday
+    board's `facets` filter its list when every name is found (`ats.read`).
     """
     lines = state.lines
     ats = board.ats
@@ -1061,7 +1100,13 @@ def _fetch_jobs(
     try:
         return _Parsed(
             ats_boards.read(
-                board, client, known=known, known_key=known_key, today=day, too_old=too_old
+                board,
+                client,
+                known=known,
+                known_key=known_key,
+                today=day,
+                too_old=too_old,
+                facets=facets,
             )
         )
     except FetchError as exc:

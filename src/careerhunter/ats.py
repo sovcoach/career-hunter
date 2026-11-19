@@ -160,6 +160,25 @@ class BoardRead:
     notes: list[str] = field(default_factory=list)
     stopped: Exception | None = None
     stopped_in: str = "detail"  # "list" when a later list page stopped the read
+    # How a Workday board's `ats_facets` matched this run; None when it has none.
+    facets: FacetCheck | None = None
+
+
+# A Workday board's facet filter from its watchlist entry (`ats_facets`): each facet by
+# the name the board shows, with the value names to keep. Names, never ids: the ids are
+# looked up in the board's own facets every run.
+Facets = tuple[tuple[str, tuple[str, ...]], ...]
+
+
+@dataclass(frozen=True)
+class FacetCheck:
+    """How `ats_facets` matched the board's facets this run.
+
+    `unmatched` has each name not found, as `<facet>: <value>`, in config order. Any
+    unmatched name means the board was read unfiltered, as if it had no `ats_facets`.
+    """
+
+    unmatched: tuple[str, ...] = ()
 
 
 class Client:
@@ -481,8 +500,13 @@ def read(
     today: dt.date | None = None,
     too_old: TooOld = _never_too_old,
     known_key: Known = _nothing_known,
+    facets: Facets = (),
 ) -> BoardRead:
     """Every job on one board this run.
+
+    `facets` applies to a Workday board only (`_workday_list_pages`): its list is read
+    filtered by those facet values when every name is found, else unfiltered. The
+    result's `facets` says how they matched.
 
     A first list request that fails raises: a fetch error as it is, a non-200 reply as
     BoardHTTPError, a bad body as BoardParseError, and the board stores nothing. When a
@@ -523,11 +547,12 @@ def read(
         stubs = _bamboohr_list(board.slug, client.get_json(url))
         return _with_details(stubs, client, (known, known_key), too_old, limit, _bamboohr_detail)
     if board.ats == "workday":
-        stubs, notes, stopped = _workday_list_pages(board, url, client, today)
+        (stubs, notes, stopped), check = _workday_list_pages(board, url, client, today, facets)
         found = _with_details(
             stubs, client, (known, known_key), too_old, limit, _workday_detail, stopped=stopped
         )
         found.notes[:0] = notes
+        found.facets = check
         return found
     return BoardRead(_parse(board.ats, board.slug, client.get_json(url)))
 
@@ -808,48 +833,142 @@ def _workday_base(board: Board) -> str:
     return f"https://{board.slug}.{board.host}.myworkdayjobs.com/wday/cxs/{board.slug}/{board.site}"
 
 
-def _workday_list_pages(board: Board, url: str, client: Client, today: dt.date | None) -> Listed:
+def _workday_payload(applied: dict[str, list[str]], offset: int) -> dict[str, object]:
+    return {"appliedFacets": applied, "limit": WORKDAY_PAGE, "offset": offset, "searchText": ""}
+
+
+def _workday_list_pages(
+    board: Board, url: str, client: Client, today: dt.date | None, facets: Facets = ()
+) -> tuple[Listed, FacetCheck | None]:
     """Every page, by offset, until a short page, a repeated page or the page limit.
 
     A page whose externalPaths are the previous page's, in order, means the board is
     ignoring the offset: paging stops there, what was read is kept, and a note says so,
     the same as the page limit. An error on a later page keeps the pages read before it
     (`_later_page_stop`).
+
+    With `facets`, the unfiltered first page is read for the board's facets, and the
+    names are mapped to request keys and ids (`facet_ids`). When every name is found the
+    list is then paged from offset 0 with those facets applied, so the first request is
+    one extra. When any name is not found the board is read unfiltered, and that first
+    page is its first page.
     """
+    applied: dict[str, list[str]] = {}
+    check: FacetCheck | None = None
+    first: object | None = None
+    if facets:
+        first = client.post_json(url, _workday_payload({}, 0))  # a failure raises, as before
+        applied, unmatched = facet_ids(first, facets)
+        check = FacetCheck(tuple(unmatched))
+        if unmatched:
+            applied = {}
+        else:
+            first = None
     jobs: list[Job | Skip] = []
     offset = 0
     previous: list[object] | None = None
     for page in range(MAX_PAGES):
-        payload = {"appliedFacets": {}, "limit": WORKDAY_PAGE, "offset": offset, "searchText": ""}
         try:
-            data = client.post_json(url, payload)
+            if page == 0 and first is not None:
+                data = first
+            else:
+                data = client.post_json(url, _workday_payload(applied, offset))
         except (FetchError, BoardHTTPError) as exc:
             if page == 0:
                 raise
-            return _later_page_stop(exc, jobs, offset)
+            return _later_page_stop(exc, jobs, offset), check
         rows = data.get("jobPostings") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             raise BoardParseError("unexpected JSON shape")
         paths = [row.get("externalPath") if isinstance(row, dict) else None for row in rows]
         if rows and paths == previous:
-            return (
-                jobs,
-                [
-                    f"repeated page at offset {offset} (the same postings as the page before); "
-                    "later postings left for the next run"
-                ],
-                None,
+            note = (
+                f"repeated page at offset {offset} (the same postings as the page before); "
+                "later postings left for the next run"
             )
+            return (jobs, [note], None), check
         previous = paths
         jobs.extend(_workday_job(item, board, today) for item in rows)
         offset += len(rows)
         if len(rows) < WORKDAY_PAGE:
-            return jobs, [], None
-    return (
-        jobs,
-        [f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"],
-        None,
-    )
+            return (jobs, [], None), check
+    note = f"page limit reached ({MAX_PAGES} pages); later postings left for the next run"
+    return (jobs, [note], None), check
+
+
+# A facet's request key and a value's id, as the board sends them. Anything else in a
+# facet group is not used.
+_FACET_KEY = re.compile(r"^[A-Za-z0-9_]{1,100}$")
+_FACET_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+
+
+def _folded_name(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def _facet_leaves(nodes: object) -> list[tuple[str, str, list[tuple[str, str]]]]:
+    """Every facet on a list page as (name, request key, [(value name, id)]).
+
+    A facet is `{facetParameter, descriptor, values}`. A value is `{descriptor, id}`; a
+    value that is itself a facet (`facetParameter` and `values`) is a facet nested in a
+    group, such as a board's locations under a location group, and is walked too. A
+    group whose values are all facets gives no values of its own.
+    """
+    found: list[tuple[str, str, list[tuple[str, str]]]] = []
+    if not isinstance(nodes, list):
+        return found
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        key, name, values = node.get("facetParameter"), node.get("descriptor"), node.get("values")
+        if not isinstance(values, list):
+            continue
+        own: list[tuple[str, str]] = []
+        nested: list[object] = []
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            if "facetParameter" in value and isinstance(value.get("values"), list):
+                nested.append(value)
+                continue
+            label, ident = value.get("descriptor"), value.get("id")
+            if isinstance(label, str) and isinstance(ident, str) and _FACET_ID.fullmatch(ident):
+                own.append((label, ident))
+        if own and isinstance(key, str) and isinstance(name, str) and _FACET_KEY.fullmatch(key):
+            found.append((name, key, own))
+        found.extend(_facet_leaves(nested))
+    return found
+
+
+def facet_ids(data: object, facets: Facets) -> tuple[dict[str, list[str]], list[str]]:
+    """`appliedFacets` for these facet and value names, and the names not found.
+
+    Names match the board's own after case folding and with runs of spaces as one. A
+    value name that several values share stands for all of them, as does a facet name
+    several facets share. A name not found is `<facet>: <value>`, once per value.
+    """
+    leaves = _facet_leaves(data.get("facets") if isinstance(data, dict) else None)
+    applied: dict[str, list[str]] = {}
+    unmatched: list[str] = []
+    for facet, values in facets:
+        wanted = _folded_name(facet)
+        matching = [(key, own) for name, key, own in leaves if _folded_name(name) == wanted]
+        for value in values:
+            label = _folded_name(value)
+            hits = [
+                (key, ident)
+                for key, own in matching
+                for name, ident in own
+                if _folded_name(name) == label
+            ]
+            if not hits:
+                unmatched.append(f"{facet}: {value}")
+                continue
+            for key, ident in hits:
+                ids = applied.setdefault(key, [])
+                if ident not in ids:
+                    ids.append(ident)
+    return applied, unmatched
 
 
 def _workday_job(item: object, board: Board, today: dt.date | None) -> Job | Skip:
