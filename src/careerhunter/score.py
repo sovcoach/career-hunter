@@ -16,11 +16,13 @@ from a fixed list (GAP_TYPES). With a resume, a `yes` or `partly` whose evidence
 found in the resume counts as `no`, and so does an `experience` item whose evidence is
 only in the resume's summary: experience counts only where the roles and skills show it
 (`resume_parts`). An unmet tool or skill whose name appears outside the summary is a
-minor gap (`partly`), never core. An `entry_level` flag counts only with a quote found
-in the posting. The tier (high, medium or low) is computed here from the core and minor
-gaps (`_apply_tiers`, `fit_rubric.requirement_tiers`), and no threshold is ever sent to
-the model. This module stores the tier name. `fit_rating` is left null. There is no
-mapping onto 0-10.
+minor gap (`partly`), never core. The seniority line: an unmet ask of 4 or more years is
+a core seniority gap, a smaller one is minor (and no gap at all with a junior or entry
+title), and a senior or lead title is a core seniority gap. An `entry_level` flag counts
+only with a quote found in the posting. The tier (high, medium or low) is computed here
+from the core and minor gaps (`_apply_tiers`, `fit_rubric.requirement_tiers`), and no
+threshold is ever sent to the model. This module stores the tier name. `fit_rating` is
+left null. There is no mapping onto 0-10.
 
 The hard gates are not sent (ADR-027). `filters.decide` has applied them before any
 posting is scored, and a model shown `required_languages` next to a posting reported
@@ -306,6 +308,9 @@ class _Gap:
     type: str | None
     # Used for the tier only, never stored: the gap is the role's main job function.
     main_function: bool = dataclasses.field(default=False, compare=False)
+    # Used for the tier only: a seniority gap (4 or more years asked, or a senior or
+    # lead title), which rules out high.
+    seniority: bool = dataclasses.field(default=False, compare=False)
 
 
 # What the reply classes each stated item as. Only an unmet `required` or `preferred`
@@ -474,7 +479,7 @@ def score_posting(
     ]
     if resume is not None:
         items = [_evidenced(item, resume.text) for item in items]
-    parsed = derive_gaps(items)
+    parsed = derive_gaps(items, posting.title)
     if resume is not None and _copies_resume(parsed, resume.text):
         return None
     veto = None if criteria is None else _veto(content, posting, criteria)
@@ -898,16 +903,66 @@ def _terms(text: str) -> list[str]:
     return terms
 
 
-def derive_gaps(items: Sequence[Requirement]) -> list[_Gap]:
+# The seniority line (operator, Batch Q). An unmet ask of SENIOR_YEARS or more years is a
+# core seniority gap; a smaller one is minor, and with a junior or entry title it isn't
+# a gap at all. A senior or lead title is a seniority gap too.
+SENIOR_YEARS = 4
+_JUNIOR_TITLE = (
+    "junior",
+    "jr",
+    "entry",
+    "entry level",
+    "associate",
+    "new grad",
+    "new graduate",
+    "recent graduate",
+    "graduate",
+    "intern",
+    "internship",
+    "co-op",
+    "tier 1",
+    "level 1",
+)
+_SENIOR_TITLE = ("senior", "sr", "lead")
+_LEVEL_ONE = re.compile(r"(?:^|\s)(?:i|1)\s*(?:$|[,(\-\u2013\u2014|])", re.IGNORECASE)
+SENIOR_TITLE_GAP = "Senior or lead title"
+
+
+def junior_title(title: str) -> bool:
+    """True for a junior or entry title: junior, entry level, associate, new or recent
+    graduate, intern, co-op, Tier 1 or Level 1, or a level I or 1 after the role."""
+    return any(has_phrase(title, word) for word in _JUNIOR_TITLE) or bool(_LEVEL_ONE.search(title))
+
+
+def senior_title(title: str) -> bool:
+    """True for a senior or lead title (senior, sr, lead, as whole words)."""
+    return any(has_phrase(title, word) for word in _SENIOR_TITLE)
+
+
+def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
     """The gaps, in code: an unmet `required` or `preferred` item, or a `soft` one not
     met at all. A `core` item not met at all is a core gap; anything else, a partly met
-    item included, is minor. Duties and trained items are never gaps."""
+    item included, is minor. Duties and trained items are never gaps.
+
+    The seniority line comes first for an item that asks for years: SENIOR_YEARS or more,
+    not met at all, is a core seniority gap whatever the reply's `core` says; fewer is
+    minor, and is no gap at all with a junior or entry `title`. A senior or lead `title`
+    adds a core seniority gap."""
     gaps: list[_Gap] = []
     seen: set[str] = set()
+    junior = junior_title(title)
     for item in items:
         if item.met == "yes":
             continue
-        if item.kind in GAP_KINDS:
+        seniority = False
+        if item.kind in GAP_KINDS and item.years >= SENIOR_YEARS:
+            kind = "core" if item.met == "no" else "minor"
+            seniority = item.met == "no"
+        elif item.kind in GAP_KINDS and item.years > 0:
+            if junior:
+                continue
+            kind = "minor"
+        elif item.kind in GAP_KINDS:
             kind = "core" if item.core and item.met == "no" else "minor"
         elif item.kind == "soft" and item.met == "no":
             kind = "minor"
@@ -917,7 +972,17 @@ def derive_gaps(items: Sequence[Requirement]) -> list[_Gap]:
         if not name or name.casefold() in seen:
             continue
         seen.add(name.casefold())
-        gaps.append(_Gap(name, kind, item.type, main_function=item.main_function))
+        gaps.append(
+            _Gap(
+                name,
+                kind,
+                "seniority" if seniority else item.type,
+                main_function=item.main_function and item.years == 0,
+                seniority=seniority,
+            )
+        )
+    if senior_title(title) and SENIOR_TITLE_GAP.casefold() not in seen:
+        gaps.append(_Gap(SENIOR_TITLE_GAP, "core", "seniority", seniority=True))
     return gaps
 
 
@@ -1027,7 +1092,8 @@ def _apply_tiers(
 
     In code, never sent to the model (`fit_rubric.requirement_tiers`):
     - `exclude_at_core` or more core gaps: excluded (a `gap_tier` skip);
-    - two or more core gaps, or a core gap in the role's main function: low;
+    - two or more core gaps, or a core gap in the role's main function, or a seniority
+      gap (4 or more years asked, or a senior or lead title): low;
     - one other core gap: medium;
     - no core gap: high with at most `high_max_minor` minor gaps (plus
       `entry_level_extra_minor` when the posting is grounded as entry level), else
@@ -1039,7 +1105,7 @@ def _apply_tiers(
     minor = len(counted) - len(core)
     if len(core) >= rubric["exclude_at_core"]:
         return counted, None, True
-    if len(core) >= 2 or any(gap.main_function for gap in core):
+    if len(core) >= 2 or any(gap.main_function or gap.seniority for gap in core):
         return counted, "low", False
     if core:
         return counted, "medium", False

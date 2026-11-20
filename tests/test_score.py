@@ -1041,17 +1041,16 @@ def test_the_summary_and_the_roles_are_told_apart() -> None:
 
 def test_an_industry_word_in_the_summary_is_not_experience() -> None:
     fpa = requirement(
-        "2-3 years of FP&A experience",
+        "FP&A experience",
         type="experience",
         core=True,
         main_function=True,
-        years=3,
         met="yes",
         evidence="finance",
     )
     result = _resumed(fpa)
     assert json.loads(result.gaps) == [
-        {"name": "2-3 years of FP&A experience", "kind": "core", "type": "experience"}
+        {"name": "FP&A experience", "kind": "core", "type": "experience"}
     ]
     assert result.tier == "low"
 
@@ -1100,3 +1099,94 @@ def test_the_prompt_states_the_general_experience_rule() -> None:
     assert "Experience counts only where the resume's roles" in scoring.SYSTEM_PROMPT
     assert "is not experience in that field's job functions" in scoring.SYSTEM_PROMPT
     assert "profile" not in scoring.SYSTEM_PROMPT
+
+
+# --- the seniority line: 4 years (operator, Batch Q) ------------------------------------------
+
+
+def _titled(title: str, *items: dict[str, object]) -> Score:
+    text = PostingText("Example Robotics", title, "Example City", "remote", description="x")
+    result = score_posting(
+        text, DEFAULTS, transport=lambda url, body: reply(fit_reply(items=items))
+    )
+    assert result is not None
+    return result
+
+
+def _years(count: int, *, core: bool = True, met: str = "no") -> dict[str, object]:
+    return requirement(
+        f"{count}+ years in the role's own function",
+        type="experience",
+        core=core,
+        main_function=True,
+        years=count,
+        met=met,
+    )
+
+
+def test_four_or_more_years_is_a_core_seniority_gap_and_rules_out_high() -> None:
+    for count in (4, 5):
+        result = _titled("Technical Account Manager", _years(count, core=False))
+        assert json.loads(result.gaps) == [
+            {
+                "name": f"{count}+ years in the role's own function",
+                "kind": "core",
+                "type": "seniority",
+            }
+        ]
+        assert result.tier == "low"
+
+
+def test_up_to_three_years_is_minor_whatever_the_reply_says() -> None:
+    for count in (1, 2, 3):
+        result = _titled("Security Analyst", _years(count))
+        assert json.loads(result.gaps) == [
+            {
+                "name": f"{count}+ years in the role's own function",
+                "kind": "minor",
+                "type": "experience",
+            }
+        ]
+        assert result.tier == "high"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Junior Security Analyst",
+        "Entry-Level Operations Support Analyst",
+        "Associate, Customer Success",
+        "Software Developer (New Graduate)",
+        "IT Support Intern",
+        "SOC Analyst Tier 1",
+        "Analyst I",
+        "Threat Analyst 1, Managed Response",
+    ],
+)
+def test_a_junior_title_drops_a_three_year_ask_entirely(title: str) -> None:
+    result = _titled(title, _years(3))
+    assert json.loads(result.gaps) == [] and result.tier == "high"
+    four = _titled(title, _years(4))
+    assert four.tier == "low"  # four years stays core even with a junior title
+
+
+def test_a_senior_or_lead_title_is_a_core_seniority_gap() -> None:
+    for title in ("Senior Security Analyst", "Team Lead, Support", "Sr. Developer"):
+        result = _titled(title)
+        assert json.loads(result.gaps) == [
+            {"name": "Senior or lead title", "kind": "core", "type": "seniority"}
+        ]
+        assert result.tier == "low"
+    assert _titled("Leadership Coordinator").tier == "high"  # whole words only
+
+
+def test_years_partly_met_are_minor_and_years_met_are_no_gap() -> None:
+    assert _titled("Analyst", _years(5, met="partly")).tier == "high"
+    assert json.loads(_titled("Analyst", _years(5, met="yes")).gaps) == []
+
+
+def test_only_minor_gaps_on_a_years_heavy_posting_never_make_it_low() -> None:
+    items = tuple(
+        requirement(f"{n} years of tool {n}", type="experience", years=2) for n in range(6)
+    )
+    assert _titled("Systems Analyst", *items).tier == "medium"
