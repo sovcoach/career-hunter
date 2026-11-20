@@ -7,22 +7,24 @@ constant, not a config field. The model id is `scoring.chat_model` (default
 `local-model`).
 
 The prompt is built from lanes and location rules, the posting fields,
-and the resume when one is in use. The model lists every item the posting states, each
-classed (`required`, `preferred`, `duty`, `trained` or `soft`), with whether the resume
-meets it. The gaps are derived here (`derive_gaps`): only an unmet required or preferred
-item, or a soft one not met at all, is a gap; a duty, or anything the posting says it
-will teach, never is. Gap names are put in one style (`gap_name`) and gap types come
-from a fixed list (GAP_TYPES). With a resume, a `yes` or `partly` whose evidence is not
-found in the resume counts as `no`, and so does an `experience` item whose evidence is
-only in the resume's summary: experience counts only where the roles and skills show it
-(`resume_parts`). An unmet tool or skill whose name appears outside the summary is a
-minor gap (`partly`), never core. The seniority line: an unmet ask of 4 or more years is
-a core seniority gap, a smaller one is minor (and no gap at all with a junior or entry
-title), and a senior or lead title is a core seniority gap. An `entry_level` flag counts
-only with a quote found in the posting. The tier (high, medium or low) is computed here
-from the core and minor gaps (`_apply_tiers`, `fit_rubric.requirement_tiers`), and no
-threshold is ever sent to the model. This module stores the tier name. `fit_rating` is
-left null. There is no mapping onto 0-10.
+and the resume when one is in use, the parts that are the same on every call first and
+the posting last, so the server can reuse its cached prefix. The model is asked to
+reason briefly and to list only the gaps: each qualification the posting requires or
+prefers that the resume doesn't meet (`no`) or meets only partly (`partly`), as a short
+name, `required` or `preferred`, the years asked, `core`, `main_function`, a type and a
+short quote. Met qualifications, duties and what the posting will teach are never
+listed, so never gaps. Each gap's kind is derived here (`derive_gaps`); names are cut to
+MAX_GAP_WORDS words and put in one style (`gap_name`), and types come from a fixed list
+(GAP_TYPES). With a resume, an unmet tool or skill whose name appears outside the
+resume's summary (`resume_parts`) is a minor gap (`partly`), never core; the rule that
+experience counts only where the roles and skills show it is the prompt's. The seniority
+line: an unmet ask of 4 or more years is a core seniority gap, a smaller one is minor
+(and no gap at all with a junior or entry title), and a senior or lead title is a core
+seniority gap. An `entry_level` flag counts only with a quote found in the posting. The
+tier (high, medium or low) is computed here from the core and minor gaps
+(`_apply_tiers`, `fit_rubric.requirement_tiers`), and no threshold is ever sent to the
+model. This module stores the tier name. `fit_rating` is left null. There is no mapping
+onto 0-10.
 
 The hard gates are not sent (ADR-027). `filters.decide` has applied them before any
 posting is scored, and a model shown `required_languages` next to a posting reported
@@ -157,32 +159,31 @@ REJECTED = {
     "too-short": "quote too short",
     "unknown-rule": "unknown rule",
 }
+# The reply is kept short (Batch Q, the speed fix): only the gaps, each in a few words.
+MAX_GAP_WORDS = 6
+MAX_GAP_QUOTE_WORDS = 10
 SYSTEM_PROMPT = (
+    "Think briefly and decide quickly: one short check per qualification, then answer. "
     "Reply with one JSON object only, following the schema. "
-    "requirements: every item the posting states, each once, in its own words: each "
-    "qualification it requires or prefers, each duty or responsibility of the job, "
-    "each thing it says it will teach or train, and each soft skill. kind: "
-    '"required" or "preferred" for a qualification the posting asks the candidate to '
-    'have; "duty" for what the job does (a responsibility, not a qualification); '
-    '"trained" for anything the posting says it will teach, train or help the '
-    'candidate learn; "soft" for a soft skill or personal quality. core: true when the '
-    "item is central to the role's main function or is a minimum number of years of "
-    "experience, else false. main_function: true only when the item is the role's main "
-    "job function itself (for example, years as an analyst in that same function). "
-    "years: the minimum years of experience the item asks for, 0 when it asks none. "
-    'met: "yes", "partly" or "no", judged only against the resume; evidence: for yes '
-    "or partly, a short phrase copied exactly from the resume that shows it, else an "
-    "empty string. Experience counts only where the resume's roles (the jobs held) and "
-    "skills actually show it. An industry or field word in the resume's summary, such as "
-    "a list of sectors worked across, is not experience in that field's job functions "
-    "(for example FP&A, accounting, M&A or brokerage): such an item is not met unless a "
-    "role or a skill shows the function itself. "
-    "type: one of the listed types. entry_level: when the posting says "
-    "it is junior or entry level, or welcomes candidates without every qualification "
-    '(such as recent graduates, "we\'ll train you", or "apply anyway"), a short '
-    "quote copied exactly from the posting that says so, else an empty string. "
-    "key_requirements: up to three key requirements the posting itself states, each a "
-    f"short phrase of at most {MAX_REQUIREMENT} characters. No prose."
+    "gaps: only the qualifications the posting requires or prefers that the resume "
+    "does not meet, or meets only partly. Never list a qualification the resume meets, a "
+    "duty or responsibility of the job, or anything the posting says it will teach or "
+    "train. For each gap: name, a short name of at most "
+    f'{MAX_GAP_WORDS} words; kind, "required" or "preferred"; met, "no" or '
+    '"partly", judged only against the resume. Experience counts only where the '
+    "resume's roles (the jobs held) and skills actually show it; an industry or field "
+    "word in the resume's summary, such as a list of sectors worked across, is not "
+    "experience in that field's job functions (for example FP&A, accounting, M&A or "
+    "brokerage). years: the minimum years of experience it asks for, 0 when none. "
+    "core: true when it is central to the role's main function or is a minimum number "
+    "of years of experience. main_function: true only when it is the role's main job "
+    "function itself. type: one of the listed types. quote: at most "
+    f"{MAX_GAP_QUOTE_WORDS} words copied from the posting that state it. entry_level: "
+    "when the posting says it is junior or entry level, or welcomes candidates without "
+    'every qualification (such as recent graduates, "we\'ll train you", or "apply '
+    'anyway"), a short quote copied exactly from the posting that says so, else an '
+    "empty string. key_requirements: up to three key requirements the posting itself "
+    f"states, each a short phrase of at most {MAX_REQUIREMENT} characters. No prose."
 )
 # Added to the system prompt when the operator's criteria file is sent.
 CRITERIA_INSTRUCTION = (
@@ -313,19 +314,20 @@ class _Gap:
     seniority: bool = dataclasses.field(default=False, compare=False)
 
 
-# What the reply classes each stated item as. Only an unmet `required` or `preferred`
-# item can be a gap, and a `soft` one only when it is not met at all. A `duty` (what
-# the job does) or a `trained` item (what the posting says it will teach) never is.
-ITEM_KINDS = ("required", "preferred", "duty", "trained", "soft")
-GAP_KINDS = frozenset({"required", "preferred"})
+# The reply lists only gaps: an unmet or partly met qualification the posting requires
+# or prefers. Met qualifications, duties and what the posting will teach are never
+# listed, so they are never gaps.
+ITEM_KINDS = ("required", "preferred")
+GAP_KINDS = frozenset(ITEM_KINDS)
 # The fixed gap types. A reply's type outside this list is stored as `other`.
 GAP_TYPES = tuple(name for name in GAP_TYPE_NAMES if name != "seniority")
-MET = ("yes", "partly", "no")
+MET = ("no", "partly")
 
 
 @dataclass(frozen=True)
 class Requirement:
-    """One item the posting states, as the reply classed it."""
+    """One gap the reply lists: a qualification the resume doesn't meet, or meets partly.
+    `quote` (the posting's words) is checked for an avoided language, never stored."""
 
     text: str
     kind: str
@@ -334,7 +336,7 @@ class Requirement:
     main_function: bool
     years: int
     met: str
-    evidence: str
+    quote: str = ""
 
 
 def require_loopback(url: str) -> tuple[str, int, str]:
@@ -475,9 +477,12 @@ def score_posting(
         item
         for item in items
         if not unstated_language(item.text, posting, config)
-        and not unstated_language(item.evidence, posting, config)
+        and not unstated_language(item.quote, posting, config)
     ]
     if resume is not None:
+        # D-A1, on each gap name as the model sent it, before it is cut to a few words.
+        if _copies_resume([_Gap(item.text, "minor", None) for item in items], resume.text):
+            return None
         items = [_evidenced(item, resume.text) for item in items]
     parsed = derive_gaps(items, posting.title)
     if resume is not None and _copies_resume(parsed, resume.text):
@@ -624,17 +629,18 @@ def _request_body(
     examples: Sequence[Example] = (),
     criteria: Criteria | None = None,
 ) -> bytes:
+    # Everything that is the same on every call comes first and the posting last, so the
+    # server can reuse its cached processing of the shared prefix (Batch Q).
     view: dict[str, Any] = {
         "lanes": _section(config, "search", "lanes"),
         "location_rules": _section(config, "search", "location_rules"),
-        "posting": {
-            "company": posting.company,
-            "title": posting.title,
-            "location": posting.location,
-            "work_model": posting.work_model,
-            "description": posting.description,
-        },
     }
+    if criteria is not None:
+        view["criteria"] = [
+            {"rule": rule.number, "kind": rule.kind, "text": rule.text}
+            | ({"cap": rule.cap} if rule.cap else {})
+            for rule in criteria.rules
+        ]
     if resume is not None:
         view["resume"] = resume.text
     shown = [
@@ -646,12 +652,13 @@ def _request_body(
     ]
     if shown:
         view["labelled_examples"] = shown
-    if criteria is not None:
-        view["criteria"] = [
-            {"rule": rule.number, "kind": rule.kind, "text": rule.text}
-            | ({"cap": rule.cap} if rule.cap else {})
-            for rule in criteria.rules
-        ]
+    view["posting"] = {
+        "company": posting.company,
+        "title": posting.title,
+        "location": posting.location,
+        "work_model": posting.work_model,
+        "description": posting.description,
+    }
     payload = {
         "model": chat_model(config),
         **SAMPLING,
@@ -704,28 +711,28 @@ def reply_schema(with_criteria: bool) -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "required": [
-            "text",
+            "name",
             "kind",
-            "type",
+            "met",
+            "years",
             "core",
             "main_function",
-            "years",
-            "met",
-            "evidence",
+            "type",
+            "quote",
         ],
         "properties": {
-            "text": {"type": "string"},
+            "name": {"type": "string"},
             "kind": {"type": "string", "enum": list(ITEM_KINDS)},
-            "type": {"type": "string", "enum": list(GAP_TYPES)},
+            "met": {"type": "string", "enum": list(MET)},
+            "years": {"type": "integer", "minimum": 0},
             "core": {"type": "boolean"},
             "main_function": {"type": "boolean"},
-            "years": {"type": "integer", "minimum": 0},
-            "met": {"type": "string", "enum": list(MET)},
-            "evidence": {"type": "string"},
+            "type": {"type": "string", "enum": list(GAP_TYPES)},
+            "quote": {"type": "string"},
         },
     }
     properties: dict[str, Any] = {
-        "requirements": {"type": "array", "items": item},
+        "gaps": {"type": "array", "items": item},
         "key_requirements": {"type": "array", "items": {"type": "string"}},
         "entry_level": {"type": "string"},
     }
@@ -783,12 +790,12 @@ def _content(body: bytes) -> str | None:
 
 
 def _parse_requirements(content: str) -> list[Requirement] | None:
-    """The reply's stated items, or None when the reply does not parse. One malformed
-    item makes the whole reply one that does not parse, as a malformed gap did."""
+    """The reply's gaps, or None when the reply does not parse. One malformed gap makes
+    the whole reply one that does not parse."""
     raw = _json_object(content)
     if not isinstance(raw, dict):
         return None
-    items = raw.get("requirements")
+    items = raw.get("gaps")
     if not isinstance(items, list):
         return None
     parsed: list[Requirement] = []
@@ -803,16 +810,16 @@ def _parse_requirements(content: str) -> list[Requirement] | None:
 def _one_requirement(item: object) -> Requirement | None:
     if not isinstance(item, dict):
         return None
-    text, kind, met = item.get("text"), item.get("kind"), item.get("met")
+    text, kind, met = item.get("name"), item.get("kind"), item.get("met")
     core, main, years = item.get("core"), item.get("main_function"), item.get("years")
-    evidence, item_type = item.get("evidence", ""), item.get("type", "other")
+    quote, item_type = item.get("quote", ""), item.get("type", "other")
     if not isinstance(text, str) or not text.strip() or kind not in ITEM_KINDS or met not in MET:
         return None
     if not isinstance(core, bool) or not isinstance(main, bool):
         return None
     if isinstance(years, bool) or not isinstance(years, int) or years < 0:
         return None
-    if not isinstance(evidence, str) or not isinstance(item_type, str):
+    if not isinstance(quote, str) or not isinstance(item_type, str):
         return None
     folded = _fold(item_type)
     return Requirement(
@@ -823,7 +830,7 @@ def _one_requirement(item: object) -> Requirement | None:
         main_function=main,
         years=years,
         met=met,
-        evidence=" ".join(_CONTROL.sub(" ", evidence).split()),
+        quote=" ".join(_CONTROL.sub(" ", quote).split()[:MAX_GAP_QUOTE_WORDS]),
     )
 
 
@@ -865,24 +872,13 @@ def resume_parts(text: str) -> tuple[str, str]:
 
 
 def _evidenced(item: Requirement, resume_text: str) -> Requirement:
-    """The item, checked against the resume (the evidence itself is never stored):
-
-    - `yes` or `partly` whose evidence is not found in the resume as whole words
-      becomes `no`;
-    - an `experience` item counts only where the resume's roles and skills show it, so
-      evidence found only in the summary (an industry word there is not experience in
-      that field's job functions) also becomes `no`;
-    - an unmet `tool` or `skill` item that names a distinctive term (4 or more
-      characters, capitalised, not a word like "Advanced") found as a whole word
-      outside the summary becomes `partly`: a minor gap, never core.
-    """
+    """The gap, checked against the resume: an unmet `tool` or `skill` gap that names a
+    distinctive term (4 or more characters, capitalised, not a word like "Advanced")
+    found as a whole word outside the resume's summary becomes `partly`: a minor gap,
+    never core. Met qualifications aren't in the reply, so there is no evidence to check;
+    the experience rule (roles and skills, not the summary) is the prompt's."""
     _summary, body = resume_parts(resume_text)
     if item.met != "no":
-        evidence = item.evidence.strip()
-        if not evidence or not has_phrase(resume_text, evidence):
-            return dataclasses.replace(item, met="no")
-        if item.type == "experience" and not has_phrase(body, evidence):
-            return dataclasses.replace(item, met="no")
         return item
     if item.type in ("tool", "skill") and any(has_phrase(body, term) for term in _terms(item.text)):
         return dataclasses.replace(item, met="partly")
@@ -940,9 +936,9 @@ def senior_title(title: str) -> bool:
 
 
 def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
-    """The gaps, in code: an unmet `required` or `preferred` item, or a `soft` one not
-    met at all. A `core` item not met at all is a core gap; anything else, a partly met
-    item included, is minor. Duties and trained items are never gaps.
+    """The gaps, in code, from the reply's unmet or partly met qualifications. A `core`
+    one not met at all is a core gap; anything else, a partly met one included, is
+    minor.
 
     The seniority line comes first for an item that asks for years: SENIOR_YEARS or more,
     not met at all, is a core seniority gap whatever the reply's `core` says; fewer is
@@ -952,8 +948,6 @@ def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
     seen: set[str] = set()
     junior = junior_title(title)
     for item in items:
-        if item.met == "yes":
-            continue
         seniority = False
         if item.kind in GAP_KINDS and item.years >= SENIOR_YEARS:
             kind = "core" if item.met == "no" else "minor"
@@ -964,11 +958,9 @@ def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
             kind = "minor"
         elif item.kind in GAP_KINDS:
             kind = "core" if item.core and item.met == "no" else "minor"
-        elif item.kind == "soft" and item.met == "no":
-            kind = "minor"
         else:
             continue
-        name = gap_name(item.text)
+        name = gap_name(" ".join(item.text.split()[:MAX_GAP_WORDS]))
         if not name or name.casefold() in seen:
             continue
         seen.add(name.casefold())

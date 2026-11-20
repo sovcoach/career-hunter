@@ -222,18 +222,18 @@ def requirement(
     main_function: bool = False,
     years: int = 0,
     met: str = "no",
-    evidence: str = "",
+    quote: str = "",
 ) -> dict[str, Any]:
-    """One stated item in a scoring reply, as the JSON schema asks for it."""
+    """One gap in a scoring reply, as the JSON schema asks for it."""
     return {
-        "text": text,
+        "name": text,
         "kind": kind,
-        "type": type,
+        "met": met,
+        "years": years,
         "core": core,
         "main_function": main_function,
-        "years": years,
-        "met": met,
-        "evidence": evidence,
+        "type": type,
+        "quote": quote,
     }
 
 
@@ -244,15 +244,15 @@ def fit_reply(
     entry_level: str = "",
     **extra: Any,
 ) -> str:
-    """A scoring reply's JSON. Each `gaps` entry is (text, "core" | "minor"[, type]): a
-    required item the resume doesn't meet, so it becomes that gap. `items` are added as
-    they are; `extra` keys (veto, cap) go at the top level."""
+    """A scoring reply's JSON. Each `gaps` entry is (name, "core" | "minor"[, type]): a
+    required qualification the resume doesn't meet. `items` are added as they are;
+    `extra` keys (veto, cap) go at the top level."""
     listed = [
         requirement(gap[0], type=gap[2] if len(gap) > 2 else "other", core=gap[1] == "core")
         for gap in gaps
     ]
     body = {
-        "requirements": [*listed, *items],
+        "gaps": [*listed, *items],
         "key_requirements": list(key),
         "entry_level": entry_level,
         **extra,

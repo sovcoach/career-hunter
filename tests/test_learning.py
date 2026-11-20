@@ -101,7 +101,7 @@ def _sent(
 
     def transport(address: str, payload: bytes) -> tuple[int, bytes]:
         payloads.append(payload)
-        return reply('{"requirements":[],"key_requirements":[],"entry_level":""}')
+        return reply('{"gaps":[],"key_requirements":[],"entry_level":""}')
 
     score_posting(scored or posting(), RUBRIC, transport=transport, examples=examples)
     view: dict[str, Any] = json.loads(json.loads(payloads[0])["messages"][1]["content"])
@@ -143,7 +143,7 @@ def test_examples_appear_only_in_the_loopback_payload(search: sqlite3.Connection
 
     def transport(address: str, payload: bytes) -> tuple[int, bytes]:
         payloads.append(payload)
-        return reply('{"requirements": [], "key_requirements": ["Forklift licence"]}')
+        return reply('{"gaps": [], "key_requirements": ["Forklift licence"]}')
 
     def scorer(item: PostingText) -> Any:
         return score_posting(item, rules, transport=transport, examples=examples)

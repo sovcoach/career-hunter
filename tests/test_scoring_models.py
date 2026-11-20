@@ -119,11 +119,7 @@ def test_the_scorer_sends_the_configured_chat_model_to_the_constant_url() -> Non
         seen.append((url, json.loads(payload)))
         reply = {
             "choices": [
-                {
-                    "message": {
-                        "content": '{"requirements":[],"key_requirements":[],"entry_level":""}'
-                    }
-                }
+                {"message": {"content": '{"gaps":[],"key_requirements":[],"entry_level":""}'}}
             ]
         }
         return 200, json.dumps(reply).encode()

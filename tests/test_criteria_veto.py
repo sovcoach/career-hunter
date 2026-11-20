@@ -48,7 +48,7 @@ def _score(
 ) -> Score | None:
     listed = GAPS if gaps is None else gaps
     content: dict[str, Any] = {
-        "requirements": [
+        "gaps": [
             requirement(gap["name"], type=gap["type"], core=gap["kind"] == "core") for gap in listed
         ],
         "key_requirements": [],
@@ -289,7 +289,7 @@ def test_the_request_has_numbered_rules_and_no_gate_lists() -> None:
             seen.append(json.loads(payload)),
             (
                 200,
-                json.dumps({"choices": [{"message": {"content": '{"requirements":[]}'}}]}).encode(),
+                json.dumps({"choices": [{"message": {"content": '{"gaps":[]}'}}]}).encode(),
             ),
         )[1],
         criteria=RULES,

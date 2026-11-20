@@ -119,24 +119,31 @@ def test_the_request_asks_for_a_schema_reply_with_the_fixed_sampling_and_seed() 
     spec = response_format["json_schema"]
     assert spec["strict"] is True and spec["name"] == scoring.SCHEMA_NAME
     assert spec["schema"] == scoring.reply_schema(False)
-    assert set(spec["schema"]["required"]) == {"requirements", "key_requirements", "entry_level"}
+    assert set(spec["schema"]["required"]) == {"gaps", "key_requirements", "entry_level"}
     assert "veto" not in spec["schema"]["properties"]
-    item = spec["schema"]["properties"]["requirements"]["items"]
-    assert item["properties"]["kind"]["enum"] == [
-        "required",
-        "preferred",
-        "duty",
-        "trained",
-        "soft",
-    ]
-    assert item["properties"]["met"]["enum"] == ["yes", "partly", "no"]
-    assert set(item["required"]) == set(item["properties"])
+    item = spec["schema"]["properties"]["gaps"]["items"]
+    assert item["properties"]["kind"]["enum"] == ["required", "preferred"]
+    assert item["properties"]["met"]["enum"] == ["no", "partly"]
+    assert (
+        set(item["required"])
+        == set(item["properties"])
+        == {
+            "name",
+            "kind",
+            "met",
+            "years",
+            "core",
+            "main_function",
+            "type",
+            "quote",
+        }
+    )
 
 
 def test_with_criteria_the_schema_asks_for_veto_and_cap_or_null() -> None:
     schema = scoring.reply_schema(True)
     assert set(schema["required"]) == {
-        "requirements",
+        "gaps",
         "key_requirements",
         "entry_level",
         "veto",
@@ -147,8 +154,9 @@ def test_with_criteria_the_schema_asks_for_veto_and_cap_or_null() -> None:
 
 
 def test_a_reply_that_breaks_the_schema_does_not_parse() -> None:
-    bad_kind = json.dumps({"requirements": [requirement("Excel", "major")]})
-    for content in (bad_kind, '{"gaps":[]}', "[]"):
+    bad_kind = json.dumps({"gaps": [requirement("Excel", "duty")]})
+    met = json.dumps({"gaps": [requirement("Excel", met="yes")]})
+    for content in (bad_kind, met, '{"requirements":[]}', "[]"):
         assert score_posting(posting(), RUBRIC, transport=lambda u, b, c=content: reply(c)) is None
 
 
@@ -427,24 +435,22 @@ def _message(content: object) -> bytes:
         pytest.param(_message(None), id="null-content"),
         pytest.param(_message(42), id="number-content"),
         pytest.param(_message("[1]"), id="content-not-object"),
-        pytest.param(_message('{"requirements": "x"}'), id="requirements-not-list"),
-        pytest.param(_message('{"requirements": ["SQL"]}'), id="item-not-object"),
+        pytest.param(_message('{"gaps": "x"}'), id="requirements-not-list"),
+        pytest.param(_message('{"gaps": ["SQL"]}'), id="item-not-object"),
+        pytest.param(_message(json.dumps({"gaps": [requirement("SQL", "major")]})), id="bad-kind"),
         pytest.param(
-            _message(json.dumps({"requirements": [requirement("SQL", "major")]})), id="bad-kind"
-        ),
-        pytest.param(
-            _message(json.dumps({"requirements": [requirement("SQL", met="maybe")]})),
+            _message(json.dumps({"gaps": [requirement("SQL", met="maybe")]})),
             id="bad-met",
         ),
         pytest.param(
-            _message(json.dumps({"requirements": [requirement("SQL", years=-1)]})),
+            _message(json.dumps({"gaps": [requirement("SQL", years=-1)]})),
             id="negative-years",
         ),
         pytest.param(
-            _message(json.dumps({"requirements": [{**requirement("SQL"), "core": "yes"}]})),
+            _message(json.dumps({"gaps": [{**requirement("SQL"), "core": "yes"}]})),
             id="core-not-bool",
         ),
-        pytest.param(_message(json.dumps({"requirements": [requirement(" ")]})), id="blank-text"),
+        pytest.param(_message(json.dumps({"gaps": [requirement(" ")]})), id="blank-text"),
     ],
 )
 def test_a_reply_of_the_wrong_shape_leaves_the_posting_unscored(body: bytes) -> None:
@@ -569,7 +575,7 @@ def test_the_prompt_never_carries_the_hard_gates() -> None:
 
 LANGUAGES = {**RUBRIC, "hard_gates": {"required_languages": ["Examplish", "français"]}}
 PHANTOM = {
-    "requirements": [
+    "gaps": [
         requirement("Examplish language proficiency", type="language", core=True),
         requirement("Forklift licence"),
     ],
@@ -756,7 +762,7 @@ def test_the_prompt_asks_for_requirements_apart_from_the_gaps() -> None:
 def test_up_to_three_requirements_are_kept_cleaned_and_deduplicated() -> None:
     found = requirements(
         {
-            "requirements": [],
+            "gaps": [],
             "key_requirements": [
                 "  Forklift\nlicence ",
                 "forklift   LICENCE",  # the same phrase again
@@ -773,14 +779,14 @@ def test_up_to_three_requirements_are_kept_cleaned_and_deduplicated() -> None:
 
 def test_a_long_requirement_is_cut_at_a_word() -> None:
     long = "Experience coordinating inbound and outbound freight across several sites"
-    (found,) = requirements({"requirements": [], "key_requirements": [long]})
+    (found,) = requirements({"gaps": [], "key_requirements": [long]})
     assert len(found) <= scoring.MAX_REQUIREMENT and found.endswith("…")
     assert found == "Experience coordinating inbound and outbound freight…"
 
 
 @pytest.mark.parametrize("value", [None, "Forklift licence", {"a": 1}, [None], []], ids=repr)
 def test_a_missing_or_malformed_list_gives_none_and_keeps_the_score(value: object) -> None:
-    payload: dict[str, object] = {"requirements": []}
+    payload: dict[str, object] = {"gaps": []}
     if value is not None:
         payload["key_requirements"] = value
     assert requirements(payload) == ()
@@ -789,7 +795,7 @@ def test_a_missing_or_malformed_list_gives_none_and_keeps_the_score(value: objec
 def test_a_requirement_that_names_a_gap_is_dropped() -> None:
     found = requirements(
         {
-            "requirements": [requirement("Class 1 licence")],
+            "gaps": [requirement("Class 1 licence")],
             "key_requirements": ["A valid CLASS 1 licence", "Bilingual service", "Class 1"],
         }
     )
@@ -804,7 +810,7 @@ def test_a_requirement_that_copies_the_resume_is_dropped() -> None:
     )
     found = requirements(
         {
-            "requirements": [],
+            "gaps": [],
             "key_requirements": [
                 "Coordinated forty warehouse staff across two night shifts",
                 "Forklift licence",
@@ -815,7 +821,7 @@ def test_a_requirement_that_copies_the_resume_is_dropped() -> None:
     assert found == ("Forklift licence",)
 
 
-# --- stated items, classed; gaps derived in code (Batch Q) -----------------------------------
+# --- the reply lists only gaps; the code derives their kind (Batch Q) -----------------------
 
 TRAINING = PostingText(
     "Example Automate",
@@ -835,59 +841,28 @@ def _scored(content: str, *, resume: Resume | None = None, text: PostingText = T
     return result
 
 
-def test_duties_and_trained_items_are_never_gaps() -> None:
-    """A junior posting's duty list and what it will teach don't count against it."""
+def test_the_reply_lists_only_gaps_and_a_partly_met_one_is_minor() -> None:
     content = fit_reply(
         items=(
-            requirement("Build workflow automations", "duty", core=True),
-            requirement("Develop dashboards for clients", "duty"),
-            requirement("Our in-house tools", "trained", type="tool", core=True),
-            requirement("Attention to detail", "soft", met="partly", evidence=""),
-        )
-    )
-    result = _scored(content)
-    assert json.loads(result.gaps) == [] and result.tier == "high"
-
-
-def test_a_soft_item_counts_only_when_not_met_at_all_and_then_as_minor() -> None:
-    result = _scored(fit_reply(items=(requirement("Teamwork", "soft", core=True),)))
-    assert json.loads(result.gaps) == [{"name": "Teamwork", "kind": "minor", "type": "other"}]
-
-
-def test_required_and_preferred_unmet_items_are_gaps_and_partly_is_minor() -> None:
-    content = fit_reply(
-        items=(
-            requirement("SQL", type="skill", core=True),
+            requirement("SQL", type="skill", core=True, quote="Strong SQL required"),
             requirement("Azure", "preferred", type="tool"),
-            requirement("Python", type="skill", core=True, met="partly", evidence="Python"),
-            requirement("Excel", type="tool", met="yes", evidence="Excel"),
+            requirement("Python", type="skill", core=True, met="partly"),
         )
     )
-    result = _scored(content)
+    result = _scored(content, resume=_RESUME)
     assert json.loads(result.gaps) == [
         {"name": "SQL", "kind": "core", "type": "skill"},
         {"name": "Azure", "kind": "minor", "type": "tool"},
         {"name": "Python", "kind": "minor", "type": "skill"},
     ]
+    assert "Strong SQL required" not in result.llm_output  # with a resume: canonical gaps only
 
 
-def test_evidence_not_in_the_resume_turns_yes_into_no() -> None:
-    resume = Resume("Sam Example. Built weekly reports in Excel for a depot.", "cd" * 32)
-    content = fit_reply(
-        items=(
-            requirement("Excel reporting", type="tool", met="yes", evidence="reports in Excel"),
-            requirement(
-                "Power BI", type="tool", core=True, met="yes", evidence="Power BI dashboards"
-            ),
-            requirement("SQL", type="skill", met="partly", evidence="SQL"),  # too short
-        )
-    )
-    result = _scored(content, resume=resume)
-    assert json.loads(result.gaps) == [
-        {"name": "Power BI", "kind": "core", "type": "tool"},
-        {"name": "SQL", "kind": "minor", "type": "skill"},
+def test_a_gap_name_is_cut_to_six_words_and_the_copy_check_sees_it_whole() -> None:
+    long = requirement("Hands on experience with every modern cloud platform", type="skill")
+    assert json.loads(_scored(fit_reply(items=(long,))).gaps) == [
+        {"name": "Hands on experience with every modern", "kind": "minor", "type": "skill"}
     ]
-    assert "Power BI dashboards" not in result.llm_output  # evidence is never stored
 
 
 def test_gap_names_are_one_style_and_types_a_fixed_list() -> None:
@@ -913,21 +888,38 @@ def test_entry_level_counts_only_with_a_quote_found_in_the_posting() -> None:
     assert _scored(fit_reply(entry_level="we'll train")).entry_level is False  # not in it
     assert _scored(fit_reply(entry_level="Junior")).entry_level is False  # too short
     assert _scored(fit_reply(entry_level="Junior Automation Developer")).entry_level is True
-    assert _scored(json.dumps({"requirements": [], "entry_level": 5})).entry_level is False
+    assert _scored(json.dumps({"gaps": [], "entry_level": 5})).entry_level is False
 
 
-def test_the_prompt_asks_for_every_stated_item_and_the_training_offer() -> None:
+def test_the_prompt_asks_for_gaps_only_briefly_and_puts_the_posting_last() -> None:
     seen: dict[str, bytes] = {}
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         seen["body"] = payload
         return reply(fit_reply())
 
-    score_posting(posting(), RUBRIC, transport=transport)
-    system = json.loads(seen["body"])["messages"][0]["content"]
-    for phrase in ("every item the posting states", '"duty"', '"trained"', "copied exactly"):
+    score_posting(posting(), RUBRIC, transport=transport, resume=_RESUME)
+    messages = json.loads(seen["body"])["messages"]
+    system = messages[0]["content"]
+    for phrase in ("Think briefly and decide quickly", "only the qualifications", "Never list"):
         assert phrase in system
     assert "gap_tiers" not in system and "max_gaps" not in system
+    assert list(json.loads(messages[1]["content"]))[-1] == "posting"
+
+
+def test_the_shared_prefix_is_byte_identical_across_postings() -> None:
+    bodies: list[str] = []
+
+    def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        bodies.append(json.loads(payload)["messages"][1]["content"])
+        return reply(fit_reply())
+
+    other = PostingText("Sample Logistics", "Dispatch Planner", "Elsewhere", description="y")
+    for text in (posting(), other):
+        score_posting(text, RUBRIC, transport=transport, resume=_RESUME)
+    cut_at = [body.index('"posting":') for body in bodies]
+    assert bodies[0][: cut_at[0]] == bodies[1][: cut_at[1]]
+    assert bodies[0][cut_at[0] :] != bodies[1][cut_at[1] :]
 
 
 # --- the tier, in code; no threshold is sent (Batch Q) ---------------------------------------
@@ -962,11 +954,10 @@ def test_the_tier_follows_core_and_minor_gaps(
 
 
 def test_a_core_gap_in_the_main_function_is_low() -> None:
-    main = requirement("2-3 years as an analyst in this function", core=True, main_function=True)
+    main = requirement("Analyst work in this function", core=True, main_function=True)
     assert _tier(fit_reply(items=(main,))).tier == "low"
-    # The same item, met: no gap at all.
-    met = {**main, "met": "yes"}
-    assert _tier(fit_reply(items=(met,))).tier == "high"
+    # Met, it isn't listed at all: no gap.
+    assert _tier(fit_reply()).tier == "high"
 
 
 def test_three_core_gaps_exclude_the_posting() -> None:
@@ -1005,7 +996,7 @@ def test_no_threshold_or_tier_reaches_the_model() -> None:
     for word in ("requirement_tiers", "high_max_minor", "exclude_at_core", "gap_tiers", "max_gaps"):
         assert word not in text
     view = json.loads(json.loads(seen["body"])["messages"][1]["content"])
-    assert set(view) == {"lanes", "location_rules", "posting"}
+    assert list(view) == ["lanes", "location_rules", "posting"]
 
 
 # --- experience only from roles and skills (Batch Q) ----------------------------------------
@@ -1037,43 +1028,6 @@ def test_the_summary_and_the_roles_are_told_apart() -> None:
     )
     for heading in ("EXPERIENCE", "Professional Experience:", "Employment history", "Work History"):
         assert scoring.resume_parts(f"Summary line\n{heading}\nA role")[0] == "Summary line\n"
-
-
-def test_an_industry_word_in_the_summary_is_not_experience() -> None:
-    fpa = requirement(
-        "FP&A experience",
-        type="experience",
-        core=True,
-        main_function=True,
-        met="yes",
-        evidence="finance",
-    )
-    result = _resumed(fpa)
-    assert json.loads(result.gaps) == [
-        {"name": "FP&A experience", "kind": "core", "type": "experience"}
-    ]
-    assert result.tier == "low"
-
-
-def test_experience_a_role_shows_still_counts() -> None:
-    dispatch = requirement(
-        "Dispatch scheduling experience",
-        type="experience",
-        core=True,
-        met="yes",
-        evidence="ran dispatch schedules",
-    )
-    assert json.loads(_resumed(dispatch).gaps) == []
-
-
-def test_evidence_matches_whole_words_so_short_skills_still_count() -> None:
-    sql = requirement("SQL", type="skill", core=True, met="yes", evidence="SQL")
-    excel = requirement("Excel", type="tool", met="yes", evidence="Excel")
-    part = requirement("Excelsior suite", type="tool", met="yes", evidence="Excels")
-    assert json.loads(_resumed(sql, excel).gaps) == []
-    assert json.loads(_resumed(part).gaps) == [
-        {"name": "Excelsior suite", "kind": "minor", "type": "tool"}
-    ]
 
 
 def test_a_listed_tool_the_model_missed_is_a_minor_gap_never_core() -> None:
@@ -1115,7 +1069,7 @@ def _titled(title: str, *items: dict[str, object]) -> Score:
 
 def _years(count: int, *, core: bool = True, met: str = "no") -> dict[str, object]:
     return requirement(
-        f"{count}+ years in the role's own function",
+        f"{count}+ years in this function",
         type="experience",
         core=core,
         main_function=True,
@@ -1129,7 +1083,7 @@ def test_four_or_more_years_is_a_core_seniority_gap_and_rules_out_high() -> None
         result = _titled("Technical Account Manager", _years(count, core=False))
         assert json.loads(result.gaps) == [
             {
-                "name": f"{count}+ years in the role's own function",
+                "name": f"{count}+ years in this function",
                 "kind": "core",
                 "type": "seniority",
             }
@@ -1142,7 +1096,7 @@ def test_up_to_three_years_is_minor_whatever_the_reply_says() -> None:
         result = _titled("Security Analyst", _years(count))
         assert json.loads(result.gaps) == [
             {
-                "name": f"{count}+ years in the role's own function",
+                "name": f"{count}+ years in this function",
                 "kind": "minor",
                 "type": "experience",
             }
@@ -1180,9 +1134,9 @@ def test_a_senior_or_lead_title_is_a_core_seniority_gap() -> None:
     assert _titled("Leadership Coordinator").tier == "high"  # whole words only
 
 
-def test_years_partly_met_are_minor_and_years_met_are_no_gap() -> None:
+def test_years_partly_met_are_minor() -> None:
     assert _titled("Analyst", _years(5, met="partly")).tier == "high"
-    assert json.loads(_titled("Analyst", _years(5, met="yes")).gaps) == []
+    assert json.loads(_titled("Analyst").gaps) == []  # met: not listed, no gap
 
 
 def test_only_minor_gaps_on_a_years_heavy_posting_never_make_it_low() -> None:

@@ -278,9 +278,7 @@ def _request(stated: criteria.Criteria | None) -> dict[str, Any]:
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         seen.append(payload)
-        reply = {
-            "choices": [{"message": {"content": '{"requirements": [], "key_requirements": []}'}}]
-        }
+        reply = {"choices": [{"message": {"content": '{"gaps": [], "key_requirements": []}'}}]}
         return 200, json.dumps(reply).encode()
 
     posting = PostingText("Example Robotics", "Operations Coordinator", "Example City", None)

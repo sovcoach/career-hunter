@@ -194,20 +194,18 @@ def model_transport(_url: str, payload: bytes, **_kw: object) -> tuple[int, byte
     gaps, requirements = ANSWERS.get(view["posting"]["title"], ([], []))
     items = [
         {
-            "text": gap["name"],
+            "name": gap["name"],
             "kind": "required",
-            "type": gap["type"],
+            "met": "no",
+            "years": 0,
             "core": gap["kind"] == "core",
             "main_function": False,
-            "years": 0,
-            "met": "no",
-            "evidence": "",
+            "type": gap["type"],
+            "quote": "",
         }
         for gap in gaps
     ]
-    content = json.dumps(
-        {"requirements": items, "key_requirements": requirements, "entry_level": ""}
-    )
+    content = json.dumps({"gaps": items, "key_requirements": requirements, "entry_level": ""})
     return 200, json.dumps({"choices": [{"message": {"content": content}}]}).encode()
 
 

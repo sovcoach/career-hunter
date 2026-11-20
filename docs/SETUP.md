@@ -218,10 +218,9 @@ Every alert carries a fit: `Fit: High` or `Medium`. A posting scored `low` is st
 
 ### How a posting is scored
 
-The local model reads the posting and your resume and lists every item the posting states, each classed: a qualification it `required`s or `preferred`s, a `duty` of the job, something it says it will teach (`trained`), or a `soft` skill. For each it says whether your resume meets it, with the words from your resume that show it. The program then decides, in code:
+The local model reads the posting and your resume and lists only the gaps: each qualification the posting requires or prefers that your resume doesn't meet, or meets only partly, in a few words. It never lists a qualification you meet, a duty of the job, or something the posting says it will teach, so those are never gaps. It is told to keep its reasoning brief. Experience counts only where your resume's roles and skills show it: an industry word in your resume's summary isn't experience in that field's job functions. The program then decides, in code:
 
-- **Only an unmet required or preferred item is a gap**, or a soft skill your resume doesn't show at all. A duty, or anything the posting says it will teach, never is.
-- **Evidence is checked.** A "met" whose words aren't in your resume counts as not met. Experience counts only where your resume's roles and skills show it: an industry word in your resume's summary (the text before its first `Experience` or `Work history` heading) isn't experience in that field's job functions. A tool or skill named in your roles or skills is at most a minor gap.
+- **Core or minor.** A gap central to the role that you don't meet at all is core; a partly met one is minor. A tool or skill named in your resume's roles or skills (after its first `Experience` or `Work history` heading) is at most a minor gap.
 - **The seniority line:** a posting asking for 4 or more years you don't show is a core gap, and so is a senior or lead title. Up to 3 years is a minor gap, and none at all when the title is junior or entry level (junior, entry level, associate, new or recent graduate, intern, co-op, Tier 1, Level 1, or a level I or 1).
 - **The fit** comes from the core and minor gaps, with `fit_rubric.requirement_tiers`:
 
