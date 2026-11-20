@@ -194,8 +194,8 @@ The watcher and the scorer read `config.yaml` and `exclusions.yaml` only. A note
 |---|---|
 | Target titles, in priority groups | `search.lanes` |
 | Where on-site, hybrid, and remote work is acceptable | `search.location_rules` |
-| How many missing requirements still count, and the fit each tier means | `fit_rubric.gap_tiers` (every tier needs `fit: low`, `medium` or `high`) |
-| The lowest fit at which a title outside every lane still alerts | `search.off_lane_min_fit` (default `high`) |
+| How many core and minor gaps a posting may have at each fit (worked out in code, never sent to the model) | `fit_rubric.requirement_tiers` (see "How a posting is scored") |
+| The lowest fit at which a title outside every lane still alerts, or `never` | `search.off_lane_min_fit` (default `high`) |
 | Your resume, for scoring and a similarity score that `embed-eval` reads (see "Import your resume") | `search.resume: resume/current.txt` |
 | Postings you won't take, or whose fit you'd hold down, as numbered rules in your own words: a posting that meets a veto rule is skipped, and one that meets a cap rule is held to its fit (see "Your scoring criteria") | `search.criteria_file: criteria.md` |
 | Languages, credentials, shifts, pay, seniority (in the title, or also the description), and a minimum salary | `hard_gates` |
@@ -212,15 +212,37 @@ The templates use placeholder names such as Example Robotics, Example City, and 
 
 `search.target_titles`, `search.locations`, and `search.work_models` still validate so an older file loads. The watcher does not match them. Use lanes and location rules.
 
-Lanes label and order alerts; they never skip a posting. A title is matched against every title in every lane, as whole words, ignoring case, and the lane with the best (lowest) priority wins. Alerts go off-lane last, then best fit first, then non-fallback lanes before `fallback: true` ones, then by priority, then oldest. A title that matches no lane is still gated and scored, and alerts only at `search.off_lane_min_fit` or better, labelled `Off-lane`. A title that matches no lane literally can still match by the normalized rule: a lane title that is two or more words and then `Specialist`, `Analyst` or `Associate` (one built-in group) matches a posting with the same words and any of those three, ignoring level words (Junior, Senior, Sr., I to IV, 1 to 4, Level N) and reading `Analyst, Client Experience` as `Client Experience Analyst`. So `IT Support Specialist` also matches `Senior IT Support Associate II` and `IT Support Associate - Night Shift`, but not `IT Support Associate Manager`, `IT Support Lead` or `Business Analyst, IT Support`. A one-word core such as `Data Analyst` only matches literally. A posting keeps the lane it was given when it was stored, even if you change the lanes later, until you run `careerhunter lanes reassign`. Without `search.lanes`, lane checking is off and `doctor` says so: alerts go by fit, then oldest. Lanes are separate from `hard_gates.never_gated_families`.
+Lanes label and order alerts; they never skip a posting. A title is matched against every title in every lane, as whole words, ignoring case, and the lane with the best (lowest) priority wins. Each lane has a `group`: `primary` (the default), `career_change` or `stopgap` (`fallback: true` is read as `stopgap`; a lane can't set both). Alerts go by group first (every primary posting, then career change, then stopgap, then off-lane), then best fit first, then by priority, then oldest. So a High stopgap posting never outranks a Medium primary one, and when `alerts.max_per_poll` holds alerts back, stopgap postings wait first. The group decides the order and the label (`Lane: support (stopgap)`, `Lane: operations (career change)`), never whether a posting alerts. A title that matches no lane is still gated and scored, and alerts only at `search.off_lane_min_fit` or better, labelled `Off-lane`; with `off_lane_min_fit: never` it is never alerted. A title that matches no lane literally can still match by the normalized rule: a lane title that is two or more words and then `Specialist`, `Analyst` or `Associate` (one built-in group) matches a posting with the same words and any of those three, ignoring level words (Junior, Senior, Sr., I to IV, 1 to 4, Level N) and reading `Analyst, Client Experience` as `Client Experience Analyst`. So `IT Support Specialist` also matches `Senior IT Support Associate II` and `IT Support Associate - Night Shift`, but not `IT Support Associate Manager`, `IT Support Lead` or `Business Analyst, IT Support`. A one-word core such as `Data Analyst` only matches literally. A posting keeps the lane it was given when it was stored, even if you change the lanes later, until you run `careerhunter lanes reassign`. Without `search.lanes`, lane checking is off and `doctor` says so: alerts go by fit, then oldest. Lanes are separate from `hard_gates.never_gated_families`.
 
-Every alert carries a fit: `Fit: High`, `Medium` or `Low`, from the `fit` of the tier the posting was scored into. A posting the model hasn't scored yet, or scored into a tier name that is no longer in `gap_tiers`, is held and not alerted until it has a fit. `doctor` counts what is held.
+Every alert carries a fit: `Fit: High` or `Medium`. A posting scored `low` is stored and never alerted. A posting the model hasn't scored yet, or scored under a tier name that isn't high, medium or low (an older release's), is held and not alerted until it has a fit. `doctor` counts what is held.
+
+### How a posting is scored
+
+The local model reads the posting and your resume and lists every item the posting states, each classed: a qualification it `required`s or `preferred`s, a `duty` of the job, something it says it will teach (`trained`), or a `soft` skill. For each it says whether your resume meets it, with the words from your resume that show it. The program then decides, in code:
+
+- **Only an unmet required or preferred item is a gap**, or a soft skill your resume doesn't show at all. A duty, or anything the posting says it will teach, never is.
+- **Evidence is checked.** A "met" whose words aren't in your resume counts as not met. Experience counts only where your resume's roles and skills show it: an industry word in your resume's summary (the text before its first `Experience` or `Work history` heading) isn't experience in that field's job functions. A tool or skill named in your roles or skills is at most a minor gap.
+- **The seniority line:** a posting asking for 4 or more years you don't show is a core gap, and so is a senior or lead title. Up to 3 years is a minor gap, and none at all when the title is junior or entry level (junior, entry level, associate, new or recent graduate, intern, co-op, Tier 1, Level 1, or a level I or 1).
+- **The fit** comes from the core and minor gaps, with `fit_rubric.requirement_tiers`:
+
+  ```yaml
+  fit_rubric:
+    requirement_tiers:
+      high_max_minor: 2          # High: no core gap and at most this many minor gaps
+      entry_level_extra_minor: 2 # more minor gaps allowed when the posting says it's entry level
+      exclude_at_core: 3         # this many core gaps or more: skipped (gap_tier)
+      exempt_types: [education]  # gap types that never count; leave empty to count them all
+  ```
+
+  Two core gaps, a core gap in the role's main function, or a seniority gap make it Low. One other core gap makes it Medium. With no core gap it's High up to `high_max_minor` minor gaps, and Medium beyond that: minor gaps alone never make a posting Low. The gap types are experience, skill, tool, education, certification, licence, language, seniority and other. Every key is optional and has the default shown, except `exempt_types`, which defaults to none.
+
+The model never sees these numbers, and its sampling settings are fixed, with a fixed seed, so the same posting and resume give the same reply.
 
 **After you change `search.lanes`, or upgrade to a release that matches titles differently,** run `uv run careerhunter lanes reassign --dry-run`. It lists each stored posting whose lane would change, with its id, title, and old and new lane (`off-lane` for none), and each posting not checked against the lanes yet (`not checked -> <lane>`), then the counts and how many held postings would become alertable. It writes nothing. If the list looks right, run `uv run careerhunter lanes reassign` to apply exactly those moves; each is logged in `search.db`. Released postings alert at the bot's next poll, within `alerts.max_per_poll`, and one older than `search.max_posting_age_days` is skipped as `too_old` instead. Without `search.lanes` it refuses.
 
 **Upgrading from 0.3.0?** Follow "Upgrading to a new release" near the end of this guide. Postings that were already scored, and not yet alerted, get their fit from your config on the next watch run, by their tier name. With `search.lanes` set, that run also gives every stored posting its lane.
 
-`fit_rubric.weights` and `fit_rubric.thresholds` are not applied. Scoring uses `gap_tiers` and leaves the numeric rating empty.
+`fit_rubric.weights` and `fit_rubric.thresholds` are not applied. Scoring uses `requirement_tiers` and leaves the numeric rating empty.
 
 `fit_rubric.embedding_weight` is validated and the watcher does not apply it. The watcher does not blend it into the score or the alert. `careerhunter embed-eval` reads it when ranking a report. `search.resume: null` skips embeddings.
 
@@ -913,6 +935,69 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
 
+## Upgrading from 0.9.0 to 0.10.0
+
+Follow the nine steps above with the tag `v0.10.0` (`git checkout v0.10.0` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 4:** `config.yaml` has to change, with the services stopped and the data folder backed up (steps 1 and 2). Until it does, the config is refused when it is loaded, and `doctor` says:
+
+  ```text
+  config.yaml     BAD /Volumes/ExampleDrive/ExampleFolder/config.yaml has 1 problem(s):
+    - fit_rubric.gap_tiers is no longer a setting: replace it with fit_rubric.requirement_tiers (see "Upgrading from 0.9.0 to 0.10.0" in SETUP.md). The tier now follows from core and minor gaps, in code
+  ```
+
+  1. Replace the whole `fit_rubric.gap_tiers` block with `requirement_tiers` (see "How a posting is scored"). `exempt_requirements` becomes `exempt_types`, with type names (a degree is `education`):
+
+     ```yaml
+     fit_rubric:
+       requirement_tiers:
+         high_max_minor: 2
+         entry_level_extra_minor: 2
+         exclude_at_core: 3
+         exempt_types: [education]
+     ```
+
+  2. Optional: give each lane a `group` (`primary`, `career_change` or `stopgap`) in place of `fallback: true`. A lane without one is primary. A lane can't set both:
+
+     ```yaml
+     search:
+       lanes:
+         - name: operations
+           priority: 1
+           group: primary
+           titles: [Operations Coordinator]
+         - name: customer_success
+           priority: 2
+           group: stopgap
+           titles: [Customer Success Specialist]
+     ```
+
+  3. Optional: `search.off_lane_min_fit: never`, so no off-lane posting is alerted.
+
+  After changing the lanes, run `uv run careerhunter lanes reassign --dry-run` once the upgrade is done.
+- **Step 5:** `doctor` exits 0 once the config is changed. Both databases are already at their schema versions:
+
+  ```text
+  search.db       OK  schema version 35
+  ```
+
+- **Step 6:** `migrate` applies nothing:
+
+  ```text
+  search.db: applied nothing; schema version 35
+  ei_record_2026-27.db: applied nothing; schema version 4
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+- **Step 7:** skip it.
+- **Step 8:** these lines show the upgrade took (with the example lanes above, and `never` set):
+
+  ```text
+  lanes           OK  2 lanes (1 primary, 1 stopgap); off-lane postings are never alerted
+  ```
+
+A posting with no location is no longer skipped; ones already skipped as `empty_location` stay skipped. Postings scored before the upgrade keep their stored fit and their old tier name. One that is pending and already has a fit can still be alerted, now in the new order; an off-lane one is held with `never`. To score a posting again under the new rules, run `uv run careerhunter rescore --posting <id> --dry-run`, then without `--dry-run`.
+
 ## Upgrading from 0.8.1 to 0.9.0
 
 Follow the nine steps above with the tag `v0.9.0` (`git checkout v0.9.0` in the release checkout, then `uv sync --locked`). These steps differ:
@@ -1191,8 +1276,8 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `… left unscored (model took longer than N s …); moved to the back of the queue` | The model was still working on that posting when `scoring.timeout_seconds` ran out | Nothing to fix for one. The run went on, and the posting is tried again after the others. If `doctor`'s `scoring calls` line shows many timeouts, raise the timeout or use a faster model |
 | `score timeouts WARN N postings timed out 2 times in a row; set aside and not scored` | Those postings timed out on two runs in a row and are no longer sent to the model | Run `uv run careerhunter rescore --set-aside` to have the next run try them again, after raising `scoring.timeout_seconds` if they keep timing out |
 | `workday facets WARN <board>: "<facet>: <value>" not found last run …` | A name in that board's `ats_facets` wasn't in its facets on the last read, so the board was read unfiltered | Check the name against the board's search filters. If it was renamed, update `ats_facets`; if no posting has that value now, nothing to fix |
-| `config.yaml BAD … tiers need fit: low \| medium \| high; missing or not one of those on [...]` | A gap tier has no `fit`, or a value other than those three | Add `fit: low`, `medium` or `high` to each tier it names |
-| `watch held WARN … with no fit` | Postings were scored into a tier name that isn't in `fit_rubric.gap_tiers` any more | Put the tier back, or accept that they stay held. The next run fills in their fit once the name is back |
+| `config.yaml BAD fit_rubric.gap_tiers is no longer a setting …` | The config still has the gap-count rubric of 0.9.0 and earlier | Replace `gap_tiers` with `requirement_tiers` (see "Upgrading from 0.9.0 to 0.10.0") |
+| `watch held WARN … with no fit` | Postings were scored under a tier name that isn't high, medium or low, or `fit_rubric.requirement_tiers` isn't set | Set `requirement_tiers`, or re-score them with `careerhunter rescore --posting <id>` |
 | `watch run BAD the last run started N min ago and did not finish` | A watch run crashed, was stopped, or hit a database error | See `logs/watch.log`. Its counts are not used; the next finished run counts again |
 | `bot alerts BAD held since …` | The bot couldn't read `config.yaml` at its last poll, so it sent no watcher alerts | Fix `config.yaml` (`doctor` shows the problem). The next poll sends them |
 | The bot replies `Config can't be read, so nothing was recorded. Run careerhunter doctor.` | `/log` needs `config.yaml` for the date and the claim check | Fix `config.yaml`, then send the link again |

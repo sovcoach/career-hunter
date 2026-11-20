@@ -28,6 +28,7 @@ WALKTHROUGH_RELEASE = {"search": 19, "ei_record": 1}
 
 # Notes for an earlier upgrade keep that release's numbers too, as released.
 PAST_UPGRADES = {
+    "## Upgrading from 0.8.1 to 0.9.0": {"search": 35, "ei_record": 4},
     "## Upgrading from 0.8.0 to 0.8.1": {"search": 34, "ei_record": 4},
     "## Upgrading from 0.7.0 to 0.8.0": {"search": 33, "ei_record": 4},
     "## Upgrading from 0.6.0 to 0.7.0": {"search": 30, "ei_record": 4},

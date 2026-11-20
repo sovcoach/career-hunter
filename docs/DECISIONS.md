@@ -20,20 +20,21 @@ Entries follow a lightweight ADR (architecture decision record) format. New phas
 | 012 | The repo goes public after Phase 1 verification; `main` is protected then | Accepted (Phase 1); amended by 021; amended (local merges); amended (web merges) |
 | 013 | No exemptions in the data-path hook, not even for its own tests | Accepted (Phase 1); amended (Phase 2) |
 | 014 | Two data layers: `search.db`, and one EI record file per claim | Accepted (Phase 1.5); amended (#34); amended by 024; amended (batch M) |
-| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39, #41, #34, #42, #43); amended by 024 |
+| 015 | Telegram is a cloud service: bot messages are kept minimal | Accepted (Phase 2); amended by 019; amended (#38, #33, #39, #41, #34, #42, #43); amended by 024; amended by 029 |
 | 016 | The bot's trust boundary: long polling, an allowlist in code, opaque single-use buttons, fail-closed startup | Accepted (Phase 2); amended (#30) |
 | 017 | A snapshot of every job ad applied to | Accepted (Phase 2); amended by 024 |
 | 018 | One setting for the time zone | Accepted (Phase 2) |
-| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023; amended (#39, #42, #44) |
+| 019 | Local embedding vectors live in `search.db` beside the LLM tier | Accepted (Phase 3.5); amended (#30); amended by 023; amended (#39, #42, #44); amended by 029 |
 | 020 | Discovery asks a local SearXNG and queues companies for approval | Accepted (Phase 4); amended; amended (#30); amended (#40, #41); amended (#42); amended (0.5.1); amended (batch M) |
 | 021 | The public repo is MIT | Accepted (Phase 5) |
 | 022 | A watch run isolates failures, logs as it goes, and has a time budget | Accepted (#30); amended by 023; amended (#38, #39, #32, #35, #36, #40, #41, #42); amended by 025; amended by 027; amended (batch N) |
 | 023 | Scoring is grounded in an imported resume, and re-scored when it changes | Accepted (#37); amended (#38, #43, #44); amended (batch N) |
 | 024 | Each application keeps its job description | Accepted (0.5.0); amended (0.5.1) |
-| 025 | LM Studio needs an API token, and the chat model may be a reasoning model | Accepted (0.5.1); amended (batch N) |
+| 025 | LM Studio needs an API token, and the chat model may be a reasoning model | Accepted (0.5.1); amended (batch N); amended by 029 |
 | 026 | The scorer takes the operator's own criteria from a file in the data folder | Accepted (0.6.0); amended by 028 |
 | 027 | Every posting is gated on its full description before it is scored | Accepted (batch M) |
 | 028 | A criteria rule is a veto, grounded by a quote the code checks | Accepted (batch N); amended (caps) |
+| 029 | The tier is computed in code from the posting's classed requirements; alerts go by lane group | Accepted (batch Q) |
 
 ---
 
@@ -395,6 +396,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-015: Telegram is a cloud service: bot messages are kept minimal
 
+> **Amended by [ADR-029](#adr-029-the-tier-is-computed-in-code-from-the-postings-classed-requirements-alerts-go-by-lane-group) (batch Q).** Alerts now go by lane group first (primary, then career change, then stopgap, then off-lane), then fit, then lane priority, then the oldest; this replaces every order stated below. The lane line reads `Lane: <name> (career change)` or `Lane: <name> (stopgap)` for those groups. With `search.off_lane_min_fit: never`, no off-lane posting is alerted. A posting whose fit is `low` is stored and never alerted.
+
 > **Amended by [ADR-024](#adr-024-each-application-keeps-its-job-description).** A job description goes through Telegram one way: pasted after the `/log` line (a long paste is stitched from the messages Telegram split it into), sent as a file captioned with the `/log` line, or sent as a reply when the bot asks for it. It is never sent back. Replies say only `Job description saved.` or ask for it, and the bot log counts the messages a JD was made of, never their text. A LinkedIn link is never fetched, so `/log` refuses one without `| Company | Title`.
 
 > **Amended by [ADR-019](#adr-019-local-embedding-vectors-live-in-searchdb-beside-the-llm-tier) (Phase 3.5).** A watcher alert also includes the tier name and, when a cosine is stored, that cosine. It still does not send notes, fit ratings, gaps, the model text, vectors, skip reasons, or the claim.
@@ -520,6 +523,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A fixed offset doesn't follow any daylight-saving changes. Choosing between a name and an offset is left to the operator.
 
 ## ADR-019: Local embedding vectors live in search.db beside the LLM tier
+
+> **Amended by [ADR-029](#adr-029-the-tier-is-computed-in-code-from-the-postings-classed-requirements-alerts-go-by-lane-group) (batch Q).** The LLM tier is now high, medium or low, computed in code; `embed-eval` ranks it as 1, 0.5 and 0, in place of the order of `gap_tiers`.
 
 > **Amended by ADR-015's digest amendment (#39).** Alerts no longer carry `LLM: <tier>` or the `similarity:` line described below: a digest row has no tier name and no cosine, and since #34 a job ad sent with `/log` gets no alert of its own. The cosine is still stored beside the tier, and `embed-eval` reads it.
 
@@ -765,6 +770,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-025: LM Studio needs an API token, and the chat model may be a reasoning model
 
+> **Amended by [ADR-029](#adr-029-the-tier-is-computed-in-code-from-the-postings-classed-requirements-alerts-go-by-lane-group) (batch Q).** The scoring request now asks for a JSON-schema reply and uses a thinking model's sampling preset with a fixed seed, never temperature 0.
+
 **Context.**
 - LM Studio's server can require an API token, and this Mac's server keeps that on. Without the token every call is refused with 401, which looked the same as a server that was down.
 - The only chat model available is a reasoning model shared with other services. It writes its thinking (`<think>…</think>`) before its answer and takes far longer than 120 seconds on some postings.
@@ -861,3 +868,33 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A model that reads a rule too broadly can still veto with a real quote. The skip reason names the rule, and `doctor` counts vetoes, so a rule that vetoes too much can be seen and reworded.
 - The judgment is the model's. The tests use fake replies and check only the code path, so a change of model needs checking by hand.
 - Editing the file re-scores nothing, as before (ADR-026). A posting scored before a new rule is vetoed only when it is next re-scored.
+
+## ADR-029: The tier is computed in code from the posting's classed requirements; alerts go by lane group
+
+**Context.**
+- The tier was a bare count of the gaps the model listed: 0 to 2 gaps was High whatever their kind, and the model saw the thresholds. A re-score that merged or dropped one gap crossed the line between High and Medium.
+- The model read a junior posting's duty list as requirements, so a posting that offers training lost to a senior one with a few sharp requirements.
+- An industry word in a resume's summary was read as experience in that field's job functions.
+- Off-lane postings alerted at High, the same bar as every other posting, and a High stopgap posting outranked a Medium primary one.
+- Replies were sometimes unparseable, and some calls ran to the timeout. The scorer is a thinking model, and greedy decoding (temperature 0) can make one repeat itself.
+
+**Decision.**
+- **The reply follows a JSON schema.** The request carries `response_format` of type `json_schema` (strict), which LM Studio enforces as it generates. Sampling is fixed in code, not config: the thinking-mode preset for precise tasks (temperature 0.6, top_p 0.95, top_k 20, min_p 0) with a fixed seed, so the same request gives the same reply where the server honours the seed, and `presence_penalty` 1.5. Calibration found the preset alone looping in its thinking on some postings until the timeout; 1.5 is the model maker's setting against endless repetition.
+- **The model lists, the code decides.** The reply lists every item the posting states, each classed `required`, `preferred`, `duty`, `trained` (the posting says it will teach it) or `soft`, with `core`, `main_function`, the minimum `years` asked, whether the resume meets it (`yes`, `partly`, `no`) and `evidence` copied from the resume. Gaps are derived in code: only an unmet required or preferred item, or a soft one not met at all, is a gap. A duty or a trained item never is. Gap names are put in one style and gap types come from a fixed list.
+- **Evidence is checked.** A `yes` or `partly` whose evidence is not in the resume, as whole words, counts as `no`. Experience counts only where the resume's roles and skills show it: evidence for an `experience` item found only in the resume's summary (the text before its first roles heading) counts as `no`. An unmet tool or skill whose distinctive name appears outside the summary is a minor gap, never core.
+- **The seniority line.** An unmet ask of 4 or more years is a core seniority gap; 1 to 3 years is minor, and is no gap at all with a junior or entry title. A senior or lead title is a core seniority gap.
+- **The tier is computed in code** (`fit_rubric.requirement_tiers`), and nothing about it is sent: `exclude_at_core` core gaps (default 3) skip the posting (`gap_tier`); two core gaps, a core gap in the role's main function, or a seniority gap make it `low`; one other core gap makes it `medium`; with no core gap, at most `high_max_minor` minor gaps (default 2, plus `entry_level_extra_minor` when the posting is grounded as entry level by a quote) make it `high`, and more make it `medium`. Minor gaps alone never make a posting low. The tier name is its fit. A low fit is stored and never alerted. `gap_tiers` is refused, with a pointer to the upgrade notes.
+- **Lane groups order the alerts.** Each lane is `primary` (the default), `career_change` or `stopgap` (`fallback: true` is read as stopgap). Alerts go by group first, then fit, then lane priority, then the oldest. The group decides the order and the label, never whether a posting alerts. When `alerts.max_per_poll` holds alerts back, the poll's postings are chosen by group first across watch runs, so stopgap postings wait first; within a group an earlier run still goes first, and each run's chosen postings go as one digest. `search.off_lane_min_fit: never` keeps every off-lane posting from alerting.
+- **An empty location is never a drop.** A posting whose board or page gives no location is scored and alerted as usual, ranked normally in its group, and its alert says `Location unknown`. Capturing a location at intake is later work.
+- **No profile.** What the operator wants lives in the lanes and is decided in code; the model only judges fit against the resume.
+
+**Alternatives.**
+- Keeping the count with a stricter line. Rejected: the count still swings when the model merges or splits gaps, and the kind of gap is what matters.
+- An operator-written profile sent with the resume, stating fields worked in and not. Rejected: a general rule on evidence covers it without sending more personal text, and the lanes already say what the operator wants.
+- Temperature 0. Rejected for a thinking model: it can loop until the timeout.
+- A separate, higher bar for off-lane postings. Rejected: `never` is simpler, and the lanes say what is wanted.
+
+**Trade-offs.**
+- The classing is the model's judgment, and the tests use fake replies. A change of model needs the calibration set run again by hand.
+- The summary is found by a heading. A resume without a roles heading has no summary, and only the prompt's rule applies to it.
+- Stored scores keep their old tier names until they are re-scored. Postings that already have a fit keep it.
