@@ -1006,3 +1006,97 @@ def test_no_threshold_or_tier_reaches_the_model() -> None:
         assert word not in text
     view = json.loads(json.loads(seen["body"])["messages"][1]["content"])
     assert set(view) == {"lanes", "location_rules", "posting"}
+
+
+# --- experience only from roles and skills (Batch Q) ----------------------------------------
+
+SUMMARY_RESUME = Resume(
+    "Jordan Sample\n"
+    "Operations specialist with eight years across logistics, retail and finance.\n"
+    "\n"
+    "Work Experience\n"
+    "Coordinator, Example Freight (2019-2024): ran dispatch schedules and SharePoint "
+    "lists for three depots.\n"
+    "Skills: Excel, SQL, Power Automate\n",
+    "ef" * 32,
+)
+
+
+def _resumed(*items: dict[str, object]) -> Score:
+    content = fit_reply(items=items)
+    return _scored(content, resume=SUMMARY_RESUME, text=posting())
+
+
+def test_the_summary_and_the_roles_are_told_apart() -> None:
+    summary, body = scoring.resume_parts(SUMMARY_RESUME.text)
+    assert "logistics, retail and finance" in summary and "Work Experience" not in summary
+    assert body.startswith("Work Experience")
+    assert scoring.resume_parts("No headings at all. Finance and tech.") == (
+        "",
+        "No headings at all. Finance and tech.",
+    )
+    for heading in ("EXPERIENCE", "Professional Experience:", "Employment history", "Work History"):
+        assert scoring.resume_parts(f"Summary line\n{heading}\nA role")[0] == "Summary line\n"
+
+
+def test_an_industry_word_in_the_summary_is_not_experience() -> None:
+    fpa = requirement(
+        "2-3 years of FP&A experience",
+        type="experience",
+        core=True,
+        main_function=True,
+        years=3,
+        met="yes",
+        evidence="finance",
+    )
+    result = _resumed(fpa)
+    assert json.loads(result.gaps) == [
+        {"name": "2-3 years of FP&A experience", "kind": "core", "type": "experience"}
+    ]
+    assert result.tier == "low"
+
+
+def test_experience_a_role_shows_still_counts() -> None:
+    dispatch = requirement(
+        "Dispatch scheduling experience",
+        type="experience",
+        core=True,
+        met="yes",
+        evidence="ran dispatch schedules",
+    )
+    assert json.loads(_resumed(dispatch).gaps) == []
+
+
+def test_evidence_matches_whole_words_so_short_skills_still_count() -> None:
+    sql = requirement("SQL", type="skill", core=True, met="yes", evidence="SQL")
+    excel = requirement("Excel", type="tool", met="yes", evidence="Excel")
+    part = requirement("Excelsior suite", type="tool", met="yes", evidence="Excels")
+    assert json.loads(_resumed(sql, excel).gaps) == []
+    assert json.loads(_resumed(part).gaps) == [
+        {"name": "Excelsior suite", "kind": "minor", "type": "tool"}
+    ]
+
+
+def test_a_listed_tool_the_model_missed_is_a_minor_gap_never_core() -> None:
+    sharepoint = requirement("SharePoint development", type="tool", core=True)
+    automate = requirement("Advanced Power Automate flows", type="skill", core=True)
+    result = _resumed(sharepoint, automate)
+    assert json.loads(result.gaps) == [
+        {"name": "SharePoint development", "kind": "minor", "type": "tool"},
+        {"name": "Advanced Power Automate flows", "kind": "minor", "type": "skill"},
+    ]
+
+
+def test_the_term_guard_reads_only_tools_and_skills_outside_the_summary() -> None:
+    # "Retail" is in the summary only; an experience item is never softened by a term.
+    retail = requirement("Retail tooling", type="tool", core=True)
+    finance = requirement("Corporate Finance experience", type="experience", core=True)
+    advanced = requirement("Advanced proficiency", type="skill", core=True)
+    result = _resumed(retail, finance, advanced)
+    assert [gap["kind"] for gap in json.loads(result.gaps)] == ["core", "core", "core"]
+
+
+def test_the_prompt_states_the_general_experience_rule() -> None:
+    assert "Experience counts only where the resume's roles" in scoring.SYSTEM_PROMPT
+    assert "is not experience in that field's job functions" in scoring.SYSTEM_PROMPT
+    assert "profile" not in scoring.SYSTEM_PROMPT

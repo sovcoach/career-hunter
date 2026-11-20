@@ -9,15 +9,18 @@ constant, not a config field. The model id is `scoring.chat_model` (default
 The prompt is built from lanes and location rules, the posting fields,
 and the resume when one is in use. The model lists every item the posting states, each
 classed (`required`, `preferred`, `duty`, `trained` or `soft`), with whether the resume
-meets it. The gaps are derived here (`derive_gaps`): only an unmet required or
-preferred item, or a soft one not met at all, is a gap; a duty, or anything the
-posting says it will teach, never is. Gap names are put in one style (`gap_name`) and
-gap types come from a fixed list (GAP_TYPES). With a resume, a `yes` or `partly` whose
-evidence is not found in the resume counts as `no`. An `entry_level` flag counts only
-with a quote found in the posting. The tier (high, medium or low) is computed here from
-the core and minor gaps (`_apply_tiers`, `fit_rubric.requirement_tiers`), and no
-threshold is ever sent to the model. This module stores the tier name. `fit_rating` is
-left null. There is no mapping onto 0-10.
+meets it. The gaps are derived here (`derive_gaps`): only an unmet required or preferred
+item, or a soft one not met at all, is a gap; a duty, or anything the posting says it
+will teach, never is. Gap names are put in one style (`gap_name`) and gap types come
+from a fixed list (GAP_TYPES). With a resume, a `yes` or `partly` whose evidence is not
+found in the resume counts as `no`, and so does an `experience` item whose evidence is
+only in the resume's summary: experience counts only where the roles and skills show it
+(`resume_parts`). An unmet tool or skill whose name appears outside the summary is a
+minor gap (`partly`), never core. An `entry_level` flag counts only with a quote found
+in the posting. The tier (high, medium or low) is computed here from the core and minor
+gaps (`_apply_tiers`, `fit_rubric.requirement_tiers`), and no threshold is ever sent to
+the model. This module stores the tier name. `fit_rating` is left null. There is no
+mapping onto 0-10.
 
 The hard gates are not sent (ADR-027). `filters.decide` has applied them before any
 posting is scored, and a model shown `required_languages` next to a posting reported
@@ -96,7 +99,7 @@ from careerhunter import loopback
 from careerhunter.config import DEFAULT_CHAT_MODEL, GAP_TYPE_NAMES, chat_model, requirement_tiers
 from careerhunter.criteria import Criteria, Rule
 from careerhunter.deadline import Deadline
-from careerhunter.filters import PostingText, mentions
+from careerhunter.filters import PostingText, has_phrase, mentions
 from careerhunter.resume import Resume
 from careerhunter.search_store import Example
 
@@ -167,7 +170,12 @@ SYSTEM_PROMPT = (
     "years: the minimum years of experience the item asks for, 0 when it asks none. "
     'met: "yes", "partly" or "no", judged only against the resume; evidence: for yes '
     "or partly, a short phrase copied exactly from the resume that shows it, else an "
-    "empty string. type: one of the listed types. entry_level: when the posting says "
+    "empty string. Experience counts only where the resume's roles (the jobs held) and "
+    "skills actually show it. An industry or field word in the resume's summary, such as "
+    "a list of sectors worked across, is not experience in that field's job functions "
+    "(for example FP&A, accounting, M&A or brokerage): such an item is not met unless a "
+    "role or a skill shows the function itself. "
+    "type: one of the listed types. entry_level: when the posting says "
     "it is junior or entry level, or welcomes candidates without every qualification "
     '(such as recent graduates, "we\'ll train you", or "apply anyway"), a short '
     "quote copied exactly from the posting that says so, else an empty string. "
@@ -814,16 +822,80 @@ def _one_requirement(item: object) -> Requirement | None:
     )
 
 
+# A resume heading that starts its roles. Text before the first one is the summary.
+_ROLES_HEADING = re.compile(
+    r"^[ \t]*(?:(?:work|professional|relevant|employment|career)[ \t]+)?"
+    r"(?:experience|history|employment)[ \t]*:?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Words that say how well, not what: never a distinctive term.
+_PLAIN_WORDS = frozenset(
+    {
+        "ability",
+        "advanced",
+        "basic",
+        "excellent",
+        "experience",
+        "familiarity",
+        "knowledge",
+        "proficiency",
+        "proficient",
+        "skills",
+        "strong",
+        "understanding",
+        "working",
+    }
+)
+_TERM = re.compile(r"[A-Za-z][A-Za-z0-9+#.\-]*[A-Za-z0-9+#]")
+
+
+def resume_parts(text: str) -> tuple[str, str]:
+    """The resume's summary (the text before its first roles heading, such as
+    "Experience" or "Work history") and the rest. Without such a heading there is no
+    summary: ("", text)."""
+    heading = _ROLES_HEADING.search(text)
+    if heading is None:
+        return "", text
+    return text[: heading.start()], text[heading.start() :]
+
+
 def _evidenced(item: Requirement, resume_text: str) -> Requirement:
-    """The item, with `met` turned to `no` when it claims yes or partly and its
-    evidence is not in the resume: too short (MIN_QUOTE after `normalized`), or not
-    found there. The evidence itself is never stored."""
-    if item.met == "no":
+    """The item, checked against the resume (the evidence itself is never stored):
+
+    - `yes` or `partly` whose evidence is not found in the resume as whole words
+      becomes `no`;
+    - an `experience` item counts only where the resume's roles and skills show it, so
+      evidence found only in the summary (an industry word there is not experience in
+      that field's job functions) also becomes `no`;
+    - an unmet `tool` or `skill` item that names a distinctive term (4 or more
+      characters, capitalised, not a word like "Advanced") found as a whole word
+      outside the summary becomes `partly`: a minor gap, never core.
+    """
+    _summary, body = resume_parts(resume_text)
+    if item.met != "no":
+        evidence = item.evidence.strip()
+        if not evidence or not has_phrase(resume_text, evidence):
+            return dataclasses.replace(item, met="no")
+        if item.type == "experience" and not has_phrase(body, evidence):
+            return dataclasses.replace(item, met="no")
         return item
-    needle = normalized(item.evidence)
-    if len(needle) >= MIN_QUOTE and needle in normalized(resume_text):
-        return item
-    return dataclasses.replace(item, met="no")
+    if item.type in ("tool", "skill") and any(has_phrase(body, term) for term in _terms(item.text)):
+        return dataclasses.replace(item, met="partly")
+    return item
+
+
+def _terms(text: str) -> list[str]:
+    """The distinctive terms of a requirement: capitalised words of 4 or more characters
+    (a product or tool name), not the first word unless it has a capital inside it."""
+    terms = []
+    for index, match in enumerate(_TERM.finditer(text)):
+        word = match.group()
+        if len(word) < 4 or word.casefold() in _PLAIN_WORDS or not word[0].isupper():
+            continue
+        if index == 0 and not any(ch.isupper() for ch in word[1:]):
+            continue
+        terms.append(word)
+    return terms
 
 
 def derive_gaps(items: Sequence[Requirement]) -> list[_Gap]:
@@ -853,11 +925,15 @@ _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z][a-z])")
 
 
 def gap_name(text: str) -> str:
-    """A gap name in one style: `_` and camelCase become words (in lower case), runs of
-    whitespace one space, trimmed, and the first letter upper case. Plain wording keeps
-    its own case otherwise, so "SQL basics" stays as it is."""
+    """A gap name in one style: an identifier-style name (one token, with `_` or in
+    camelCase starting lower case) becomes words in lower case; runs of whitespace one
+    space, trimmed, and the first letter upper case. Plain wording keeps its own case
+    otherwise, so "SQL basics" and "SharePoint" stay as they are."""
     cleaned = " ".join(_CONTROL.sub(" ", text).split())
-    if "_" in cleaned or _CAMEL.search(cleaned):
+    identifier = " " not in cleaned and (
+        "_" in cleaned or (cleaned[:1].islower() and bool(_CAMEL.search(cleaned)))
+    )
+    if identifier:
         cleaned = " ".join(_CAMEL.sub(" ", cleaned.replace("_", " ")).split()).lower()
     return cleaned[:1].upper() + cleaned[1:]
 
