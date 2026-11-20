@@ -121,7 +121,7 @@ def _scorer(plan: dict[str, Any], calls: list[str]) -> Any:
         outcome = plan.get(text.company)
         if isinstance(outcome, BaseException):
             raise outcome
-        return Score(llm_output='{"gaps":[]}', gaps="[]", tier="strong")
+        return Score(llm_output='{"gaps":[]}', gaps="[]", tier="high")
 
     return scorer
 

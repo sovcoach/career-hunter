@@ -57,7 +57,9 @@ def test_three_unparseable_replies_give_the_posting_up(search: sqlite3.Connectio
     assert search_store.parse_given_up_count(search) == 1
     assert search_store.held_counts(search).unscored == 0  # not held: given up
 
-    lines = _run(search, '{"gaps":[]}')  # a good reply now: the posting is not sent again
+    lines = _run(
+        search, '{"gaps":[],"key_requirements":[],"entry_level":""}'
+    )  # a good reply now: the posting is not sent again
     assert lines[0] == "called 0"
     assert postings(search)[0]["llm_output"] is None
 
@@ -66,9 +68,9 @@ def test_a_reply_that_parses_clears_the_count(search: sqlite3.Connection) -> Non
     _run(search, "no json at all")
     _run(search, "no json at all")
     assert _failures(search) == [(2, 0)]
-    _run(search, '<think>fine</think>{"gaps":[]}')
+    _run(search, '<think>fine</think>{"gaps":[],"key_requirements":[],"entry_level":""}')
     assert _failures(search) == []
-    assert postings(search)[0]["llm_output"] == '{"gaps":[]}'
+    assert postings(search)[0]["llm_output"] == '{"gaps":[],"key_requirements":[],"entry_level":""}'
 
 
 def test_a_model_that_does_not_answer_is_not_a_parse_failure(search: sqlite3.Connection) -> None:

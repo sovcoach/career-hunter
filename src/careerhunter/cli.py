@@ -1854,7 +1854,18 @@ def _doctor_lanes(report: _Report, config_doc: dict[str, Any] | None) -> None:
         return
     count = plural(len(configured), "lane", "lanes")
     minimum = off_lane_min_fit(config_doc)
-    report.line("lanes", "OK", f"{count}; off-lane postings alert at {minimum} fit or better")
+    groups = {lane.group: 0 for lane in configured}
+    for lane in configured:
+        groups[lane.group] += 1
+    shown = ", ".join(f"{groups[g]} {g.replace('_', ' ')}" for g in lanes.GROUPS if g in groups)
+    if minimum == "never":
+        report.line("lanes", "OK", f"{count} ({shown}); off-lane postings are never alerted")
+    else:
+        report.line(
+            "lanes",
+            "OK",
+            f"{count} ({shown}); off-lane postings alert at {minimum} fit or better",
+        )
 
 
 def _doctor_watch_runs(
@@ -1886,9 +1897,10 @@ def _doctor_watch_runs(
     if finished is None:
         report.line("watch held", "--", "no finished run yet, so nothing is counted")
         return
-    detail = (
-        f"{finished['held_unscored']} unscored, {finished['held_no_fit']} with no fit, "
-        f"{finished['held_off_lane']} off-lane below the threshold"
+    detail = f"{finished['held_unscored']} unscored, {finished['held_no_fit']} with no fit, " + (
+        f"{finished['held_off_lane']} off-lane (never alerted)"
+        if config_doc is not None and off_lane_min_fit(config_doc) == "never"
+        else f"{finished['held_off_lane']} off-lane below the threshold"
     )
     if finished["budget_reached"]:
         detail += "; that run's budget left work for the next one"
@@ -1896,7 +1908,8 @@ def _doctor_watch_runs(
         report.line(
             "watch held",
             "WARN",
-            f"{detail}. A tier name isn't in fit_rubric.gap_tiers; those wait until it is",
+            f"{detail}. A tier name isn't one of fit_rubric.requirement_tiers' (high, medium, "
+            "low); those wait until it is",
         )
     else:
         report.line("watch held", "OK", detail)
@@ -2082,10 +2095,10 @@ def _doctor_components(
 
 
 def _model_in_use(config_doc: dict[str, Any]) -> bool:
-    """Whether a watch run calls LM Studio: scoring needs fit_rubric.gap_tiers, and
-    embeddings need a resume in config."""
+    """Whether a watch run calls LM Studio: scoring needs fit_rubric.requirement_tiers,
+    and embeddings need a resume in config."""
     rubric = config_doc.get("fit_rubric")
-    tiers = rubric.get("gap_tiers") if isinstance(rubric, dict) else None
+    tiers = rubric.get("requirement_tiers") if isinstance(rubric, dict) else None
     return isinstance(tiers, dict) or resume.configured(config_doc)
 
 
@@ -2118,7 +2131,7 @@ def _doctor_lm_studio(report: _Report, config_doc: dict[str, Any] | None) -> Non
     if config_doc is None:
         return
     if not _model_in_use(config_doc):
-        report.line("LM Studio", "--", "not used (no fit_rubric.gap_tiers and no resume)")
+        report.line("LM Studio", "--", "not used (no fit_rubric.requirement_tiers and no resume)")
         return
     report.line("LM Studio", *lm_studio_status())
 

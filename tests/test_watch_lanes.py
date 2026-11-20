@@ -141,11 +141,13 @@ def test_off_lane_postings_below_the_threshold_are_counted_as_held(
     search: sqlite3.Connection,
 ) -> None:
     scorer = Recorder()
-    scorer.replies["Warehouse Associate"] = Score(llm_output="{}", gaps="[]", tier="possible")
+    scorer.replies["Warehouse Associate"] = Score(llm_output="{}", gaps="[]", tier="medium")
     run(search, BOARDS, ("examplea",), config=with_lanes(), scorer=scorer)
     assert _held_off_lane(search) == 1  # medium, below the default high
     w.run(search, [], today=DAY, fetcher=Scripted({}), config=with_lanes(off_lane_min_fit="medium"))
     assert _held_off_lane(search) == 0
+    w.run(search, [], today=DAY, fetcher=Scripted({}), config=with_lanes(off_lane_min_fit="never"))
+    assert _held_off_lane(search) == 1  # never: every off-lane posting is held
     w.run(search, [], today=DAY, fetcher=Scripted({}), config=FITS)  # lanes off: none held
     assert _held_off_lane(search) == 0
     search.execute("UPDATE postings SET alerted_at = '2026-11-01T09:00:00Z'")

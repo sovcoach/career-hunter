@@ -76,7 +76,7 @@ def _current(datadir: DataDir) -> Path:
 
 
 def _kept(text: PostingText) -> Score:
-    return Score(llm_output="model text", gaps="[]", tier="strong")
+    return Score(llm_output="model text", gaps="[]", tier="high")
 
 
 def _greenhouse_text() -> str:
@@ -143,7 +143,7 @@ def test_a_kept_posting_stores_the_cosine_beside_the_tier(
     ).fetchone()
     assert row["fit_rating"] is None
     assert row["llm_output"] == "model text"
-    assert row["scout_metadata"] == '{"tier": "strong"}'
+    assert row["scout_metadata"] == '{"tier": "high"}'
     assert row["embedding_score"] == pytest.approx(1.0)
     assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 0
     assert not any(line.startswith("embedding miss") for line in lines)

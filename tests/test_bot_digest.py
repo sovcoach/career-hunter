@@ -181,12 +181,82 @@ def test_the_cap_carries_the_rest_over_in_lane_order(env: Env, keep_umask: None)
     _post(env, "Off Lane", lane=None)
     _post(env, "Fallback Ops", lane="customer_success")
     assert _poll(env) == 0
-    assert _heads(env) == ["Example Org — Top Ops", "Example Org — Fallback Ops"]
+    # Stopgap waits first: both primary postings go before it, whatever their fit.
+    assert _heads(env) == ["Example Org — Top Ops", "Example Org — Medium Ops"]
     assert _digests(env)[0]["text"].startswith("New postings: 2\n\n")
     assert _poll(env) == 0
-    assert _heads(env)[2:] == ["Example Org — Medium Ops", "Example Org — Off Lane"]
+    assert _heads(env)[2:] == ["Example Org — Fallback Ops", "Example Org — Off Lane"]
     assert _poll(env) == 0
     assert len(_digests(env)) == 2  # nothing left
+
+
+def test_a_low_fit_is_stored_and_never_alerted(env: Env, keep_umask: None) -> None:
+    _post(env, "Low Ops", fit="low")
+    _post(env, "Medium Ops", fit="medium")
+    assert _poll(env) == 0
+    assert _heads(env) == ["Example Org — Medium Ops"]
+    assert _poll(env) == 0
+    assert len(_digests(env)) == 1  # the low one never goes
+
+
+def test_with_one_a_poll_the_groups_go_in_order_and_off_lane_never(
+    env: Env, keep_umask: None
+) -> None:
+    doc = yaml.safe_load(env.datadir.config_path.read_text())
+    doc["alerts"] = {"max_per_poll": 1}
+    doc["search"]["off_lane_min_fit"] = "never"
+    doc["search"]["lanes"].append(
+        {"name": "change", "priority": 3, "group": "career_change", "titles": ["Example Role"]}
+    )
+    env.datadir.config_path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    _post(env, "Stopgap High", lane="customer_success")
+    _post(env, "Change High", lane="change")
+    _post(env, "Primary Medium", fit="medium")
+    _post(env, "Off Lane High", lane=None)
+    for _ in range(4):
+        assert _poll(env) == 0
+    assert _heads(env) == [
+        "Example Org — Primary Medium",
+        "Example Org — Change High",
+        "Example Org — Stopgap High",
+    ]
+    rows = [row[1].split(" | ")[1] for row in _rows(env)]  # after "Location unknown"
+    assert rows == [
+        "Lane: operations",
+        "Lane: change (career change)",
+        "Lane: customer_success (stopgap)",
+    ]
+
+
+def test_a_later_runs_primary_goes_before_an_earlier_runs_stopgap(
+    env: Env, keep_umask: None
+) -> None:
+    _config(env, max_per_poll=1)
+    early = _run(env, "2026-10-28T10:00:00Z", finished="2026-10-28T10:05:00Z")
+    late = _run(env, "2026-10-28T11:00:00Z", finished="2026-10-28T11:05:00Z")
+    _set(env, _post(env, "Early Stopgap", lane="customer_success"), score_run_id=early)
+    _set(env, _post(env, "Early Primary", fit="medium"), score_run_id=early)
+    _set(env, _post(env, "Late Primary", fit="medium"), score_run_id=late)
+    for _ in range(3):
+        assert _poll(env) == 0
+    # Same group: the earlier run first. Stopgap waits for every primary, whatever its run.
+    assert _heads(env) == [
+        "Example Org — Early Primary",
+        "Example Org — Late Primary",
+        "Example Org — Early Stopgap",
+    ]
+
+
+def test_one_poll_sends_one_digest_per_run_best_group_first(env: Env, keep_umask: None) -> None:
+    early = _run(env, "2026-10-28T10:00:00Z", finished="2026-10-28T10:05:00Z")
+    late = _run(env, "2026-10-28T11:00:00Z", finished="2026-10-28T11:05:00Z")
+    _set(env, _post(env, "Early Stopgap", lane="customer_success"), score_run_id=early)
+    _set(env, _post(env, "Late Primary"), score_run_id=late)
+    _set(env, _post(env, "Late Stopgap", lane="customer_success"), score_run_id=late)
+    assert _poll(env) == 0
+    firsts = [d["text"].split("\n\n")[1].split("\n")[0] for d in _digests(env)]
+    assert firsts == ["1. Example Org — Late Primary", "1. Example Org — Early Stopgap"]
+    assert len(_digests(env)) == 2
 
 
 def test_one_digest_per_run_older_runs_and_unknown_runs_first(env: Env, keep_umask: None) -> None:
@@ -194,7 +264,7 @@ def test_one_digest_per_run_older_runs_and_unknown_runs_first(env: Env, keep_uma
     late = _run(env, "2026-10-28T11:00:00Z", finished="2026-10-28T11:05:00Z")
     _set(env, _post(env, "Late Top"), score_run_id=late)
     _set(env, _post(env, "Early Medium", fit="medium"), score_run_id=early)
-    _post(env, "Before Runs", fit="low")  # scored before migration 0011: no run
+    _post(env, "Before Runs", fit="medium")  # scored before migration 0011: no run
     assert _poll(env) == 0
     digests = _digests(env)
     assert [d["text"].split("\n\n")[1].split("\n")[0] for d in digests] == [
@@ -207,8 +277,8 @@ def test_one_digest_per_run_older_runs_and_unknown_runs_first(env: Env, keep_uma
 def test_an_earlier_runs_leftovers_go_before_a_later_run(env: Env, keep_umask: None) -> None:
     _config(env, max_per_poll=1)
     early = _run(env, "2026-10-28T10:00:00Z", finished="2026-10-28T10:05:00Z")
-    _set(env, _post(env, "Early One", fit="low"), score_run_id=early)
-    _set(env, _post(env, "Early Two", fit="low"), score_run_id=early)
+    _set(env, _post(env, "Early One", fit="medium"), score_run_id=early)
+    _set(env, _post(env, "Early Two", fit="medium"), score_run_id=early)
     assert _poll(env) == 0
     late = _run(env, "2026-10-28T11:00:00Z", finished="2026-10-28T11:05:00Z")
     _set(env, _post(env, "Late High"), score_run_id=late)
@@ -580,11 +650,32 @@ def test_a_job_ad_that_is_a_scored_watcher_posting_is_logged_against_it(
     assert _digests(env) == []  # it has an application, so it is never alerted
 
 
+def test_a_posting_with_no_location_is_alerted_as_location_unknown_in_its_place(
+    env: Env, keep_umask: None
+) -> None:
+    _post(env, "Known Place", fit="medium")
+    unknown = _post(env, "No Place")
+    _set(env, unknown, location="")
+    conn = db.connect(env.datadir.search_db_path)
+    try:
+        conn.execute("UPDATE postings SET location = 'Example City' WHERE title = 'Known Place'")
+    finally:
+        conn.close()
+    assert _poll(env) == 0
+    rows = _rows(env)
+    # It ranks as usual within its group: High before Medium.
+    assert [row[0] for row in rows] == ["Example Org — No Place", "Example Org — Known Place"]
+    assert rows[0][1].startswith("Location unknown | Lane: operations | Fit: High")
+    assert rows[1][1].startswith("Example City | Lane: operations | Fit: Medium")
+
+
 def test_a_row_leaves_out_what_it_cannot_show(env: Env, keep_umask: None) -> None:
     posting = _post(env, "Coordinator", schedule="some_future_mark")
     _set(env, posting, gaps="not a list", url=None)
     assert _poll(env) == 0
-    assert _rows(env) == [["Example Org — Coordinator", "Lane: operations | Fit: High"]]
+    assert _rows(env) == [
+        ["Example Org — Coordinator", "Location unknown | Lane: operations | Fit: High"]
+    ]
 
 
 def test_a_store_failure_reading_alerts_sends_nothing(

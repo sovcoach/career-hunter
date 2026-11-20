@@ -7,6 +7,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Scoring lists only the gaps, briefly, and the code decides the fit.** The local model lists each qualification the posting requires or prefers that the resume doesn't meet, or meets only partly, as a short name with whether it's required or preferred, any years asked and a short quote. It never lists met qualifications, duties or what the posting will teach, so those are never gaps. It's asked to reason briefly. Experience counts only where the resume's roles and skills show it, not from an industry word in its summary. Gap names are put in one style, and gap types come from a fixed list. The parts of the request that are the same on every call come first and the posting last, so LM Studio can reuse its cached processing.
+- **The 4-year seniority line.** An unmet ask of 4 or more years, or a senior or lead title, is a core gap. Up to 3 years is minor, and is no gap at all with a junior or entry title.
+- **`fit_rubric.requirement_tiers` replaces `gap_tiers`**, which is now refused. The fit (high, medium or low) is worked out in code from the core and minor gaps, and no threshold is sent to the model. Minor gaps alone never make a posting low, and a low fit is stored but never alerted.
+- **Lane groups.** A lane is `primary` (the default), `career_change` or `stopgap`; `fallback: true` still means stopgap. Alerts go by group first, then fit, so a High stopgap posting never outranks a primary one, and stopgap postings wait first when `alerts.max_per_poll` holds some back. The lane line says `(career change)` or `(stopgap)`. `search.off_lane_min_fit` takes `never`. `doctor`'s lanes line counts the groups.
+- The scoring request asks for a JSON-schema reply and uses a thinking model's sampling preset (temperature 0.6, top_p 0.95, top_k 20, presence penalty 1.5 against endless repetition) with a fixed seed, in place of temperature 0.
+- No schema change: `search.db` stays at 35 and the EI record at 4. `config.yaml` has to change on upgrade (see "Upgrading from 0.9.0 to 0.10.0").
+
+### Fixed
+- A posting with no location is no longer dropped. It used to be skipped as `empty_location` whenever location rules were set and the board gave no work model, which lost ordinary postings whose job description names no place. It is now scored and alerted as usual, ranked normally within its lane group, and its alert says `Location unknown`. A watchlist entry's `role_filters.locations` doesn't skip it either. Postings already skipped as `empty_location` stay skipped.
+
 ## [0.9.0] - 2026-11-19
 
 ### Added

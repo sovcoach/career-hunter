@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import http.client
 import io
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -210,3 +211,50 @@ def use_example_watchlist(config_path: Path) -> None:
     doc = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     doc["watchlist"] = template_watchlist()
     config_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+
+def requirement(
+    text: str,
+    kind: str = "required",
+    *,
+    type: str = "other",
+    core: bool = False,
+    main_function: bool = False,
+    years: int = 0,
+    met: str = "no",
+    quote: str = "",
+) -> dict[str, Any]:
+    """One gap in a scoring reply, as the JSON schema asks for it."""
+    return {
+        "name": text,
+        "kind": kind,
+        "met": met,
+        "years": years,
+        "core": core,
+        "main_function": main_function,
+        "type": type,
+        "quote": quote,
+    }
+
+
+def fit_reply(
+    *gaps: tuple[str, str] | tuple[str, str, str],
+    items: tuple[dict[str, Any], ...] = (),
+    key: tuple[str, ...] = (),
+    entry_level: str = "",
+    **extra: Any,
+) -> str:
+    """A scoring reply's JSON. Each `gaps` entry is (name, "core" | "minor"[, type]): a
+    required qualification the resume doesn't meet. `items` are added as they are;
+    `extra` keys (veto, cap) go at the top level."""
+    listed = [
+        requirement(gap[0], type=gap[2] if len(gap) > 2 else "other", core=gap[1] == "core")
+        for gap in gaps
+    ]
+    body = {
+        "gaps": [*listed, *items],
+        "key_requirements": list(key),
+        "entry_level": entry_level,
+        **extra,
+    }
+    return json.dumps(body)

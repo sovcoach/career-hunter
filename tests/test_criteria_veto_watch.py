@@ -13,7 +13,7 @@ from tests.test_rescore import NEW, OLD, Recorder, board, lever, row, run, seed
 SLUG = "examplerobotics"
 SKIP = "criteria: 2. No contract or term under 12"
 VETOED = Score(llm_output="{}", gaps="[]", tier=None, veto=Veto(2, skip=SKIP))
-REJECTED = Score(llm_output='{"gaps":[]}', gaps="[]", tier="strong", veto=Veto(2, "not-found"))
+REJECTED = Score(llm_output='{"gaps":[]}', gaps="[]", tier="high", veto=Veto(2, "not-found"))
 
 
 def _boards(*jobs: tuple[str, str]) -> dict[str, object]:
@@ -99,7 +99,7 @@ def test_a_rejected_veto_is_scored_as_usual(search: sqlite3.Connection) -> None:
 def test_an_unknown_rule_is_logged_without_a_number(search: sqlite3.Connection) -> None:
     scorer = Recorder()
     scorer.replies["Coordinator"] = Score(
-        llm_output="{}", gaps="[]", tier="strong", veto=Veto(None, "unknown-rule")
+        llm_output="{}", gaps="[]", tier="high", veto=Veto(None, "unknown-rule")
     )
     lines = run(search, _boards(("r1", "Coordinator")), (SLUG,), scorer=scorer, resume=OLD)
     assert _logged(lines, ": 'Coordinator' veto rejected (unknown rule); scored")
@@ -138,16 +138,7 @@ def test_withdrawals_are_marked_sent_once(search: sqlite3.Connection) -> None:
 
 # --- caps (ADR-028) ------------------------------------------------------------------------
 
-FITS = {
-    "fit_rubric": {
-        "gap_tiers": {
-            "tiers": [
-                {"name": "strong", "max_gaps": 1, "fit": "high"},
-                {"name": "weak", "max_gaps": 3, "fit": "low"},
-            ]
-        }
-    }
-}
+FITS = {"fit_rubric": {"requirement_tiers": {}}}
 
 
 def _capped(tier: str, level: str = "medium") -> Score:
@@ -163,8 +154,8 @@ def _stored(conn: sqlite3.Connection, title: str) -> tuple[str | None, dict[str,
 
 def test_a_cap_lowers_a_high_fit_and_keeps_a_lower_one(search: sqlite3.Connection) -> None:
     scorer = Recorder()
-    scorer.replies["Coordinator"] = _capped("strong")
-    scorer.replies["Planner"] = _capped("weak")
+    scorer.replies["Coordinator"] = _capped("high")
+    scorer.replies["Planner"] = _capped("low")
     lines = run(
         search,
         _boards(("r1", "Coordinator"), ("r2", "Planner")),
@@ -173,8 +164,8 @@ def test_a_cap_lowers_a_high_fit_and_keeps_a_lower_one(search: sqlite3.Connectio
         resume=OLD,
         config=FITS,
     )
-    assert _stored(search, "Coordinator") == ("medium", {"tier": "strong", "cap_rule": 3})
-    assert _stored(search, "Planner") == ("low", {"tier": "weak", "cap_rule": 3})
+    assert _stored(search, "Coordinator") == ("medium", {"tier": "high", "cap_rule": 3})
+    assert _stored(search, "Planner") == ("low", {"tier": "low", "cap_rule": 3})
     assert _logged(lines, ": 'Coordinator' capped at medium (criteria 3)")
     assert _outcomes(search) == ["capped", "capped"]
     assert _skips(search) == []
@@ -187,7 +178,7 @@ def test_a_cap_on_an_alerted_re_score_lowers_the_fit_and_withdraws_nothing(
     search.execute("UPDATE postings SET alerted_at = '2026-11-01T10:00:00Z', fit = 'high'")
     search.commit()
     scorer = Recorder()
-    scorer.replies["Coordinator"] = _capped("strong")
+    scorer.replies["Coordinator"] = _capped("high")
     run(
         search,
         _boards(("r1", "Coordinator")),
@@ -204,12 +195,12 @@ def test_a_cap_on_an_alerted_re_score_lowers_the_fit_and_withdraws_nothing(
 def test_a_rejected_cap_scores_as_usual(search: sqlite3.Connection) -> None:
     scorer = Recorder()
     scorer.replies["Coordinator"] = Score(
-        llm_output="{}", gaps="[]", tier="strong", cap=Cap(3, "not-found")
+        llm_output="{}", gaps="[]", tier="high", cap=Cap(3, "not-found")
     )
     lines = run(
         search, _boards(("r1", "Coordinator")), (SLUG,), scorer=scorer, resume=OLD, config=FITS
     )
-    assert _stored(search, "Coordinator") == ("high", {"tier": "strong"})
+    assert _stored(search, "Coordinator") == ("high", {"tier": "high"})
     assert _outcomes(search) == ["cap_rejected"]
     assert _logged(lines, ": 'Coordinator' cap rejected (quote not found, rule 3); scored")
 
@@ -217,7 +208,7 @@ def test_a_rejected_cap_scores_as_usual(search: sqlite3.Connection) -> None:
 def test_a_veto_beats_a_cap_in_the_watcher(search: sqlite3.Connection) -> None:
     scorer = Recorder()
     scorer.replies["Coordinator"] = Score(
-        llm_output="{}", gaps="[]", tier="strong", veto=Veto(2, skip=SKIP), cap=Cap(3, level="low")
+        llm_output="{}", gaps="[]", tier="high", veto=Veto(2, skip=SKIP), cap=Cap(3, level="low")
     )
     run(search, _boards(("r1", "Coordinator")), (SLUG,), scorer=scorer, resume=OLD, config=FITS)
     assert _skips(search) == [("Coordinator", SKIP, 0)]
@@ -226,7 +217,7 @@ def test_a_veto_beats_a_cap_in_the_watcher(search: sqlite3.Connection) -> None:
 
 def test_cap_calls_count_as_answered(search: sqlite3.Connection) -> None:
     scorer = Recorder()
-    scorer.replies["Coordinator"] = _capped("strong")
+    scorer.replies["Coordinator"] = _capped("high")
     run(search, _boards(("r1", "Coordinator")), (SLUG,), scorer=scorer, resume=OLD, config=FITS)
     stats = search_store.score_call_stats(search, "2000-01-01T00:00:00Z")
     assert (len(stats.answered_ms), stats.not_answered) == (1, 0)

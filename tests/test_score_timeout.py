@@ -65,7 +65,7 @@ def test_a_call_starts_only_while_the_timeout_fits_in_the_budget(
 
     def scorer(text: Any) -> Score:
         clock.advance(100)
-        return Score(llm_output="kept", gaps="[]", tier="strong")
+        return Score(llm_output="kept", gaps="[]", tier="high")
 
     lines = w.run(
         search,
@@ -118,7 +118,7 @@ def test_watch_gives_the_scorer_the_configured_timeout(
 
     def local_score(posting: object, config: object, **kwargs: Any) -> Score:
         seen["timeout"] = kwargs["transport"].keywords["timeout"]
-        return Score(llm_output="{}", gaps="[]", tier="strong")
+        return Score(llm_output="{}", gaps="[]", tier="high")
 
     monkeypatch.setattr(cli.watch, "run", run)
     monkeypatch.setattr(cli, "score_posting", local_score)

@@ -65,13 +65,7 @@ CONFIG: dict[str, Any] = {
         "seniority_words": ["Senior", "Director"],
     },
     "fit_rubric": {
-        "gap_tiers": {
-            "tiers": [
-                {"name": "strong", "max_gaps": 1, "fit": "high"},
-                {"name": "possible", "max_gaps": 2, "fit": "medium"},
-            ],
-            "exclude_from_gaps": 3,
-        },
+        "requirement_tiers": {"high_max_minor": 1, "exclude_at_core": 3},
     },
     "schedule": {"timezone": "UTC"},
     "watchlist": [
@@ -159,10 +153,11 @@ BOARDS: dict[str, Any] = {
     ],
 }
 
-# What the fake local model answers for each title: the gaps, then key requirements.
+# What the fake local model answers for each title: the unmet requirements (as gaps),
+# then key requirements.
 ANSWERS: dict[str, tuple[list[dict[str, str]], list[str]]] = {
     "Operations Coordinator": (
-        [{"name": "forklift certificate", "kind": "minor", "type": "credential"}],
+        [{"name": "forklift certificate", "kind": "minor", "type": "certification"}],
         ["inventory software", "forklift certificate"],
     ),
     "Project Assistant": (
@@ -193,11 +188,24 @@ def board_fetcher(address: str, **_kw: object) -> Fetched:
 
 
 def model_transport(_url: str, payload: bytes, **_kw: object) -> tuple[int, bytes]:
-    """The fake local model: canned gaps for the posting's title."""
+    """The fake local model: canned unmet requirements for the posting's title."""
     request = json.loads(payload)
     view = json.loads(request["messages"][-1]["content"])
     gaps, requirements = ANSWERS.get(view["posting"]["title"], ([], []))
-    content = json.dumps({"gaps": gaps, "requirements": requirements})
+    items = [
+        {
+            "name": gap["name"],
+            "kind": "required",
+            "met": "no",
+            "years": 0,
+            "core": gap["kind"] == "core",
+            "main_function": False,
+            "type": gap["type"],
+            "quote": "",
+        }
+        for gap in gaps
+    ]
+    content = json.dumps({"gaps": items, "key_requirements": requirements, "entry_level": ""})
     return 200, json.dumps({"choices": [{"message": {"content": content}}]}).encode()
 
 

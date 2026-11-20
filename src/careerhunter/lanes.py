@@ -1,7 +1,8 @@
 """Match a posting's title to a lane from `search.lanes` (#33).
 
-A lane is a named group of target titles with a priority (1 is best) and an optional
-`fallback` flag. A title entry is a string, or a list of variants that count as one
+A lane is a named group of target titles with a priority (1 is best) and a group:
+`primary` (the default), `career_change` or `stopgap` (`fallback: true` is read as
+stopgap). A title entry is a string, or a list of variants that count as one
 title. A posting's title matches an entry when any variant appears in it as whole
 words, ignoring case, by `filters.has_phrase`: the same folding as every other title
 match here. When titles in several lanes match, the lane with the best (lowest)
@@ -26,12 +27,16 @@ Lanes only label and order postings. They never skip one and never exempt one fr
 hard gate: `hard_gates.never_gated_families` is a separate list, and neither reads the
 other. A config without `search.lanes` has no lanes, and lane checking is off.
 
-Alert order (`alert_order`, ADR-015 as amended). With lanes, pending alerts go:
-off-lane last; then the best fit first; then non-fallback lanes before fallback ones;
-then the best lane priority; then the oldest (`first_seen`, then id). A stored lane
-that is no longer in config sorts as a fallback after every configured lane, but before
-off-lane. An off-lane posting whose fit is below `search.off_lane_min_fit` is held, and
-so is a posting the watcher has not checked against the lanes yet. Without lanes,
+Alert order (`alert_order`, ADR-015 as amended in Batch Q). With lanes, pending alerts
+go by lane group first: every primary posting, then career change, then stopgap, then
+off-lane; within a group, the best fit first; then the best lane priority; then the
+oldest (`first_seen`, then id). So a High stopgap posting never outranks a primary
+one, and when `alerts.max_per_poll` holds alerts back, stopgap postings wait first.
+The group decides the order and the label (`Lane: support (stopgap)`), never whether a
+posting alerts. A stored lane that is no longer in config sorts as stopgap after every
+configured lane. An off-lane posting whose fit is below `search.off_lane_min_fit` is
+held, every off-lane posting is with `never`, and so is a posting the watcher has not
+checked against the lanes yet. Without lanes,
 alerts go by fit, then oldest, and none is held for its lane. The sort is done here in
 Python, so it does not depend on how a SQLite version orders nulls.
 """
@@ -45,18 +50,33 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from careerhunter import db, search_store
-from careerhunter.config import max_posting_age_days, off_lane_min_fit
+from careerhunter.config import LANE_GROUPS, max_posting_age_days, off_lane_min_fit
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import has_phrase, too_old
 from careerhunter.search_store import PendingAlert
 from careerhunter.titles import loose_match
+
+GROUPS = LANE_GROUPS
+_LABELS = {"primary": "", "career_change": " (career change)", "stopgap": " (stopgap)"}
 
 
 @dataclass(frozen=True)
 class Lane:
     name: str
     priority: int
-    fallback: bool
+    group: str = "primary"
+
+    @property
+    def fallback(self) -> bool:
+        """True for a stopgap lane (the old `fallback: true`)."""
+        return self.group == "stopgap"
+
+
+def _lane(raw: Mapping[str, Any]) -> Lane:
+    group = raw.get("group")
+    if group not in GROUPS:
+        group = "stopgap" if raw.get("fallback") is True else "primary"
+    return Lane(raw["name"], raw["priority"], group)
 
 
 def configured(doc: Mapping[str, Any] | None) -> list[Lane] | None:
@@ -65,11 +85,7 @@ def configured(doc: Mapping[str, Any] | None) -> list[Lane] | None:
     raw = search.get("lanes") if isinstance(search, Mapping) else None
     if not isinstance(raw, list) or not raw:
         return None
-    lanes = [
-        Lane(lane["name"], lane["priority"], bool(lane.get("fallback", False)))
-        for lane in raw
-        if isinstance(lane, Mapping)
-    ]
+    lanes = [_lane(lane) for lane in raw if isinstance(lane, Mapping)]
     return sorted(lanes, key=lambda lane: lane.priority)
 
 
@@ -92,7 +108,7 @@ def _best(title: str, raw: list[Any], test: Callable[[str, str], bool]) -> Lane 
         if not isinstance(lane, Mapping):
             continue
         if any(test(title, variant) for variant in _variants(lane.get("titles"))):
-            found = Lane(lane["name"], lane["priority"], bool(lane.get("fallback", False)))
+            found = _lane(lane)
             if best is None or found.priority < best.priority:
                 best = found
     return best
@@ -110,10 +126,12 @@ def _variants(titles: object) -> Iterator[str]:
 
 @dataclass(frozen=True)
 class Ordered:
-    """One alert to send, in order, with its lane line (None when lanes are off)."""
+    """One alert to send, in order, with its lane line (None when lanes are off) and its
+    group's rank (0 primary, 1 career change, 2 stopgap, 3 off-lane; 0 without lanes)."""
 
     posting_id: int
     lane_line: str | None
+    group: int = 0
 
 
 def alert_order(pending: list[PendingAlert], doc: Mapping[str, Any]) -> list[Ordered]:
@@ -127,22 +145,28 @@ def alert_order(pending: list[PendingAlert], doc: Mapping[str, Any]) -> list[Ord
         return [Ordered(alert.posting_id, None) for alert in ranked]
     by_name = {lane.name: lane for lane in lanes}
     lowest = max(lane.priority for lane in lanes) + 1  # a missing lane goes after all
-    min_rank = _fit_rank(off_lane_min_fit(doc))
-    keyed: list[tuple[tuple[int, int, int, int, str, int], Ordered]] = []
+    minimum = off_lane_min_fit(doc)
+    never = minimum == "never"
+    min_rank = len(FIT_LEVELS) if never else _fit_rank(minimum)
+    stopgap = GROUPS.index("stopgap")
+    keyed: list[tuple[tuple[int, int, int, str, int], Ordered]] = []
     for alert in pending:
         if not alert.lane_checked:
             continue  # the watcher checks it on its next run
         rank = _fit_rank(alert.fit)
         if alert.lane is None:
             if rank < min_rank:
-                continue  # off-lane and below the threshold: held
-            key = (1, -rank, 1, lowest, alert.first_seen, alert.posting_id)
-            keyed.append((key, Ordered(alert.posting_id, "Off-lane")))
+                continue  # off-lane and below the threshold, or never: held
+            key = (len(GROUPS), -rank, lowest, alert.first_seen, alert.posting_id)
+            keyed.append((key, Ordered(alert.posting_id, "Off-lane", len(GROUPS))))
             continue
         lane = by_name.get(alert.lane)
-        fallback, priority = (1, lowest) if lane is None else (int(lane.fallback), lane.priority)
-        key = (0, -rank, fallback, priority, alert.first_seen, alert.posting_id)
-        keyed.append((key, Ordered(alert.posting_id, f"Lane: {alert.lane}")))
+        if lane is None:
+            group, priority, label = stopgap, lowest, _LABELS["stopgap"]
+        else:
+            group, priority, label = GROUPS.index(lane.group), lane.priority, _LABELS[lane.group]
+        key = (group, -rank, priority, alert.first_seen, alert.posting_id)
+        keyed.append((key, Ordered(alert.posting_id, f"Lane: {alert.lane}{label}", group)))
     return [ordered for _, ordered in sorted(keyed, key=lambda pair: pair[0])]
 
 

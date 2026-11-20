@@ -997,7 +997,7 @@ def test_watch_command_records_the_example_boards_without_a_socket(
         raise AssertionError(board)
 
     def local_score(posting: object, config: object, **kwargs: object) -> Score:
-        return Score(llm_output='{"gaps":[]}', gaps="[]", tier="strong")
+        return Score(llm_output='{"gaps":[]}', gaps="[]", tier="high")
 
     monkeypatch.setattr(cli, "fetch_url", fake)
     monkeypatch.setattr(cli, "score_posting", local_score)
@@ -1027,7 +1027,7 @@ def test_watch_command_records_the_example_boards_without_a_socket(
             assert row["fit_rating"] is None
             assert row["gaps"] == "[]"
             assert row["llm_output"] == '{"gaps":[]}'
-            assert row["scout_metadata"] == '{"tier": "strong"}'
+            assert row["scout_metadata"] == '{"tier": "high"}'
             assert row["snapshot_path"] is None
     finally:
         conn.close()
@@ -1481,7 +1481,7 @@ def test_a_scoring_row_that_raises_is_isolated(search: sqlite3.Connection) -> No
     def scorer(text: Any) -> Score | None:
         if text.company == "Example B":
             raise RuntimeError("synthetic")
-        return Score(llm_output="kept", gaps="[]", tier="strong")
+        return Score(llm_output="kept", gaps="[]", tier="high")
 
     lines = w.run(search, [], today=DAY, fetcher=OnBoard({}), scorer=scorer)
     assert "watch: Example B: RuntimeError; continuing" in lines
@@ -1568,7 +1568,7 @@ def test_a_run_log_failure_inside_the_run_stops_it(
 
 def _example_boards(monkeypatch: pytest.MonkeyPatch, fetch: Any) -> None:
     def local_score(posting: object, config: object, **kwargs: object) -> Score:
-        return Score(llm_output='{"gaps":[]}', gaps="[]", tier="strong")
+        return Score(llm_output='{"gaps":[]}', gaps="[]", tier="high")
 
     monkeypatch.setattr(cli, "fetch_url", fetch)
     monkeypatch.setattr(cli, "score_posting", local_score)
@@ -2023,7 +2023,7 @@ def test_when_the_boards_use_the_whole_budget_the_other_passes_wait(
 
     def scorer(text: Any) -> Score:
         scored.append(text.company)
-        return Score(llm_output="kept", gaps="[]", tier="strong")
+        return Score(llm_output="kept", gaps="[]", tier="high")
 
     fetcher = Timed(three_boards().mapping, clock, cost=5)
     lines = w.run(
@@ -2061,7 +2061,7 @@ def test_scoring_waiting_rows_stops_when_the_budget_runs_out(
 
     def scorer(text: Any) -> Score:
         clock.advance(120)
-        return Score(llm_output="kept", gaps="[]", tier="strong")
+        return Score(llm_output="kept", gaps="[]", tier="high")
 
     # The boards cost 2 minutes each; reading a stored posting again before it is
     # scored (ADR-027) costs nothing here, so the scorer alone uses up the budget.
@@ -2131,7 +2131,7 @@ def test_new_postings_after_the_budget_runs_out_are_stored_but_not_scored(
     def scorer(text: Any) -> Score:
         scored.append(text.title)
         clock.advance(300)
-        return Score(llm_output="kept", gaps="[]", tier="strong")
+        return Score(llm_output="kept", gaps="[]", tier="high")
 
     fetcher = Timed({board("Example A"): jobs_for("Example A", 1001, 1002, 1003)}, clock)
     lines = w.run(

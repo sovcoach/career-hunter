@@ -12,8 +12,8 @@ from careerhunter.score import score_posting, strip_reasoning
 from tests.fakes import FakeServer, Reply
 from tests.test_score import RUBRIC, posting, reply
 
-ANSWER = '{"gaps":[],"requirements":["Synthetic scheduling tool"]}'
-THINKING = 'The candidate lacks nothing obvious. {"gaps": [{"name": "draft"}]} Let me answer.'
+ANSWER = '{"gaps":[],"key_requirements":["Synthetic scheduling tool"],"entry_level":""}'
+THINKING = 'The candidate lacks nothing. {"gaps": [{"text": "draft"}]} Let me answer.'
 
 
 def _scored(content: str) -> scoring.Score | None:

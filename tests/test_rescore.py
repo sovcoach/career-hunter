@@ -76,7 +76,7 @@ class Recorder:
         self.events.append(f"score {text.title}")
         if self.clock is not None:
             self.clock.advance(self.cost)
-        reply = self.replies.get(text.title, Score(llm_output="{}", gaps="[]", tier="strong"))
+        reply = self.replies.get(text.title, Score(llm_output="{}", gaps="[]", tier="high"))
         if isinstance(reply, Exception):
             raise reply
         return reply
@@ -288,7 +288,7 @@ def test_an_alerted_posting_is_re_scored_and_not_alerted_again(search: sqlite3.C
     with db.transaction(search):
         search_store.mark_alerted(search, posting_id, "2026-11-01T09:00:00Z")
     scorer = Recorder()
-    scorer.replies["Coordinator"] = Score(llm_output='{"gaps":[]}', gaps="[]", tier="possible")
+    scorer.replies["Coordinator"] = Score(llm_output='{"gaps":[]}', gaps="[]", tier="medium")
     run(
         search,
         {board("examplerobotics"): lever("examplerobotics", ("r1", "Coordinator"))},
