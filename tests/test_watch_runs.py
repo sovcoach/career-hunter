@@ -116,7 +116,7 @@ def test_held_counts_leave_out_skipped_and_alerted_postings(search: sqlite3.Conn
     _scored_without_fit(search, "Renamed tier", "renamed")
     alerted = _scored_without_fit(search, "Renamed but alerted", "renamed")
     search_store.mark_alerted(search, alerted, "2026-11-01T09:00:00Z")
-    _scored_without_fit(search, "Filled in", "strong")
+    _scored_without_fit(search, "Filled in", "high")
     w.run(search, [], today=DAY, fetcher=Scripted({}), config=FITS)
     (row,) = runs(search)
     assert (row["held_unscored"], row["held_no_fit"], row["held_off_lane"]) == (1, 1, 0)

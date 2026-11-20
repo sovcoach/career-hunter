@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from careerhunter.config import REQUIREMENT_TIERS, requirement_tiers
+
 
 class EvalError(Exception):
     """A closed message. It names a config field, not a posting or a path."""
@@ -25,7 +27,7 @@ class EvalError(Exception):
 
 @dataclass(frozen=True)
 class Row:
-    """One stored cosine. The tier is None when it is missing or not in gap_tiers."""
+    """One stored cosine. The tier is None when it is missing or not a requirement tier."""
 
     posting_id: int
     tier: str | None
@@ -43,21 +45,11 @@ class Row:
 
 
 def tier_names(config: Mapping[str, Any]) -> list[str]:
-    """gap_tiers names, best first. A missing list or a name with whitespace is an error."""
-    rubric = config.get("fit_rubric")
-    gap = rubric.get("gap_tiers") if isinstance(rubric, Mapping) else None
-    tiers = gap.get("tiers") if isinstance(gap, Mapping) else None
-    if not isinstance(tiers, list) or not tiers:
-        raise EvalError("fit_rubric.gap_tiers is not set")
-    names: list[str] = []
-    for item in tiers:
-        name = item.get("name") if isinstance(item, Mapping) else None
-        if not isinstance(name, str) or not name.strip() or any(ch.isspace() for ch in name):
-            raise EvalError("fit_rubric.gap_tiers names must be a single word")
-        names.append(name.strip())
-    if len(set(names)) != len(names):
-        raise EvalError("fit_rubric.gap_tiers names must be unique")
-    return names
+    """The tier names, best first (high, medium, low). An error without
+    fit_rubric.requirement_tiers."""
+    if requirement_tiers(config) is None:
+        raise EvalError("fit_rubric.requirement_tiers is not set")
+    return list(REQUIREMENT_TIERS)
 
 
 def embedding_weight(config: Mapping[str, Any]) -> float | None:

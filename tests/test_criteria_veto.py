@@ -121,7 +121,7 @@ def test_3_a_contract_with_a_path_to_permanent_is_neither_vetoed_nor_capped() ->
         _posting("A 6-month contract with a stated path to a permanent role at the depot.")
     )
     assert result is not None and not result.vetoed and result.capped is None
-    assert result.tier == "strong"
+    assert result.tier == "high"
 
 
 def test_4_french_in_wording_the_gate_misses_is_vetoed() -> None:
@@ -143,7 +143,7 @@ def test_6_a_fabricated_quote_is_rejected_and_the_posting_is_scored() -> None:
     result = _score(posting, {"rule": 2, "quote": "3-month contract, no extension"})
     assert result is not None and not result.vetoed
     assert result.veto == Veto(2, "not-found")
-    assert result.tier == "strong"  # scored from the same reply's gaps
+    assert result.tier == "high"  # scored from the same reply's gaps
     assert json.loads(result.gaps) == GAPS
 
 
@@ -152,14 +152,14 @@ def test_7_a_contract_with_only_a_possible_extension_is_capped_at_medium() -> No
     result = _score(posting, cap={"rule": 3, "quote": "possibility of extension"})
     assert result is not None and not result.vetoed
     assert result.cap == Cap(3, level="medium") and result.capped == "medium"
-    assert result.tier == "strong"  # the tier stands; the watcher caps the fit
+    assert result.tier == "high"  # the tier stands; the watcher caps the fit
 
 
 def test_8_a_fabricated_cap_quote_is_discarded_and_the_posting_is_scored() -> None:
     posting = _posting("A permanent, full-time role coordinating synthetic shipments.")
     result = _score(posting, cap={"rule": 3, "quote": "possibility of extension"})
     assert result is not None and result.capped is None
-    assert result.cap == Cap(3, "not-found") and result.tier == "strong"
+    assert result.cap == Cap(3, "not-found") and result.tier == "high"
 
 
 # --- caps beside vetoes -------------------------------------------------------------------
@@ -228,7 +228,7 @@ def test_a_veto_that_is_not_an_object_is_rejected() -> None:
 def test_a_veto_with_no_criteria_sent_is_ignored() -> None:
     posting = _posting("A 3-month contract, full-time hours.")
     result = _score(posting, {"rule": 2, "quote": "3-month contract"}, stated=None)
-    assert result is not None and result.veto is None and result.tier == "strong"
+    assert result is not None and result.veto is None and result.tier == "high"
 
 
 def test_the_quote_matches_across_whitespace_and_case() -> None:

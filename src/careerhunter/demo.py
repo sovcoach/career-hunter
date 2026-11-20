@@ -65,13 +65,7 @@ CONFIG: dict[str, Any] = {
         "seniority_words": ["Senior", "Director"],
     },
     "fit_rubric": {
-        "gap_tiers": {
-            "tiers": [
-                {"name": "strong", "max_gaps": 1, "fit": "high"},
-                {"name": "possible", "max_gaps": 2, "fit": "medium"},
-            ],
-            "exclude_from_gaps": 3,
-        },
+        "requirement_tiers": {"high_max_minor": 1, "exclude_at_core": 3},
     },
     "schedule": {"timezone": "UTC"},
     "watchlist": [

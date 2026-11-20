@@ -81,7 +81,7 @@ def _raise(error: Exception) -> Callable[[], Score | None]:
 
 def test_a_scored_call_records_its_end_and_duration(search: sqlite3.Connection) -> None:
     ticks = Ticks()
-    kept = Score(llm_output="model text", gaps="[]", tier="strong")
+    kept = Score(llm_output="model text", gaps="[]", tier="high")
     _run(search, _taking(118.25, ticks, lambda: kept), ticks)
     [call] = _calls(search)
     run_id = search.execute("SELECT max(id) FROM watch_runs").fetchone()[0]

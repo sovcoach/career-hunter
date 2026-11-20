@@ -17,17 +17,7 @@ from tests.fakes import FakeClock
 from tests.test_rescore import NEW, OLD, Recorder, board, lever, run, titles
 from tests.test_watch import DAY, OnBoard, Scripted, minutes
 
-FITS = {
-    "fit_rubric": {
-        "gap_tiers": {
-            "tiers": [
-                {"name": "strong", "max_gaps": 1, "fit": "high"},
-                {"name": "possible", "max_gaps": 2, "fit": "medium"},
-            ],
-            "exclude_from_gaps": 3,
-        }
-    }
-}
+FITS = {"fit_rubric": {"requirement_tiers": {"high_max_minor": 1, "exclude_at_core": 3}}}
 
 
 def fit_of(conn: sqlite3.Connection, title: str) -> str | None:
@@ -48,7 +38,7 @@ def one_board(*jobs: tuple[str, str]) -> dict[str, Any]:
 
 def test_a_new_score_stores_its_tiers_fit(search: sqlite3.Connection) -> None:
     scorer = Recorder()
-    scorer.replies["Second"] = scored("possible")
+    scorer.replies["Second"] = scored("medium")
     run(
         search,
         one_board(("a1", "First"), ("a2", "Second")),
@@ -83,7 +73,7 @@ def test_a_re_score_replaces_the_fit_and_a_failed_one_keeps_it(search: sqlite3.C
     assert (fit_of(search, "Kept"), fit_of(search, "Moved")) == ("high", "high")
     scorer = Recorder()
     scorer.replies["Kept"] = None  # unparseable: the old score, hash and fit stay
-    scorer.replies["Moved"] = scored("possible")
+    scorer.replies["Moved"] = scored("medium")
     run(search, one_board(*jobs), ("examplea",), scorer=scorer, resume=NEW, config=FITS)
     assert sorted(titles(scorer)) == ["Kept", "Moved"]
     assert fit_of(search, "Kept") == "high"
@@ -118,12 +108,12 @@ def _scored_without_fit(conn: sqlite3.Connection, title: str, tier: str | None) 
 def test_the_fill_in_maps_stored_tier_names_and_holds_unknown_ones(
     search: sqlite3.Connection,
 ) -> None:
-    _scored_without_fit(search, "Waiting strong", "strong")
-    _scored_without_fit(search, "Waiting possible", "possible")
+    _scored_without_fit(search, "Waiting strong", "high")
+    _scored_without_fit(search, "Waiting possible", "medium")
     _scored_without_fit(search, "Waiting renamed", "renamed")
-    alerted = _scored_without_fit(search, "Already alerted", "strong")
+    alerted = _scored_without_fit(search, "Already alerted", "high")
     search_store.mark_alerted(search, alerted, "2026-10-02T09:00:00Z")
-    skipped = _scored_without_fit(search, "Skipped", "strong")
+    skipped = _scored_without_fit(search, "Skipped", "high")
     search_store.insert_skip(search, skipped, "2026-10-02", "manual")
     lines = w.run(search, [], today=DAY, fetcher=Scripted({}), config=FITS)
     assert "watch: fit filled in from config for 2 scored postings" in lines
@@ -136,10 +126,10 @@ def test_the_fill_in_maps_stored_tier_names_and_holds_unknown_ones(
     assert not any("fit filled in" in line for line in again)
 
 
-def test_the_fill_in_runs_without_a_scorer_and_without_gap_tiers(
+def test_the_fill_in_runs_without_a_scorer_and_without_requirement_tiers(
     search: sqlite3.Connection,
 ) -> None:
-    _scored_without_fit(search, "Waiting", "strong")
+    _scored_without_fit(search, "Waiting", "high")
     lines = w.run(search, [], today=DAY, fetcher=Scripted({}), config={})
     assert not any("fit filled in" in line for line in lines)
     assert fit_of(search, "Waiting") is None
@@ -148,7 +138,7 @@ def test_the_fill_in_runs_without_a_scorer_and_without_gap_tiers(
 
 
 def test_a_crash_in_the_fill_in_is_isolated(search: sqlite3.Connection, monkeypatch: Any) -> None:
-    _scored_without_fit(search, "Waiting", "strong")
+    _scored_without_fit(search, "Waiting", "high")
 
     def broken(conn: sqlite3.Connection, fits: Any, run_id: Any) -> int:
         raise ValueError("synthetic")
@@ -289,10 +279,10 @@ def test_a_score_stores_its_requirements_and_run_and_replaces_them(
 def test_the_fill_in_records_the_run_that_made_a_posting_alertable(
     search: sqlite3.Connection,
 ) -> None:
-    filled = _scored_without_fit(search, "Waiting strong", "strong")
+    filled = _scored_without_fit(search, "Waiting strong", "high")
     held = _scored_without_fit(search, "Waiting renamed", "renamed")
     run_id = search_store.start_watch_run(search, "2026-11-01T09:00:00Z")
-    assert search_store.fill_missing_fits(search, {"strong": "high"}, run_id) == 1
+    assert search_store.fill_missing_fits(search, {"high": "high"}, run_id) == 1
     assert _row(search, filled) == (None, run_id)
     assert _row(search, held) == (None, None)
 
@@ -311,7 +301,7 @@ def _run_ids(conn: sqlite3.Connection) -> list[int]:
 def test_a_watch_score_stores_its_run_and_key_requirements(search: sqlite3.Connection) -> None:
     scorer = Recorder()
     scorer.replies["First"] = Score(
-        llm_output="{}", gaps="[]", tier="strong", key_requirements=("Forklift licence",)
+        llm_output="{}", gaps="[]", tier="high", key_requirements=("Forklift licence",)
     )
     run(search, one_board(("a1", "First"), ("a2", "Second")), ("examplea",), scorer=scorer)
     (first_run,) = _run_ids(search)
@@ -320,7 +310,7 @@ def test_a_watch_score_stores_its_run_and_key_requirements(search: sqlite3.Conne
 
 
 def test_a_fit_filled_in_records_the_run_that_filled_it(search: sqlite3.Connection) -> None:
-    _scored_without_fit(search, "Waiting strong", "strong")
+    _scored_without_fit(search, "Waiting strong", "high")
     w.run(search, [], today=DAY, fetcher=Scripted({}), config=FITS)
     (first_run,) = _run_ids(search)
     assert _stored(search, "Waiting strong") == (None, first_run)

@@ -313,7 +313,7 @@ def test_criteria_go_in_the_request_as_numbered_rules_with_the_instruction() -> 
 def _run(search: sqlite3.Connection, problem: str | None, calls: list[str]) -> list[str]:
     def scorer(posting: PostingText) -> Score:
         calls.append(posting.title)
-        return Score(llm_output="model text", gaps="[]", tier="strong")
+        return Score(llm_output="model text", gaps="[]", tier="high")
 
     board = url("greenhouse", "examplerobotics")
     return watch.run(
@@ -505,7 +505,7 @@ def test_watch_sends_the_criteria_or_holds_scoring(
     def local_score(posting: object, config: object, **kwargs: Any) -> Score:
         stated = kwargs["criteria"]
         seen["criteria"] = None if stated is None else stated.rules
-        return Score(llm_output="{}", gaps="[]", tier="strong")
+        return Score(llm_output="{}", gaps="[]", tier="high")
 
     monkeypatch.setattr(cli.watch, "run", run)
     monkeypatch.setattr(cli, "score_posting", local_score)

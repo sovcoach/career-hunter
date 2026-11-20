@@ -1595,7 +1595,7 @@ def _insert(
         schedule=schedule,
         gaps='["SENTINEL-gaps-alert"]' if scored else None,
         llm_output='{"gaps":["SENTINEL-llm-alert"]}' if scored else None,
-        scout_metadata='{"tier": "strong"}' if scored else None,
+        scout_metadata='{"tier": "high"}' if scored else None,
         fit_rating=8 if scored else None,
     )
     _, posting_id, _, _ = search_store.find_or_create_posting(
@@ -2145,21 +2145,19 @@ def test_a_held_posting_is_never_alerted_is_retried_and_alerts_once_scored(
     assert len(_sends(env)) == 1
 
 
-def test_a_tier_name_missing_from_config_is_held_until_it_is_back(
-    env: Env, keep_umask: None
-) -> None:
+def test_a_tier_with_no_fit_in_config_is_held_until_it_has_one(env: Env, keep_umask: None) -> None:
     from careerhunter.score import Score
     from tests.test_rescore import Recorder
 
     config = _bot_config(env)
+    without = copy.deepcopy(config)
+    del without["fit_rubric"]["requirement_tiers"]
     scorer = Recorder()
-    scorer.replies["Operations Coordinator"] = Score(llm_output="{}", gaps="[]", tier="renamed")
-    _watch(env, scorer, config)
+    scorer.replies["Operations Coordinator"] = Score(llm_output="{}", gaps="[]", tier="medium")
+    _watch(env, scorer, without)
     assert _poll(env) == 0
     assert _sends(env) == []
-    renamed = copy.deepcopy(config)
-    renamed["fit_rubric"]["gap_tiers"]["tiers"][1]["name"] = "renamed"
-    lines = _watch(env, Recorder(), renamed)  # already scored: not sent to the model again
+    lines = _watch(env, Recorder(), config)  # already scored: not sent to the model again
     assert "watch: fit filled in from config for 1 scored postings" in lines
     assert _poll(env) == 0
     assert len(_sends(env)) == 1
@@ -2210,13 +2208,15 @@ def test_alerts_go_in_lane_order_with_their_lane_line(env: Env, keep_umask: None
 def test_an_off_lane_posting_waits_until_the_threshold_is_lowered(
     env: Env, keep_umask: None
 ) -> None:
-    _insert(env, "Example Org", "Off Lane", "https://jobs.example.com/ads/1", lane=None, fit="low")
+    _insert(
+        env, "Example Org", "Off Lane", "https://jobs.example.com/ads/1", lane=None, fit="medium"
+    )
     assert _poll(env) == 0
     assert _sends(env) == []
     conn = env.search()
     assert conn.execute("SELECT alerted_at FROM postings").fetchone()[0] is None
     conn.close()
-    _set_search(env, off_lane_min_fit="low")
+    _set_search(env, off_lane_min_fit="medium")
     assert _poll(env) == 0
     assert _heads(env) == ["Example Org — Off Lane"]
     assert "Off-lane" in _sends(env)[0]["text"]

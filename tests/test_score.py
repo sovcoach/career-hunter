@@ -28,14 +28,11 @@ from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, po
 
 RUBRIC = {
     "fit_rubric": {
-        "gap_tiers": {
-            "tiers": [
-                {"name": "strong", "max_gaps": 1},
-                {"name": "possible", "max_gaps": 2},
-            ],
-            "exclude_from_gaps": 3,
-            "boundary": {"at_gaps": 1, "all_minor": "strong", "any_core": "possible"},
-            "exempt_requirements": ["education"],
+        "requirement_tiers": {
+            "high_max_minor": 1,
+            "entry_level_extra_minor": 2,
+            "exclude_at_core": 2,
+            "exempt_types": ["education"],
         }
     },
     "search": {
@@ -88,7 +85,7 @@ def test_the_prompt_uses_only_the_rubric_and_the_posting() -> None:
         return reply(fit_reply())
 
     result = score_posting(posting(), RUBRIC, transport=transport)
-    assert result is not None and result.tier == "strong" and result.gaps == "[]"
+    assert result is not None and result.tier == "high" and result.gaps == "[]"
     assert result.excluded is False
     text = seen["body"].decode()
     assert seen["url"] == DEFAULT_URL.encode()
@@ -190,16 +187,16 @@ def test_gap_tiers_name_the_tier_and_a_high_count_skips() -> None:
         return score_posting(posting(), RUBRIC, transport=lambda url, body: reply(content))
 
     empty = run(fit_reply())
-    assert empty is not None and empty.tier == "strong" and empty.excluded is False
+    assert empty is not None and empty.tier == "high" and empty.excluded is False
     minor = run(fit_reply(("spreadsheets", "minor", "skill")))
-    assert minor is not None and minor.tier == "strong"
+    assert minor is not None and minor.tier == "high"
     assert json.loads(minor.gaps) == [{"name": "Spreadsheets", "kind": "minor", "type": "skill"}]
     core = run("```json\n" + fit_reply(("French", "core", "language")) + "\n```")
-    assert core is not None and core.tier == "possible"
+    assert core is not None and core.tier == "medium"
     two = run(fit_reply(("French", "core"), ("Excel", "minor")))
-    assert two is not None and two.tier == "possible"
+    assert two is not None and two.tier == "medium"
     exempt = run(fit_reply(("a degree", "core", "education"), ("Excel", "minor", "skill")))
-    assert exempt is not None and exempt.tier == "strong"
+    assert exempt is not None and exempt.tier == "high"
     assert json.loads(exempt.gaps) == [{"name": "Excel", "kind": "minor", "type": "skill"}]
     over = run(fit_reply(("a", "core"), ("b", "core"), ("c", "minor")))
     assert over is not None and over.excluded and over.tier is None
@@ -264,7 +261,7 @@ def test_watch_scores_a_kept_posting_and_leaves_a_failure_unscored(
 
     def good(text: PostingText) -> Score:
         assert text.description is None  # Greenhouse list rows have no description
-        return Score(llm_output="model text", gaps="[]", tier="strong")
+        return Score(llm_output="model text", gaps="[]", tier="high")
 
     lines = watch.run(
         search,
@@ -279,7 +276,7 @@ def test_watch_scores_a_kept_posting_and_leaves_a_failure_unscored(
     assert row["fit_rating"] is None
     assert row["gaps"] == "[]"
     assert row["llm_output"] == "model text"
-    assert row["scout_metadata"] == '{"tier": "strong"}'
+    assert row["scout_metadata"] == '{"tier": "high"}'
     assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 0
 
     other = url("lever", "samplelogistics")
@@ -288,7 +285,7 @@ def test_watch_scores_a_kept_posting_and_leaves_a_failure_unscored(
     def mixed(text: PostingText) -> Score | None:
         if text.company == "Sample Logistics":
             raise OSError("synthetic")
-        return Score(llm_output="kept", gaps="[]", tier="possible")
+        return Score(llm_output="kept", gaps="[]", tier="medium")
 
     later = watch.run(
         search,
@@ -520,7 +517,7 @@ def test_a_reply_whose_headers_arrive_at_100_seconds_is_scored(
 ) -> None:
     server, _clock = _model(monkeypatch, header_cost=100.0)
     result = score_posting(posting(), RUBRIC)
-    assert result is not None and result.tier == "strong"
+    assert result is not None and result.tier == "high"
     # The reply does not stream, so one step may take the whole total.
     assert [timeout for *_rest, timeout in server.opened] == [120.0]
     assert [a.seconds for a in loopback_watchdog.armed] == [120.0]
@@ -602,7 +599,7 @@ def test_a_gap_and_a_requirement_naming_an_unstated_avoided_language_are_dropped
     assert json.loads(result.gaps) == [
         {"name": "Forklift licence", "kind": "minor", "type": "other"}
     ]
-    assert result.tier == "strong"  # one minor gap, not one core and one minor
+    assert result.tier == "high"  # one minor gap, not one core and one minor
     assert result.key_requirements == ("Remote in Canada",)  # the licence names a gap
 
 
@@ -612,7 +609,7 @@ def test_a_language_the_posting_states_is_kept() -> None:
         "Examplish language proficiency",
         "Forklift licence",
     ]
-    assert result.tier == "possible"
+    assert result.tier == "medium"
     assert "Examplish language required" in result.key_requirements
 
 
@@ -661,7 +658,7 @@ def test_the_resume_is_in_the_request_and_not_in_the_score() -> None:
     result, sent = _with_resume(
         "Sure! " + fit_reply(("French", "core", "language")) + " Hope that helps."
     )
-    assert result is not None and result.tier == "possible"
+    assert result is not None and result.tier == "medium"
     view = json.loads(json.loads(sent[0])["messages"][1]["content"])
     assert view["resume"] == _RESUME_TEXT
     assert result.llm_output == '{"gaps":[{"kind":"core","name":"French","type":"language"}]}'
@@ -849,7 +846,7 @@ def test_duties_and_trained_items_are_never_gaps() -> None:
         )
     )
     result = _scored(content)
-    assert json.loads(result.gaps) == [] and result.tier == "strong"
+    assert json.loads(result.gaps) == [] and result.tier == "high"
 
 
 def test_a_soft_item_counts_only_when_not_met_at_all_and_then_as_minor() -> None:
@@ -931,3 +928,81 @@ def test_the_prompt_asks_for_every_stated_item_and_the_training_offer() -> None:
     for phrase in ("every item the posting states", '"duty"', '"trained"', "copied exactly"):
         assert phrase in system
     assert "gap_tiers" not in system and "max_gaps" not in system
+
+
+# --- the tier, in code; no threshold is sent (Batch Q) ---------------------------------------
+
+DEFAULTS = {"fit_rubric": {"requirement_tiers": {"exempt_types": ["education"]}}}
+
+
+def _tier(content: str, text: PostingText = TRAINING) -> Score:
+    result = score_posting(text, DEFAULTS, transport=lambda url, body: reply(content))
+    assert result is not None
+    return result
+
+
+@pytest.mark.parametrize(
+    ("gaps", "expected"),
+    [
+        ((), "high"),
+        ((("a", "minor"), ("b", "minor")), "high"),
+        ((("a", "minor"), ("b", "minor"), ("c", "minor")), "medium"),
+        (tuple((f"m{n}", "minor") for n in range(12)), "medium"),  # minor only: never low
+        ((("a", "core"),), "medium"),
+        ((("a", "core"), ("b", "minor"), ("c", "minor"), ("d", "minor")), "medium"),
+        ((("a", "core"), ("b", "core")), "low"),
+    ],
+    ids=["none", "two-minor", "three-minor", "many-minor", "one-core", "core-and-minor", "2-core"],
+)
+def test_the_tier_follows_core_and_minor_gaps(
+    gaps: tuple[tuple[str, str], ...], expected: str
+) -> None:
+    result = _tier(fit_reply(*gaps))
+    assert result.tier == expected and result.excluded is False
+
+
+def test_a_core_gap_in_the_main_function_is_low() -> None:
+    main = requirement("2-3 years as an analyst in this function", core=True, main_function=True)
+    assert _tier(fit_reply(items=(main,))).tier == "low"
+    # The same item, met: no gap at all.
+    met = {**main, "met": "yes"}
+    assert _tier(fit_reply(items=(met,))).tier == "high"
+
+
+def test_three_core_gaps_exclude_the_posting() -> None:
+    result = _tier(fit_reply(("a", "core"), ("b", "core"), ("c", "core")))
+    assert result.excluded and result.tier is None
+
+
+def test_an_entry_level_posting_may_have_more_minor_gaps_at_high() -> None:
+    four = tuple((f"m{n}", "minor") for n in range(4))
+    assert _tier(fit_reply(*four)).tier == "medium"
+    assert _tier(fit_reply(*four, entry_level="Apply anyway.")).tier == "high"
+    five = tuple((f"m{n}", "minor") for n in range(5))
+    assert _tier(fit_reply(*five, entry_level="Apply anyway.")).tier == "medium"
+
+
+def test_an_exempt_type_never_counts() -> None:
+    degree = requirement("Bachelor's degree", type="education", core=True)
+    result = _tier(fit_reply(items=(degree,)))
+    assert result.tier == "high" and json.loads(result.gaps) == []
+
+
+def test_no_threshold_or_tier_reaches_the_model() -> None:
+    seen: dict[str, bytes] = {}
+
+    def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        seen["body"] = payload
+        return reply(fit_reply())
+
+    tuned = {
+        "fit_rubric": {
+            "requirement_tiers": {"high_max_minor": 7, "exclude_at_core": 9, "exempt_types": []}
+        }
+    }
+    score_posting(posting(), tuned, transport=transport)
+    text = seen["body"].decode()
+    for word in ("requirement_tiers", "high_max_minor", "exclude_at_core", "gap_tiers", "max_gaps"):
+        assert word not in text
+    view = json.loads(json.loads(seen["body"])["messages"][1]["content"])
+    assert set(view) == {"lanes", "location_rules", "posting"}

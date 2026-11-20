@@ -82,11 +82,13 @@ hard_gates:
   title_exceptions: []         # titles allowed despite containing a seniority word
   never_gated_families: []     # title families gated only when explicitly senior
 
-# How postings are scored: the local model lists the requirements a posting asks for
-# that you are missing, and gap_tiers turns the count into a tier and a fit.
+# How postings are scored: the local model lists every requirement the posting states,
+# each classed, and whether your resume meets it. The tier (high, medium or low, also
+# the fit) is worked out from the core and minor gaps in code; the model never sees
+# these numbers. A low fit is stored and never alerted.
 fit_rubric:
   # weights and thresholds still validate so an older file loads, and are not applied.
-  # With gap_tiers set they can be left out.
+  # With requirement_tiers set they can be left out.
   weights:
     title_match: 3
     skills_match: 3
@@ -95,18 +97,11 @@ fit_rubric:
   thresholds:
     strong: 8
     worth_a_look: 5
-  gap_tiers:
-    tiers:                     # best first, by the most gaps the tier allows
-      # fit is required on every tier: low, medium or high. Alerts show it, and a
-      # boundary outcome takes the fit of the tier it names.
-      - {name: strong, max_gaps: 1, fit: high}
-      - {name: possible, max_gaps: 2, fit: medium}
-    exclude_from_gaps: 3       # this many gaps or more: skip
-    boundary:                  # at exactly this many gaps, decide by the kind of gap
-      at_gaps: 1
-      all_minor: strong        # every gap learnable or nice-to-have
-      any_core: possible       # any gap core to the job
-    exempt_requirements: []    # requirement types that never count as a gap
+  requirement_tiers:
+    high_max_minor: 2          # High: no core gap and at most this many minor gaps
+    entry_level_extra_minor: 2 # more minor gaps allowed when the posting says it's entry level
+    exclude_at_core: 3         # this many core gaps or more: skip
+    exempt_types: []           # gap types that never count, e.g. [education]
   # Optional number from 0 to 1. The watcher does not use it for skips, alerts, or
   # what it stores. embed-eval ranks a blend with it when it is set. Null leaves it unset.
   embedding_weight: null

@@ -24,14 +24,7 @@ from tests.test_watch_ats import (
     wd_info,
 )
 
-FITS = {
-    "fit_rubric": {
-        "gap_tiers": {
-            "tiers": [{"name": "strong", "max_gaps": 1, "fit": "high"}],
-            "exclude_from_gaps": 3,
-        }
-    }
-}
+FITS = {"fit_rubric": {"requirement_tiers": {}}}
 LEVER_ID = "0b6a1c2d-3e4f-4a5b-8c9d-0e1f2a3b4c5d"
 LEVER = PostingRef(Board("lever", "freshlogistics"), LEVER_ID)
 LEVER_API = f"https://api.lever.co/v0/postings/freshlogistics/{LEVER_ID}?mode=json"
@@ -52,7 +45,7 @@ def lever_posting(title: str = "Operations Coordinator", **extra: object) -> dic
 
 
 def always_strong(posting: PostingText) -> Score:
-    return Score(llm_output="{}", gaps="[]", tier="strong")
+    return Score(llm_output="{}", gaps="[]", tier="high")
 
 
 def found(*refs: PostingRef) -> Any:
@@ -126,14 +119,19 @@ def test_an_off_lane_discovered_posting_below_the_threshold_is_held(
             "lanes": [{"name": "Support", "priority": 1, "titles": ["Support"]}],
             "off_lane_min_fit": "high",
         },
-        "fit_rubric": {
-            "gap_tiers": {
-                "tiers": [{"name": "strong", "max_gaps": 1, "fit": "medium"}],
-                "exclude_from_gaps": 3,
-            }
-        },
+        "fit_rubric": {"requirement_tiers": {}},
     }
-    run(search, Scripted({LEVER_API: fetched(lever_posting())}), LEVER, config=config)
+
+    def medium(posting: PostingText) -> Score:
+        return Score(llm_output="{}", gaps="[]", tier="medium")
+
+    run(
+        search,
+        Scripted({LEVER_API: fetched(lever_posting())}),
+        LEVER,
+        config=config,
+        scorer=medium,
+    )
     pending = search_store.pending_alerts(search)
     assert len(pending) == 1 and pending[0].lane is None and pending[0].lane_checked
     assert lanes.alert_order(pending, config) == []  # off-lane and medium: held

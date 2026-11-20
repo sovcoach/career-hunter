@@ -8,7 +8,8 @@ claims.validate_section.
 The structured fit criteria (issue #9) are optional sections alongside the original
 fields. Validation lives here. `careerhunter watch` applies exclusions, hard gates,
 location rules, role filters and schedule limits. `score.py` then scores
-survivors against `gap_tiers` on a local loopback model and leaves `fit_rating` null.
+survivors on a local loopback model, computes the tier from `requirement_tiers` in
+code, and leaves `fit_rating` null.
 The bot sends one alert digest per watch run. Quiet hours are not
 implemented. `schedule.watcher_interval_minutes` is how often the watch
 LaunchAgent runs, default 60 and at least 15.
@@ -17,9 +18,12 @@ LaunchAgent runs, default 60 and at least 15.
 - search.off_lane_min_fit: the lowest fit (low, medium or high, default high) at which
   a posting whose title matches no lane still alerts;
 - search.location_rules: places for on-site and hybrid work, regions for remote;
-- fit_rubric.gap_tiers: a rating from the number of missing requirements. Every tier
-  names its fit (low, medium or high), and a boundary outcome takes the fit of the
-  tier it names;
+- fit_rubric.requirement_tiers: how the tier (high, medium or low, which is also the
+  fit) follows from the core and minor gaps, computed in code and never sent to the
+  model. `high_max_minor` (default 2) is the most minor gaps a High posting may have,
+  plus `entry_level_extra_minor` (default 2) when the posting is grounded as entry
+  level; `exclude_at_core` (default 3) core gaps skip the posting (`gap_tier`); and
+  gaps of a type in `exempt_types` don't count. The old `gap_tiers` is refused;
 - hard_gates: language, credential, shift-pattern, pay-structure and seniority gates,
   with title exceptions;
 - schedule_limits: a cap on weekend work, flagged rather than excluded;
@@ -40,8 +44,8 @@ LaunchAgent runs, default 60 and at least 15.
   defaults to `local-model`; with no embedding_model, embeddings are off (no request
   is sent). The server URLs are not config.
 
-With lanes present, search.target_titles becomes optional; with gap_tiers present, the
-fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
+With lanes present, search.target_titles becomes optional; with requirement_tiers
+present, the fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
 optional. search.resume and fit_rubric.embedding_weight are optional. resume is a path
 relative to the data folder. When it is set, the watcher stores a cosine beside the
 tier. embedding_weight is a number from 0 to 1. The watcher does not read it for
@@ -380,46 +384,46 @@ def _validate_location_rules(rules: Any, problems: list[str]) -> None:
     _optional_str_list(rules, "remote", where, problems)
 
 
-def _validate_gap_tiers(rubric: Any, problems: list[str]) -> None:
-    where = "fit_rubric.gap_tiers"
-    tiers = rubric.get("tiers")
-    names: list[str] = []
-    maxes: list[int] = []
-    unmapped: list[str] = []
-    if not isinstance(tiers, list) or not tiers:
-        problems.append(f"{where}.tiers must be a non-empty list, best tier first")
-    else:
-        for i, tier in enumerate(tiers):
-            if not isinstance(tier, dict) or not isinstance(tier.get("name"), str):
-                problems.append(f"{where}.tiers[{i}] needs a name and max_gaps")
-                continue
-            names.append(tier["name"])
-            if not _int(tier.get("max_gaps")) or tier["max_gaps"] < 0:
-                problems.append(f"{where}.tiers[{i}].max_gaps must be an integer >= 0")
-            else:
-                maxes.append(tier["max_gaps"])
-            if tier.get("fit") not in FIT_LEVELS:
-                unmapped.append(tier["name"])
-        if unmapped:
+# The tiers requirement_tiers gives, best first. Each tier's name is also its fit.
+REQUIREMENT_TIERS = ("high", "medium", "low")
+REQUIREMENT_TIER_DEFAULTS = {
+    "high_max_minor": 2,
+    "entry_level_extra_minor": 2,
+    "exclude_at_core": 3,
+}
+GAP_TYPE_NAMES = (
+    "experience",
+    "skill",
+    "tool",
+    "education",
+    "certification",
+    "licence",
+    "language",
+    "seniority",
+    "other",
+)
+GAP_TIERS_REFUSED = (
+    "fit_rubric.gap_tiers is no longer a setting: replace it with "
+    'fit_rubric.requirement_tiers (see "Upgrading from 0.9.0 to 0.10.0" in SETUP.md). '
+    "The tier now follows from core and minor gaps, in code"
+)
+
+
+def _validate_requirement_tiers(rubric: Any, problems: list[str]) -> None:
+    where = "fit_rubric.requirement_tiers"
+    extra = set(rubric) - {*REQUIREMENT_TIER_DEFAULTS, "exempt_types"}
+    if extra:
+        problems.append(f"{where} has unknown keys: {sorted(extra)}")
+    for key, default in REQUIREMENT_TIER_DEFAULTS.items():
+        value = rubric.get(key, default)
+        lowest = 2 if key == "exclude_at_core" else 0
+        if not _int(value) or not lowest <= value <= 20:
             problems.append(
-                f"{where}.tiers need fit: {' | '.join(FIT_LEVELS)}; "
-                f"missing or not one of those on {unmapped}"
+                f"{where}.{key} must be an integer from {lowest} to 20 (default {default})"
             )
-        if maxes != sorted(maxes) or len(set(maxes)) != len(maxes):
-            problems.append(f"{where}.tiers must be ordered by increasing max_gaps")
-        if len(set(names)) != len(names):
-            problems.append(f"{where}.tiers names must be unique")
-    exclude = rubric.get("exclude_from_gaps")
-    if not _int(exclude) or (maxes and exclude <= max(maxes)):
-        problems.append(f"{where}.exclude_from_gaps must be an integer above every max_gaps")
-    boundary = _optional_mapping(rubric, "boundary", where, problems)
-    if boundary:
-        if not _int(boundary.get("at_gaps")):
-            problems.append(f"{where}.boundary.at_gaps must be an integer")
-        for key in ("all_minor", "any_core"):
-            if boundary.get(key) not in names:
-                problems.append(f"{where}.boundary.{key} must name one of the tiers {names}")
-    _optional_str_list(rubric, "exempt_requirements", where, problems)
+    types = rubric.get("exempt_types", [])
+    if not isinstance(types, list) or not all(item in GAP_TYPE_NAMES for item in types):
+        problems.append(f"{where}.exempt_types must be a list of: {' | '.join(GAP_TYPE_NAMES)}")
 
 
 _HARD_GATES = frozenset(
@@ -708,12 +712,14 @@ def validate_config(doc: Any) -> list[str]:
     rubric = _section(doc, "fit_rubric", problems)
     if "embedding_weight" in rubric:
         _embedding_weight(rubric["embedding_weight"], problems)
-    gap_tiers = _optional_mapping(rubric, "gap_tiers", "fit_rubric", problems)
+    if "gap_tiers" in rubric:
+        problems.append(GAP_TIERS_REFUSED)
+    gap_tiers = _optional_mapping(rubric, "requirement_tiers", "fit_rubric", problems)
     if gap_tiers is not None:
-        _validate_gap_tiers(gap_tiers, problems)
+        _validate_requirement_tiers(gap_tiers, problems)
     weights = rubric.get("weights")
     if weights is None and gap_tiers is not None:
-        pass  # the gap-count rubric replaces the weighted one
+        pass  # the requirement rubric replaces the weighted one
     elif not isinstance(weights, dict) or not weights:
         problems.append("fit_rubric.weights must be a non-empty mapping")
     else:
@@ -977,25 +983,23 @@ def off_lane_min_fit(doc: Mapping[str, Any] | None) -> str:
 
 
 def tier_fits(doc: Mapping[str, Any] | None) -> dict[str, str]:
-    """Each gap tier's name and its fit, from an already validated config.
+    """Each tier's name and its fit, from an already validated config.
 
-    A tier without a valid fit is left out, so a name missing here has no fit. With no
-    gap tiers the mapping is empty.
+    With `fit_rubric.requirement_tiers` the tiers are high, medium and low, and each
+    name is its own fit. Without it the mapping is empty, so no posting gets a fit.
     """
-    if not isinstance(doc, Mapping):
-        return {}
-    rubric = doc.get("fit_rubric")
-    gap_tiers = rubric.get("gap_tiers") if isinstance(rubric, dict) else None
-    tiers = gap_tiers.get("tiers") if isinstance(gap_tiers, dict) else None
-    if not isinstance(tiers, list):
-        return {}
-    return {
-        tier["name"]: tier["fit"]
-        for tier in tiers
-        if isinstance(tier, dict)
-        and isinstance(tier.get("name"), str)
-        and tier.get("fit") in FIT_LEVELS
-    }
+    return {name: name for name in REQUIREMENT_TIERS} if requirement_tiers(doc) else {}
+
+
+def requirement_tiers(doc: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """`fit_rubric.requirement_tiers` with its defaults filled in, or None when unset."""
+    rubric = doc.get("fit_rubric") if isinstance(doc, Mapping) else None
+    value = rubric.get("requirement_tiers") if isinstance(rubric, Mapping) else None
+    if not isinstance(value, Mapping):
+        return None
+    filled: dict[str, Any] = {**REQUIREMENT_TIER_DEFAULTS, "exempt_types": []}
+    filled.update({key: value[key] for key in filled if key in value})
+    return filled
 
 
 _UTC_OFFSET = re.compile(r"UTC(?:([+-])(\d{1,2})(?::([0-5]\d))?)?")

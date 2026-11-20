@@ -1896,7 +1896,8 @@ def _doctor_watch_runs(
         report.line(
             "watch held",
             "WARN",
-            f"{detail}. A tier name isn't in fit_rubric.gap_tiers; those wait until it is",
+            f"{detail}. A tier name isn't one of fit_rubric.requirement_tiers' (high, medium, "
+            "low); those wait until it is",
         )
     else:
         report.line("watch held", "OK", detail)
@@ -2082,10 +2083,10 @@ def _doctor_components(
 
 
 def _model_in_use(config_doc: dict[str, Any]) -> bool:
-    """Whether a watch run calls LM Studio: scoring needs fit_rubric.gap_tiers, and
-    embeddings need a resume in config."""
+    """Whether a watch run calls LM Studio: scoring needs fit_rubric.requirement_tiers,
+    and embeddings need a resume in config."""
     rubric = config_doc.get("fit_rubric")
-    tiers = rubric.get("gap_tiers") if isinstance(rubric, dict) else None
+    tiers = rubric.get("requirement_tiers") if isinstance(rubric, dict) else None
     return isinstance(tiers, dict) or resume.configured(config_doc)
 
 
@@ -2118,7 +2119,7 @@ def _doctor_lm_studio(report: _Report, config_doc: dict[str, Any] | None) -> Non
     if config_doc is None:
         return
     if not _model_in_use(config_doc):
-        report.line("LM Studio", "--", "not used (no fit_rubric.gap_tiers and no resume)")
+        report.line("LM Studio", "--", "not used (no fit_rubric.requirement_tiers and no resume)")
         return
     report.line("LM Studio", *lm_studio_status())
 

@@ -18,7 +18,7 @@ from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, ur
 
 SLUG = "examplewidgets"
 BOARD = company("Example Widgets", "greenhouse", SLUG)
-RUBRIC = {"fit_rubric": {"gap_tiers": [{"name": "strong", "max_gaps": 0, "fit": "high"}]}}
+RUBRIC = {"fit_rubric": {"requirement_tiers": {}}}
 SEARX = {
     "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "career_hosts": []},
     "search": {"target_titles": ["One"], "locations": ["Example City"]},
@@ -44,7 +44,7 @@ def _useful(conn: sqlite3.Connection) -> list[int | None]:
 
 
 def _answers(posting: PostingText) -> Score:
-    return Score(llm_output='{"gaps":[]}', gaps="[]", tier="strong")
+    return Score(llm_output='{"gaps":[]}', gaps="[]", tier="high")
 
 
 def _down(posting: PostingText) -> Score | None:

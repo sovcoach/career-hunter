@@ -92,7 +92,7 @@ def test_watch_sends_the_stored_token_and_never_prints_it(
 
     def local_score(posting: object, config: object, **kwargs: Any) -> Score:
         seen["score"] = kwargs["transport"].keywords.get("token")
-        return Score(llm_output="{}", gaps="[]", tier="strong")
+        return Score(llm_output="{}", gaps="[]", tier="high")
 
     monkeypatch.setattr(cli.watch, "run", run)
     monkeypatch.setattr(cli, "score_posting", local_score)
@@ -312,5 +312,5 @@ def test_doctor_skips_lm_studio_when_nothing_calls_it(
     cli._doctor_lm_studio(cli._Report(), {"fit_rubric": {"weights": {}}})
     cli._doctor_lm_studio(cli._Report(), None)  # an invalid config.yaml: no line
     assert capsys.readouterr().out == (
-        "LM Studio       --  not used (no fit_rubric.gap_tiers and no resume)\n"
+        "LM Studio       --  not used (no fit_rubric.requirement_tiers and no resume)\n"
     )

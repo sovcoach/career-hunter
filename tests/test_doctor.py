@@ -560,7 +560,7 @@ def test_postings_with_no_fit_are_a_warning(
     code, out = doctor(probe, capsys)
     assert code == 0
     assert "watch held      WARN 0 unscored, 3 with no fit" in out
-    assert "A tier name isn't in fit_rubric.gap_tiers" in out
+    assert "A tier name isn't one of fit_rubric.requirement_tiers'" in out
 
 
 def test_a_run_that_never_finished_is_bad_and_its_counts_are_not_used(

@@ -189,12 +189,21 @@ def test_the_cap_carries_the_rest_over_in_lane_order(env: Env, keep_umask: None)
     assert len(_digests(env)) == 2  # nothing left
 
 
+def test_a_low_fit_is_stored_and_never_alerted(env: Env, keep_umask: None) -> None:
+    _post(env, "Low Ops", fit="low")
+    _post(env, "Medium Ops", fit="medium")
+    assert _poll(env) == 0
+    assert _heads(env) == ["Example Org — Medium Ops"]
+    assert _poll(env) == 0
+    assert len(_digests(env)) == 1  # the low one never goes
+
+
 def test_one_digest_per_run_older_runs_and_unknown_runs_first(env: Env, keep_umask: None) -> None:
     early = _run(env, "2026-10-28T10:00:00Z", finished="2026-10-28T10:05:00Z")
     late = _run(env, "2026-10-28T11:00:00Z", finished="2026-10-28T11:05:00Z")
     _set(env, _post(env, "Late Top"), score_run_id=late)
     _set(env, _post(env, "Early Medium", fit="medium"), score_run_id=early)
-    _post(env, "Before Runs", fit="low")  # scored before migration 0011: no run
+    _post(env, "Before Runs", fit="medium")  # scored before migration 0011: no run
     assert _poll(env) == 0
     digests = _digests(env)
     assert [d["text"].split("\n\n")[1].split("\n")[0] for d in digests] == [
@@ -207,8 +216,8 @@ def test_one_digest_per_run_older_runs_and_unknown_runs_first(env: Env, keep_uma
 def test_an_earlier_runs_leftovers_go_before_a_later_run(env: Env, keep_umask: None) -> None:
     _config(env, max_per_poll=1)
     early = _run(env, "2026-10-28T10:00:00Z", finished="2026-10-28T10:05:00Z")
-    _set(env, _post(env, "Early One", fit="low"), score_run_id=early)
-    _set(env, _post(env, "Early Two", fit="low"), score_run_id=early)
+    _set(env, _post(env, "Early One", fit="medium"), score_run_id=early)
+    _set(env, _post(env, "Early Two", fit="medium"), score_run_id=early)
     assert _poll(env) == 0
     late = _run(env, "2026-10-28T11:00:00Z", finished="2026-10-28T11:05:00Z")
     _set(env, _post(env, "Late High"), score_run_id=late)

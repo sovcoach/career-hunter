@@ -57,9 +57,14 @@ def test_tier_unit_puts_the_best_tier_at_one() -> None:
     assert embed_eval.tier_unit("only", ["only"]) == pytest.approx(1.0)
 
 
-def test_a_tier_name_with_whitespace_is_refused() -> None:
+def test_the_tier_names_are_the_three_requirement_tiers() -> None:
+    assert embed_eval.tier_names({"fit_rubric": {"requirement_tiers": {}}}) == [
+        "high",
+        "medium",
+        "low",
+    ]
     with pytest.raises(embed_eval.EvalError):
-        embed_eval.tier_names({"fit_rubric": {"gap_tiers": {"tiers": [{"name": "two words"}]}}})
+        embed_eval.tier_names({"fit_rubric": {"weights": {"a": 1}}})
 
 
 def test_render_omits_the_blend_until_a_weight_is_set() -> None:
@@ -161,7 +166,7 @@ def _prepare(root: Path, *, weight: float | None) -> None:
             title=TITLE,
             url="https://jobs.example.com/ads/1",
             cosine=1.0,
-            tier="strong",
+            tier="high",
             outcome="applied",
             correlation="11" * 16,
         )
@@ -171,7 +176,7 @@ def _prepare(root: Path, *, weight: float | None) -> None:
             title="Support Coordinator",
             url="https://jobs.example.com/ads/2",
             cosine=0.0,
-            tier="strong",
+            tier="high",
             outcome="undecided",
             correlation="22" * 16,
         )
@@ -181,7 +186,7 @@ def _prepare(root: Path, *, weight: float | None) -> None:
             title="Warehouse Coordinator",
             url="https://jobs.example.com/ads/3",
             cosine=-1.0,
-            tier="possible",
+            tier="medium",
             outcome="skipped",
             correlation="33" * 16,
         )
@@ -201,7 +206,7 @@ def _prepare(root: Path, *, weight: float | None) -> None:
             title="Hidden Role",
             url="https://jobs.example.com/ads/5",
             cosine=None,
-            tier="strong",
+            tier="high",
             outcome="applied",
             correlation="55" * 16,
         )
@@ -232,8 +237,8 @@ def test_the_report_ranks_cosine_and_keeps_the_blend_out_of_the_database(
     assert _metric(text, "embedding_weight") == "0.000000"
     assert _metric(text, "blend_spearman") == "1.000000"
     assert _metric(text, "blend_precision_at_5") == "0.500000"
-    assert "1 strong 1.000000 applied 1.000000" in text
-    assert "3 possible -1.000000 skipped 0.000000" in text
+    assert "1 high 1.000000 applied 1.000000" in text
+    assert "3 medium -1.000000 skipped 0.500000" in text
     assert "4 - 0.500000 skipped -" in text
     secrets = (COMPANY, TITLE, PLACE, NOTES, MODEL, GAPS, HIDDEN, "Sample Logistics", "424242")
     for secret in secrets:
@@ -280,17 +285,17 @@ def test_a_missing_config_writes_nothing(
     assert not (inited / "evals").exists()
 
 
-def test_missing_gap_tiers_write_nothing(
+def test_missing_requirement_tiers_write_nothing(
     inited: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str]
 ) -> None:
     path = inited / "config.yaml"
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    del doc["fit_rubric"]["gap_tiers"]
+    del doc["fit_rubric"]["requirement_tiers"]
     path.write_text(yaml.safe_dump(doc), encoding="utf-8")
     assert cli.main(["embed-eval"], probe=probe) == cli.EXIT_ERROR
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "fit_rubric.gap_tiers is not set" in captured.err
+    assert "fit_rubric.requirement_tiers is not set" in captured.err
     assert str(inited) not in captured.err
     assert not (inited / "evals").exists()
 

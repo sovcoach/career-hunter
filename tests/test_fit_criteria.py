@@ -14,6 +14,7 @@ from careerhunter.config import (
     discovery_enabled,
     discovery_interval_minutes,
     off_lane_min_fit,
+    requirement_tiers,
     telegram_chat_id,
     tier_fits,
     timezone,
@@ -41,7 +42,7 @@ def test_the_template_uses_every_new_field_and_is_valid() -> None:
     assert d["discovery"]["searxng_url"] is None
     assert d["discovery"]["career_hosts"] == []
     assert d["discovery"]["interval_minutes"] == 1440
-    assert "gap_tiers" in d["fit_rubric"]
+    assert "requirement_tiers" in d["fit_rubric"] and "gap_tiers" not in d["fit_rubric"]
     assert {"seniority_words", "title_exceptions", "shift_patterns"} <= set(d["hard_gates"])
     assert "schedule_limits" in d
     assert d["watchlist"] == []  # inert until edited; see test_template_watchlist
@@ -58,11 +59,11 @@ def test_lanes_make_target_titles_optional() -> None:
     assert any("target_titles" in p for p in validate_config(d))
 
 
-def test_gap_tiers_make_weights_and_thresholds_optional() -> None:
+def test_requirement_tiers_make_weights_and_thresholds_optional() -> None:
     d = doc()
     del d["fit_rubric"]["weights"], d["fit_rubric"]["thresholds"]
     assert validate_config(d) == []
-    del d["fit_rubric"]["gap_tiers"]
+    del d["fit_rubric"]["requirement_tiers"]
     problems = validate_config(d)
     assert any("weights" in p for p in problems)
     assert any("thresholds" in p for p in problems)
@@ -162,19 +163,25 @@ def _set(path: str, value: Any) -> Any:
             "line from config.yaml",
         ),
         (_set("search.location_rules.radius", 5), "unknown keys"),
-        (_set("fit_rubric.gap_tiers.tiers", []), "tiers must be a non-empty list"),
         (
-            _set(
-                "fit_rubric.gap_tiers.tiers",
-                [{"name": "a", "max_gaps": 3}, {"name": "b", "max_gaps": 1}],
-            ),
-            "ordered by increasing max_gaps",
+            _set("fit_rubric.requirement_tiers.high_max_minor", -1),
+            "high_max_minor must be an integer from 0 to 20",
         ),
-        (_set("fit_rubric.gap_tiers.tiers.0.max_gaps", -1), "max_gaps must be an integer >= 0"),
-        (_set("fit_rubric.gap_tiers.exclude_from_gaps", 2), "above every max_gaps"),
-        (_set("fit_rubric.gap_tiers.boundary.all_minor", "best"), "must name one of the tiers"),
-        (_set("fit_rubric.gap_tiers.boundary.at_gaps", "one"), "at_gaps must be an integer"),
-        (_set("fit_rubric.gap_tiers.exempt_requirements", "degree"), "exempt_requirements"),
+        (
+            _set("fit_rubric.requirement_tiers.exclude_at_core", 1),
+            "exclude_at_core must be an integer from 2 to 20",
+        ),
+        (
+            _set("fit_rubric.requirement_tiers.entry_level_extra_minor", True),
+            "entry_level_extra_minor must be an integer",
+        ),
+        (_set("fit_rubric.requirement_tiers.exempt_types", ["degree"]), "exempt_types must be"),
+        (_set("fit_rubric.requirement_tiers.max_gaps", 3), "unknown keys: ['max_gaps']"),
+        (
+            _set("fit_rubric.gap_tiers", {"tiers": []}),
+            "fit_rubric.gap_tiers is no longer a setting: replace it with "
+            "fit_rubric.requirement_tiers",
+        ),
         (_set("hard_gates.shift_patterns", "overnight"), "hard_gates.shift_patterns"),
         (_set("hard_gates.seniority_words", []), "title_exceptions needs"),
         (
@@ -245,59 +252,27 @@ def test_problems_are_reported(mutate: Any, message: str) -> None:
     assert any(message in p for p in problems), problems
 
 
-def test_a_tier_without_fit_is_reported_by_name() -> None:
-    d = doc()
-    del d["fit_rubric"]["gap_tiers"]["tiers"][0]["fit"]
-    problems = validate_config(d)
-    assert problems == [
-        "fit_rubric.gap_tiers.tiers need fit: low | medium | high; "
-        "missing or not one of those on ['strong']"
-    ]
-
-
-def test_every_tier_without_a_valid_fit_is_listed_in_one_problem() -> None:
-    d = doc()
-    d["fit_rubric"]["gap_tiers"]["tiers"] = [
-        {"name": "top", "max_gaps": 0},
-        {"name": "middle", "max_gaps": 1, "fit": "great"},
-        {"name": "lower", "max_gaps": 2, "fit": "low"},
-        {"name": "bottom", "max_gaps": 3, "fit": True},
-    ]
-    d["fit_rubric"]["gap_tiers"]["exclude_from_gaps"] = 4
-    d["fit_rubric"]["gap_tiers"]["boundary"] = None
-    problems = validate_config(d)
-    assert problems == [
-        "fit_rubric.gap_tiers.tiers need fit: low | medium | high; "
-        "missing or not one of those on ['top', 'middle', 'bottom']"
-    ]
-
-
-def test_an_unknown_boundary_name_is_reported_beside_a_missing_fit() -> None:
-    d = doc()
-    d["fit_rubric"]["gap_tiers"]["boundary"]["any_core"] = "weak"
-    del d["fit_rubric"]["gap_tiers"]["tiers"][1]["fit"]
-    problems = validate_config(d)
-    assert any("boundary.any_core must name one of the tiers" in p for p in problems)
-    assert any("missing or not one of those on ['possible']" in p for p in problems)
-
-
-def test_tier_fits_maps_each_name_and_a_boundary_takes_its_tiers_fit() -> None:
-    d = doc()
-    fits = tier_fits(d)
-    assert fits == {"strong": "high", "possible": "medium"}
-    boundary = d["fit_rubric"]["gap_tiers"]["boundary"]
-    assert fits[boundary["all_minor"]] == "high"
-    assert fits[boundary["any_core"]] == "medium"
-
-
-def test_tier_fits_leaves_out_what_has_no_fit() -> None:
-    d = doc()
-    del d["fit_rubric"]["gap_tiers"]["tiers"][1]["fit"]
-    assert tier_fits(d) == {"strong": "high"}
+def test_tier_fits_name_the_three_tiers_only_with_requirement_tiers() -> None:
+    assert tier_fits(doc()) == {"high": "high", "medium": "medium", "low": "low"}
     assert tier_fits(None) == {}
     assert tier_fits({"fit_rubric": {"weights": {"a": 1}}}) == {}
-    assert tier_fits({"fit_rubric": {"gap_tiers": {"tiers": "x"}}}) == {}
-    assert tier_fits({"fit_rubric": {"gap_tiers": {"tiers": ["x", {"fit": "low"}]}}}) == {}
+    assert tier_fits({"fit_rubric": {"requirement_tiers": "x"}}) == {}
+
+
+def test_requirement_tiers_fill_in_their_defaults() -> None:
+    assert requirement_tiers({"fit_rubric": {"requirement_tiers": {}}}) == {
+        "high_max_minor": 2,
+        "entry_level_extra_minor": 2,
+        "exclude_at_core": 3,
+        "exempt_types": [],
+    }
+    assert requirement_tiers({"fit_rubric": {"requirement_tiers": {"high_max_minor": 4}}}) == {
+        "high_max_minor": 4,
+        "entry_level_extra_minor": 2,
+        "exclude_at_core": 3,
+        "exempt_types": [],
+    }
+    assert requirement_tiers({}) is None
 
 
 def test_off_lane_min_fit_defaults_to_high() -> None:
@@ -327,7 +302,7 @@ def test_a_bad_off_lane_min_fit_is_reported(value: object) -> None:
 def test_every_problem_is_reported_in_one_pass() -> None:
     d = doc()
     d["search"]["lanes"][0]["priority"] = 0
-    d["fit_rubric"]["gap_tiers"]["exclude_from_gaps"] = 0
+    d["fit_rubric"]["requirement_tiers"]["exclude_at_core"] = 0
     d["schedule_limits"]["over_limit"] = "ignore"
     d["telegram"]["chat_id"] = "me"
     assert len(validate_config(d)) >= 4

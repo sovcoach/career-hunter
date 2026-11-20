@@ -19,10 +19,10 @@ from tests.test_watch import DAY, OnBoard
 PHANTOM = Score(
     llm_output="{}",
     gaps='[{"name":"Examplish language proficiency","kind":"core"}]',
-    tier="strong",
+    tier="high",
     key_requirements=("Examplish language required",),
 )
-CLEAN = Score(llm_output="{}", gaps="[]", tier="strong")
+CLEAN = Score(llm_output="{}", gaps="[]", tier="high")
 
 
 @pytest.fixture

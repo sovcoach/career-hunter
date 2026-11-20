@@ -6,7 +6,7 @@ ad and wrong for a model on this Mac. This client allows only `http` to `127.0.0
 constant, not a config field. The model id is `scoring.chat_model` (default
 `local-model`).
 
-The prompt is built from lanes, location rules and `gap_tiers`, the posting fields,
+The prompt is built from lanes and location rules, the posting fields,
 and the resume when one is in use. The model lists every item the posting states, each
 classed (`required`, `preferred`, `duty`, `trained` or `soft`), with whether the resume
 meets it. The gaps are derived here (`derive_gaps`): only an unmet required or
@@ -14,8 +14,10 @@ preferred item, or a soft one not met at all, is a gap; a duty, or anything the
 posting says it will teach, never is. Gap names are put in one style (`gap_name`) and
 gap types come from a fixed list (GAP_TYPES). With a resume, a `yes` or `partly` whose
 evidence is not found in the resume counts as `no`. An `entry_level` flag counts only
-with a quote found in the posting. This module applies `gap_tiers` and stores the
-tier name. `fit_rating` is left null. There is no mapping onto 0-10.
+with a quote found in the posting. The tier (high, medium or low) is computed here from
+the core and minor gaps (`_apply_tiers`, `fit_rubric.requirement_tiers`), and no
+threshold is ever sent to the model. This module stores the tier name. `fit_rating` is
+left null. There is no mapping onto 0-10.
 
 The hard gates are not sent (ADR-027). `filters.decide` has applied them before any
 posting is scored, and a model shown `required_languages` next to a posting reported
@@ -91,7 +93,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from careerhunter import loopback
-from careerhunter.config import DEFAULT_CHAT_MODEL, chat_model
+from careerhunter.config import DEFAULT_CHAT_MODEL, GAP_TYPE_NAMES, chat_model, requirement_tiers
 from careerhunter.criteria import Criteria, Rule
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText, mentions
@@ -294,6 +296,8 @@ class _Gap:
     name: str
     kind: str
     type: str | None
+    # Used for the tier only, never stored: the gap is the role's main job function.
+    main_function: bool = dataclasses.field(default=False, compare=False)
 
 
 # What the reply classes each stated item as. Only an unmet `required` or `preferred`
@@ -302,16 +306,7 @@ class _Gap:
 ITEM_KINDS = ("required", "preferred", "duty", "trained", "soft")
 GAP_KINDS = frozenset({"required", "preferred"})
 # The fixed gap types. A reply's type outside this list is stored as `other`.
-GAP_TYPES = (
-    "experience",
-    "skill",
-    "tool",
-    "education",
-    "certification",
-    "licence",
-    "language",
-    "other",
-)
+GAP_TYPES = tuple(name for name in GAP_TYPE_NAMES if name != "seniority")
 MET = ("yes", "partly", "no")
 
 
@@ -476,7 +471,8 @@ def score_posting(
         return None
     veto = None if criteria is None else _veto(content, posting, criteria)
     cap = None if criteria is None else _cap(content, posting, criteria)
-    counted, tier, excluded = _apply_tiers(parsed, rubric)
+    entry_level = _entry_level(content, posting)
+    counted, tier, excluded = _apply_tiers(parsed, rubric, entry_level=entry_level)
     if tier is None and not excluded and not (veto is not None and veto.rejected is None):
         return None
     # D-A1: with a resume in the prompt, the reply itself is never stored. Nor is a
@@ -498,7 +494,7 @@ def score_posting(
         )[:MAX_REQUIREMENTS],
         veto=veto,
         cap=cap,
-        entry_level=_entry_level(content, posting),
+        entry_level=entry_level,
     )
 
 
@@ -618,7 +614,6 @@ def _request_body(
     view: dict[str, Any] = {
         "lanes": _section(config, "search", "lanes"),
         "location_rules": _section(config, "search", "location_rules"),
-        "gap_tiers": _rubric(config),
         "posting": {
             "company": posting.company,
             "title": posting.title,
@@ -752,10 +747,7 @@ def _section(config: Mapping[str, Any], parent: str, key: str) -> Any:
 
 
 def _rubric(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    value = _section(config, "fit_rubric", "gap_tiers")
-    if isinstance(value, Mapping):
-        return value
-    return None
+    return requirement_tiers(config)
 
 
 def _content(body: bytes) -> str | None:
@@ -853,7 +845,7 @@ def derive_gaps(items: Sequence[Requirement]) -> list[_Gap]:
         if not name or name.casefold() in seen:
             continue
         seen.add(name.casefold())
-        gaps.append(_Gap(name, kind, item.type))
+        gaps.append(_Gap(name, kind, item.type, main_function=item.main_function))
     return gaps
 
 
@@ -953,38 +945,30 @@ def _capped(phrase: str) -> str:
 
 
 def _apply_tiers(
-    gaps: list[_Gap], rubric: Mapping[str, Any]
+    gaps: list[_Gap], rubric: Mapping[str, Any], *, entry_level: bool = False
 ) -> tuple[list[_Gap], str | None, bool]:
-    """The gaps that count, the tier name, and whether the count excludes the posting."""
-    exempt = {_fold(item) for item in _strings(rubric.get("exempt_requirements"))}
+    """The gaps that count, the tier, and whether the core gaps exclude the posting.
+
+    In code, never sent to the model (`fit_rubric.requirement_tiers`):
+    - `exclude_at_core` or more core gaps: excluded (a `gap_tier` skip);
+    - two or more core gaps, or a core gap in the role's main function: low;
+    - one other core gap: medium;
+    - no core gap: high with at most `high_max_minor` minor gaps (plus
+      `entry_level_extra_minor` when the posting is grounded as entry level), else
+      medium. Only minor gaps never make a posting low.
+    """
+    exempt = {_fold(item) for item in _strings(rubric.get("exempt_types"))}
     counted = [gap for gap in gaps if not (gap.type and _fold(gap.type) in exempt)]
-    exclude_at = rubric.get("exclude_from_gaps")
-    if (
-        isinstance(exclude_at, int)
-        and not isinstance(exclude_at, bool)
-        and len(counted) >= exclude_at
-    ):
+    core = [gap for gap in counted if gap.kind == "core"]
+    minor = len(counted) - len(core)
+    if len(core) >= rubric["exclude_at_core"]:
         return counted, None, True
-    boundary = rubric.get("boundary")
-    if isinstance(boundary, Mapping) and boundary.get("at_gaps") == len(counted):
-        key = "all_minor" if all(gap.kind == "minor" for gap in counted) else "any_core"
-        name = boundary.get(key)
-        if isinstance(name, str):
-            return counted, name, False
-        return counted, None, False
-    for tier in rubric.get("tiers") or []:
-        if not isinstance(tier, Mapping):
-            continue
-        max_gaps = tier.get("max_gaps")
-        name = tier.get("name")
-        if (
-            isinstance(max_gaps, int)
-            and not isinstance(max_gaps, bool)
-            and isinstance(name, str)
-            and len(counted) <= max_gaps
-        ):
-            return counted, name, False
-    return counted, None, False
+    if len(core) >= 2 or any(gap.main_function for gap in core):
+        return counted, "low", False
+    if core:
+        return counted, "medium", False
+    allowed = rubric["high_max_minor"] + (rubric["entry_level_extra_minor"] if entry_level else 0)
+    return counted, "high" if minor <= allowed else "medium", False
 
 
 def _gap_dict(gap: _Gap) -> dict[str, str]:
