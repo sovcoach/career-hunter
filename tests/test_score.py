@@ -101,6 +101,43 @@ def test_the_prompt_uses_only_the_rubric_and_the_posting() -> None:
     assert "local-model" in text
 
 
+def test_the_request_asks_for_a_schema_reply_with_the_fixed_sampling_and_seed() -> None:
+    seen: list[dict[str, object]] = []
+
+    def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        seen.append(json.loads(payload))
+        return reply('{"gaps":[],"requirements":[]}')
+
+    score_posting(posting(), RUBRIC, transport=transport)
+    score_posting(posting(), RUBRIC, transport=transport)
+    first, second = seen
+    assert first == second  # the same request each time, seed included
+    assert first["temperature"] == 0.6 and first["temperature"] != 0
+    assert (first["top_p"], first["top_k"], first["min_p"]) == (0.95, 20, 0.0)
+    assert (first["presence_penalty"], first["repeat_penalty"]) == (1.5, 1.0)
+    assert first["seed"] == scoring.SEED
+    assert {key: first[key] for key in scoring.SAMPLING} == scoring.SAMPLING
+    response_format = first["response_format"]
+    assert isinstance(response_format, dict) and response_format["type"] == "json_schema"
+    spec = response_format["json_schema"]
+    assert spec["strict"] is True and spec["name"] == scoring.SCHEMA_NAME
+    assert spec["schema"] == scoring.reply_schema(False)
+    assert set(spec["schema"]["required"]) == {"gaps", "requirements"}
+    assert "veto" not in spec["schema"]["properties"]
+
+
+def test_with_criteria_the_schema_asks_for_veto_and_cap_or_null() -> None:
+    schema = scoring.reply_schema(True)
+    assert set(schema["required"]) == {"gaps", "requirements", "veto", "cap"}
+    assert schema["properties"]["veto"]["anyOf"][0] == {"type": "null"}
+    assert schema["additionalProperties"] is False
+
+
+def test_a_reply_that_breaks_the_schema_does_not_parse() -> None:
+    for content in ('{"gaps":[{"name":"Excel","kind":"major"}]}', '{"gap":[]}', "[]"):
+        assert score_posting(posting(), RUBRIC, transport=lambda u, b, c=content: reply(c)) is None
+
+
 def test_notes_do_not_change_a_verdict_or_enter_the_score() -> None:
     plain = {
         "hard_gates": {"seniority_words": ["Senior"]},

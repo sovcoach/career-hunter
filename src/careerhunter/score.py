@@ -60,6 +60,12 @@ A cap that passes is `Score.cap`, with the level, and the watcher stores the low
 the tier's fit and that level. One that fails is rejected and the score stands. A veto
 that passes wins over a cap. A reply with a cap is stored as canonical gaps too.
 
+Structured output and sampling. Every request asks for a reply that follows a JSON
+schema (`response_format` of type `json_schema`, strict), which LM Studio enforces as it
+generates. A reply that breaks it anyway does not parse, as before. The sampling
+settings and the seed are the fixed SAMPLING and SEED: a thinking model's preset, never
+temperature 0, and never configurable.
+
 Reasoning models. The chat model may think before it answers. Its thinking is removed
 before anything is parsed or stored (`strip_reasoning`), and a reply whose thinking
 never closes does not parse. The body may be up to MAX_REPLY bytes, since the thinking
@@ -113,6 +119,23 @@ _THINK_BLOCK = re.compile(rf"<({_THINK_TAGS})>.*?</\1\s*>", re.IGNORECASE | re.D
 _THINK_OPEN = re.compile(rf"<(?:{_THINK_TAGS})>", re.IGNORECASE)
 _THINK_CLOSE = re.compile(rf"</(?:{_THINK_TAGS})\s*>", re.IGNORECASE)
 Transport = Callable[[str, bytes], tuple[int, bytes]]
+# Sampling, sent with every scoring request and not configurable. The scorer is a
+# thinking model: greedy decoding (temperature 0) can make one repeat itself until the
+# timeout, so the request uses the thinking-mode preset for precise tasks (temperature
+# 0.6, top_p 0.95, top_k 20, min_p 0) with a fixed seed, so that the same request gives
+# the same reply where the server honours the seed. That preset alone still looped in its
+# thinking on some postings (calibration, Batch Q), so presence_penalty is 1.5, the
+# model maker's setting against endless repetition.
+SAMPLING: dict[str, float | int] = {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repeat_penalty": 1.0,
+}
+SEED = 20261119
+SCHEMA_NAME = "posting_fit"
 MAX_QUOTE = 200  # what the model is asked for; a longer quote is still checked
 MIN_QUOTE = 8  # characters after `normalized`: shorter shows no match
 # The fixed reasons a veto is not honoured, by key.
@@ -557,7 +580,16 @@ def _request_body(
         ]
     payload = {
         "model": chat_model(config),
-        "temperature": 0,
+        **SAMPLING,
+        "seed": SEED,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": SCHEMA_NAME,
+                "strict": True,
+                "schema": reply_schema(criteria is not None),
+            },
+        },
         "messages": [
             {
                 "role": "system",
@@ -581,6 +613,51 @@ def _request_body(
         ],
     }
     return json.dumps(payload).encode()
+
+
+def _quoted_rule() -> dict[str, Any]:
+    """A veto or a cap in the reply: null, or a rule number and a quote."""
+    return {
+        "anyOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["rule", "quote"],
+                "properties": {"rule": {"type": "integer"}, "quote": {"type": "string"}},
+            },
+        ]
+    }
+
+
+def reply_schema(with_criteria: bool) -> dict[str, Any]:
+    """The JSON schema the reply must follow (`response_format`, strict). With criteria,
+    `veto` and `cap` are required and null when the posting meets no rule."""
+    properties: dict[str, Any] = {
+        "gaps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "kind", "type"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["minor", "core"]},
+                    "type": {"type": "string"},
+                },
+            },
+        },
+        "requirements": {"type": "array", "items": {"type": "string"}},
+    }
+    if with_criteria:
+        properties["veto"] = _quoted_rule()
+        properties["cap"] = _quoted_rule()
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(properties),
+        "properties": properties,
+    }
 
 
 def unstated_language(phrase: str, posting: PostingText, config: Mapping[str, Any]) -> bool:
