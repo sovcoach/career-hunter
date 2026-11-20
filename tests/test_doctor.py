@@ -507,9 +507,29 @@ def test_lanes_and_watch_runs_on_a_fresh_setup(
     ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _code, out = doctor(probe, capsys)
-    assert "lanes           OK  2 lanes; off-lane postings alert at high fit or better" in out
+    assert (
+        "lanes           OK  2 lanes (1 primary, 1 stopgap); "
+        "off-lane postings alert at high fit or better" in out
+    )
     assert "watch run       --  none recorded yet" in out
     assert "bot alerts      OK  not held" in out
+
+
+def test_never_and_the_groups_show_in_the_lanes_line(
+    ready: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = ready / "config.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["search"]["off_lane_min_fit"] = "never"
+    doc["search"]["lanes"].append(
+        {"name": "change", "priority": 3, "group": "career_change", "titles": ["Example Role"]}
+    )
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    _code, out = doctor(probe, capsys)
+    assert (
+        "lanes           OK  3 lanes (1 primary, 1 career change, 1 stopgap); "
+        "off-lane postings are never alerted"
+    ) in out
 
 
 def test_lanes_off_is_reported_not_silent(

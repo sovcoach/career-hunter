@@ -2190,17 +2190,17 @@ def test_alerts_go_in_lane_order_with_their_lane_line(env: Env, keep_umask: None
     assert _poll(env) == 0
     assert _heads(env) == [
         "Example Org — Top Ops",
+        "Example Org — Medium Ops",
         "Example Org — Fallback",
         "Example Org — Retired",
-        "Example Org — Medium Ops",
         "Example Org — Off Lane",
     ]
     lane_lines = [row[1].split(" | ")[0] for row in _rows(env)]
     assert lane_lines == [
         "Lane: operations",
-        "Lane: customer_success",
-        "Lane: retired_lane",
         "Lane: operations",
+        "Lane: customer_success (stopgap)",
+        "Lane: retired_lane (stopgap)",
         "Off-lane",
     ]
 

@@ -550,15 +550,15 @@ class HeldCounts:
 
     unscored: int  # no score yet: waiting to be scored or retried
     no_fit: int  # scored and not alerted, but its tier name has no fit in config
-    off_lane: int = 0  # scored, off-lane, and below search.off_lane_min_fit
+    off_lane: int = 0  # scored, off-lane, and below search.off_lane_min_fit (or never)
 
 
 def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None) -> HeldCounts:
     """How many watcher and discovery postings with no skip are held, read now.
 
     `off_lane_min_fit` is `search.off_lane_min_fit` while lane checking is on: an
-    off-lane posting with a lower fit is held. None means lane checking is off, and no
-    posting is held for its lane.
+    off-lane posting with a lower fit is held, and with `never` every one is. None means
+    lane checking is off, and no posting is held for its lane.
     """
     row = conn.execute(
         """
@@ -585,7 +585,11 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
                 "AND (CASE p.fit WHEN 'low' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 END) "
                 "< ? "
                 "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)",
-                (FIT_LEVELS.index(off_lane_min_fit),),
+                (
+                    len(FIT_LEVELS)
+                    if off_lane_min_fit not in FIT_LEVELS
+                    else FIT_LEVELS.index(off_lane_min_fit),
+                ),
             ).fetchone()[0]
         )
     return HeldCounts(unscored=int(row["unscored"]), no_fit=int(row["no_fit"]), off_lane=off_lane)

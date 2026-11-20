@@ -182,6 +182,11 @@ def _set(path: str, value: Any) -> Any:
             "fit_rubric.gap_tiers is no longer a setting: replace it with "
             "fit_rubric.requirement_tiers",
         ),
+        (_set("search.lanes.0.group", "backup"), "group must be one of primary"),
+        (
+            _set("search.lanes.1.fallback", True),
+            "sets both group and fallback: keep group",
+        ),
         (_set("hard_gates.shift_patterns", "overnight"), "hard_gates.shift_patterns"),
         (_set("hard_gates.seniority_words", []), "title_exceptions needs"),
         (
@@ -295,7 +300,7 @@ def test_a_bad_off_lane_min_fit_is_reported(value: object) -> None:
     d = doc()
     d["search"]["off_lane_min_fit"] = value
     assert validate_config(d) == [
-        "search.off_lane_min_fit must be one of low | medium | high (default high)"
+        "search.off_lane_min_fit must be one of low | medium | high | never (default high)"
     ]
 
 

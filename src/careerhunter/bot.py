@@ -808,8 +808,11 @@ class Bot:
         finished, or started more than `stale_run` ago (killed or crashed), so a run is
         never sent half-scored and a dead one never blocks its postings. Postings with
         no run (scored before search migration 0011) go first, then runs oldest first,
-        so a later run cannot push an earlier run's postings back. At most
-        ``alerts.max_per_poll`` postings go per poll; the rest carry over in order.
+        so a later run cannot push an earlier run's postings of the same lane group back.
+        At most ``alerts.max_per_poll`` postings go per poll, chosen by lane group first
+        (primary, career change, stopgap, off-lane), so stopgap postings are the ones that
+        wait, whatever their run; the rest carry over in order. The chosen postings go as
+        one digest per run, the digest with the best group first.
         A posting Telegram refused on its own goes behind the others, so it can't take
         the same slot every poll; the refusals are counted in search.db (search migration
         0017), so a restart remembers them. After REFUSALS_TO_GIVE_UP refusals the bot
@@ -838,13 +841,14 @@ class Bot:
     def _digests(
         self, pending: list[search_store.PendingAlert], doc: Mapping[str, Any]
     ) -> list[list[lanes.Ordered]]:
-        """This poll's digests: one per run, runs in order, at most the cap in all."""
+        """This poll's digests: at most the cap in all, chosen by lane group, then run,
+        then alert order; one digest per run, the one with the best group first."""
         by_id = {alert.posting_id: alert for alert in pending}
         stale_before = _utc(self.clock() - stale_run(doc))
-        groups: dict[tuple[int, int], list[lanes.Ordered]] = {}
+        candidates: list[tuple[tuple[int, int, int, int], tuple[int, int], lanes.Ordered]] = []
         refused: list[tuple[tuple[int, int], lanes.Ordered]] = []
         behind = self._refused_now()
-        for item in lanes.alert_order(pending, doc):
+        for index, item in enumerate(lanes.alert_order(pending, doc)):
             alert = by_id[item.posting_id]
             if alert.run_id is not None and not (
                 alert.run_finished
@@ -855,13 +859,13 @@ class Bot:
             if item.posting_id in behind:
                 refused.append((key, item))
             else:
-                groups.setdefault(key, []).append(item)
-        ordered = [(key, item) for key in sorted(groups) for item in groups[key]] + refused
-        chosen = ordered[: alerts_max_per_poll(doc)]
+                candidates.append(((item.group, *key, index), key, item))
+        ordered = [(key, item) for _, key, item in sorted(candidates, key=lambda c: c[0])]
+        chosen = (ordered + refused)[: alerts_max_per_poll(doc)]
         digests: dict[tuple[int, int], list[lanes.Ordered]] = {}
         for key, item in chosen:
             digests.setdefault(key, []).append(item)
-        return list(digests.values())
+        return sorted(digests.values(), key=lambda rows: min(row.group for row in rows))
 
     def _send_digest(self, rows: list[lanes.Ordered], doc: Mapping[str, Any]) -> bool:
         """Send one run's digest. False when the poll should stop."""

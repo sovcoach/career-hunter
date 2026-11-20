@@ -14,9 +14,12 @@ The bot sends one alert digest per watch run. Quiet hours are not
 implemented. `schedule.watcher_interval_minutes` is how often the watch
 LaunchAgent runs, default 60 and at least 15.
 
-- search.lanes: named groups of target titles, by priority, optionally a fallback;
+- search.lanes: named groups of target titles, by priority, each in a group: primary
+  (the default), career_change or stopgap. `fallback: true` is read as stopgap, and a
+  lane may not set both;
 - search.off_lane_min_fit: the lowest fit (low, medium or high, default high) at which
-  a posting whose title matches no lane still alerts;
+  a posting whose title matches no lane still alerts, or `never`: no off-lane posting
+  is ever alerted;
 - search.location_rules: places for on-site and hybrid work, regions for remote;
 - fit_rubric.requirement_tiers: how the tier (high, medium or low, which is also the
   fit) follows from the core and minor gaps, computed in code and never sent to the
@@ -97,6 +100,11 @@ DEFAULT_CANDIDATES_PER_DAY = 3
 CANDIDATES_PER_DAY_LIMITS = (1, 20)
 OVER_LIMIT_ACTIONS = ("flag", "exclude")
 DEFAULT_OFF_LANE_MIN_FIT = "high"
+OFF_LANE_NEVER = "never"
+OFF_LANE_MIN_FITS = (*FIT_LEVELS, OFF_LANE_NEVER)
+# Lane groups, in alert order: every primary posting before any career-change one, and
+# those before any stopgap one.
+LANE_GROUPS = ("primary", "career_change", "stopgap")
 DEFAULT_MAX_POSTING_AGE_DAYS = 7
 MAX_POSTING_AGE_LIMIT = 365
 DEFAULT_MAX_PER_POLL = 10
@@ -342,7 +350,7 @@ def _validate_lanes(lanes: Any, problems: list[str]) -> None:
         if not isinstance(lane, dict):
             problems.append(f"{where} must be a mapping with name, priority and titles")
             continue
-        extra = set(lane) - {"name", "priority", "fallback", "titles"}
+        extra = set(lane) - {"name", "priority", "fallback", "group", "titles"}
         if extra:
             problems.append(f"{where} has unknown keys: {sorted(extra)}")
         name = lane.get("name")
@@ -357,6 +365,13 @@ def _validate_lanes(lanes: Any, problems: list[str]) -> None:
             priorities.append(priority)
         if not isinstance(lane.get("fallback", False), bool):
             problems.append(f"{where}.fallback must be true or false")
+        if "group" in lane and lane["group"] not in LANE_GROUPS:
+            problems.append(f"{where}.group must be one of {' | '.join(LANE_GROUPS)}")
+        if "group" in lane and "fallback" in lane:
+            problems.append(
+                f"{where} sets both group and fallback: keep group (fallback: true is "
+                "the same as group: stopgap)"
+            )
         titles = lane.get("titles")
         # A title entry is a string, or a list of variants that count as one title.
         if not isinstance(titles, list) or not titles or not all(map(_is_title, titles)):
@@ -694,9 +709,9 @@ def validate_config(doc: Any) -> list[str]:
                 f"search.max_posting_age_days must be an integer from 1 to "
                 f"{MAX_POSTING_AGE_LIMIT} (default {DEFAULT_MAX_POSTING_AGE_DAYS})"
             )
-        if search.get("off_lane_min_fit", DEFAULT_OFF_LANE_MIN_FIT) not in FIT_LEVELS:
+        if search.get("off_lane_min_fit", DEFAULT_OFF_LANE_MIN_FIT) not in OFF_LANE_MIN_FITS:
             problems.append(
-                f"search.off_lane_min_fit must be one of {' | '.join(FIT_LEVELS)} "
+                f"search.off_lane_min_fit must be one of {' | '.join(OFF_LANE_MIN_FITS)} "
                 f"(default {DEFAULT_OFF_LANE_MIN_FIT})"
             )
 
@@ -976,10 +991,13 @@ def max_posting_age_days(doc: Mapping[str, Any] | None) -> int:
 
 
 def off_lane_min_fit(doc: Mapping[str, Any] | None) -> str:
-    """The lowest fit an off-lane posting needs to alert. `high` when it is not set."""
+    """The lowest fit an off-lane posting needs to alert, or `never`. `high` when it is
+    not set."""
     search = doc.get("search") if isinstance(doc, Mapping) else None
     value = search.get("off_lane_min_fit") if isinstance(search, Mapping) else None
-    return value if isinstance(value, str) and value in FIT_LEVELS else DEFAULT_OFF_LANE_MIN_FIT
+    if isinstance(value, str) and value in OFF_LANE_MIN_FITS:
+        return value
+    return DEFAULT_OFF_LANE_MIN_FIT
 
 
 def tier_fits(doc: Mapping[str, Any] | None) -> dict[str, str]:

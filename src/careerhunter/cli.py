@@ -1854,7 +1854,18 @@ def _doctor_lanes(report: _Report, config_doc: dict[str, Any] | None) -> None:
         return
     count = plural(len(configured), "lane", "lanes")
     minimum = off_lane_min_fit(config_doc)
-    report.line("lanes", "OK", f"{count}; off-lane postings alert at {minimum} fit or better")
+    groups = {lane.group: 0 for lane in configured}
+    for lane in configured:
+        groups[lane.group] += 1
+    shown = ", ".join(f"{groups[g]} {g.replace('_', ' ')}" for g in lanes.GROUPS if g in groups)
+    if minimum == "never":
+        report.line("lanes", "OK", f"{count} ({shown}); off-lane postings are never alerted")
+    else:
+        report.line(
+            "lanes",
+            "OK",
+            f"{count} ({shown}); off-lane postings alert at {minimum} fit or better",
+        )
 
 
 def _doctor_watch_runs(
@@ -1886,9 +1897,10 @@ def _doctor_watch_runs(
     if finished is None:
         report.line("watch held", "--", "no finished run yet, so nothing is counted")
         return
-    detail = (
-        f"{finished['held_unscored']} unscored, {finished['held_no_fit']} with no fit, "
-        f"{finished['held_off_lane']} off-lane below the threshold"
+    detail = f"{finished['held_unscored']} unscored, {finished['held_no_fit']} with no fit, " + (
+        f"{finished['held_off_lane']} off-lane (never alerted)"
+        if config_doc is not None and off_lane_min_fit(config_doc) == "never"
+        else f"{finished['held_off_lane']} off-lane below the threshold"
     )
     if finished["budget_reached"]:
         detail += "; that run's budget left work for the next one"

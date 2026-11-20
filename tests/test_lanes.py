@@ -29,8 +29,8 @@ def doc(*lane_list: dict[str, Any]) -> dict[str, Any]:
     return d
 
 
-OPERATIONS = Lane("operations", 1, False)
-CUSTOMER = Lane("customer_success", 2, True)
+OPERATIONS = Lane("operations", 1)
+CUSTOMER = Lane("customer_success", 2, "stopgap")
 
 
 @pytest.mark.parametrize(
@@ -60,14 +60,14 @@ def test_the_best_priority_wins_when_titles_in_several_lanes_match() -> None:
         {"name": "fallback_ops", "priority": 2, "fallback": True, "titles": ["Ops"]},
         {"name": "narrow", "priority": 1, "titles": [["Field Ops Coordinator", "Site Lead"]]},
     )
-    assert lanes.match("Field Ops Coordinator", d) == Lane("narrow", 1, False)
-    assert lanes.match("Ops Coordinator", d) == Lane("fallback_ops", 2, True)
-    assert lanes.match("Logistics Coordinator", d) == Lane("broad", 3, False)
-    assert lanes.match("Site Lead", d) == Lane("narrow", 1, False)
+    assert lanes.match("Field Ops Coordinator", d) == Lane("narrow", 1)
+    assert lanes.match("Ops Coordinator", d) == Lane("fallback_ops", 2, "stopgap")
+    assert lanes.match("Logistics Coordinator", d) == Lane("broad", 3)
+    assert lanes.match("Site Lead", d) == Lane("narrow", 1)
 
 
-SUPPORT = Lane("it_support", 1, False)
-CLIENT = Lane("client_experience", 2, False)
+SUPPORT = Lane("it_support", 1)
+CLIENT = Lane("client_experience", 2)
 
 
 def normalized_doc() -> dict[str, Any]:
@@ -112,8 +112,8 @@ def test_a_literal_match_wins_over_a_better_priority_normalized_one() -> None:
         {"name": "it_support", "priority": 1, "titles": ["IT Support Specialist"]},
         {"name": "associates", "priority": 2, "titles": ["Support Associate"]},
     )
-    assert lanes.match("IT Support Associate", d) == Lane("associates", 2, False)
-    assert lanes.match("IT Support Analyst", d) == Lane("it_support", 1, False)
+    assert lanes.match("IT Support Associate", d) == Lane("associates", 2)
+    assert lanes.match("IT Support Analyst", d) == Lane("it_support", 1)
 
 
 def test_configured_lists_lanes_by_priority_and_none_without_any() -> None:
@@ -121,7 +121,7 @@ def test_configured_lists_lanes_by_priority_and_none_without_any() -> None:
         {"name": "second", "priority": 5, "titles": ["B"]},
         {"name": "first", "priority": 2, "fallback": True, "titles": ["A"]},
     )
-    assert lanes.configured(d) == [Lane("first", 2, True), Lane("second", 5, False)]
+    assert lanes.configured(d) == [Lane("first", 2, "stopgap"), Lane("second", 5)]
     del d["search"]["lanes"]
     assert lanes.configured(d) is None
     assert lanes.match("A", d) is None
@@ -143,7 +143,7 @@ def test_odd_entries_in_an_unvalidated_doc_are_ignored() -> None:
     raw = {"search": {"lanes": ["x", {"name": "a", "priority": 1, "titles": "A"}]}}
     assert lanes.match("A", raw) is None
     raw = {"search": {"lanes": [{"name": "a", "priority": 1, "titles": [3, ["A", 4]]}]}}
-    assert lanes.match("A", raw) == Lane("a", 1, False)
+    assert lanes.match("A", raw) == Lane("a", 1)
 
 
 # --- alert order and holds (D2, D8, off_lane_min_fit) ------------------------------------------
@@ -171,20 +171,61 @@ def ids(ordered: list[lanes.Ordered]) -> list[int]:
     return [item.posting_id for item in ordered]
 
 
-def test_off_lane_goes_last_then_fit_then_fallback_then_priority_then_oldest() -> None:
+def test_the_group_goes_first_then_fit_then_priority_then_oldest() -> None:
     d = doc(*ORDER_LANES)
     d["search"]["off_lane_min_fit"] = "low"
     alerts = [
         pending(1, "high", None),  # off-lane, best fit: still last
         pending(2, "medium", "first"),
-        pending(3, "high", "backup"),  # fallback: after non-fallback of the same fit
+        pending(3, "high", "backup"),  # stopgap: after every primary, whatever its fit
         pending(4, "high", "second"),
         pending(5, "high", "first", first_seen="2026-11-02"),
         pending(6, "high", "first", first_seen="2026-11-01"),  # older: first
         pending(7, "low", "first"),
         pending(8, "medium", None),
     ]
-    assert ids(lanes.alert_order(alerts, d)) == [6, 5, 4, 3, 2, 7, 1, 8]
+    assert ids(lanes.alert_order(alerts, d)) == [6, 5, 4, 2, 7, 3, 1, 8]
+
+
+def test_a_primary_medium_ranks_above_a_stopgap_high_and_career_change_between() -> None:
+    d = doc(
+        *ORDER_LANES, {"name": "change", "priority": 4, "group": "career_change", "titles": ["D"]}
+    )
+    alerts = [
+        pending(1, "high", "backup"),
+        pending(2, "high", "change"),
+        pending(3, "medium", "second"),
+    ]
+    ordered = lanes.alert_order(alerts, d)
+    assert ids(ordered) == [3, 2, 1]
+    assert [item.lane_line for item in ordered] == [
+        "Lane: second",
+        "Lane: change (career change)",
+        "Lane: backup (stopgap)",
+    ]
+
+
+def test_never_holds_every_off_lane_posting() -> None:
+    d = doc(*ORDER_LANES)
+    d["search"]["off_lane_min_fit"] = "never"
+    alerts = [pending(1, "high", None), pending(2, "medium", None), pending(3, "medium", "first")]
+    assert ids(lanes.alert_order(alerts, d)) == [3]
+
+
+def test_a_group_and_fallback_read_the_same_and_the_default_is_primary() -> None:
+    d = doc(
+        {"name": "a", "priority": 1, "titles": ["A"]},
+        {"name": "b", "priority": 2, "group": "stopgap", "titles": ["B"]},
+        {"name": "c", "priority": 3, "fallback": True, "titles": ["C"]},
+        {"name": "d", "priority": 4, "group": "career_change", "titles": ["D"]},
+    )
+    assert [(lane.name, lane.group) for lane in lanes.configured(d) or []] == [
+        ("a", "primary"),
+        ("b", "stopgap"),
+        ("c", "stopgap"),
+        ("d", "career_change"),
+    ]
+    assert lanes.match("D", d) == Lane("d", 4, "career_change")
 
 
 def test_the_same_day_keeps_the_oldest_id_first() -> None:
@@ -193,7 +234,7 @@ def test_the_same_day_keeps_the_oldest_id_first() -> None:
     assert ids(lanes.alert_order(alerts, d)) == [3, 9]
 
 
-def test_a_stored_lane_missing_from_config_sorts_as_a_fallback_before_off_lane() -> None:
+def test_a_stored_lane_missing_from_config_sorts_as_stopgap_before_off_lane() -> None:
     d = doc(*ORDER_LANES)
     d["search"]["off_lane_min_fit"] = "low"
     alerts = [
@@ -206,12 +247,13 @@ def test_a_stored_lane_missing_from_config_sorts_as_a_fallback_before_off_lane()
     assert ids(ordered) == [4, 3, 2, 1]
     assert [item.lane_line for item in ordered] == [
         "Lane: first",
-        "Lane: backup",
-        "Lane: retired",
+        "Lane: backup (stopgap)",
+        "Lane: retired (stopgap)",
         "Off-lane",
     ]
-    # A better fit still goes first: the missing lane only ranks within its fit tier.
-    better = [pending(5, "high", "retired"), pending(6, "medium", "first")]
+    # Within stopgap a better fit still goes first: the missing lane ranks by priority only
+    # inside its fit.
+    better = [pending(5, "high", "retired"), pending(6, "medium", "backup")]
     assert ids(lanes.alert_order(better, d)) == [5, 6]
 
 

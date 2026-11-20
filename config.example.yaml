@@ -21,8 +21,11 @@ search:
   work_models: [remote, hybrid, onsite]
   # Optional: target titles grouped into lanes by priority. A title may be a list of
   # variants that count as one title, matched as whole words in any case. Lanes label
-  # and order alerts and never skip a posting. A fallback lane ranks below an equally
-  # good fit in any other lane. Without lanes, alerts go by fit, then oldest.
+  # and order alerts and never skip a posting. Each lane is in a group: primary (the
+  # default), career_change or stopgap. Alerts go by group first (every primary
+  # posting, then career change, then stopgap), then fit, then lane priority, so a
+  # High stopgap posting never outranks a primary one. Without lanes, alerts go by
+  # fit, then oldest.
   # When no lane matches literally, a title of two or more words then Specialist,
   # Analyst or Associate also matches the same words with any of those three,
   # ignoring level words (Junior, Senior, II, Level 2 ...) and reading
@@ -36,11 +39,12 @@ search:
         - [Project Coordinator, Project Assistant]
     - name: customer_success
       priority: 2
-      fallback: true
+      group: stopgap
       titles:
         - Customer Success Specialist
   # Optional: the lowest fit (low, medium or high) at which a posting whose title
-  # matches no lane still alerts, labelled Off-lane and sent last. Default high.
+  # matches no lane still alerts, labelled Off-lane and sent last, or never: no
+  # off-lane posting is ever alerted (it is still stored and scored). Default high.
   off_lane_min_fit: high
   # Optional. Postings older than this many days (by the board's posted date, or
   # the day first seen when the board gives none) are skipped as too_old. 1 to 365,
