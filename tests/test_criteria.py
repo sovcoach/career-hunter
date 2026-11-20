@@ -278,7 +278,9 @@ def _request(stated: criteria.Criteria | None) -> dict[str, Any]:
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         seen.append(payload)
-        reply = {"choices": [{"message": {"content": '{"gaps": [], "requirements": []}'}}]}
+        reply = {
+            "choices": [{"message": {"content": '{"requirements": [], "key_requirements": []}'}}]
+        }
         return 200, json.dumps(reply).encode()
 
     posting = PostingText("Example Robotics", "Operations Coordinator", "Example City", None)
@@ -300,7 +302,8 @@ def test_criteria_go_in_the_request_as_numbered_rules_with_the_instruction() -> 
     ]
     system = body["messages"][0]["content"]
     assert system.endswith(score.CRITERIA_INSTRUCTION)
-    assert '"veto":{"rule":N,"quote":"..."}' in score.CRITERIA_INSTRUCTION
+    assert 'set "veto" to {"rule":N,"quote":"..."}' in score.CRITERIA_INSTRUCTION
+    assert "set veto and cap to null" in score.CRITERIA_INSTRUCTION
     assert "minor or core" not in score.CRITERIA_INSTRUCTION
 
 

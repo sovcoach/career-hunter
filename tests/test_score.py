@@ -23,7 +23,7 @@ from careerhunter.score import (
     require_loopback,
     score_posting,
 )
-from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply
+from tests.fakes import FakeClock, FakeServer, ManualWatchdog, Reply, fit_reply, requirement
 from tests.test_watch import DAY, Scripted, company, fetched, one_greenhouse, postings, url
 
 RUBRIC = {
@@ -35,7 +35,7 @@ RUBRIC = {
             ],
             "exclude_from_gaps": 3,
             "boundary": {"at_gaps": 1, "all_minor": "strong", "any_core": "possible"},
-            "exempt_requirements": ["degree"],
+            "exempt_requirements": ["education"],
         }
     },
     "search": {
@@ -85,7 +85,7 @@ def test_the_prompt_uses_only_the_rubric_and_the_posting() -> None:
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         seen["url"] = url.encode()
         seen["body"] = payload
-        return reply('{"gaps":[]}')
+        return reply(fit_reply())
 
     result = score_posting(posting(), RUBRIC, transport=transport)
     assert result is not None and result.tier == "strong" and result.gaps == "[]"
@@ -106,7 +106,7 @@ def test_the_request_asks_for_a_schema_reply_with_the_fixed_sampling_and_seed() 
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         seen.append(json.loads(payload))
-        return reply('{"gaps":[],"requirements":[]}')
+        return reply(fit_reply())
 
     score_posting(posting(), RUBRIC, transport=transport)
     score_posting(posting(), RUBRIC, transport=transport)
@@ -122,19 +122,36 @@ def test_the_request_asks_for_a_schema_reply_with_the_fixed_sampling_and_seed() 
     spec = response_format["json_schema"]
     assert spec["strict"] is True and spec["name"] == scoring.SCHEMA_NAME
     assert spec["schema"] == scoring.reply_schema(False)
-    assert set(spec["schema"]["required"]) == {"gaps", "requirements"}
+    assert set(spec["schema"]["required"]) == {"requirements", "key_requirements", "entry_level"}
     assert "veto" not in spec["schema"]["properties"]
+    item = spec["schema"]["properties"]["requirements"]["items"]
+    assert item["properties"]["kind"]["enum"] == [
+        "required",
+        "preferred",
+        "duty",
+        "trained",
+        "soft",
+    ]
+    assert item["properties"]["met"]["enum"] == ["yes", "partly", "no"]
+    assert set(item["required"]) == set(item["properties"])
 
 
 def test_with_criteria_the_schema_asks_for_veto_and_cap_or_null() -> None:
     schema = scoring.reply_schema(True)
-    assert set(schema["required"]) == {"gaps", "requirements", "veto", "cap"}
+    assert set(schema["required"]) == {
+        "requirements",
+        "key_requirements",
+        "entry_level",
+        "veto",
+        "cap",
+    }
     assert schema["properties"]["veto"]["anyOf"][0] == {"type": "null"}
     assert schema["additionalProperties"] is False
 
 
 def test_a_reply_that_breaks_the_schema_does_not_parse() -> None:
-    for content in ('{"gaps":[{"name":"Excel","kind":"major"}]}', '{"gap":[]}', "[]"):
+    bad_kind = json.dumps({"requirements": [requirement("Excel", "major")]})
+    for content in (bad_kind, '{"gaps":[]}', "[]"):
         assert score_posting(posting(), RUBRIC, transport=lambda u, b, c=content: reply(c)) is None
 
 
@@ -162,7 +179,7 @@ def test_notes_do_not_change_a_verdict_or_enter_the_score() -> None:
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         seen["body"] = payload
-        return reply('{"gaps":[]}')
+        return reply(fit_reply())
 
     assert score_posting(posting(), noted, transport=transport) is not None
     assert "DO-NOT-LEAK-NOTES" not in seen["body"].decode()
@@ -172,24 +189,19 @@ def test_gap_tiers_name_the_tier_and_a_high_count_skips() -> None:
     def run(content: str) -> Score | None:
         return score_posting(posting(), RUBRIC, transport=lambda url, body: reply(content))
 
-    empty = run('{"gaps":[]}')
+    empty = run(fit_reply())
     assert empty is not None and empty.tier == "strong" and empty.excluded is False
-    minor = run('{"gaps":[{"name":"spreadsheets","kind":"minor","type":"skill"}]}')
+    minor = run(fit_reply(("spreadsheets", "minor", "skill")))
     assert minor is not None and minor.tier == "strong"
-    assert json.loads(minor.gaps) == [{"name": "spreadsheets", "kind": "minor", "type": "skill"}]
-    core = run('```json\n{"gaps":[{"name":"French","kind":"core","type":"language"}]}\n```')
+    assert json.loads(minor.gaps) == [{"name": "Spreadsheets", "kind": "minor", "type": "skill"}]
+    core = run("```json\n" + fit_reply(("French", "core", "language")) + "\n```")
     assert core is not None and core.tier == "possible"
-    two = run('{"gaps":[{"name":"French","kind":"core"},{"name":"Excel","kind":"minor"}]}')
+    two = run(fit_reply(("French", "core"), ("Excel", "minor")))
     assert two is not None and two.tier == "possible"
-    exempt = run(
-        '{"gaps":[{"name":"a degree","kind":"core","type":"degree"},'
-        '{"name":"Excel","kind":"minor","type":"skill"}]}'
-    )
+    exempt = run(fit_reply(("a degree", "core", "education"), ("Excel", "minor", "skill")))
     assert exempt is not None and exempt.tier == "strong"
     assert json.loads(exempt.gaps) == [{"name": "Excel", "kind": "minor", "type": "skill"}]
-    over = run(
-        '{"gaps":[{"name":"a","kind":"core"},{"name":"b","kind":"core"},{"name":"c","kind":"minor"}]}'
-    )
+    over = run(fit_reply(("a", "core"), ("b", "core"), ("c", "minor")))
     assert over is not None and over.excluded and over.tier is None
     assert score_posting(posting(), RUBRIC, transport=lambda url, body: reply("nope")) is None
 
@@ -418,12 +430,24 @@ def _message(content: object) -> bytes:
         pytest.param(_message(None), id="null-content"),
         pytest.param(_message(42), id="number-content"),
         pytest.param(_message("[1]"), id="content-not-object"),
-        pytest.param(_message('{"gaps": "x"}'), id="gaps-not-list"),
-        pytest.param(_message('{"gaps": [{"kind": "minor"}]}'), id="gap-without-name"),
-        pytest.param(_message('{"gaps": [{"name": "SQL", "kind": "major"}]}'), id="bad-kind"),
+        pytest.param(_message('{"requirements": "x"}'), id="requirements-not-list"),
+        pytest.param(_message('{"requirements": ["SQL"]}'), id="item-not-object"),
         pytest.param(
-            _message('{"gaps": [{"name": "SQL", "kind": "minor", "type": 5}]}'), id="bad-type"
+            _message(json.dumps({"requirements": [requirement("SQL", "major")]})), id="bad-kind"
         ),
+        pytest.param(
+            _message(json.dumps({"requirements": [requirement("SQL", met="maybe")]})),
+            id="bad-met",
+        ),
+        pytest.param(
+            _message(json.dumps({"requirements": [requirement("SQL", years=-1)]})),
+            id="negative-years",
+        ),
+        pytest.param(
+            _message(json.dumps({"requirements": [{**requirement("SQL"), "core": "yes"}]})),
+            id="core-not-bool",
+        ),
+        pytest.param(_message(json.dumps({"requirements": [requirement(" ")]})), id="blank-text"),
     ],
 )
 def test_a_reply_of_the_wrong_shape_leaves_the_posting_unscored(body: bytes) -> None:
@@ -434,9 +458,9 @@ def test_a_bug_in_our_own_parser_still_raises(monkeypatch: pytest.MonkeyPatch) -
     def bug(content: str) -> object:
         raise RuntimeError("synthetic bug")
 
-    monkeypatch.setattr(scoring, "_parse_gaps", bug)
+    monkeypatch.setattr(scoring, "_parse_requirements", bug)
     with pytest.raises(RuntimeError, match="synthetic bug"):
-        score_posting(posting(), RUBRIC, transport=lambda url, payload: reply('{"gaps": []}'))
+        score_posting(posting(), RUBRIC, transport=lambda url, payload: reply(fit_reply()))
 
 
 def test_a_model_that_stops_answering_is_not_asked_again_this_run(
@@ -485,7 +509,7 @@ def test_a_model_that_stops_answering_is_not_asked_again_this_run(
 
 def _model(monkeypatch: pytest.MonkeyPatch, header_cost: float) -> tuple[FakeServer, FakeClock]:
     clock = FakeClock()
-    server = FakeServer(Reply(body=reply('{"gaps": []}')[1], clock=clock, header_cost=header_cost))
+    server = FakeServer(Reply(body=reply(fit_reply())[1], clock=clock, header_cost=header_cost))
     monkeypatch.setattr(loopback, "_clock", clock)
     monkeypatch.setattr(loopback, "LoopbackConnection", server)
     return server, clock
@@ -526,7 +550,7 @@ def test_the_prompt_never_carries_the_hard_gates() -> None:
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         seen["body"] = payload
-        return reply('{"gaps":[]}')
+        return reply(fit_reply())
 
     config = {
         **RUBRIC,
@@ -548,11 +572,12 @@ def test_the_prompt_never_carries_the_hard_gates() -> None:
 
 LANGUAGES = {**RUBRIC, "hard_gates": {"required_languages": ["Examplish", "français"]}}
 PHANTOM = {
-    "gaps": [
-        {"name": "Examplish language proficiency", "kind": "core", "type": "language"},
-        {"name": "Forklift licence", "kind": "minor"},
+    "requirements": [
+        requirement("Examplish language proficiency", type="language", core=True),
+        requirement("Forklift licence"),
     ],
-    "requirements": ["Examplish language required", "Forklift licence", "Remote in Canada"],
+    "key_requirements": ["Examplish language required", "Forklift licence", "Remote in Canada"],
+    "entry_level": "",
 }
 
 
@@ -574,7 +599,9 @@ def _languages(description: str) -> Score:
 
 def test_a_gap_and_a_requirement_naming_an_unstated_avoided_language_are_dropped() -> None:
     result = _languages("A synthetic posting about scheduling.")
-    assert json.loads(result.gaps) == [{"name": "Forklift licence", "kind": "minor"}]
+    assert json.loads(result.gaps) == [
+        {"name": "Forklift licence", "kind": "minor", "type": "other"}
+    ]
     assert result.tier == "strong"  # one minor gap, not one core and one minor
     assert result.key_requirements == ("Remote in Canada",)  # the licence names a gap
 
@@ -590,7 +617,7 @@ def test_a_language_the_posting_states_is_kept() -> None:
 
 
 def test_the_guard_folds_accents_and_case_like_the_filter() -> None:
-    phantom = {"gaps": [{"name": "FRANÇAIS courant", "kind": "core"}], "requirements": []}
+    phantom = json.loads(fit_reply(("FRANÇAIS courant", "core")))
     result = score_posting(
         posting(), LANGUAGES, transport=lambda url, body: reply(json.dumps(phantom))
     )
@@ -601,10 +628,9 @@ def test_the_guard_folds_accents_and_case_like_the_filter() -> None:
 
 
 def test_a_more_than_three_list_still_gives_three_after_the_guard() -> None:
-    reply_body = {
-        "gaps": [],
-        "requirements": ["Examplish fluency", "Forklift licence", "Weekend shifts", "Class 5"],
-    }
+    reply_body = json.loads(
+        fit_reply(key=("Examplish fluency", "Forklift licence", "Weekend shifts", "Class 5"))
+    )
     result = score_posting(
         posting(), LANGUAGES, transport=lambda url, body: reply(json.dumps(reply_body))
     )
@@ -633,7 +659,7 @@ def _with_resume(content: str) -> tuple[Score | None, list[bytes]]:
 
 def test_the_resume_is_in_the_request_and_not_in_the_score() -> None:
     result, sent = _with_resume(
-        'Sure! {"gaps":[{"name":"French","kind":"core","type":"language"}]} Hope that helps.'
+        "Sure! " + fit_reply(("French", "core", "language")) + " Hope that helps."
     )
     assert result is not None and result.tier == "possible"
     view = json.loads(json.loads(sent[0])["messages"][1]["content"])
@@ -648,28 +674,24 @@ def test_without_a_resume_the_request_has_none_and_the_reply_is_kept() -> None:
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         sent.append(payload)
-        return reply('{"gaps":[]} trailing words')
+        return reply(fit_reply() + " trailing words")
 
     result = score_posting(posting(), RUBRIC, transport=transport)
     assert result is not None and result.resume_sha256 is None
     assert "resume" not in json.loads(json.loads(sent[0])["messages"][1]["content"])
-    assert result.llm_output == '{"gaps":[]} trailing words'
+    assert result.llm_output == fit_reply() + " trailing words"
 
 
 def test_canonical_gaps_keep_unicode_and_sort_keys() -> None:
-    result, _sent = _with_resume('{"gaps":[{"type":"langue","kind":"minor","name":"Français"}]}')
+    result, _sent = _with_resume(fit_reply(("Français", "minor", "language")))
     assert result is not None
-    assert result.llm_output == '{"gaps":[{"kind":"minor","name":"Français","type":"langue"}]}'
+    assert result.llm_output == '{"gaps":[{"kind":"minor","name":"Français","type":"language"}]}'
 
 
-@pytest.mark.parametrize("field", ["name", "type"])
-def test_a_gap_text_over_120_characters_is_unparseable(field: str) -> None:
-    long = "x" * 121
-    gap = {"name": "Excel", "kind": "minor", field: long}
-    result, _sent = _with_resume(json.dumps({"gaps": [gap]}))
+def test_a_gap_text_over_120_characters_is_unparseable() -> None:
+    result, _sent = _with_resume(fit_reply(("x" * 121, "minor")))
     assert result is None
-    ok = {"name": "Excel", "kind": "minor", field: "y" * 120}
-    assert _with_resume(json.dumps({"gaps": [ok]}))[0] is not None
+    assert _with_resume(fit_reply(("y" * 120, "minor")))[0] is not None
 
 
 _RUN_40 = _RESUME_TEXT[10:50]  # exactly 40 characters of the resume
@@ -689,23 +711,19 @@ assert len(_RUN_40) == 40
     ],
     ids=["exact", "upper", "newlines", "tabs", "nbsp", "full-width", "inside"],
 )
-@pytest.mark.parametrize("field", ["name", "type"])
-def test_forty_characters_copied_from_the_resume_is_unparseable(copied: str, field: str) -> None:
-    gap = {"name": "Excel", "kind": "minor", field: copied}
-    result, _sent = _with_resume(json.dumps({"gaps": [gap]}))
+def test_forty_characters_copied_from_the_resume_is_unparseable(copied: str) -> None:
+    result, _sent = _with_resume(fit_reply((copied, "minor")))
     assert result is None
 
 
 def test_thirty_nine_copied_characters_pass() -> None:
-    gap = {"name": _RUN_40[:39], "kind": "minor"}
-    result, _sent = _with_resume(json.dumps({"gaps": [gap]}))
+    result, _sent = _with_resume(fit_reply((_RUN_40[:39], "minor")))
     assert result is not None
 
 
 def test_the_copy_check_only_applies_with_a_resume() -> None:
-    gap = {"name": _RUN_40, "kind": "minor"}
     result = score_posting(
-        posting(), RUBRIC, transport=lambda url, body: reply(json.dumps({"gaps": [gap]}))
+        posting(), RUBRIC, transport=lambda url, body: reply(fit_reply((_RUN_40, "minor")))
     )
     assert result is not None
 
@@ -731,18 +749,18 @@ def test_the_prompt_asks_for_requirements_apart_from_the_gaps() -> None:
 
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
         seen["body"] = payload
-        return reply('{"gaps":[]}')
+        return reply(fit_reply())
 
     score_posting(posting(), RUBRIC, transport=transport)
     system = json.loads(seen["body"])["messages"][0]["content"]
-    assert '"requirements":["..."]' in system and "up to three" in system
+    assert "key_requirements: up to three" in system
 
 
 def test_up_to_three_requirements_are_kept_cleaned_and_deduplicated() -> None:
     found = requirements(
         {
-            "gaps": [],
-            "requirements": [
+            "requirements": [],
+            "key_requirements": [
                 "  Forklift\nlicence ",
                 "forklift   LICENCE",  # the same phrase again
                 "Weekend\x07 availability",
@@ -758,24 +776,24 @@ def test_up_to_three_requirements_are_kept_cleaned_and_deduplicated() -> None:
 
 def test_a_long_requirement_is_cut_at_a_word() -> None:
     long = "Experience coordinating inbound and outbound freight across several sites"
-    (found,) = requirements({"gaps": [], "requirements": [long]})
+    (found,) = requirements({"requirements": [], "key_requirements": [long]})
     assert len(found) <= scoring.MAX_REQUIREMENT and found.endswith("…")
     assert found == "Experience coordinating inbound and outbound freight…"
 
 
 @pytest.mark.parametrize("value", [None, "Forklift licence", {"a": 1}, [None], []], ids=repr)
 def test_a_missing_or_malformed_list_gives_none_and_keeps_the_score(value: object) -> None:
-    payload: dict[str, object] = {"gaps": []}
+    payload: dict[str, object] = {"requirements": []}
     if value is not None:
-        payload["requirements"] = value
+        payload["key_requirements"] = value
     assert requirements(payload) == ()
 
 
 def test_a_requirement_that_names_a_gap_is_dropped() -> None:
     found = requirements(
         {
-            "gaps": [{"name": "Class 1 licence", "kind": "minor"}],
-            "requirements": ["A valid CLASS 1 licence", "Bilingual service", "Class 1"],
+            "requirements": [requirement("Class 1 licence")],
+            "key_requirements": ["A valid CLASS 1 licence", "Bilingual service", "Class 1"],
         }
     )
     # "Class 1" alone does not contain the gap name, so it is posting text and stays.
@@ -789,8 +807,8 @@ def test_a_requirement_that_copies_the_resume_is_dropped() -> None:
     )
     found = requirements(
         {
-            "gaps": [],
-            "requirements": [
+            "requirements": [],
+            "key_requirements": [
                 "Coordinated forty warehouse staff across two night shifts",
                 "Forklift licence",
             ],
@@ -798,3 +816,118 @@ def test_a_requirement_that_copies_the_resume_is_dropped() -> None:
         resume=resume,
     )
     assert found == ("Forklift licence",)
+
+
+# --- stated items, classed; gaps derived in code (Batch Q) -----------------------------------
+
+TRAINING = PostingText(
+    "Example Automate",
+    "Junior Automation Developer",
+    "Example City",
+    work_model="remote",
+    description=(
+        "You will build workflows for clients. We will train you on our tools. "
+        "Don't meet every requirement? Apply anyway. Strong attention to detail."
+    ),
+)
+
+
+def _scored(content: str, *, resume: Resume | None = None, text: PostingText = TRAINING) -> Score:
+    result = score_posting(text, RUBRIC, transport=lambda url, body: reply(content), resume=resume)
+    assert result is not None
+    return result
+
+
+def test_duties_and_trained_items_are_never_gaps() -> None:
+    """A junior posting's duty list and what it will teach don't count against it."""
+    content = fit_reply(
+        items=(
+            requirement("Build workflow automations", "duty", core=True),
+            requirement("Develop dashboards for clients", "duty"),
+            requirement("Our in-house tools", "trained", type="tool", core=True),
+            requirement("Attention to detail", "soft", met="partly", evidence=""),
+        )
+    )
+    result = _scored(content)
+    assert json.loads(result.gaps) == [] and result.tier == "strong"
+
+
+def test_a_soft_item_counts_only_when_not_met_at_all_and_then_as_minor() -> None:
+    result = _scored(fit_reply(items=(requirement("Teamwork", "soft", core=True),)))
+    assert json.loads(result.gaps) == [{"name": "Teamwork", "kind": "minor", "type": "other"}]
+
+
+def test_required_and_preferred_unmet_items_are_gaps_and_partly_is_minor() -> None:
+    content = fit_reply(
+        items=(
+            requirement("SQL", type="skill", core=True),
+            requirement("Azure", "preferred", type="tool"),
+            requirement("Python", type="skill", core=True, met="partly", evidence="Python"),
+            requirement("Excel", type="tool", met="yes", evidence="Excel"),
+        )
+    )
+    result = _scored(content)
+    assert json.loads(result.gaps) == [
+        {"name": "SQL", "kind": "core", "type": "skill"},
+        {"name": "Azure", "kind": "minor", "type": "tool"},
+        {"name": "Python", "kind": "minor", "type": "skill"},
+    ]
+
+
+def test_evidence_not_in_the_resume_turns_yes_into_no() -> None:
+    resume = Resume("Sam Example. Built weekly reports in Excel for a depot.", "cd" * 32)
+    content = fit_reply(
+        items=(
+            requirement("Excel reporting", type="tool", met="yes", evidence="reports in Excel"),
+            requirement(
+                "Power BI", type="tool", core=True, met="yes", evidence="Power BI dashboards"
+            ),
+            requirement("SQL", type="skill", met="partly", evidence="SQL"),  # too short
+        )
+    )
+    result = _scored(content, resume=resume)
+    assert json.loads(result.gaps) == [
+        {"name": "Power BI", "kind": "core", "type": "tool"},
+        {"name": "SQL", "kind": "minor", "type": "skill"},
+    ]
+    assert "Power BI dashboards" not in result.llm_output  # evidence is never stored
+
+
+def test_gap_names_are_one_style_and_types_a_fixed_list() -> None:
+    assert scoring.gap_name("investment_wealth_management_experience") == (
+        "Investment wealth management experience"
+    )
+    assert scoring.gap_name("toolExperience") == "Tool experience"
+    assert scoring.gap_name("  SQL   basics ") == "SQL basics"
+    assert scoring.gap_name("power BI") == "Power BI"
+    content = fit_reply(
+        items=(
+            requirement("licensing_certification_requirements", type="technical_skills"),
+            requirement("Licensing certification requirements"),  # the same gap again
+        )
+    )
+    assert json.loads(_scored(content).gaps) == [
+        {"name": "Licensing certification requirements", "kind": "minor", "type": "other"}
+    ]
+
+
+def test_entry_level_counts_only_with_a_quote_found_in_the_posting() -> None:
+    assert _scored(fit_reply(entry_level="Apply anyway.")).entry_level is True
+    assert _scored(fit_reply(entry_level="we'll train")).entry_level is False  # not in it
+    assert _scored(fit_reply(entry_level="Junior")).entry_level is False  # too short
+    assert _scored(fit_reply(entry_level="Junior Automation Developer")).entry_level is True
+    assert _scored(json.dumps({"requirements": [], "entry_level": 5})).entry_level is False
+
+
+def test_the_prompt_asks_for_every_stated_item_and_the_training_offer() -> None:
+    seen: dict[str, bytes] = {}
+
+    def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        seen["body"] = payload
+        return reply(fit_reply())
+
+    score_posting(posting(), RUBRIC, transport=transport)
+    system = json.loads(seen["body"])["messages"][0]["content"]
+    for phrase in ("every item the posting states", '"duty"', '"trained"', "copied exactly"):
+        assert phrase in system
+    assert "gap_tiers" not in system and "max_gaps" not in system

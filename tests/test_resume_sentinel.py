@@ -27,7 +27,7 @@ from careerhunter.platform_checks import SystemProbe
 from careerhunter.score import ScoreError, score_posting
 from careerhunter.storage_guard import DataDir
 from tests.conftest import ACTIVE, set_claims
-from tests.fakes import use_example_watchlist
+from tests.fakes import fit_reply, use_example_watchlist
 from tests.test_bot import CHAT, TOKEN, Clock, FakeTelegram
 from tests.test_resume import document_xml, make_docx, make_pdf
 from tests.test_watch import fetched, one_greenhouse, url
@@ -95,12 +95,14 @@ class FakeModel:
         if view["posting"]["company"] == "Example Robotics":
             content = (
                 f"From the resume ({SENTINEL}) I see one gap: "
-                '{"gaps":[{"name":"Forklift licence","kind":"minor"}],'
-                f'"requirements":["Knows {SENTINEL}","Forklift licence course",'
-                '"Weekend shifts"]}'
+                '{"requirements":[{"text":"Forklift licence","kind":"required",'
+                '"type":"certification","core":false,"main_function":false,"years":0,'
+                '"met":"no","evidence":""}],'
+                f'"key_requirements":["Knows {SENTINEL}","Forklift licence course",'
+                '"Weekend shifts"],"entry_level":""}'
             )
         else:
-            content = json.dumps({"gaps": [{"name": f"Has {SENTINEL}", "kind": "core"}]})
+            content = fit_reply((f"Has {SENTINEL}", "core"))
         body = {"choices": [{"message": {"content": content}}]}
         return 200, json.dumps(body).encode()
 
@@ -217,7 +219,9 @@ def test_the_resume_reaches_the_model_and_nothing_else(
     by_company = {row[0]: (row[1], row[2]) for row in rows}
     assert by_company["Sample Logistics"] == (None, None)
     llm_output, sha = by_company["Example Robotics"]
-    assert llm_output == '{"gaps":[{"kind":"minor","name":"Forklift licence"}]}'
+    assert llm_output == (
+        '{"gaps":[{"kind":"minor","name":"Forklift licence","type":"certification"}]}'
+    )
     assert sha is not None and len(sha) == 64
 
 

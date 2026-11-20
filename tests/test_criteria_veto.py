@@ -17,6 +17,7 @@ from careerhunter import criteria
 from careerhunter import score as scoring
 from careerhunter.filters import PostingText
 from careerhunter.score import Cap, Score, Veto, score_posting
+from tests.fakes import requirement
 from tests.test_score import RUBRIC
 
 TEXT = (
@@ -27,7 +28,7 @@ TEXT = (
     "with no path to permanent."
 )
 RULES = criteria.Criteria(TEXT, len(TEXT), criteria.parse_rules(TEXT))
-GAPS = [{"name": "Forklift licence", "kind": "minor"}]
+GAPS = [{"name": "Forklift licence", "kind": "minor", "type": "certification"}]
 
 
 def _posting(description: str, title: str = "Operations Coordinator") -> PostingText:
@@ -45,7 +46,14 @@ def _score(
     gaps: list[dict[str, str]] | None = None,
     seen: list[dict[str, Any]] | None = None,
 ) -> Score | None:
-    content: dict[str, Any] = {"gaps": GAPS if gaps is None else gaps, "requirements": []}
+    listed = GAPS if gaps is None else gaps
+    content: dict[str, Any] = {
+        "requirements": [
+            requirement(gap["name"], type=gap["type"], core=gap["kind"] == "core") for gap in listed
+        ],
+        "key_requirements": [],
+        "entry_level": "",
+    }
     if veto is not None:
         content["veto"] = veto
     if cap is not None:
@@ -244,7 +252,7 @@ def test_the_quote_is_not_matched_against_the_company_or_location() -> None:
 
 def test_a_veto_stands_when_the_gaps_exclude_or_fit_no_tier() -> None:
     posting = _posting("A 3-month contract, full-time hours.")
-    many = [{"name": f"Synthetic skill {n}", "kind": "core"} for n in range(5)]
+    many = [{"name": f"Synthetic skill {n}", "kind": "core", "type": "skill"} for n in range(5)]
     result = _score(posting, {"rule": 2, "quote": "3-month contract"}, gaps=many)
     assert result is not None and result.vetoed
 
@@ -279,7 +287,10 @@ def test_the_request_has_numbered_rules_and_no_gate_lists() -> None:
         config,
         transport=lambda url, payload: (
             seen.append(json.loads(payload)),
-            (200, json.dumps({"choices": [{"message": {"content": '{"gaps":[]}'}}]}).encode()),
+            (
+                200,
+                json.dumps({"choices": [{"message": {"content": '{"requirements":[]}'}}]}).encode(),
+            ),
         )[1],
         criteria=RULES,
     )
@@ -299,12 +310,12 @@ def test_the_instruction_applies_rules_as_written() -> None:
         "an asset included when the rule names it",
         "allowed side of a limit",
         "exception the rule itself allows",
-        '"cap":{"rule":N,"quote":"..."}',
+        'set "cap" to {"rule":N,"quote":"..."}',
     ):
         assert words in text
     assert "is not a match: a skill wanted only as an asset" not in text  # the old wording
     assert f"at most {scoring.MAX_QUOTE} characters" in text
-    assert "never list them as gaps or requirements" in text
+    assert "never list them as requirements" in text
 
 
 def test_a_veto_naming_a_cap_rule_is_rejected() -> None:
