@@ -315,7 +315,7 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 
 ## Phase roadmap
 
-Only what is on `main` is listed. The latest release is v0.9.0.
+Only what is on `main` is listed. The latest release is v0.10.0.
 
 | Phase | Scope | Status |
 |---|---|---|
