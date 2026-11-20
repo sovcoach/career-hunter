@@ -1,3 +1,3 @@
 """career-hunter: a self-hosted job-search tracker that doubles as an EI job-search record."""
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
