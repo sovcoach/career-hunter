@@ -7,6 +7,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A posting with no location is no longer dropped. It used to be skipped as `empty_location` whenever location rules were set and the board gave no work model, which lost ordinary postings whose job description names no place. It is now scored and alerted as usual, ranked normally within its lane group, and its alert says `Location unknown`. A watchlist entry's `role_filters.locations` doesn't skip it either. Postings already skipped as `empty_location` stay skipped.
+
 ## [0.9.0] - 2026-11-19
 
 ### Added

@@ -29,11 +29,12 @@ posting is not an on-site or hybrid one whose own location is one. "Up to 25% tr
 or "occasional visits to head office" has no cadence and never skips. The rule is always
 on whenever `onsite_hybrid` is set; there is no setting for it.
 
-With `search.location_rules` set, a posting with blank location text and no work
-model from the board is skipped as `empty_location`. A work model from the board
-stands in for the location: such a posting is not skipped as empty, and with no text
-there is nothing to match against the lists, so they do not skip it either. Without
-location rules an empty location is not a reason to skip.
+An empty location is never a reason to skip (Batch Q). A posting with blank location
+text, whatever its work model, has nothing to match against the location lists or a
+watchlist entry's `locations`, so neither skips it: it is scored and alerted as usual,
+and its alert says `Location unknown`. Its description is still checked for office days
+elsewhere. (`empty_location` was a skip reason before 0.10.0; skips already stored with
+it stay.)
 
 Seniority words match whole words of the title, ignoring case. The description is
 checked too only when `seniority_in_description` is true. `title_exceptions` and
@@ -399,8 +400,6 @@ def _location(posting: PostingText, rules: Mapping[str, Any]) -> str | None:
     if not rules:
         return None
     blank = not posting.location.strip()
-    if blank and posting.work_model is None:
-        return "empty_location"
     if not blank and not _place_allowed(posting, rules):
         return "location_rule"
     if _office_days_elsewhere(posting, rules):
@@ -464,8 +463,8 @@ def _role(posting: PostingText, filters: Mapping[str, Any] | None) -> str | None
     if models and work_model is not None and work_model not in models:
         return "role_filter"
     places = _strings(filters.get("locations"))
-    if places and not _any(posting.location, places):
-        return "role_filter"
+    if places and posting.location.strip() and not _any(posting.location, places):
+        return "role_filter"  # an empty location is never a reason (Batch Q)
     return None
 
 

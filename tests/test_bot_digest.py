@@ -220,7 +220,7 @@ def test_with_one_a_poll_the_groups_go_in_order_and_off_lane_never(
         "Example Org — Change High",
         "Example Org — Stopgap High",
     ]
-    rows = [row[1].split(" | ")[0] for row in _rows(env)]
+    rows = [row[1].split(" | ")[1] for row in _rows(env)]  # after "Location unknown"
     assert rows == [
         "Lane: operations",
         "Lane: change (career change)",
@@ -650,11 +650,32 @@ def test_a_job_ad_that_is_a_scored_watcher_posting_is_logged_against_it(
     assert _digests(env) == []  # it has an application, so it is never alerted
 
 
+def test_a_posting_with_no_location_is_alerted_as_location_unknown_in_its_place(
+    env: Env, keep_umask: None
+) -> None:
+    _post(env, "Known Place", fit="medium")
+    unknown = _post(env, "No Place")
+    _set(env, unknown, location="")
+    conn = db.connect(env.datadir.search_db_path)
+    try:
+        conn.execute("UPDATE postings SET location = 'Example City' WHERE title = 'Known Place'")
+    finally:
+        conn.close()
+    assert _poll(env) == 0
+    rows = _rows(env)
+    # It ranks as usual within its group: High before Medium.
+    assert [row[0] for row in rows] == ["Example Org — No Place", "Example Org — Known Place"]
+    assert rows[0][1].startswith("Location unknown | Lane: operations | Fit: High")
+    assert rows[1][1].startswith("Example City | Lane: operations | Fit: Medium")
+
+
 def test_a_row_leaves_out_what_it_cannot_show(env: Env, keep_umask: None) -> None:
     posting = _post(env, "Coordinator", schedule="some_future_mark")
     _set(env, posting, gaps="not a list", url=None)
     assert _poll(env) == 0
-    assert _rows(env) == [["Example Org — Coordinator", "Lane: operations | Fit: High"]]
+    assert _rows(env) == [
+        ["Example Org — Coordinator", "Location unknown | Lane: operations | Fit: High"]
+    ]
 
 
 def test_a_store_failure_reading_alerts_sends_nothing(

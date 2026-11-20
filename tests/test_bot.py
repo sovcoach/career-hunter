@@ -1660,11 +1660,11 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
     assert [p["text"] for p in sends] == [
         "New postings: 2\n\n"
         "1. Example Robotics — Operations Coordinator\n"
-        "Lane: operations | Fit: High | 1 gap\n"
+        "Location unknown | Lane: operations | Fit: High | 1 gap\n"
         "Schedule: weekend days over your limit, on call\n"
         "https://jobs.example.com/ads/robotics\n\n"
         "2. Example Staffing (agency) — Support Coordinator\n"
-        "Lane: operations | Fit: High | 1 gap\n"
+        "Location unknown | Lane: operations | Fit: High | 1 gap\n"
         "https://jobs.example.com/ads/staffing"
     ]
     keyboard = sends[0]["reply_markup"]["inline_keyboard"]
@@ -2195,7 +2195,7 @@ def test_alerts_go_in_lane_order_with_their_lane_line(env: Env, keep_umask: None
         "Example Org — Retired",
         "Example Org — Off Lane",
     ]
-    lane_lines = [row[1].split(" | ")[0] for row in _rows(env)]
+    lane_lines = [row[1].split(" | ")[1] for row in _rows(env)]  # after "Location unknown"
     assert lane_lines == [
         "Lane: operations",
         "Lane: operations",

@@ -314,6 +314,7 @@ def stale_run(doc: Mapping[str, Any] | None) -> dt.timedelta:
     return dt.timedelta(seconds=2 * run_seconds(doc))
 
 
+LOCATION_UNKNOWN = "Location unknown"  # a posting whose board or page gave no location
 _CAPS = {"company": 80, "title": 120, "location": 80, "lane": 60, "requirement": 60}
 MAX_URL = 1000
 _SCHEDULE_WORDS = {"on_call": "on call", "over_weekend_limit": "weekend days over your limit"}
@@ -354,6 +355,8 @@ def _digest_row(numbered: _Numbered) -> str:
     facts = []
     if fields.location.strip():
         facts.append(_clip(fields.location, _CAPS["location"]))
+    else:
+        facts.append(LOCATION_UNKNOWN)
     if numbered.entry.order.lane_line:
         facts.append(_clip(numbered.entry.order.lane_line, _CAPS["lane"]))
     facts.append(f"Fit: {_fit_label(fields.fit)}")

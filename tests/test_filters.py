@@ -321,12 +321,10 @@ def test_a_given_work_model_is_strict() -> None:
     )
 
 
-def test_an_empty_location_is_skipped_only_with_location_rules_and_no_work_model() -> None:
+def test_an_empty_location_is_never_a_reason_to_skip() -> None:
     for blank in ("", "   "):
-        assert verdict("Coordinator", location=blank, work_model=None, config=RULES).reason == (
-            "empty_location"
-        )
-        # No location rules: an empty location is not a reason.
+        assert verdict("Coordinator", location=blank, work_model=None, config=RULES).reason is None
+        # No location rules: an empty location is not a reason either.
         assert verdict("Coordinator", location=blank, work_model=None, config={}).reason is None
         # A work model from the board stands in for the location (a remote Lever or Ashby row).
         for model in ("remote", "onsite", "hybrid"):
@@ -336,14 +334,24 @@ def test_an_empty_location_is_skipped_only_with_location_rules_and_no_work_model
             )
 
 
-def test_an_empty_location_comes_before_the_role_filters() -> None:
+def test_an_empty_location_passes_a_role_filters_locations() -> None:
     picky = {"locations": ["Example City"]}
     assert (
         verdict(
             "Coordinator", location="", work_model=None, config=RULES, role_filters=picky
         ).reason
-        == "empty_location"
+        is None
     )
+    elsewhere = verdict(
+        "Coordinator", location="Other City", work_model=None, config=RULES, role_filters=picky
+    )
+    assert elsewhere.reason == "location_rule"  # a stated place outside the rules still skips
+
+
+def test_an_empty_location_is_still_checked_for_office_days_elsewhere() -> None:
+    text = "You will work from our Other City office 3 days a week."
+    result = verdict("Coordinator", location="", work_model=None, config=RULES, description=text)
+    assert result.reason == "office_days_elsewhere"
 
 
 def test_role_filter_work_models_use_only_a_positive_inference() -> None:
@@ -687,7 +695,7 @@ def test_a_short_exception_no_longer_exempts_a_title_that_merely_contains_it() -
     assert verdict("Port Coordinator", description="Senior team", config=described).reason is None
 
 
-def test_an_empty_location_from_a_board_is_skipped_and_logged(search: sqlite3.Connection) -> None:
+def test_an_empty_location_from_a_board_is_kept_and_scored(search: sqlite3.Connection) -> None:
     board = url("greenhouse", "examplerobotics")
     payload = one_greenhouse("examplerobotics", title="Operations Coordinator")
     payload["jobs"][0]["location"] = {"name": "  "}  # type: ignore[index]
@@ -698,11 +706,11 @@ def test_an_empty_location_from_a_board_is_skipped_and_logged(search: sqlite3.Co
         fetcher=Scripted({board: fetched(payload)}),
         config=RULES,
     )
-    assert any("'Operations Coordinator' skipped (empty_location)" in line for line in lines)
-    assert [r["reason"] for r in search.execute("SELECT reason FROM skips")] == ["empty_location"]
+    assert not any("skipped" in line for line in lines)
+    assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 0
 
 
-def test_a_recheck_skips_a_stored_empty_location_once_rules_are_set(
+def test_a_recheck_keeps_a_stored_empty_location_once_rules_are_set(
     search: sqlite3.Connection,
 ) -> None:
     board = url("greenhouse", "examplerobotics")
@@ -714,8 +722,8 @@ def test_a_recheck_skips_a_stored_empty_location_once_rules_are_set(
     lines = watch.run(
         search, [item], today=DAY, fetcher=Scripted({board: fetched(payload)}), config=RULES
     )
-    assert any("skipped (empty_location)" in line for line in lines)
-    assert [r["reason"] for r in search.execute("SELECT reason FROM skips")] == ["empty_location"]
+    assert not any("skipped" in line for line in lines)
+    assert search.execute("SELECT count(*) AS n FROM skips").fetchone()["n"] == 0
 
 
 # --- travel never skips; regular office days elsewhere do ------------------------------------

@@ -228,11 +228,10 @@ def test_seniority_in_the_description_runs_on_every_ats(
         # Hybrid is checked like on-site.
         ("lever", {"location": "Other City", "model": "hybrid"}, "location_rule"),
         ("ashby", {"location": "Other City", "model": "hybrid"}, "location_rule"),
-        # Blank location: Greenhouse, BambooHR and Workday give no work model, so it is empty; the
-        # others give one.
-        ("greenhouse", {"location": ""}, "empty_location"),
-        ("bamboohr", {"location": ""}, "empty_location"),
-        ("workday", {"location": ""}, "empty_location"),
+        # Blank location: never a skip, with or without a work model from the board.
+        ("greenhouse", {"location": ""}, None),
+        ("bamboohr", {"location": ""}, None),
+        ("workday", {"location": ""}, None),
         ("lever", {"location": "", "model": "remote"}, None),
         ("ashby", {"location": "", "model": "remote"}, None),
     ],
