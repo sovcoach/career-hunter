@@ -940,14 +940,21 @@ If something goes wrong before step 6 finishes, nothing in the data folder has c
 
 Follow the nine steps above with the tag `v0.11.0` (`git checkout v0.11.0` in the release checkout, then `uv sync --locked`). These steps differ:
 
-- **Step 2:** after the backup, also take a read-only snapshot with the new release and check it, before any migration touches the data folder. Use a folder on an encrypted volume, outside the data folder and outside any git checkout:
+- **Step 3, then a snapshot:** `db snapshot` is new in 0.11.0, so move the release checkout to `v0.11.0` first (step 3 changes nothing in the data folder). Then, still before any migration, take a read-only snapshot with it and check it. Use a folder that exists, on an encrypted volume, outside the data folder and outside any git checkout:
 
   ```bash
-  uv run careerhunter db snapshot --to /Volumes/ExampleDrive/Snapshots
+  cd ~/Projects/career-hunter-release && uv run careerhunter db snapshot --to /Volumes/ExampleDrive/Snapshots
   ```
 
   Every database line must say `integrity ok`; any other result stops the command, and the upgrade waits until it is fixed.
-- **Step 4:** no change is needed. If `discovery.queries_per_run` times `discovery.query_delay_seconds` is more than 60 seconds, the config is refused until you add `discovery.result_pages: 1` or ask fewer queries, since each query now reads 2 result pages by default.
+- **Step 4: a config at the discovery limit needs `discovery.result_pages: 1` before you migrate.** Each query now reads 2 result pages by default, and `discovery.queries_per_run` times `discovery.result_pages` times `discovery.query_delay_seconds` must be at most 120 seconds. So if `queries_per_run` times `query_delay_seconds` is more than 60 seconds (4 queries 30 seconds apart is 120, for example), `doctor` and `migrate` refuse the config until you add this under `discovery`, which keeps one page per query as before:
+
+  ```yaml
+  discovery:
+    result_pages: 1
+  ```
+
+  No other change is needed.
 - **Step 6:** `migrate` applies search migrations 0036 and 0037 and EI migration 0005:
 
   ```text
