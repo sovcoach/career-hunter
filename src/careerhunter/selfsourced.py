@@ -231,7 +231,9 @@ def record(
         jd, ats_location = got.jd, got.location
     if not posting.location.strip():
         # The page's JSON-LD gave none: the ATS JSON's, then a `Location:` line.
-        found = ats_location or locations.from_text(jd.text if jd is not None else None)
+        found = ats_location or locations.from_text(
+            jd.text if jd is not None else None, locations.configured_places(lane_config)
+        )
         posting = replace(posting, location=found or "")
     saved = jobdesc.save(data_dir, jd, today) if jd is not None else None
     app = Application(replace(posting, snapshot_path=path), dating, method, notes=notes)

@@ -32,11 +32,11 @@ RULES = {"onsite_hybrid": ["Example City"], "remote": ["Exampleland"]}
 @pytest.mark.parametrize(
     ("text", "found"),
     [
-        ("About us\nLocation: Example Town, Region\nDuties", "Example Town, Region"),
-        ("Job location - Example Town", "Example Town"),
-        ("Work Location: Example Town.", "Example Town"),
-        ("  Based in: Example Town ", "Example Town"),
-        ("Locations: Example Town; Sample Village", "Example Town; Sample Village"),
+        ("About us\nLocation: Example Town, Ohio\nDuties", "Example Town, Ohio"),
+        ("Job location - Example Town, OH", "Example Town, OH"),
+        ("Work Location: Example Town, Ohio.", "Example Town, Ohio"),
+        ("  Based in: Example Town, Ohio ", "Example Town, Ohio"),
+        ("Locations: Example Town, OH; Remote", "Example Town, OH; Remote"),
         ("Location-based services are our business.", None),
         ("Our location is great.", None),
         ("We are based in Example Town.", None),
@@ -50,10 +50,12 @@ def test_a_location_line_is_read_only_at_the_start_of_a_line(
     assert locations.from_text(text) == found
 
 
-def test_a_long_location_line_is_cut() -> None:
-    found = locations.from_text("Location: " + "Example " * 40)
-    assert found is not None
-    assert len(found) <= locations.MAX_LOCATION
+def test_a_location_line_longer_than_the_limit_is_not_kept() -> None:
+    text = "Location: " + "Example Town, Ohio; " * 10
+    assert locations.from_text(text) is None
+    place, line = locations.read_text(text)
+    assert place is None
+    assert line is not None and len(line) <= locations.MAX_LOCATION
 
 
 # --- JSON-LD ---------------------------------------------------------------------------
@@ -217,10 +219,10 @@ def test_log_reads_a_location_line_when_the_page_has_none(
     pages.body = (
         b'<script type="application/ld+json">{"@type": "JobPosting", "title": "Analyst", '
         b'"hiringOrganization": {"name": "Example Robotics"}, '
-        b'"description": "Duties.\\nLocation: Example Town"}</script>'
+        b'"description": "Duties.\\nLocation: Example Town, Ohio"}</script>'
     )
     assert cli.main(["log", AD_URL, "--method", "email", "--date", DAY], probe=probe) == 0
-    assert "Location: Example Town" in capsys.readouterr().out.splitlines()
+    assert "Location: Example Town, Ohio" in capsys.readouterr().out.splitlines()
 
 
 # --- the bot's /log ------------------------------------------------------------------------
@@ -317,7 +319,7 @@ def test_a_board_job_with_no_location_takes_its_description_line(tmp_path: Path)
         "title": "Analyst",
         "absolute_url": "https://boards.greenhouse.io/examplerobotics/jobs/5",
         "location": {"name": ""},
-        "content": "&lt;p&gt;Duties.&lt;/p&gt;&lt;p&gt;Location: Example City&lt;/p&gt;",
+        "content": "&lt;p&gt;Duties.&lt;/p&gt;&lt;p&gt;Location: Example City, Ohio&lt;/p&gt;",
     }
     lines = watch.run(
         conn,
@@ -328,7 +330,7 @@ def test_a_board_job_with_no_location_takes_its_description_line(tmp_path: Path)
     )
     assert any("'Analyst': location read from its description" in line for line in lines)
     (row,) = conn.execute("SELECT location FROM postings").fetchall()
-    assert row[0] == "Example City"
+    assert row[0] == "Example City, Ohio"
     conn.close()
 
 

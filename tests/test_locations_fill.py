@@ -70,7 +70,7 @@ def test_a_dry_run_lists_and_writes_nothing(
 ) -> None:
     first = _posting(ready, 1, snapshot=_snapshot(ready, "a.html", AD_WITH_LD))
     second = _posting(
-        ready, 2, snapshot=_snapshot(ready, "b.txt", b"Duties.\nLocation: Sample Village")
+        ready, 2, snapshot=_snapshot(ready, "b.txt", b"Duties.\nLocation: Sample Village, Ohio")
     )
     kept = _posting(
         ready, 3, location="Example City", snapshot=_snapshot(ready, "c.txt", b"Location: X")
@@ -82,7 +82,7 @@ def test_a_dry_run_lists_and_writes_nothing(
     out = capsys.readouterr().out.splitlines()
     assert out[0] == "dry run: nothing is written."
     assert f"{first:6} Example Robotics — Analyst 1: Example Town (from its job ad)" in out
-    assert f"{second:6} Example Robotics — Analyst 2: Sample Village (from its job ad)" in out
+    assert f"{second:6} Example Robotics — Analyst 2: Sample Village, Ohio (from its job ad)" in out
     assert not any(f"{kept:6} " in line or f"{none:6} " in line for line in out)
     assert out[-1] == "2 blank locations would be filled."
     assert _locations(ready) == before
@@ -135,7 +135,7 @@ def test_an_applications_kept_job_description_fills_it(
     assert _rows(ready / "search.db", "SELECT location FROM postings") == [("",)]
     ei = db.connect(ready / f"ei_record_{ACTIVE.label}.db")
     try:
-        text = "Duties.\nBased in: Sample Village"
+        text = "Duties.\nBased in: Sample Village, Ohio"
         ei.execute(
             "INSERT INTO job_descriptions (application_id, text, text_sha256, jd_source) "
             "VALUES (1, ?, ?, 'pasted')",
@@ -147,6 +147,7 @@ def test_an_applications_kept_job_description_fills_it(
     capsys.readouterr()
     assert _fill(probe) == 0
     out = capsys.readouterr().out.splitlines()
-    assert any(line.endswith("Sample Village (from its job description)") for line in out)
-    assert _rows(ready / "search.db", "SELECT location FROM postings") == [("Sample Village",)]
+    assert any(line.endswith("Sample Village, Ohio (from its job description)") for line in out)
+    stored = _rows(ready / "search.db", "SELECT location FROM postings")
+    assert stored == [("Sample Village, Ohio",)]
     assert (ready / f"ei_record_{ACTIVE.label}.db").read_bytes() == ei_before
