@@ -44,6 +44,7 @@ from careerhunter import (
     jobdesc,
     lanes,
     ledger,
+    locationfill,
     resume,
     search_store,
     secrets_store,
@@ -1726,6 +1727,44 @@ def cmd_db(
     return EXIT_OK
 
 
+def cmd_locations(datadir: DataDir, args: argparse.Namespace) -> int:
+    """`locations fill [--dry-run]`: blank stored locations, from the kept job ads and
+    job descriptions (`locationfill`). Nothing is fetched. A dry run reads only. Without
+    `--dry-run`, search.db gets the locations in one transaction; the EI records are
+    only read."""
+    if args.locations_action != "fill":  # pragma: no cover - argparse limits the choices
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    if args.dry_run:
+        conn = db.connect_read_only(datadir.search_db_path)
+        try:
+            _require_current(conn, "search", "search.db")
+            planned = locationfill.plan(conn, datadir)
+        finally:
+            conn.close()
+        print("dry run: nothing is written.")
+    else:
+        conn = db.connect(datadir.search_db_path)
+        try:
+            db.migrate(conn, "search")
+            planned = locationfill.plan(conn, datadir)
+            written = locationfill.apply(conn, planned)
+        finally:
+            conn.close()
+    for item in planned:
+        print(
+            f"{item.posting_id:6} {item.company} — {item.title}: {item.location} "
+            f"(from its {item.source})"
+        )
+    if args.dry_run:
+        print(f"{len(planned)} blank locations would be filled.")
+    else:
+        print(f"{written} blank locations filled.")
+    return EXIT_OK
+
+
 def cmd_lanes(datadir: DataDir, args: argparse.Namespace) -> int:
     """`lanes reassign [--dry-run]`: recompute every checked posting's lane, and check
     every posting not checked yet.
@@ -2679,6 +2718,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="an existing folder outside the data folder and outside any git checkout",
     )
+    p = sub.add_parser("locations", help="stored postings' locations")
+    locations_sub = p.add_subparsers(dest="locations_action", required=True)
+    p = locations_sub.add_parser(
+        "fill",
+        help="fill blank locations from the kept job ads and job descriptions; "
+        "fetches nothing, writes search.db only",
+    )
+    p.add_argument("--dry-run", action="store_true", help="list each location that would be filled")
     p = sub.add_parser("lanes", help="manage the title lanes stored on postings")
     lanes_sub = p.add_subparsers(dest="lanes_action", required=True)
     p = lanes_sub.add_parser(
@@ -2727,6 +2774,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "discover": cmd_discover,
     "scout-prompt": cmd_scout_prompt,
     "lanes": cmd_lanes,
+    "locations": cmd_locations,
     "resume": cmd_resume,
     "embed-eval": cmd_embed_eval,
     "doctor": cmd_doctor,
