@@ -1191,11 +1191,20 @@ def _record_jobs(
             )
             continue
         if not item.location.strip() and item.description:
-            found_location = locations.from_text(item.description)
+            found_location, not_place = locations.read_text(item.description)
             if found_location:  # the board gave none: its description's Location: line
                 item = replace(item, location=found_location)
                 lines.append(
                     _line(name, ats, f"{item.title!r}: location read from its description")
+                )
+            elif not_place is not None:  # kept only when it looks like a place
+                lines.append(
+                    _line(
+                        name,
+                        ats,
+                        f"{item.title!r}: the location line in its description is not a "
+                        "place; location unknown",
+                    )
                 )
         company, differed = _company_name(item.company_field, name)
         if differed is not None and differed.casefold() not in mismatches:

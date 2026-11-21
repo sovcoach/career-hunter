@@ -32,15 +32,27 @@ class Filled:
     source: str  # "job ad" or "job description"
 
 
-def _from_ad(data: bytes) -> str | None:
+@dataclass(frozen=True)
+class NotPlace:
+    """A posting whose kept text has a `Location:` line that is not a place: left blank."""
+
+    posting_id: int
+    company: str
+    title: str
+    line: str
+
+
+def _from_ad(data: bytes) -> tuple[str | None, str | None]:
+    """The job ad's location (JSON-LD, then a `Location:` line that looks like a place),
+    and a `Location:` line that does not, if any."""
     found = snapshots.posting_info(data).location
     if found:
-        return found
+        return found, None
     try:
         text = jobdesc.from_file(data).text
     except jobdesc.JobDescError:
-        return None
-    return locations.from_text(text)
+        return None, None
+    return locations.read_text(text)
 
 
 def _ei_texts(datadir: DataDir) -> dict[str, list[str]]:
@@ -65,8 +77,12 @@ def _ei_texts(datadir: DataDir) -> dict[str, list[str]]:
     return found
 
 
-def plan(search: sqlite3.Connection, datadir: DataDir) -> list[Filled]:
-    """Every blank location a kept file names, without writing anything."""
+def plan(
+    search: sqlite3.Connection, datadir: DataDir, not_place: list[NotPlace] | None = None
+) -> list[Filled]:
+    """Every blank location a kept file names, without writing anything. A `Location:`
+    line that is not a place (`locations.looks_like_place`) fills nothing; with
+    `not_place`, each such posting is added to it, so the caller can say so."""
     texts: dict[str, list[str]] | None = None
     filled: list[Filled] = []
     rows = search.execute(
@@ -76,10 +92,12 @@ def plan(search: sqlite3.Connection, datadir: DataDir) -> list[Filled]:
     for row in rows:
         posting_id = int(row["id"])
         found: str | None = None
+        rejected: str | None = None
         source = "job ad"
         if row["snapshot_path"]:
             data = snapshots.read_kept(datadir.root, str(row["snapshot_path"]))
-            found = _from_ad(data) if data is not None else None
+            if data is not None:
+                found, rejected = _from_ad(data)
         if not found:
             if texts is None:
                 texts = _ei_texts(datadir)
@@ -89,7 +107,11 @@ def plan(search: sqlite3.Connection, datadir: DataDir) -> list[Filled]:
                 (posting_id,),
             ):
                 for text in texts.get(str(app["correlation_id"]), []):
-                    found = found or locations.from_text(text)
+                    if found is None:
+                        found, line = locations.read_text(text)
+                        rejected = rejected or line
+        if not found and rejected is not None and not_place is not None:
+            not_place.append(NotPlace(posting_id, str(row["company"]), str(row["title"]), rejected))
         if found:
             filled.append(Filled(posting_id, str(row["company"]), str(row["title"]), found, source))
     return filled

@@ -7,6 +7,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A location read from job-description text (a `Location:` or `Based in:` line) is kept only when it looks like a place: it says Remote, or names a country from the built-in list, a Canadian province or territory or a US state (by name, or by postal abbreviation after a comma), in at most 120 characters. Anything else, such as a work-environment line or a city on its own, stays unknown, and the watch log and `careerhunter locations fill` say so. Locations from JSON-LD and the boards' own fields are unchanged.
+- No schema change: `search.db` stays at 37 and the EI record at 5.
+
 ## [0.11.0] - 2026-11-21
 
 ### Added
