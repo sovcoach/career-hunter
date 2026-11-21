@@ -7,6 +7,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-21
+
 ### Added
 - **A location at intake.** `careerhunter log` and `/log` read the location from the page's structured data (a remote job with the countries it is open to reads as `Remote, <country>`), then the board's own data, then a `Location:` line in the job description. `--location` and `| location: <city>` give it by hand; neither is required, and the reply says `Location: unknown` when none was found. The watcher reads a `Location:` line when a board gives none. `careerhunter locations fill [--dry-run]` fills blank stored locations from the kept job ads and job descriptions.
 - **A referral label.** `--referral`, `| referral` and the method `referral` mark a posting as a referral, and `careerhunter referral --posting ID | --url LINK` marks a stored one. A referral counts as local, needs no location, and its alert says `Referral`.
@@ -30,7 +32,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Telegram API replies and file downloads are read only up to a size cap (#46).
 
 ### Upgrading
-- `search.db` moves from schema version 35 to 37, and the EI record from 4 to 5. See "Upgrading from 0.10.0 to 0.11.0" in `docs/SETUP.md`.
+- `search.db` moves from schema version 35 to 37, and the EI record from 4 to 5. See "Upgrading from 0.10.0 to 0.11.0" in `docs/SETUP.md`. Its release checkout uses `v0.11.0`.
 
 ## [0.10.0] - 2026-11-20
 
@@ -368,7 +370,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/sovcoach/career-hunter/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/sovcoach/career-hunter/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/sovcoach/career-hunter/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/sovcoach/career-hunter/compare/v0.8.0...v0.8.1
