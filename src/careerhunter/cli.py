@@ -35,6 +35,7 @@ from careerhunter import (
     claims,
     criteria,
     db,
+    dbsnapshot,
     demo,
     discover,
     embed,
@@ -1690,6 +1691,35 @@ def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_db(
+    datadir: DataDir,
+    args: argparse.Namespace,
+    probe: SystemProbe,
+    *,
+    clock: Clock | None = None,
+) -> int:
+    """`db snapshot --to DIR`: a read-only copy of search.db and every EI record.
+
+    Each database is opened read-only and copied with SQLite's backup API into a new
+    owner-only folder under DIR, then checked with `PRAGMA integrity_check`. DIR must be
+    on a volume diskutil reports as encrypted, and outside the data folder and any git
+    checkout. Nothing in the data folder is written.
+    """
+    if args.db_action != "snapshot":  # pragma: no cover - argparse limits the choices
+        return EXIT_ERROR
+    now = clock() if clock is not None else dt.datetime.now(dt.UTC)
+    try:
+        folder, copied = dbsnapshot.snapshot(args.dest, datadir, probe, now)
+    except dbsnapshot.SnapshotError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    print(f"snapshot: {folder}")
+    for item in copied:
+        print(f"  {item.name}: integrity {item.integrity}")
+    print("Open the copies read-only (PRAGMA query_only=1); delete the folder when done.")
+    return EXIT_OK
+
+
 def cmd_lanes(datadir: DataDir, args: argparse.Namespace) -> int:
     """`lanes reassign [--dry-run]`: recompute every checked posting's lane, and check
     every posting not checked yet.
@@ -2621,6 +2651,21 @@ def build_parser() -> argparse.ArgumentParser:
         "scout-prompt",
         help="print a scout prompt from exclusions and the hard gates the watcher skips on",
     )
+    p = sub.add_parser("db", help="read-only copies of the databases, for investigations")
+    db_sub = p.add_subparsers(dest="db_action", required=True)
+    p = db_sub.add_parser(
+        "snapshot",
+        help="copy search.db and every EI record into a new folder under --to, read-only, "
+        "with an integrity check; the folder must be on an encrypted volume",
+    )
+    p.add_argument(
+        "--to",
+        dest="dest",
+        type=Path,
+        required=True,
+        metavar="DIR",
+        help="an existing folder outside the data folder and outside any git checkout",
+    )
     p = sub.add_parser("lanes", help="manage the title lanes stored on postings")
     lanes_sub = p.add_subparsers(dest="lanes_action", required=True)
     p = lanes_sub.add_parser(
@@ -2696,6 +2741,8 @@ def main(
     try:
         if args.command == "doctor":
             return cmd_doctor(datadir, args, clock=clock)
+        if args.command == "db":
+            return cmd_db(datadir, args, probe, clock=clock)
         return COMMANDS[args.command](datadir, args)
     except (
         SeedError,
