@@ -194,6 +194,10 @@ PARSE_FAILURES_TO_GIVE_UP = 3
 # Scoring calls for one posting that timed out in a row before the watcher sets it aside
 # (search migration 0034), until `careerhunter rescore --set-aside`.
 TIMEOUTS_TO_SET_ASIDE = 2
+# Failed re-reads of a posting's board page in a row (anything but HTTP 404, 410 or 429)
+# before it is set aside (search migration 0036), until `careerhunter rescore
+# --set-aside`; a re-read that works clears the count.
+REREADS_TO_SET_ASIDE = 2
 # A run whose scoring calls all timed out records an lm_studio failure from this many.
 TIMEOUT_RUN_CALLS = 2
 # Inline scoring of new postings stops once less than this is left of the budget.
@@ -1394,7 +1398,7 @@ def _recheck_one(
 # re-score passes keep never-tried first, then the oldest attempt, then the oldest
 # posting. A posting given up after PARSE_FAILURES_TO_GIVE_UP replies that did not
 # parse (search migration 0023), or set aside after TIMEOUTS_TO_SET_ASIDE timeouts in a
-# row (0034), is in neither.
+# row (0034) or REREADS_TO_SET_ASIDE failed re-reads in a row (0036), is in neither.
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
     "p.referral, "
@@ -1407,6 +1411,8 @@ _NEVER_SCORED_SQL = (
     "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
     "AND NOT EXISTS (SELECT 1 FROM score_timeouts t "
     "WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL) "
+    "AND NOT EXISTS (SELECT 1 FROM reread_failures r "
+    "WHERE r.posting_id = p.id AND r.set_aside_at IS NOT NULL) "
     "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
@@ -1423,6 +1429,8 @@ _RESCORE_SQL = (
     "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
     "AND NOT EXISTS (SELECT 1 FROM score_timeouts t "
     "WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL) "
+    "AND NOT EXISTS (SELECT 1 FROM reread_failures r "
+    "WHERE r.posting_id = p.id AND r.set_aside_at IS NOT NULL) "
     "ORDER BY p.score_attempted_at IS NOT NULL, p.score_attempted_at, p.first_seen, p.id"
 )
 _NEEDS_RESCORE_SQL = (
@@ -1596,14 +1604,20 @@ def _described(
     except BoardHTTPError as exc:
         if exc.status in (404, 410):
             job = None
-        else:
-            if exc.status == 429:
-                gate.blocked.add(urllib.parse.urlsplit(exc.url).hostname or host)
+        elif exc.status == 429:
+            gate.blocked.add(urllib.parse.urlsplit(exc.url).hostname or host)
             state.lines.append(_line(name, ats, f"{title}: HTTP {exc.status}; {_UNREAD}"))
             return None
+        else:
+            reason = _reread_reason(exc.status)
+            _reread_failed(conn, state, posting_id, reason, name, ats, title, f"HTTP {exc.status}")
+            return None
     except (FetchError, BoardParseError) as exc:
-        state.lines.append(_line(name, ats, f"{title}: {type(exc).__name__}; {_UNREAD}"))
+        reason = "parse" if isinstance(exc, BoardParseError) else "fetch-error"
+        _reread_failed(conn, state, posting_id, reason, name, ats, title, type(exc).__name__)
         return None
+    with db.transaction(conn):
+        search_store.clear_reread_failures(conn, posting_id)
     if job is None:
         with db.transaction(conn):
             if not search_store.posting_has_skip(conn, posting_id):
@@ -1622,6 +1636,42 @@ def _described(
 
 
 _UNREAD = "description not read; left for the next run"
+
+
+def _reread_reason(status: int) -> str:
+    if status == 403:
+        return "http-403"
+    return "http-5xx" if status >= 500 else "http-4xx"
+
+
+def _reread_failed(
+    conn: sqlite3.Connection,
+    state: _State,
+    posting_id: int,
+    reason: str,
+    name: str,
+    ats: str | None,
+    title: str,
+    what: str,
+) -> None:
+    """Count a failed re-read (not gone, not throttled), shown in the log as `what`.
+    After REREADS_TO_SET_ASIDE in a row the posting is set aside, not counted as gone,
+    until `rescore --set-aside`."""
+    with db.transaction(conn):
+        aside = search_store.record_reread_failure(
+            conn, posting_id, reason, _iso(state.now()), set_aside_after=REREADS_TO_SET_ASIDE
+        )
+    if aside:
+        state.lines.append(
+            _line(
+                name,
+                ats,
+                f"{title}: {what}; set aside after {REREADS_TO_SET_ASIDE} failed re-reads "
+                f"({reason}), not counted as gone, until careerhunter rescore --set-aside",
+            )
+        )
+    else:
+        state.lines.append(_line(name, ats, f"{title}: {what}; {_UNREAD}"))
 
 
 def _read_again(

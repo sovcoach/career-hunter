@@ -640,8 +640,9 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
     writes nothing.
 
     `--set-aside` releases every posting the watcher set aside after scoring timeouts
-    in a row (search migration 0034), scored or not, so the next run sends it to the
-    model again; a `--posting` id that is set aside is released too."""
+    in a row (search migration 0034) or failed re-reads of its board page in a row
+    (0036), scored or not, so the next run reads it and sends it to the model again; a
+    `--posting` id that is set aside is released too."""
     if not args.posting and not args.gap and not args.set_aside:
         _err("error: give --posting, --gap or --set-aside")
         return EXIT_ERROR
@@ -670,9 +671,10 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
             )
         for row in aside:
             alerted = "alerted" if row["alerted_at"] else "not alerted"
+            why = "timeouts" if row["aside"] == "timeouts" else f"failed re-reads ({row['aside']})"
             print(
                 f"{int(row['id']):5} {row['company']} — {row['title']}: set aside after "
-                f"timeouts, fit {row['fit']}, {alerted}"
+                f"{why}, fit {row['fit']}, {alerted}"
             )
         for posting_id in missing:
             print(f"{posting_id:5} not queued: not a scored posting without a skip or application")
@@ -2296,6 +2298,27 @@ def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
         report.line("bot refusals", "OK", "no posting given up")
 
 
+def _doctor_rereads(report: _Report, search: sqlite3.Connection) -> None:
+    """Postings set aside after failed re-reads of their board page (search migration
+    0036), by reason. No line when there are none."""
+    counts = search_store.reread_set_aside(search)
+    if not counts:
+        return
+    total = sum(counts.values())
+    reasons = ", ".join(
+        f"{n} {reason.replace('http-', 'HTTP ')}"
+        if len(counts) > 1
+        else reason.replace("http-", "HTTP ")
+        for reason, n in counts.items()
+    )
+    report.line(
+        "re-reads",
+        "WARN",
+        f"{plural(total, 'posting', 'postings')} set aside after failed re-reads ({reasons}); "
+        "retry: careerhunter rescore --set-aside",
+    )
+
+
 def _doctor_set_aside(report: _Report, search: sqlite3.Connection) -> None:
     """Postings the watcher set aside after scoring timeouts in a row (0034), with the
     command that releases them. Counts only."""
@@ -2530,6 +2553,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
         _doctor_alert_hold(report, search)
         _doctor_refusals(report, search)
         _doctor_set_aside(report, search)
+        _doctor_rereads(report, search)
         _doctor_facets(report, search, config_doc)
         _doctor_job_descriptions(report, search)
 

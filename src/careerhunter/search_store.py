@@ -589,7 +589,9 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
             SELECT 1 FROM score_parse_failures f
             WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) AND NOT EXISTS (
             SELECT 1 FROM score_timeouts t
-            WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL)), 0) AS unscored,
+            WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL) AND NOT EXISTS (
+            SELECT 1 FROM reread_failures r
+            WHERE r.posting_id = p.id AND r.set_aside_at IS NOT NULL)), 0) AS unscored,
           coalesce(sum(p.llm_output IS NOT NULL AND p.fit IS NULL AND p.alerted_at IS NULL), 0)
             AS no_fit
         FROM postings p
@@ -1136,27 +1138,71 @@ def set_aside_count(conn: sqlite3.Connection) -> int:
 
 
 def set_aside_postings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """The postings set aside after timeouts, each with its company, title, fit and
-    whether it was alerted, by id."""
+    """The postings set aside after timeouts (0034) or failed re-reads (0036), each
+    with its company, title, fit, whether it was alerted, and why (`aside`: `timeouts`,
+    or the re-read's reason such as `http-403`), by id. A posting set aside for both is
+    listed once, for its timeouts."""
     return conn.execute(
-        "SELECT p.id, c.name AS company, p.title, p.fit, p.alerted_at "
-        "FROM score_timeouts t JOIN postings p ON p.id = t.posting_id "
-        "JOIN companies c ON c.id = p.company_id "
-        "WHERE t.set_aside_at IS NOT NULL ORDER BY p.id"
+        "SELECT p.id, c.name AS company, p.title, p.fit, p.alerted_at, "
+        "CASE WHEN t.posting_id IS NOT NULL THEN 'timeouts' ELSE r.reason END AS aside "
+        "FROM postings p JOIN companies c ON c.id = p.company_id "
+        "LEFT JOIN score_timeouts t ON t.posting_id = p.id AND t.set_aside_at IS NOT NULL "
+        "LEFT JOIN reread_failures r ON r.posting_id = p.id AND r.set_aside_at IS NOT NULL "
+        "WHERE t.posting_id IS NOT NULL OR r.posting_id IS NOT NULL ORDER BY p.id"
     ).fetchall()
 
 
 def release_set_aside(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> int:
-    """Clear these postings' timeouts, so the next watch run sends them to the model
-    again. How many were set aside."""
+    """Clear these postings' timeouts and failed re-reads, so the next watch run reads
+    them and sends them to the model again. How many were set aside."""
     count = 0
     for posting_id in posting_ids:
-        count += conn.execute(
-            "DELETE FROM score_timeouts WHERE posting_id = ? AND set_aside_at IS NOT NULL",
-            (posting_id,),
-        ).rowcount
+        aside = conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM score_timeouts WHERE posting_id = ? "
+            "AND set_aside_at IS NOT NULL) OR EXISTS (SELECT 1 FROM reread_failures "
+            "WHERE posting_id = ? AND set_aside_at IS NOT NULL)",
+            (posting_id, posting_id),
+        ).fetchone()[0]
+        count += int(bool(aside))
         conn.execute("DELETE FROM score_timeouts WHERE posting_id = ?", (posting_id,))
+        conn.execute("DELETE FROM reread_failures WHERE posting_id = ?", (posting_id,))
     return count
+
+
+def record_reread_failure(
+    conn: sqlite3.Connection, posting_id: int, reason: str, stamp: str, *, set_aside_after: int
+) -> bool:
+    """Count one failed re-read of this posting's board page (search migration 0036),
+    with its fixed reason. True when this one reached `set_aside_after` in a row, so
+    the posting is now set aside."""
+    conn.execute(
+        "INSERT INTO reread_failures (posting_id, failures, reason, last_failed_at) "
+        "VALUES (?, 1, ?, ?) ON CONFLICT (posting_id) DO UPDATE SET failures = failures + 1, "
+        "reason = excluded.reason, last_failed_at = excluded.last_failed_at",
+        (posting_id, reason, stamp),
+    )
+    cur = conn.execute(
+        "UPDATE reread_failures SET set_aside_at = ? "
+        "WHERE posting_id = ? AND set_aside_at IS NULL AND failures >= ?",
+        (stamp, posting_id, set_aside_after),
+    )
+    return cur.rowcount == 1
+
+
+def clear_reread_failures(conn: sqlite3.Connection, posting_id: int) -> None:
+    """A re-read of the posting worked: its failures are no longer in a row."""
+    conn.execute("DELETE FROM reread_failures WHERE posting_id = ?", (posting_id,))
+
+
+def reread_set_aside(conn: sqlite3.Connection) -> dict[str, int]:
+    """Postings set aside after failed re-reads, counted by reason."""
+    return {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            "SELECT reason, count(*) FROM reread_failures WHERE set_aside_at IS NOT NULL "
+            "GROUP BY reason ORDER BY reason"
+        )
+    }
 
 
 @dataclass(frozen=True)
