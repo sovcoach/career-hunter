@@ -1427,6 +1427,7 @@ _RESCORE_SQL = (
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of) "
     "AND NOT EXISTS (SELECT 1 FROM score_parse_failures f "
     "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
     "AND NOT EXISTS (SELECT 1 FROM score_timeouts t "
@@ -1440,7 +1441,8 @@ _NEEDS_RESCORE_SQL = (
     "WHERE p.id = ? AND p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
-    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)"
+    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of)"
 )
 
 

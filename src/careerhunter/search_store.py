@@ -436,7 +436,8 @@ def set_posting_schedule(conn: sqlite3.Connection, posting_id: int, schedule: st
 def rescore_candidates(
     conn: sqlite3.Connection, posting_ids: Sequence[int] = (), gap_text: str | None = None
 ) -> list[sqlite3.Row]:
-    """Scored watcher or discovery postings with no skip and no application: those with
+    """Scored watcher or discovery postings with no skip and no application, their own
+    or (for a duplicate) their group's: those with
     these ids, or those whose stored gaps or key requirements contain `gap_text`
     (ignoring case). Each with its company, title, fit and whether it was alerted."""
     rows = conn.execute(
@@ -445,6 +446,7 @@ def rescore_candidates(
         "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
         "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of) "
         "ORDER BY p.id"
     ).fetchall()
     wanted = set(posting_ids)
@@ -1355,8 +1357,9 @@ def is_handled_repost(conn: sqlite3.Connection, company_id: int, title: str) -> 
 
 
 def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Watcher and discovery postings not alerted, with no skip and no application, that
-    repeat a role the operator already logged or skipped. Oldest id first."""
+    """Watcher and discovery postings not alerted, with no skip and no application (their
+    own, or for a duplicate their group's: it is covered, never skipped), that repeat a
+    role the operator already logged or skipped. Oldest id first."""
     keys = handled_title_keys(conn)
     if not keys:
         return []
@@ -1366,6 +1369,7 @@ def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         "WHERE p.source IN ('watcher', 'discovery') AND p.alerted_at IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
         "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of) "
         "ORDER BY p.id"
     ).fetchall()
     return [

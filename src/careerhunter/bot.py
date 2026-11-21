@@ -2175,17 +2175,9 @@ class Bot:
                 raise Refusal("That application is already recorded.") from None
             if path and posting.snapshot_path is None:
                 search_store.set_posting_snapshot(search, posting_id, path)
-            # One application for the group; each other posting in it gets a skip, so
-            # none is alerted or applied to again (Batch R).
-            for other in members:
-                if other != posting_id and not search_store.posting_has_skip(search, other):
-                    search_store.insert_skip(
-                        search,
-                        other,
-                        today.isoformat(),
-                        duplicates.DUPLICATE_SKIP,
-                        by_operator=True,
-                    )
+            # One application for the group: its other postings are covered by it through
+            # duplicate_of (Batch R), never skipped, so skip counts and reasons don't see
+            # them. They are never alerted (pending_alerts) or re-scored.
             # The JD kept when the posting was scored is the application's JD (Batch R);
             # an alert from before JDs were kept asks for it.
             self._confirm(

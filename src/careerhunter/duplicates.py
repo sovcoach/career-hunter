@@ -14,8 +14,9 @@ Two postings are the same role when all four hold:
 Requisition and job ids are ignored. `postings.duplicate_of` points at the group's
 first posting (the lowest id), never at another duplicate. A duplicate is never alerted
 on its own: the first posting's digest row lists every requisition. Applied records one
-application for the group, whose EI entry names every requisition; Skipped records a
-skip for every posting in it.
+application for the group, whose EI entry names every requisition; the other postings
+are covered by it through `duplicate_of` (`covering_application`), never skipped, and
+never re-scored. Skipped records a skip for every posting in it.
 """
 
 from __future__ import annotations
@@ -29,7 +30,6 @@ from careerhunter import jobdesc, locations, snapshots
 from careerhunter.filters import title_key
 
 MIN_RATIO = 0.97
-DUPLICATE_SKIP = "duplicate of an applied posting"  # the skip on a group's other postings
 _PLACE = re.compile(r"[^\w]+")
 
 
@@ -99,6 +99,17 @@ def group(conn: sqlite3.Connection, posting_id: int) -> list[int]:
         for r in conn.execute("SELECT id FROM postings WHERE duplicate_of = ? ORDER BY id", (root,))
     ]
     return [root, *others]
+
+
+def covering_application(conn: sqlite3.Connection, posting_id: int) -> int | None:
+    """The application that covers this posting: the one recorded for its group's first
+    posting, when it is a duplicate and that posting was applied to. None otherwise."""
+    row = conn.execute(
+        "SELECT a.id FROM postings p JOIN applications a ON a.posting_id = p.duplicate_of "
+        "WHERE p.id = ? ORDER BY a.id LIMIT 1",
+        (posting_id,),
+    ).fetchone()
+    return None if row is None else int(row[0])
 
 
 def requisition(conn: sqlite3.Connection, posting_id: int) -> str:

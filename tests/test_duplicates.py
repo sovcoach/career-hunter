@@ -239,10 +239,34 @@ def test_applied_records_one_application_naming_every_requisition(env: Env) -> N
     env.press("Today")
     (app,) = test_bot.ei_apps(env)
     assert app["requisitions"] == "R-1, R-2"
-    assert _skips(env) == {second: duplicates.DUPLICATE_SKIP}
-    conn = db.connect_read_only(env.datadir.search_db_path)
+    assert _skips(env) == {}  # covered by the application, never skipped
+    conn = db.connect(env.datadir.search_db_path)
     try:
+        apps = [int(r[0]) for r in conn.execute("SELECT id FROM applications")]
         assert [int(r[0]) for r in conn.execute("SELECT posting_id FROM applications")] == [first]
+        assert duplicates.covering_application(conn, second) == apps[0]
+        assert duplicates.covering_application(conn, first) is None  # its own, not covered
+        assert search_store.pending_alerts(conn) == []
+        # Not re-scored, not offered for rescore, and not swept up as a repost.
+        conn.execute("UPDATE postings SET scored_resume_sha256 = NULL")
+        assert conn.execute(watch._RESCORE_SQL, ("0" * 64,)).fetchall() == []
+        assert conn.execute(watch._NEEDS_RESCORE_SQL, (second, "0" * 64)).fetchone() is None
+        assert search_store.rescore_candidates(conn, [second]) == []
+        assert search_store.unhandled_reposts(conn) == []
+    finally:
+        conn.close()
+
+
+def test_a_duplicate_is_covered_only_once_its_group_is_applied_to(
+    env: Env,
+) -> None:
+    _, second = _group(env)
+    conn = db.connect(env.datadir.search_db_path)
+    try:
+        assert duplicates.covering_application(conn, second) is None  # nothing applied yet
+        conn.execute("UPDATE postings SET scored_resume_sha256 = NULL")
+        rescorable = [int(r[0]) for r in conn.execute(watch._RESCORE_SQL, ("0" * 64,))]
+        assert second in rescorable
     finally:
         conn.close()
 
