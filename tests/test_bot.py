@@ -763,10 +763,11 @@ def test_skip_by_link_and_a_second_skip_is_refused(env: Env) -> None:
     assert _skip_reasons(env) == ["synthetic reason"]
     env.say("/skip https://jobs.example.com/ads/1")
     assert env.api.texts()[-1] == "Already skipped."
+    # A link career-hunter doesn't have is stored first (Batch R); this one can't be
+    # read, so nothing is stored.
     env.say("/skip https://jobs.example.com/ads/404")
-    assert env.api.texts()[-1] == (
-        "I don't know that link. Send /skip to choose from recent alerts."
-    )
+    assert env.api.texts()[-1] == "I couldn't read that link: not found."
+    assert env.counts()["search.postings"] == 1
     assert _skip_reasons(env) == ["synthetic reason"]
 
 

@@ -217,7 +217,8 @@ HELP = (
     "/activity <type> [YYYY-MM-DD] <description>: a recruiter call, agency "
     "registration and so on\n"
     "/recent: your latest applications\n"
-    "/skip: skip a posting whose buttons are spent, or /skip <link>"
+    "/skip: skip a posting whose buttons are spent, or /skip <link> (a posting career-hunter "
+    "doesn't have yet is stored first; add | Company | Title if the page doesn't show them)"
 )
 # /skip lists the postings alerted this long ago or less.
 SKIP_WINDOW = dt.timedelta(days=14)
@@ -1636,12 +1637,55 @@ class Bot:
                 ]
                 self._keyboard(search, "Which posting?", buttons, STEP_TTL)
                 return
-            posting_id = search_store.posting_id_by_link(search, rest.split()[0])
-            if posting_id is None:
-                raise Refusal("I don't know that link. Send /skip to choose from recent alerts.")
+            parts = [p.strip() for p in rest.split("|")]
+            link = parts[0].split()[0] if parts[0] else ""
+            posting_id = search_store.posting_id_by_link(search, link) if link else None
+        if posting_id is None:
+            posting_id = self._store_for_skip(link, parts[1:])
+        with self._search() as search:
             if search_store.has_operator_skip(search, posting_id):
                 raise Refusal("Already skipped.")
             self._skip_reasons(search, posting_id)
+
+    def _store_for_skip(self, link: str, names: list[str]) -> int:
+        """A posting career-hunter doesn't have yet, stored so it can be skipped (Batch
+        R): `self_sourced`, with the company, title and JD the link gives (the same
+        fetch as /log), or `| Company | Title` given after it. No EI record entry."""
+        if not link or len(link) > selfsourced.MAX_URL:
+            raise Refusal("Send /skip <link>, or /skip to choose from recent alerts.")
+        if len(names) not in (0, 2) or any(not n for n in names):
+            raise Refusal("Send /skip <link>, or /skip <link> | Company | Title.")
+        company, title = (names[0], names[1]) if names else (None, None)
+        doc = self._read_config()
+        today = self._today(doc)
+        if urls.no_fetch(link) and not (company and title):
+            raise Refusal(
+                "LinkedIn links are never fetched, so give the company and title: "
+                "/skip <link> | Company | Title"
+            )
+        try:
+            posting = selfsourced.describe(link, self.fetcher, today, company=company, title=title)
+        except selfsourced.NamesMissing:
+            raise Refusal(
+                "I couldn't find the company and title on that page. "
+                "Send: /skip <link> | Company | Title"
+            ) from None
+        except selfsourced.LogError as exc:
+            raise Refusal(str(exc)) from None
+        got = jobdesc.Fetched(None)
+        if posting.url and not urls.no_fetch(posting.url):
+            got = jobdesc.fetched_with_location(posting.url, self.fetcher)
+        if not posting.location and got.location:
+            posting = replace(posting, location=got.location)
+        saved = jobdesc.save(self.datadir.root, got.jd, today) if got.jd is not None else None
+        with self._search() as search, db.transaction(search):
+            _, posting_id, _, _ = search_store.find_or_create_posting(
+                search, posting, Dating("exact", day=today.isoformat())
+            )
+            if saved is not None:
+                digest = jobdesc.normalized_sha256(saved.description.text)
+                search_store.keep_jd(search, posting_id, saved.path, digest)
+        return posting_id
 
     def _skip_reasons(self, search: sqlite3.Connection, posting_id: int) -> None:
         rows = [
