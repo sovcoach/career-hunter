@@ -79,6 +79,7 @@ from careerhunter import (
     jobdesc,
     lanes,
     ledger,
+    phrases,
     search_store,
     selfsourced,
     snapshots,
@@ -389,7 +390,7 @@ def _digest_row(numbered: _Numbered) -> str:
         if shown:
             lines.append("Schedule: " + ", ".join(shown))
     if fields.key_requirements:
-        needs = [_clip(item, _CAPS["requirement"]) for item in fields.key_requirements[:3]]
+        needs = [phrases.cut(item, _CAPS["requirement"]) for item in fields.key_requirements[:3]]
         lines.append("Needs: " + "; ".join(needs))
     if fields.url and len(fields.url) <= MAX_URL and fields.url.isprintable():
         lines.append(fields.url)
