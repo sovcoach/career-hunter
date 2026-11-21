@@ -73,6 +73,7 @@ def sanitize(app: Application, correlation_id: str) -> EiApplication:
         snapshot_path=app.posting.snapshot_path,
         resume_file=app.resume_file,
         jd_expected=1,
+        requisitions=app.requisitions,
     )
 
 

@@ -52,6 +52,9 @@ class Application:
     resume_file: str | None = None
     reasoning: str | None = None
     notes: str | None = None
+    # Every requisition one application covers when one role was posted more than
+    # once (EI migration 0005), such as "R-1001, R-1002"; None otherwise.
+    requisitions: str | None = None
 
 
 @dataclass(frozen=True)

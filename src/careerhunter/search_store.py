@@ -8,7 +8,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from careerhunter import locations
+from careerhunter import duplicates, locations
 from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import title_key
@@ -946,6 +946,7 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
           AND p.llm_output IS NOT NULL
           AND p.fit IN ('medium', 'high')
           AND p.alerted_at IS NULL
+          AND p.duplicate_of IS NULL
           AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
           AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)
           AND NOT EXISTS (SELECT 1 FROM alert_refusals r
@@ -990,6 +991,7 @@ class DigestFields:
     gap_count: int | None  # None when the stored gaps are not a JSON list
     key_requirements: tuple[str, ...]
     referral: bool = False
+    also: tuple[str, ...] = ()  # the requisitions of the same role posted again (Batch R)
 
 
 def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[int, DigestFields]:
@@ -1024,8 +1026,16 @@ def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[
             gap_count=None if row["gap_count"] is None else int(row["gap_count"]),
             key_requirements=_requirements(row["key_requirements"]),
             referral=bool(row["referral"]),
+            also=_also(conn, posting_id),
         )
     return found
+
+
+def _also(conn: sqlite3.Connection, posting_id: int) -> tuple[str, ...]:
+    """How the other postings of this one's group are named (`duplicates.requisition`),
+    for its digest row. Empty when it is in no group."""
+    members = duplicates.group(conn, posting_id)
+    return tuple(dict.fromkeys(duplicates.requisition(conn, i) for i in members if i != posting_id))
 
 
 def _requirements(raw: object) -> tuple[str, ...]:

@@ -464,7 +464,7 @@ Expected output (the label and date will be yours):
 
 ```text
 search.db: applied nothing; schema version 37
-ei_record_2026-27.db: created; schema version 4
+ei_record_2026-27.db: created; schema version 5
 EI claim 2026-27 (from 2026-08-02)
 ```
 
@@ -492,7 +492,7 @@ bot alerts      OK  not held
 bot refusals    OK  no posting given up
 score timeouts  OK  none set aside
 workday facets  --  none set (ats_facets in a watchlist entry)
-claim 2026-27   OK  schema version 4
+claim 2026-27   OK  schema version 5
 claim 2026-27   OK  active, from 2026-08-02
 claim 2026-27   OK  0600
 reconcile       OK  search.db and 1 claim record agree
@@ -665,7 +665,7 @@ Sealing never happens on its own, and the claim you are on can't be sealed. If `
 
 The bot lets you record applications, statuses and activities from your phone. It only ever talks to your own private chat with it, and it has no open ports: it calls Telegram, never the other way round.
 
-**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal. Watcher postings come as one digest per watch run, each row with company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link, with its `Applied`, `Skipped` and `JD` buttons. The job description of every posting that may be alerted (a medium or high fit) is kept in `snapshots/` when it is scored; tapping `JD` sends it and changes nothing, and an `Applied` tap records it as the application's job description. A job you record with `/log` is answered with its company, title and a short reference. Status words and short references like `a7` go too. It never sends your notes, the names of the gaps it found (only how many), the numeric fit rating or EI record details. `alerts.max_per_poll` (default 10) caps how many postings go per poll; the rest follow on the next poll. What you type (activity descriptions, skip reasons, job descriptions you paste) and any job-ad or job-description files you send do go to Telegram, so don't type anything sensitive. The bot sends a job description only when you tap a row's `JD` button: the text career-hunter kept for that posting when it was scored, which came from the posting's own board, in at most 4 messages (`… the rest is in the posting.` after the fourth). It sends nothing else from it, and never a JD you pasted or sent. See ADR-015 in docs/DECISIONS.md.
+**Before you start, know what Telegram sees.** Bot chats aren't end-to-end encrypted, so what the bot sends and what you send pass through Telegram's servers. The bot keeps its own messages minimal. Watcher postings come as one digest per watch run, each row with company, title, location, lane (or `Off-lane`), fit word, the number of gaps, the schedule flag in words, up to three key requirements taken from the posting, and the link, with its `Applied`, `Skipped` and `JD` buttons. The job description of every posting that may be alerted (a medium or high fit) is kept in `snapshots/` when it is scored; tapping `JD` sends it and changes nothing, and an `Applied` tap records it as the application's job description. When the same role is posted more than once (the same company, title and known location, and the same or a near-identical kept job description, whatever the requisition numbers), it is alerted once, its row saying `Also posted as R-1002`. `Applied` then records one application whose EI entry names every requisition (`R-1001, R-1002`), and the other postings get a skip; `Skipped` skips them all. A posting with an unknown location is never grouped, so one application never covers two places. A job you record with `/log` is answered with its company, title and a short reference. Status words and short references like `a7` go too. It never sends your notes, the names of the gaps it found (only how many), the numeric fit rating or EI record details. `alerts.max_per_poll` (default 10) caps how many postings go per poll; the rest follow on the next poll. What you type (activity descriptions, skip reasons, job descriptions you paste) and any job-ad or job-description files you send do go to Telegram, so don't type anything sensitive. The bot sends a job description only when you tap a row's `JD` button: the text career-hunter kept for that posting when it was scored, which came from the posting's own board, in at most 4 messages (`… the rest is in the posting.` after the fourth). It sends nothing else from it, and never a JD you pasted or sent. See ADR-015 in docs/DECISIONS.md.
 
 ### 10a. Create the bot and store its token
 

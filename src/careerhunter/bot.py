@@ -74,6 +74,7 @@ import yaml
 from careerhunter import (
     claims,
     db,
+    duplicates,
     enums,
     jobdesc,
     lanes,
@@ -376,6 +377,8 @@ def _digest_row(numbered: _Numbered) -> str:
     if fields.gap_count is not None:
         facts.append(f"{fields.gap_count} gap" + ("" if fields.gap_count == 1 else "s"))
     lines.append(" | ".join(facts))
+    if fields.also:  # the same role, posted again under other requisitions (Batch R)
+        lines.append(_clip("Also posted as " + ", ".join(fields.also), _CAPS["location"] * 2))
     if fields.schedule:
         words = [_SCHEDULE_WORDS.get(mark, "") for mark in fields.schedule.split()]
         shown = [word for word in words if word]
@@ -2015,13 +2018,30 @@ class Bot:
                 if captured is not None:
                     path = snapshots.save(self.datadir.root, captured.data, captured.ext, today)
             saved = self._kept_jd(search, posting_id)
-            app = Application(replace(posting, snapshot_path=path), dating, method)
+            members = duplicates.group(search, posting_id)
+            app = Application(
+                replace(posting, snapshot_path=path),
+                dating,
+                method,
+                requisitions=duplicates.requisitions(search, members),
+            )
             try:
                 recorded = ledger.record_application(search, active, app, saved, lane_config=doc)
             except sqlite3.IntegrityError:
                 raise Refusal("That application is already recorded.") from None
             if path and posting.snapshot_path is None:
                 search_store.set_posting_snapshot(search, posting_id, path)
+            # One application for the group; each other posting in it gets a skip, so
+            # none is alerted or applied to again (Batch R).
+            for other in members:
+                if other != posting_id and not search_store.posting_has_skip(search, other):
+                    search_store.insert_skip(
+                        search,
+                        other,
+                        today.isoformat(),
+                        duplicates.DUPLICATE_SKIP,
+                        by_operator=True,
+                    )
             # The JD kept when the posting was scored is the application's JD (Batch R);
             # an alert from before JDs were kept asks for it.
             self._confirm(
@@ -2162,7 +2182,17 @@ class Bot:
                 raise Refusal("That posting isn't in search.db any more.")
             if search_store.has_operator_skip(search, posting_id):
                 raise Refusal("Already skipped.")
-            skip_id = ledger.record_skip(search, posting, self._today(doc).isoformat(), reason)
+            day = self._today(doc).isoformat()
+            skip_id = ledger.record_skip(search, posting, day, reason)
+            # The same role posted again is skipped with it, for the same reason.
+            for other in duplicates.group(search, posting_id):
+                shown = search_store.posting_by_id(search, other)
+                if (
+                    other != posting_id
+                    and shown is not None
+                    and not search_store.has_operator_skip(search, other)
+                ):
+                    ledger.record_skip(search, shown, day, reason)
         if reply:
             self.send(f"Skipped: {posting.company} — {posting.title}.")
         return skip_id
@@ -2176,9 +2206,18 @@ class Bot:
             return
         doc = self._config()
         with self._writable(doc) as (search, _):
-            posting = search_store.posting_by_id(search, int(payload["posting_id"]))
+            posting_id = int(payload["posting_id"])
+            posting = search_store.posting_by_id(search, posting_id)
             if posting is None or not ledger.set_skip_reason(search, skip_id, reason):
                 raise Refusal("That skip isn't in search.db any more.")
+            for other in duplicates.group(search, posting_id):  # skipped with it as `other`
+                row = search.execute(
+                    "SELECT id FROM skips WHERE posting_id = ? AND by_operator = 1 "
+                    "AND reason = 'other' ORDER BY id DESC LIMIT 1",
+                    (other,),
+                ).fetchone()
+                if other != posting_id and row is not None:
+                    ledger.set_skip_reason(search, int(row["id"]), reason)
         self.send(f"Skipped: {posting.company} — {posting.title}.")
 
     def _finish_status(self, application_id: int, status: str, day: dt.date | None = None) -> None:

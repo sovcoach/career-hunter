@@ -149,7 +149,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple, NoReturn, Self, SupportsIndex
 
 from careerhunter import ats as ats_boards
-from careerhunter import db, filters, jobdesc, lanes, locations, loopback, search_store
+from careerhunter import db, duplicates, filters, jobdesc, lanes, locations, loopback, search_store
 from careerhunter import discover as discovery
 from careerhunter.ats import (
     BoardHTTPError,
@@ -1889,6 +1889,13 @@ def _keep_jd(
         return
     with db.transaction(conn):
         search_store.keep_jd(conn, posting_id, saved.path, digest)
+        original = duplicates.find_original(conn, state.data_dir, posting_id, text)
+        if original is not None:
+            duplicates.mark(conn, posting_id, original)
+    if original is not None:
+        state.lines.append(
+            _line(name, ats, f"{title}: the same role as posting {original}; alerted with it")
+        )
 
 
 def _type_of(exc: BaseException) -> str:

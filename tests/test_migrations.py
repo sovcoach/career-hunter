@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 38)), "ei_record": [1, 2, 3, 4]}[track]
+    expected = {"search": list(range(1, 38)), "ei_record": [1, 2, 3, 4, 5]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1072,7 +1072,7 @@ def test_search_0021_lets_a_checked_lane_move_and_logs_it(tmp_path: Path) -> Non
 def test_trigger_counts_on_a_fresh_file(fresh: sqlite3.Connection, track: str) -> None:
     """The counts ARCHITECTURE states for a fresh file."""
     found = fresh.execute("SELECT count(*) FROM sqlite_master WHERE type = 'trigger'").fetchone()
-    assert found[0] == {"search": 9, "ei_record": 41}[track]
+    assert found[0] == {"search": 9, "ei_record": 42}[track]
 
 
 # --- EI 0004 and search 0030: assessment_requested and position_closed ----------------------
@@ -1107,7 +1107,7 @@ def test_ei_0004_keeps_every_status_row_and_the_records_rules(tmp_path: Path) ->
                 "INSERT INTO status_history (application_id, status, status_date) "
                 "VALUES (1, 'position_closed', '2026-09-09')"
             )
-        assert db.migrate(conn, "ei_record") == [4]
+        assert db.migrate(conn, "ei_record", ei[:4]) == [4]
         assert conn.execute("SELECT * FROM status_history ORDER BY id").fetchall() == before
         for status in ("assessment_requested", "position_closed"):
             conn.execute(

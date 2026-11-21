@@ -30,6 +30,7 @@ class EiApplication:
     snapshot_path: str | None
     resume_file: str | None
     jd_expected: int  # 1 for every application recorded since EI migration 0002
+    requisitions: str | None = None  # EI migration 0005: a merged group's requisitions
 
 
 @dataclass(frozen=True)
