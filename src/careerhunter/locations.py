@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from careerhunter.countries import is_country
@@ -117,16 +117,40 @@ _REGION_CODES = frozenset(
 _PART = re.compile(r"[,;/|()\[\]]|\s[-\u2013\u2014]\s")
 
 
-def looks_like_place(text: str) -> bool:
+def configured_places(config: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """The places named in the config's `search.location_rules` (`onsite_hybrid` and
+    `remote`), as they are written there. Read at runtime, never built in."""
+    search = config.get("search") if isinstance(config, Mapping) else None
+    rules = search.get("location_rules") if isinstance(search, Mapping) else None
+    if not isinstance(rules, Mapping):
+        return ()
+    found: list[str] = []
+    for key in ("onsite_hybrid", "remote"):
+        values = rules.get(key)
+        for value in values if isinstance(values, list) else []:
+            if isinstance(value, str) and value.strip():
+                found.append(value)
+    return tuple(found)
+
+
+def _folded(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def looks_like_place(text: str, known: Sequence[str] = ()) -> bool:
     """Whether location text read from a job description names a place: it says
     Remote, or one of its parts (split at commas, semicolons, slashes, brackets and
     spaced dashes) is a country from the built-in list or a Canadian province or
     territory or US state by name, or a postal abbreviation of one stands after a
-    comma. At most MAX_LOCATION characters."""
+    comma, or the whole text is one of `known` (the places in the config's location
+    rules, `configured_places`), ignoring case and spacing. At most MAX_LOCATION
+    characters."""
     line = " ".join(text.split())
     if not line or len(line) > MAX_LOCATION:
         return False
     if says_remote(line):
+        return True
+    if _folded(line.strip(" .")) in {_folded(place) for place in known}:
         return True
     parts = [p.strip(" .") for p in _PART.split(line)]
     if any(p and (is_country(p) or p.casefold() in _REGION_NAMES) for p in parts):
@@ -135,7 +159,7 @@ def looks_like_place(text: str) -> bool:
     return any(p.split(" ")[0] in _REGION_CODES for p in after_comma if p)
 
 
-def read_text(text: str | None) -> tuple[str | None, str | None]:
+def read_text(text: str | None, known: Sequence[str] = ()) -> tuple[str | None, str | None]:
     """A `Location:` (or `Based in:`) line of a job description: (the place, None) when
     it looks like a place (`looks_like_place`), else (None, the line as found) so the
     caller can say it was left unknown. (None, None) when there is no such line."""
@@ -147,16 +171,16 @@ def read_text(text: str | None) -> tuple[str | None, str | None]:
     raw = " ".join(match.group("place").split()).strip(" ,;.-")
     if not raw:
         return None, None
-    if looks_like_place(raw):
+    if looks_like_place(raw, known):
         return raw, None
     return None, raw[:MAX_LOCATION]
 
 
-def from_text(text: str | None) -> str | None:
+def from_text(text: str | None, known: Sequence[str] = ()) -> str | None:
     """The place a `Location:` (or `Based in:`) line of a job description names, when it
     looks like a place (`looks_like_place`); otherwise None, and the location stays
     unknown."""
-    place, rejected = read_text(text)
+    place, rejected = read_text(text, known)
     if rejected is not None:
         log.info("a location line in a job description is not a place; left unknown")
     return place

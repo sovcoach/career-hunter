@@ -17,6 +17,7 @@ the data folder's `snapshots/` is never opened.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from careerhunter import db, jobdesc, locations, snapshots
@@ -42,7 +43,7 @@ class NotPlace:
     line: str
 
 
-def _from_ad(data: bytes) -> tuple[str | None, str | None]:
+def _from_ad(data: bytes, known: Sequence[str] = ()) -> tuple[str | None, str | None]:
     """The job ad's location (JSON-LD, then a `Location:` line that looks like a place),
     and a `Location:` line that does not, if any."""
     found = snapshots.posting_info(data).location
@@ -52,7 +53,7 @@ def _from_ad(data: bytes) -> tuple[str | None, str | None]:
         text = jobdesc.from_file(data).text
     except jobdesc.JobDescError:
         return None, None
-    return locations.read_text(text)
+    return locations.read_text(text, known)
 
 
 def _ei_texts(datadir: DataDir) -> dict[str, list[str]]:
@@ -78,7 +79,10 @@ def _ei_texts(datadir: DataDir) -> dict[str, list[str]]:
 
 
 def plan(
-    search: sqlite3.Connection, datadir: DataDir, not_place: list[NotPlace] | None = None
+    search: sqlite3.Connection,
+    datadir: DataDir,
+    not_place: list[NotPlace] | None = None,
+    known: Sequence[str] = (),
 ) -> list[Filled]:
     """Every blank location a kept file names, without writing anything. A `Location:`
     line that is not a place (`locations.looks_like_place`) fills nothing; with
@@ -97,7 +101,7 @@ def plan(
         if row["snapshot_path"]:
             data = snapshots.read_kept(datadir.root, str(row["snapshot_path"]))
             if data is not None:
-                found, rejected = _from_ad(data)
+                found, rejected = _from_ad(data, known)
         if not found:
             if texts is None:
                 texts = _ei_texts(datadir)
@@ -108,7 +112,7 @@ def plan(
             ):
                 for text in texts.get(str(app["correlation_id"]), []):
                     if found is None:
-                        found, line = locations.read_text(text)
+                        found, line = locations.read_text(text, known)
                         rejected = rejected or line
         if not found and rejected is not None and not_place is not None:
             not_place.append(NotPlace(posting_id, str(row["company"]), str(row["title"]), rejected))

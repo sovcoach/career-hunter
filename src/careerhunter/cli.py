@@ -45,6 +45,7 @@ from careerhunter import (
     lanes,
     ledger,
     locationfill,
+    locations,
     resume,
     search_store,
     secrets_store,
@@ -1817,11 +1818,13 @@ def cmd_locations(datadir: DataDir, args: argparse.Namespace) -> int:
         _err("error: search.db is missing; run careerhunter init")
         return EXIT_ERROR
     not_place: list[locationfill.NotPlace] = []
+    # A bare city counts as a place when the config's location rules name it.
+    known = locations.configured_places(_config_doc(datadir))
     if args.dry_run:
         conn = db.connect_read_only(datadir.search_db_path)
         try:
             _require_current(conn, "search", "search.db")
-            planned = locationfill.plan(conn, datadir, not_place)
+            planned = locationfill.plan(conn, datadir, not_place, known)
         finally:
             conn.close()
         print("dry run: nothing is written.")
@@ -1829,7 +1832,7 @@ def cmd_locations(datadir: DataDir, args: argparse.Namespace) -> int:
         conn = db.connect(datadir.search_db_path)
         try:
             db.migrate(conn, "search")
-            planned = locationfill.plan(conn, datadir, not_place)
+            planned = locationfill.plan(conn, datadir, not_place, known)
             written = locationfill.apply(conn, planned)
         finally:
             conn.close()

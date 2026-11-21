@@ -1191,7 +1191,9 @@ def _record_jobs(
             )
             continue
         if not item.location.strip() and item.description:
-            found_location, not_place = locations.read_text(item.description)
+            found_location, not_place = locations.read_text(
+                item.description, locations.configured_places(config)
+            )
             if found_location:  # the board gave none: its description's Location: line
                 item = replace(item, location=found_location)
                 lines.append(
