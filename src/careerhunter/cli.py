@@ -642,9 +642,13 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
     `--set-aside` releases every posting the watcher set aside after scoring timeouts
     in a row (search migration 0034) or failed re-reads of its board page in a row
     (0036), scored or not, so the next run reads it and sends it to the model again; a
-    `--posting` id that is set aside is released too."""
-    if not args.posting and not args.gap and not args.set_aside:
-        _err("error: give --posting, --gap or --set-aside")
+    `--posting` id that is set aside is released too.
+
+    `--given-up` releases every posting given up after replies from the model that did
+    not parse (search migration 0023), so the next run sends it again; a `--posting` id
+    that was given up is released too."""
+    if not args.posting and not args.gap and not args.set_aside and not args.given_up:
+        _err("error: give --posting, --gap, --set-aside or --given-up")
         return EXIT_ERROR
     if not datadir.search_db_path.is_file():
         _err("error: search.db is missing; run careerhunter init")
@@ -663,7 +667,17 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
             for row in search_store.set_aside_postings(conn)
             if args.set_aside or int(row["id"]) in picked
         ]
-        missing = sorted(picked - {int(r["id"]) for r in rows} - {int(r["id"]) for r in aside})
+        given_up = [
+            row
+            for row in search_store.given_up_postings(conn)
+            if args.given_up or int(row["id"]) in picked
+        ]
+        missing = sorted(
+            picked
+            - {int(r["id"]) for r in rows}
+            - {int(r["id"]) for r in aside}
+            - {int(r["id"]) for r in given_up}
+        )
         for row in rows:
             alerted = "alerted" if row["alerted_at"] else "not alerted"
             print(
@@ -676,9 +690,16 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
                 f"{int(row['id']):5} {row['company']} — {row['title']}: set aside after "
                 f"{why}, fit {row['fit']}, {alerted}"
             )
+        for row in given_up:
+            alerted = "alerted" if row["alerted_at"] else "not alerted"
+            print(
+                f"{int(row['id']):5} {row['company']} — {row['title']}: given up after "
+                f"replies that did not parse, fit {row['fit']}, {alerted}"
+            )
         for posting_id in missing:
             print(f"{posting_id:5} not queued: not a scored posting without a skip or application")
         releasing = bool(aside) or args.set_aside
+        reviving = bool(given_up) or args.given_up
         if args.dry_run:
             would = []
             if picked or args.gap:
@@ -688,11 +709,17 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
                     f"{plural(len(aside), 'set-aside posting', 'set-aside postings')} "
                     "would be released."
                 )
+            if reviving:
+                would.append(
+                    f"{plural(len(given_up), 'given-up posting', 'given-up postings')} "
+                    "would be released."
+                )
             print(f"dry run: nothing is written. {' '.join(would)}")
             return EXIT_OK
         with db.transaction(conn):
             count = search_store.mark_for_rescore(conn, [int(r["id"]) for r in rows])
             released = search_store.release_set_aside(conn, [int(r["id"]) for r in aside])
+            revived = search_store.release_given_up(conn, [int(r["id"]) for r in given_up])
     finally:
         conn.close()
     if picked or args.gap:
@@ -703,6 +730,11 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
         print(
             f"{plural(released, 'set-aside posting', 'set-aside postings')} released; "
             f"the next watch run sends {'it' if released == 1 else 'them'} again."
+        )
+    if reviving:
+        print(
+            f"{plural(revived, 'given-up posting', 'given-up postings')} released; "
+            f"the next watch run sends {'it' if revived == 1 else 'them'} to the model again."
         )
     return EXIT_OK if not missing else EXIT_ERROR
 
@@ -2292,7 +2324,7 @@ def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
             "WARN",
             f"{plural(unparsed, 'posting', 'postings')} got a model reply that did not "
             f"parse {watch.PARSE_FAILURES_TO_GIVE_UP} times; given up and never scored "
-            "(see logs/watch.log)",
+            "(see logs/watch.log; retry: careerhunter rescore --given-up)",
         )
     if not given_up and not unparsed:
         report.line("bot refusals", "OK", "no posting given up")
@@ -2699,7 +2731,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--set-aside",
         action="store_true",
-        help="release the postings set aside after scoring timeouts, to be tried again",
+        help="release the postings set aside after scoring timeouts or failed re-reads",
+    )
+    p.add_argument(
+        "--given-up",
+        action="store_true",
+        help="release the postings given up after replies that did not parse",
     )
     p.add_argument("--dry-run", action="store_true", help="list them; write nothing")
     p = sub.add_parser(

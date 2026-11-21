@@ -108,7 +108,7 @@ def test_nothing_to_pick_is_an_error(
     scored: Path, probe: FakeProbe, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert cli.main(["rescore"], probe=probe) == cli.EXIT_ERROR
-    assert capsys.readouterr().err == "error: give --posting, --gap or --set-aside\n"
+    assert capsys.readouterr().err == "error: give --posting, --gap, --set-aside or --given-up\n"
 
 
 # --- set-aside postings (search migration 0034) ---------------------------------------------

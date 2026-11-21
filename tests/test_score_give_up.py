@@ -97,7 +97,7 @@ def test_doctor_counts_given_up_postings_under_bot_refusals(
     cli._doctor_refusals(cli._Report(), search)
     assert capsys.readouterr().out == (
         "bot refusals    WARN 1 posting got a model reply that did not parse 3 times; "
-        "given up and never scored (see logs/watch.log)\n"
+        "given up and never scored (see logs/watch.log; retry: careerhunter rescore --given-up)\n"
     )
 
 

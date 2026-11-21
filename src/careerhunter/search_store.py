@@ -1249,6 +1249,29 @@ def facet_statuses(conn: sqlite3.Connection) -> list[FacetStatus]:
     return [FacetStatus(str(row[0]), tuple(json.loads(row[1])), str(row[2])) for row in rows]
 
 
+def given_up_postings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The postings given up after replies that did not parse (search migration 0023),
+    each with its company, title, fit and whether it was alerted, by id."""
+    return conn.execute(
+        "SELECT p.id, c.name AS company, p.title, p.fit, p.alerted_at "
+        "FROM score_parse_failures f JOIN postings p ON p.id = f.posting_id "
+        "JOIN companies c ON c.id = p.company_id "
+        "WHERE f.given_up_at IS NOT NULL ORDER BY p.id"
+    ).fetchall()
+
+
+def release_given_up(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> int:
+    """Forget these postings' unparseable replies, so the next watch run sends them to
+    the model again. How many were given up."""
+    count = 0
+    for posting_id in posting_ids:
+        count += conn.execute(
+            "DELETE FROM score_parse_failures WHERE posting_id = ? AND given_up_at IS NOT NULL",
+            (posting_id,),
+        ).rowcount
+    return count
+
+
 def parse_given_up_count(conn: sqlite3.Connection) -> int:
     """Postings the watcher stopped scoring after too many replies that did not parse."""
     row = conn.execute("SELECT count(*) FROM score_parse_failures WHERE given_up_at IS NOT NULL")
