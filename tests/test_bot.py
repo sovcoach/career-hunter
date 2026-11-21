@@ -1284,6 +1284,7 @@ def test_the_log_filter_redacts_the_token(env: Env) -> None:
 class FakeReply:
     def __init__(self, body: bytes) -> None:
         self.body = body
+        self.asked: int | None = None
 
     def __enter__(self) -> FakeReply:
         return self
@@ -1291,8 +1292,9 @@ class FakeReply:
     def __exit__(self, *exc: object) -> None:
         pass
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, amt: int | None = None) -> bytes:
+        self.asked = amt
+        return self.body if amt is None else self.body[:amt]
 
 
 def test_the_client_parses_replies_and_downloads(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1359,6 +1361,34 @@ def test_a_refusal_carries_the_method_code_and_description(
     assert exc.value.method == "sendMessage" and exc.value.error_code == 400
     assert exc.value.description == "Bad Request: synthetic for <token>"
     assert exc.value.detail() == "sendMessage 400: Bad Request: synthetic for <token>"
+
+
+def test_a_reply_over_the_cap_is_not_read_past_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    reply = FakeReply(b"x" * (telegram.MAX_REPLY + 10))
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: reply)
+    with pytest.raises(telegram.TelegramTooLarge) as exc:
+        telegram.HttpTelegram(TOKEN).call("getUpdates")
+    assert reply.asked == telegram.MAX_REPLY + 1
+    assert exc.value.method == "getUpdates"
+    assert TOKEN not in str(exc.value)
+
+
+def test_a_reply_at_the_cap_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = json.dumps({"ok": True, "result": []}).encode()
+    body += b" " * (telegram.MAX_REPLY - len(body))
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: FakeReply(body))
+    assert telegram.HttpTelegram(TOKEN).call("getUpdates") == []
+
+
+def test_a_download_stops_at_its_own_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    reply = FakeReply(b"%PDF" + b"x" * 100)
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: reply)
+    with pytest.raises(telegram.TelegramError, match="larger than 50 bytes"):
+        telegram.HttpTelegram(TOKEN).download("documents/file_1.pdf", 50)
+    assert reply.asked == 51
+    small = FakeReply(b"%PDF" + b"x" * 46)
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: small)
+    assert telegram.HttpTelegram(TOKEN).download("documents/file_1.pdf", 50) == small.body
 
 
 def test_an_ok_false_reply_carries_its_code_and_description(
