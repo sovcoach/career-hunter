@@ -1656,6 +1656,28 @@ def set_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -
     conn.execute("UPDATE postings SET snapshot_path = ? WHERE id = ?", (path, posting_id))
 
 
+def keep_jd(conn: sqlite3.Connection, posting_id: int, path: str, jd_sha256: str) -> None:
+    """Record the job description kept for a posting the bot may alert (search
+    migration 0036): its file as the posting's snapshot, and its hash. A posting that
+    already has a snapshot that is not a kept JD (a job ad saved earlier) is left as it
+    is, so `snapshot_path` with a `jd_sha256` is always the kept JD."""
+    conn.execute(
+        "UPDATE postings SET snapshot_path = ?, jd_sha256 = ? "
+        "WHERE id = ? AND (snapshot_path IS NULL OR jd_sha256 IS NOT NULL)",
+        (path, jd_sha256, posting_id),
+    )
+
+
+def kept_jd(conn: sqlite3.Connection, posting_id: int) -> tuple[str, str] | None:
+    """The kept job description's file and hash, or None when none was kept."""
+    row = conn.execute(
+        "SELECT snapshot_path, jd_sha256 FROM postings WHERE id = ?", (posting_id,)
+    ).fetchone()
+    if row is None or row["jd_sha256"] is None or row["snapshot_path"] is None:
+        return None
+    return str(row["snapshot_path"]), str(row["jd_sha256"])
+
+
 def mark_referral(conn: sqlite3.Connection, posting_id: int) -> bool:
     """Mark the posting as a referral (search migration 0036). True when it was not yet
     one; a posting already marked is left as it is."""

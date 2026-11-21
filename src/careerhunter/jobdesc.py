@@ -29,6 +29,7 @@ import datetime as dt
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,21 @@ class JobDescError(Exception):
             raise ValueError(f"unknown job description error reason {reason!r}")
         self.reason = reason
         super().__init__(_MESSAGES[reason])
+
+
+_LONG_DIGITS = re.compile(r"\d{4,}")
+
+
+def normalized(text: str) -> str:
+    """A job description's text as it is compared (Batch R): NFKC, case folded, runs of
+    4 or more digits (requisition numbers, dates) removed, whitespace collapsed."""
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    return " ".join(_LONG_DIGITS.sub(" ", folded).split())
+
+
+def normalized_sha256(text: str) -> str:
+    """The SHA-256 of `normalized(text)`, as `postings.jd_sha256` keeps it (0036)."""
+    return hashlib.sha256(normalized(text).encode("utf-8")).hexdigest()
 
 
 def sha256(data: bytes) -> str:

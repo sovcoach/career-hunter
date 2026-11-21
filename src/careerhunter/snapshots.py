@@ -226,6 +226,21 @@ def upload_type(data: bytes) -> str | None:
     return None
 
 
+def read_kept(data_dir: Path, relative: str) -> bytes | None:
+    """A kept snapshot's bytes, by its path relative to the data folder. None when the
+    path is not under `snapshots/` (a `..` part or a link out never is) or the file
+    can't be read."""
+    if not relative.startswith("snapshots/") or ".." in relative.split("/"):
+        return None
+    path = (data_dir / relative).resolve()
+    if (data_dir / "snapshots").resolve() not in path.parents or not path.is_file():
+        return None
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
 def save(data_dir: Path, data: bytes, ext: str, today: dt.date) -> str:
     """Write a new snapshot owner-only and return its path relative to the data dir."""
     if not re.fullmatch(r"[a-z]{3,4}", ext):

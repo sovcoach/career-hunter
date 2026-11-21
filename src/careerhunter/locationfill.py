@@ -32,18 +32,6 @@ class Filled:
     source: str  # "job ad" or "job description"
 
 
-def _snapshot(datadir: DataDir, relative: str) -> bytes | None:
-    if not relative.startswith("snapshots/") or ".." in relative.split("/"):
-        return None
-    path = (datadir.root / relative).resolve()
-    if datadir.snapshots.resolve() not in path.parents or not path.is_file():
-        return None
-    try:
-        return path.read_bytes()
-    except OSError:
-        return None
-
-
 def _from_ad(data: bytes) -> str | None:
     found = snapshots.posting_info(data).location
     if found:
@@ -90,7 +78,7 @@ def plan(search: sqlite3.Connection, datadir: DataDir) -> list[Filled]:
         found: str | None = None
         source = "job ad"
         if row["snapshot_path"]:
-            data = _snapshot(datadir, str(row["snapshot_path"]))
+            data = snapshots.read_kept(datadir.root, str(row["snapshot_path"]))
             found = _from_ad(data) if data is not None else None
         if not found:
             if texts is None:

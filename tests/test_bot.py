@@ -1703,8 +1703,8 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
     ]
     keyboard = sends[0]["reply_markup"]["inline_keyboard"]
     assert [[b["text"] for b in row] for row in keyboard] == [
-        ["Applied 1", "Skipped 1"],
-        ["Applied 2", "Skipped 2"],
+        ["Applied 1", "Skipped 1", "JD 1"],
+        ["Applied 2", "Skipped 2", "JD 2"],
     ]
     sent = env.api.everything_sent()
     for hidden in (

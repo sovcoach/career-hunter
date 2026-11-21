@@ -149,7 +149,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple, NoReturn, Self, SupportsIndex
 
 from careerhunter import ats as ats_boards
-from careerhunter import db, filters, lanes, locations, loopback, search_store
+from careerhunter import db, filters, jobdesc, lanes, locations, loopback, search_store
 from careerhunter import discover as discovery
 from careerhunter.ats import (
     BoardHTTPError,
@@ -283,6 +283,7 @@ class _State:
     # Ashby boards read this run for a description, by board key: the jobs by their id.
     # In memory only, like every description.
     ashby: dict[str, dict[str, Job]] = field(default_factory=dict)
+    data_dir: Path | None = None  # where a kept job description is saved (snapshots/)
     # Stored postings met on their board this run, with the description it sent.
     met: dict[int, PostingText] = field(default_factory=dict)
 
@@ -439,6 +440,7 @@ def run(
         lanes_on=lanes.configured(rules) is not None,
         max_age=max_posting_age_days(rules),
         today=today,
+        data_dir=data_dir,
         score_timeout=float(scoring_timeout_seconds(rules)),
         boards=boards_budget,
     )
@@ -1846,9 +1848,47 @@ def _attempt(
             lines.append(_line(name, ats, f"{title} skipped (gap_tier)"))
         elif rescore:
             lines.append(_line(name, ats, f"{title} re-scored"))
+        if fit in ("medium", "high") and not result.excluded:
+            _keep_jd(conn, state, posting_id, posting, name, ats, title)
     reason = embedder.attach(posting_id, posting)
     if reason is not None:
         lines.append(miss_line(posting_id, reason))
+
+
+def _keep_jd(
+    conn: sqlite3.Connection,
+    state: _State,
+    posting_id: int,
+    posting: PostingText,
+    name: str,
+    ats: str | None,
+    title: str,
+) -> None:
+    """Keep the description a posting the bot may alert was scored on (Batch R), as a
+    `.txt` snapshot with its normalized hash, so the alert's JD button and an Applied
+    tap have it. Kept again only when its text changed. A failed write is logged and
+    changes nothing else."""
+    text = (posting.description or "").strip()
+    if state.data_dir is None or not text:
+        return
+    digest = jobdesc.normalized_sha256(text)
+    kept = search_store.kept_jd(conn, posting_id)
+    if kept is not None and kept[1] == digest:
+        return
+    try:
+        jd = jobdesc.from_paste(text)
+        saved = jobdesc.save(
+            state.data_dir,
+            replace(jd, source="fetched"),
+            dt.date.fromisoformat(state.today) if state.today else state.now().date(),
+        )
+    except (jobdesc.JobDescError, OSError, ValueError) as exc:
+        state.lines.append(
+            _line(name, ats, f"{title}: job description not kept ({type(exc).__name__})")
+        )
+        return
+    with db.transaction(conn):
+        search_store.keep_jd(conn, posting_id, saved.path, digest)
 
 
 def _type_of(exc: BaseException) -> str:

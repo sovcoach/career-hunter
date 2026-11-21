@@ -318,6 +318,14 @@ def stale_run(doc: Mapping[str, Any] | None) -> dt.timedelta:
 
 LOCATION_UNKNOWN = "Location unknown"  # a posting whose board or page gave no location
 REFERRAL = "Referral"  # a posting the operator marked as a referral: local, needs no location
+# The JD button (Batch R): the kept job description, in at most JD_MESSAGES messages.
+JD_MESSAGES = 4
+JD_CHUNK = 3900  # characters per message, under Telegram's 4096
+JD_REST = "… the rest is in the posting."
+JD_NONE = (
+    "No job description was kept for this posting (it was alerted before job "
+    "descriptions were kept, or its board sent none)."
+)
 _CAPS = {"company": 80, "title": 120, "location": 80, "lane": 60, "requirement": 60}
 MAX_URL = 1000
 _SCHEDULE_WORDS = {"on_call": "on call", "over_weekend_limit": "weekend days over your limit"}
@@ -599,6 +607,26 @@ def _labelled_fields(extra: list[str]) -> tuple[list[str], str | None, bool]:
         if not location:
             raise Refusal("The location after location: is empty.")
     return positional, location, referral
+
+
+def _jd_messages(text: str) -> list[str]:
+    """`text` in at most JD_MESSAGES messages of JD_CHUNK characters, cut at a
+    paragraph, else a line, else a space; JD_REST ends the last one when text is left."""
+    parts: list[str] = []
+    rest = text.strip()
+    while rest and len(parts) < JD_MESSAGES:
+        if len(rest) <= JD_CHUNK:
+            parts.append(rest)
+            rest = ""
+            break
+        room = JD_CHUNK - len(JD_REST) - 1 if len(parts) == JD_MESSAGES - 1 else JD_CHUNK
+        cut = max(rest.rfind("\n\n", 0, room), 0) or max(rest.rfind("\n", 0, room), 0)
+        cut = cut or max(rest.rfind(" ", 0, room), 0) or room
+        parts.append(rest[:cut].rstrip())
+        rest = rest[cut:].strip()
+    if rest:
+        parts[-1] = f"{parts[-1]}\n{JD_REST}"
+    return parts
 
 
 def _log_format_problem(url: str, extra: list[str]) -> str | None:
@@ -994,12 +1022,17 @@ class Bot:
                     keyboards.append(keyboard_id)
                     payload = json.dumps({"posting_id": numbered.entry.fields.posting_id})
                     buttons = []
-                    for label, action in (("Applied", "apply"), ("Skipped", "skip")):
+                    for label, action in (("Applied", "apply"), ("Skipped", "skip"), ("JD", "jd")):
                         token = secrets.token_urlsafe(16)
+                        # The JD button is on a keyboard of its own: reading the JD is not
+                        # a decision, so it never spends the row's Applied and Skipped.
+                        board = keyboard_id if action != "jd" else secrets.token_urlsafe(9)
+                        if board != keyboard_id:
+                            keyboards.append(board)
                         search.execute(
                             "INSERT INTO bot_tokens (token, keyboard, chat_id, action, payload, "
                             "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-                            (token, keyboard_id, self.chat_id, action, payload, expires),
+                            (token, board, self.chat_id, action, payload, expires),
                         )
                         buttons.append(
                             {"text": f"{label} {numbered.number}", "callback_data": token}
@@ -1655,6 +1688,8 @@ class Bot:
                 )
             if taken != 1:
                 return None
+            if row["action"] == "jd":  # never spent: it stays until the row expires
+                search.execute("UPDATE bot_tokens SET used_at = NULL WHERE token = ?", (data,))
             payload = json.loads(row["payload"])
         return str(row["action"]), payload if isinstance(payload, dict) else {}
 
@@ -1712,6 +1747,9 @@ class Bot:
         # answer only leaves the button's spinner on: the tap is still acted on.
         self._answer(query.get("id"))
         action, payload = taken
+        if action == "jd":  # read only: no buttons change
+            self._send_jd(payload)
+            return "callback:jd"
         try:
             self._dispatch(action, payload)
         except discovery.DiscoverError as exc:
@@ -1721,6 +1759,30 @@ class Bot:
         finally:
             self._take_off_buttons(message)
         return f"callback:{action}"
+
+    def _send_jd(self, payload: Mapping[str, Any]) -> None:
+        """The kept job description of an alerted posting, split at paragraphs into at
+        most JD_MESSAGES messages; JD_NONE when none was kept."""
+        posting_id = payload.get("posting_id")
+        text: str | None = None
+        heading = ""
+        if isinstance(posting_id, int) and not isinstance(posting_id, bool):
+            with self._search() as search:
+                kept = search_store.kept_jd(search, posting_id)
+                shown = search_store.posting_by_id(search, posting_id)
+            data = snapshots.read_kept(self.datadir.root, kept[0]) if kept else None
+            if data is not None:
+                try:
+                    text = jobdesc.from_file(data).text.strip() or None
+                except jobdesc.JobDescError:
+                    text = None
+            if shown is not None:
+                heading = f"Job description: {shown.company} — {shown.title}\n\n"
+        if text is None:
+            self.send(JD_NONE)
+            return
+        for part in _jd_messages(heading + text):
+            self.send(part)
 
     def _answer(self, query_id: Any, text: str | None = None) -> None:
         """answerCallbackQuery, quickly. A failure is logged, never raised."""
@@ -1952,23 +2014,38 @@ class Bot:
                 captured = snapshots.capture(posting.url, self.fetcher)
                 if captured is not None:
                     path = snapshots.save(self.datadir.root, captured.data, captured.ext, today)
+            saved = self._kept_jd(search, posting_id)
             app = Application(replace(posting, snapshot_path=path), dating, method)
             try:
-                recorded = ledger.record_application(search, active, app, lane_config=doc)
+                recorded = ledger.record_application(search, active, app, saved, lane_config=doc)
             except sqlite3.IntegrityError:
                 raise Refusal("That application is already recorded.") from None
             if path and posting.snapshot_path is None:
                 search_store.set_posting_snapshot(search, posting_id, path)
-            # The watcher keeps no description (it is used in memory for the filters and
-            # scoring only), so an application from an alert always asks for its JD.
+            # The JD kept when the posting was scored is the application's JD (Batch R);
+            # an alert from before JDs were kept asks for it.
             self._confirm(
                 search,
                 recorded.correlation_id,
                 posting.company,
                 posting.title,
                 bool(path),
-                jd="missing",
+                jd="saved" if saved is not None else "missing",
             )
+
+    def _kept_jd(self, search: sqlite3.Connection, posting_id: int) -> jobdesc.SavedJd | None:
+        """The job description kept when the posting was scored, as a saved JD."""
+        kept = search_store.kept_jd(search, posting_id)
+        data = snapshots.read_kept(self.datadir.root, kept[0]) if kept else None
+        if kept is None or data is None:
+            return None
+        try:
+            found = jobdesc.from_file(data)
+        except jobdesc.JobDescError:
+            return None
+        if not found.has_text:
+            return None
+        return jobdesc.SavedJd(replace(found, source="fetched"), kept[0])
 
     def _finish_log(
         self,
