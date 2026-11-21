@@ -35,7 +35,10 @@ on whenever `onsite_hybrid` is set; there is no setting for it.
 An unknown location is never a reason to skip (Batch Q, `locations.unknown`). A
 posting with blank location text, whatever its work model, has nothing to match
 against the location lists or a watchlist entry's `locations`, so neither skips it: it
-is scored and alerted as usual, and its alert says `Location unknown`. Its description
+is scored and alerted as usual, and its alert says `Location unknown`. The same holds
+for a location that names only a country (with no remote or hybrid stated anywhere) or
+only a building, such as "Example Tower" (Batch R); their alerts show the location as
+given. Its description
 is still checked for office days elsewhere. (`empty_location` was a skip reason before
 0.10.0; skips already stored with it stay.)
 

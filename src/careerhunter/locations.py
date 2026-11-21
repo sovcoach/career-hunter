@@ -1,8 +1,16 @@
 """Where a posting is, as far as its text says (Batch R).
 
-A location is *unknown* when it is blank: it gives no place to check against the
-location rules. An unknown location is never a reason to skip a posting: it is scored
-and alerted as usual (`filters._location`), and its alert says `Location unknown`.
+A location is *unknown* when it gives no place to check against the location rules:
+
+- it is blank;
+- it names only a country ("Japan", "U.S.A."), with no city, and neither the
+  location, the title nor the board says the job is remote or hybrid;
+- it names only a building ("Example Tower", as Workday sends some), with no city:
+  one part (no comma, semicolon, slash, pipe or " - "), with a building word.
+
+An unknown location is never a reason to skip a posting: it is scored and alerted
+as usual (`filters._location`). A country-only or building-only location is shown in
+the alert as it was given; a blank one as `Location unknown`.
 
 At intake a location is read, in order, from the page's JSON-LD (`jobLocation`, with
 `jobLocationType: TELECOMMUTE` read as Remote and `applicantLocationRequirements` as
@@ -16,9 +24,20 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from careerhunter.countries import is_country
+
 MAX_LOCATION = 120  # characters kept from a location found in text or given by hand
 
+# Whole words that name a building, not a place. Words that are also parts of town
+# names ("Park", "Place", "Square") are left out, so a town is never taken for one.
+_BUILDING = re.compile(
+    r"\b(?:tower|towers|building|bldg|centre|center|plaza|campus|complex|headquarters|hq"
+    r"|offices?)\b",
+    re.IGNORECASE,
+)
+_PARTS = re.compile("[,;/|]|\\s[-\u2013\u2014]\\s")
 _REMOTE = re.compile(r"\bremote\b", re.IGNORECASE)
+_HYBRID = re.compile(r"\bhybrid\b", re.IGNORECASE)
 # A line that states the job's location: "Location: ...", "Job location - ...",
 # "Based in: ...". Only at the start of a line, so a sentence never counts.
 _LINE = re.compile(
@@ -38,10 +57,30 @@ def says_remote(text: str) -> bool:
     return _REMOTE.search(text) is not None
 
 
+def country_only(location: str) -> bool:
+    return is_country(location)
+
+
+def building_only(location: str) -> bool:
+    text = location.strip()
+    if not text or _PARTS.search(text) or is_country(text):
+        return False
+    return _BUILDING.search(text) is not None and len(text.split()) <= 6
+
+
+def stated_remote_or_hybrid(location: str, title: str, work_model: str | None) -> bool:
+    if work_model in ("remote", "hybrid"):
+        return True
+    return any(says_remote(t) or _HYBRID.search(t) for t in (location, title))
+
+
 def unknown(location: str, *, title: str = "", work_model: str | None = None) -> bool:
     """Whether the location gives no place the location rules can check."""
-    del title, work_model  # read by the rules for a location that names no place
-    return not location.strip()
+    if not location.strip():
+        return True
+    if building_only(location):
+        return True
+    return country_only(location) and not stated_remote_or_hybrid(location, title, work_model)
 
 
 def from_text(text: str | None) -> str | None:
