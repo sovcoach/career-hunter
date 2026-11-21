@@ -7,9 +7,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-21
+
 ### Fixed
 - A location read from job-description text (a `Location:` or `Based in:` line) is kept only when it looks like a place: it says Remote, or names a country from the built-in list, a Canadian province or territory or a US state (by name, or by postal abbreviation after a comma), in at most 120 characters. A city on its own is kept when it matches, ignoring case, a whole place named in `search.location_rules`, read from the config at run time. Anything else, such as a work-environment line or any other city on its own, stays unknown, and the watch log and `careerhunter locations fill` say so. Locations from JSON-LD and the boards' own fields are unchanged.
-- No schema change: `search.db` stays at 37 and the EI record at 5.
+- No schema change: `search.db` stays at 37 and the EI record at 5. Its release checkout uses `v0.11.1`.
 
 ## [0.11.0] - 2026-11-21
 
@@ -374,7 +376,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/sovcoach/career-hunter/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/sovcoach/career-hunter/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/sovcoach/career-hunter/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/sovcoach/career-hunter/compare/v0.8.1...v0.9.0
