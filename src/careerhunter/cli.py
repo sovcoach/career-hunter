@@ -462,7 +462,12 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
         dating = selfsourced.parse_day(args.date, today)
         jd = _jd_argument(args)
         posting = selfsourced.describe(
-            args.url, fetch_page, today, company=args.company, title=args.title
+            args.url,
+            fetch_page,
+            today,
+            company=args.company,
+            title=args.title,
+            location=args.location,
         )
         with _writable(datadir) as w:
             logged = selfsourced.record(
@@ -488,6 +493,7 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
         return EXIT_ERROR
     where = f"EI claim {logged.ei_claim}" if logged.ei_claim else "search.db only, no active claim"
     print(f"Recorded: {logged.company} — {logged.title} ({where}).")
+    print(f"Location: {logged.location or 'unknown'}")
     print("Job ad saved." if logged.snapshot_saved else "No copy of the job ad was saved.")
     if logged.jd_saved:
         print("Job description saved.")
@@ -1932,6 +1938,9 @@ def _doctor_watch_runs(
         if config_doc is not None and off_lane_min_fit(config_doc) == "never"
         else f"{finished['held_off_lane']} off-lane below the threshold"
     )
+    unknown = search_store.location_unknown_count(search)
+    if unknown:
+        detail += f", {unknown} with location unknown (scored and alerted as usual)"
     if finished["budget_reached"]:
         detail += "; that run's budget left work for the next one"
     if finished["held_no_fit"]:
@@ -2543,6 +2552,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--date", required=True, help="YYYY-MM-DD, today or yesterday")
     p.add_argument("--company", help="the employer, when the page doesn't say (with --title)")
     p.add_argument("--title", help="the role, when the page doesn't say (with --company)")
+    p.add_argument(
+        "--location",
+        help="where the job is, when the page doesn't say or says it wrong (optional)",
+    )
     jd = p.add_mutually_exclusive_group()
     jd.add_argument(
         "--jd-file", metavar="PATH", help="the job description, as a PDF, HTML or text file"

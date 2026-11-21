@@ -229,6 +229,7 @@ def test_a_repost_logged_again_is_recorded_with_the_earlier_date(
     assert _named(probe, "https://jobs.example.com/ads/2", "Analyst (R67890)", "2026-10-27") == 0
     assert capsys.readouterr().out.splitlines() == [
         f"Recorded: Example Robotics — Analyst (R67890) (EI claim {ACTIVE.label}).",
+        "Location: Example City",  # from the page's JSON-LD
         "Job ad saved.",
         "No job description was saved.",
         f"You logged an application to this role on {DAY}.",

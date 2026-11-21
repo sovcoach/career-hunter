@@ -144,12 +144,12 @@ import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, NoReturn, Self, SupportsIndex
 
 from careerhunter import ats as ats_boards
-from careerhunter import db, filters, lanes, loopback, search_store
+from careerhunter import db, filters, lanes, locations, loopback, search_store
 from careerhunter import discover as discovery
 from careerhunter.ats import (
     BoardHTTPError,
@@ -1184,6 +1184,13 @@ def _record_jobs(
                 _line(name, ats, f"{item.title!r} has neither a url nor a requisition id; skipped")
             )
             continue
+        if not item.location.strip() and item.description:
+            found_location = locations.from_text(item.description)
+            if found_location:  # the board gave none: its description's Location: line
+                item = replace(item, location=found_location)
+                lines.append(
+                    _line(name, ats, f"{item.title!r}: location read from its description")
+                )
         company, differed = _company_name(item.company_field, name)
         if differed is not None and differed.casefold() not in mismatches:
             mismatches.add(differed.casefold())

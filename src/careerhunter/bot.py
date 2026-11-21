@@ -175,8 +175,9 @@ REFUSALS_TO_GIVE_UP = 3
 
 LOG_USAGE = (
     "Send: /log <link> | method | date, or just /log <link>. "
-    "Add | Company | Title when the page doesn't show them. For example: "
-    "/log https://jobs.example.com/123 | company_site | 2026-11-10"
+    "Add | Company | Title when the page doesn't show them, and | location: <city> "
+    "when it doesn't say where. For example: "
+    "/log https://jobs.example.com/123 | company_site | 2026-11-10 | location: Example City"
 )
 LINKEDIN_REFUSAL = (
     "LinkedIn links are never fetched, so give the company and title: "
@@ -206,7 +207,8 @@ JD_LATE = (
 HELP = (
     "Commands:\n"
     "/log <link> | method | date: record a job you applied to yourself, in one step "
-    "(or /log <link> to be asked; add | Company | Title if the page doesn't show them). "
+    "(or /log <link> to be asked; add | Company | Title if the page doesn't show them, "
+    "and | location: <city> if it doesn't say where). "
     "Paste the job description on the lines after it, or send its PDF, HTML or text "
     "file with the /log line as the caption\n"
     "/status <ref> <status> [YYYY-MM-DD]: update an application (dated today unless a "
@@ -559,6 +561,28 @@ class _Stitch:
     title: str | None
     parts: list[str]
     last: dt.datetime
+    location: str | None = None
+
+
+_LOCATION_FIELD = re.compile(r"^location\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def _labelled_fields(extra: list[str]) -> tuple[list[str], str | None]:
+    """The positional fields after the link, and the `location: <city>` one, which may
+    go anywhere after the link. Only one location; an empty one is refused."""
+    positional: list[str] = []
+    location: str | None = None
+    for part in extra:
+        match = _LOCATION_FIELD.match(part)
+        if match is None:
+            positional.append(part)
+            continue
+        if location is not None:
+            raise Refusal("Give one location only.")
+        location = " ".join(match.group(1).split())
+        if not location:
+            raise Refusal("The location after location: is empty.")
+    return positional, location
 
 
 def _log_format_problem(url: str, extra: list[str]) -> str | None:
@@ -1245,7 +1269,14 @@ class Bot:
                 raise Refusal(f"Not recorded: {exc}") from None
         doc = self._read_config()
         self._log_now(
-            stitch.url, stitch.method, stitch.dating, stitch.company, stitch.title, doc, jd
+            stitch.url,
+            stitch.method,
+            stitch.dating,
+            stitch.company,
+            stitch.title,
+            doc,
+            jd,
+            stitch.location,
         )
         return "log:stitched"
 
@@ -1352,6 +1383,7 @@ class Bot:
         """
         parts = [p.strip() for p in rest.split("|")]
         url, extra = parts[0], parts[1:]
+        extra, location = _labelled_fields(extra)
         problem = _log_format_problem(url, extra)
         if problem is not None:
             raise Refusal(f"{problem} {LOG_USAGE}")
@@ -1373,13 +1405,15 @@ class Bot:
         if urls.no_fetch(url) and not (company and title):
             raise Refusal(LINKEDIN_REFUSAL)
         if body is not None and method is not None and dating is not None:
-            self._stitch = _Stitch(url, method, dating, company, title, [body], self.clock())
+            self._stitch = _Stitch(
+                url, method, dating, company, title, [body], self.clock(), location
+            )
             return
         jd = self._document_jd(document) if document is not None else None
         if method is not None and dating is not None:
-            self._log_now(url, method, dating, company, title, doc, jd)
+            self._log_now(url, method, dating, company, title, doc, jd, location)
             return
-        posting = self._describe(url, today, company, title)
+        posting = self._describe(url, today, company, title, location)
         found = {
             "url": posting.url or url,
             "company": posting.company,
@@ -1402,10 +1436,17 @@ class Bot:
         self._finish_log(found, method, dating, doc)
 
     def _describe(
-        self, url: str, today: dt.date, company: str | None, title: str | None
+        self,
+        url: str,
+        today: dt.date,
+        company: str | None,
+        title: str | None,
+        location: str | None = None,
     ) -> Posting:
         try:
-            return selfsourced.describe(url, self.fetcher, today, company=company, title=title)
+            return selfsourced.describe(
+                url, self.fetcher, today, company=company, title=title, location=location
+            )
         except selfsourced.LinkedInNamesMissing:
             raise Refusal(LINKEDIN_REFUSAL) from None
         except selfsourced.NamesMissing as exc:
@@ -1422,9 +1463,10 @@ class Bot:
         title: str | None,
         doc: dict[str, Any],
         jd: jobdesc.JobDescription | None,
+        location: str | None = None,
     ) -> None:
         """Fetch what the page shows, then record the /log with its JD, if any."""
-        posting = self._describe(url, self._today(doc), company, title)
+        posting = self._describe(url, self._today(doc), company, title, location)
         found = {
             "url": posting.url or url,
             "company": posting.company,
@@ -1954,6 +1996,7 @@ class Bot:
                 logged.snapshot_saved,
                 earlier=logged.earlier,
                 jd=state,
+                location=logged.location,
             )
 
     def _confirm(
@@ -1966,8 +2009,10 @@ class Bot:
         *,
         jd: str,
         earlier: str | None = None,
+        location: str | None = None,
     ) -> None:
         """`Recorded: … (ref aN).`, then the request for the JD when none was saved.
+        With `location` (a /log), a `Location:` line follows, `unknown` when blank.
 
         `jd` is `saved`, `missing` or `no_text`, for /log and for Applied alike. A saved
         JD can be replaced by replying to the Recorded message; otherwise the JD is asked
@@ -1982,6 +2027,8 @@ class Bot:
             text += " Job ad saved."
         if jd == "saved":
             text += " Job description saved."
+        if location is not None:
+            text += f"\nLocation: {location or 'unknown'}"
         if earlier:
             text += "\n" + earlier
         message_id = self.send(text)

@@ -8,6 +8,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from careerhunter import locations
 from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import title_key
@@ -545,6 +546,24 @@ def score_attempted_at(conn: sqlite3.Connection, posting_id: int) -> str | None:
 def set_score_attempted_at(conn: sqlite3.Connection, posting_id: int, stamp: str | None) -> None:
     """When the posting was last sent to the model; None clears it."""
     conn.execute("UPDATE postings SET score_attempted_at = ? WHERE id = ?", (stamp, posting_id))
+
+
+def location_unknown_count(conn: sqlite3.Connection) -> int:
+    """Watcher and discovery postings with no skip whose location gives no place the
+    location rules can check (`locations.unknown`): blank, a country only, a building
+    only. Read now, for doctor's `watch held` line."""
+    rows = conn.execute(
+        "SELECT p.title, p.location, p.work_model FROM postings p "
+        "WHERE p.source IN ('watcher', 'discovery') "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
+    )
+    return sum(
+        1
+        for row in rows
+        if locations.unknown(
+            str(row["location"] or ""), title=str(row["title"]), work_model=row["work_model"]
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -1564,6 +1583,15 @@ def posting_by_id(conn: sqlite3.Connection, posting_id: int) -> Posting | None:
 
 def set_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -> None:
     conn.execute("UPDATE postings SET snapshot_path = ? WHERE id = ?", (path, posting_id))
+
+
+def fill_posting_location(conn: sqlite3.Connection, posting_id: int, location: str) -> bool:
+    """Set the posting's location only when it is blank. True when it was set."""
+    cur = conn.execute(
+        "UPDATE postings SET location = ? WHERE id = ? AND trim(location) = ''",
+        (location, posting_id),
+    )
+    return cur.rowcount == 1
 
 
 def fill_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -> None:

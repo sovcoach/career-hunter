@@ -94,7 +94,8 @@ def test_fragments_are_stitched_exactly_as_sent(env: Env, parts: list[str]) -> N
     (row,) = jd_rows(env)
     assert row["text"] == botmod.STITCH_SEPARATOR.join(parts)
     assert env.api.texts()[-1] == (
-        "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job description saved."
+        "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job description saved.\n"
+        "Location: Example City"
     )
     sent = env.api.everything_sent()
     assert PART_1 not in sent and "synthetic tickets" not in sent  # never echoed
@@ -257,7 +258,7 @@ def test_a_captioned_file_is_the_jd(env: Env) -> None:
         "html",
     )
     assert (env.datadir.root / row["file_path"]).read_bytes() == data
-    assert env.api.texts()[-1].endswith("Job description saved.")
+    assert "Job description saved.\nLocation: " in env.api.texts()[-1]
 
 
 def test_a_caption_over_the_limit_or_without_a_date_is_refused(env: Env) -> None:
@@ -352,7 +353,7 @@ def test_a_fetched_jd_is_used_when_none_was_pasted(env: Env) -> None:
     (row,) = jd_rows(env)
     assert (row["text"], row["jd_source"]) == ("Fetched synthetic duties.", "fetched")
     assert env.api.texts()[-1].endswith("Job ad saved.") is False
-    assert env.api.texts()[-1].endswith("Job description saved.")
+    assert "Job description saved.\nLocation: " in env.api.texts()[-1]
     env.say(HEADER.replace("2026-10-21", "2026-10-22") + "\nPasted wins.")
     later(env, 5)
     env.bot.tick()

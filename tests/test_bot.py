@@ -424,7 +424,8 @@ def test_log_in_one_step_records_the_posting_and_the_application(env: Env) -> No
     """/log <link> | method | date: one message, one ledger call, both layers (#34)."""
     env.say(f"/log {AD_URL} | Company site | 2026-10-21")
     assert env.api.texts()[-2:] == [
-        "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved.",
+        "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved.\n"
+        "Location: Example City",  # from the page's JSON-LD
         botmod.JD_REQUEST,  # the page has no JD to fetch
     ]
     s, e = env.search(), env.ei()
@@ -492,7 +493,9 @@ def test_log_without_details_on_the_page_asks_for_them(env: Env) -> None:
     assert "/log <link> | method | date | Company | Title" in env.api.texts()[-1]
     assert env.counts()["search.postings"] == 0
     env.say(f"/log {SHELL_URL} | email | 2026-10-21 | Sample Logistics | Synthetic Clerk")
-    assert env.api.texts()[-2] == "Recorded: Sample Logistics — Synthetic Clerk (ref a1)."
+    assert env.api.texts()[-2] == (
+        "Recorded: Sample Logistics — Synthetic Clerk (ref a1).\nLocation: unknown"
+    )
     assert env.api.texts()[-1] == botmod.JD_REQUEST  # a JD file is the copy of the ad too
 
 
@@ -506,6 +509,7 @@ def test_a_repost_logged_again_names_only_the_earlier_date(env: Env) -> None:
     env.say(f"/log {ROLE_AD}b | email | 2026-10-27 | Example Robotics | Analyst (R67890)")
     assert env.api.texts()[-2] == (
         "Recorded: Example Robotics — Analyst (R67890) (ref a2).\n"
+        "Location: unknown\n"
         "You logged an application to this role on 2026-10-20."
     )
     assert env.api.texts()[-1] == botmod.JD_REQUEST

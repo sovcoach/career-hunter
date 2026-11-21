@@ -32,6 +32,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+from careerhunter import locations
 from careerhunter.fetch import Fetched, FetchError
 
 MIN_READABLE_CHARS = 1500
@@ -120,19 +121,14 @@ def _text(value: Any) -> str | None:
 
 
 def posting_info(html: bytes) -> PostingInfo:
-    """Title, company and location from JSON-LD, falling back to the page title."""
+    """Title, company and location from JSON-LD, falling back to the page title. The
+    location is `locations.from_json_ld`: the address, Remote for a TELECOMMUTE job and
+    the countries an applicant must be in."""
     page = _parse(html)
     for job in _job_postings(page.json_ld):
         org = job.get("hiringOrganization")
         company = _text(org.get("name")) if isinstance(org, dict) else _text(org)
-        place = job.get("jobLocation")
-        place = place[0] if isinstance(place, list) and place else place
-        address = place.get("address") if isinstance(place, dict) else None
-        location = None
-        if isinstance(address, dict):
-            bits = [_text(address.get(k)) for k in ("addressLocality", "addressRegion")]
-            location = ", ".join(b for b in bits if b) or None
-        return PostingInfo(_text(job.get("title")), company, location)
+        return PostingInfo(_text(job.get("title")), company, locations.from_json_ld(job))
     return PostingInfo(title=_text(page.title))
 
 

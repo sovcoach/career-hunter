@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from careerhunter import ats, htmltext, pdftext, snapshots, urls
+from careerhunter import ats, htmltext, locations, pdftext, snapshots, urls
 from careerhunter.fetch import FetchError
 from careerhunter.snapshots import Fetcher
 
@@ -251,32 +251,65 @@ def _ats_description(endpoint: str, data: Any) -> str | None:
     return None
 
 
-def _from_ats(url: str, fetcher: Fetcher) -> str | None:
+def _ats_location(endpoint: str, data: Any) -> str | None:
+    """The location in an ATS's public JSON for one posting, read the way the watcher
+    reads it from the board (`ats.py`), with "Remote" added for a remote work model."""
+    if not isinstance(data, dict):
+        return None
+    if "/wday/cxs/" in endpoint:
+        info = data.get("jobPostingInfo")
+        place = info.get("location") if isinstance(info, dict) else None
+        return " ".join(place.split()) if isinstance(place, str) and place.strip() else None
+    job: ats.Job | ats.Skip | None = None
+    if "greenhouse.io" in endpoint:
+        job = ats._greenhouse_job(data, "posting")
+    elif "lever.co" in endpoint:
+        job = ats._lever_job(data, "posting")
+    elif "ashbyhq.com" in endpoint:
+        job = ats._ashby_job(data, "posting")
+    if not isinstance(job, ats.Job):
+        return None
+    return locations.with_work_model(job.location, job.work_model) or None
+
+
+def _from_ats(url: str, fetcher: Fetcher) -> tuple[str | None, str | None]:
+    """The description and the location in the posting's ATS JSON, from one request."""
     endpoint = snapshots.ats_json_url(url)
     if endpoint is None:
-        return None
+        return None, None
     endpoint, _, ashby_id = endpoint.partition("#")
     if urls.no_fetch(endpoint):
-        return None
+        return None, None
     try:
         data = json.loads(fetcher(endpoint).body)
     except (FetchError, ValueError):
-        return None
+        return None, None
     if ashby_id:  # the Ashby board lists every job; keep only this one
         jobs = data.get("jobs", []) if isinstance(data, dict) else []
         data = next((j for j in jobs if isinstance(j, dict) and j.get("id") == ashby_id), None)
-    return _ats_description(endpoint, data)
+    return _ats_description(endpoint, data), _ats_location(endpoint, data)
 
 
-def fetched(url: str, fetcher: Fetcher) -> JobDescription | None:
-    """The description fetched from the posting's page or its ATS's JSON, or None.
+@dataclass(frozen=True)
+class Fetched:
+    """What one fetch of a posting gave: its description, and a location when the ATS
+    JSON it was read from names one."""
+
+    jd: JobDescription | None
+    location: str | None = None
+
+
+def fetched_with_location(url: str, fetcher: Fetcher) -> Fetched:
+    """The description fetched from the posting's page or its ATS's JSON, and the
+    location that JSON names, when it was read.
 
     Never fetches a host that is not fetched (`urls.no_fetch`). A text that fails the
     paste rules (too long, for one) is not used.
     """
     if not url or urls.no_fetch(url):
-        return None
+        return Fetched(None)
     text: str | None = None
+    location: str | None = None
     final = url
     try:
         page = fetcher(url)
@@ -287,13 +320,18 @@ def fetched(url: str, fetcher: Fetcher) -> JobDescription | None:
         if page.status == 200:
             text = _json_ld_description(page.body)
     if text is None and not urls.no_fetch(final):
-        text = _from_ats(final, fetcher)
+        text, location = _from_ats(final, fetcher)
     if not text:
-        return None
+        return Fetched(None, location)
     try:
-        return JobDescription(_checked_text(text), "fetched", "txt")
+        return Fetched(JobDescription(_checked_text(text), "fetched", "txt"), location)
     except JobDescError:
-        return None
+        return Fetched(None, location)
+
+
+def fetched(url: str, fetcher: Fetcher) -> JobDescription | None:
+    """The description fetched from the posting's page or its ATS's JSON, or None."""
+    return fetched_with_location(url, fetcher).jd
 
 
 def save(data_dir: Path, jd: JobDescription, today: dt.date) -> SavedJd:
