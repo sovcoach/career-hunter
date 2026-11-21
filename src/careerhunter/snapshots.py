@@ -167,14 +167,18 @@ def ats_json_url(url: str) -> str | None:
         if i >= 1 and len(segments) > i + 1:
             site, rest = segments[i - 1], "/".join(segments[i + 1 :])
             return f"https://{host}/wday/cxs/{workday['tenant']}/{site}/job/{rest}"
-    if host in ("boards.greenhouse.io", "job-boards.greenhouse.io") and "jobs" in segments:
+    # The EU board host is read through the usual API (checked on a live public board;
+    # see discover._GREENHOUSE).
+    greenhouse = ("boards.greenhouse.io", "job-boards.greenhouse.io", "job-boards.eu.greenhouse.io")
+    if host in greenhouse and "jobs" in segments:
         i = segments.index("jobs")
         if i >= 1 and len(segments) > i + 1 and segments[i + 1].isdigit():
             return (
                 f"https://boards-api.greenhouse.io/v1/boards/{segments[0]}/jobs/{segments[i + 1]}"
             )
-    if host == "jobs.lever.co" and len(segments) >= 2:
-        return f"https://api.lever.co/v0/postings/{segments[0]}/{segments[1]}"
+    if host in ("jobs.lever.co", "jobs.eu.lever.co") and len(segments) >= 2:
+        api = "api.eu.lever.co" if host == "jobs.eu.lever.co" else "api.lever.co"
+        return f"https://{api}/v0/postings/{segments[0]}/{segments[1]}"
     if host == "jobs.ashbyhq.com" and len(segments) >= 2:
         return f"https://api.ashbyhq.com/posting-api/job-board/{segments[0]}#{segments[1]}"
     return None

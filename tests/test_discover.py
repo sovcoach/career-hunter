@@ -65,6 +65,7 @@ def _enable(root: Path, *, hosts: list[str] | None = None) -> None:
     path = root / "config.yaml"
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
     doc["discovery"]["searxng_url"] = "http://127.0.0.1:8888/search"
+    doc["discovery"]["result_pages"] = 1  # one request per query; paging is tested apart
     if hosts is not None:
         doc["discovery"]["career_hosts"] = hosts
     path.write_text(yaml.safe_dump(doc), encoding="utf-8")
@@ -84,7 +85,7 @@ def inited(data_env: Path, probe: SystemProbe, capsys: pytest.CaptureFixture[str
 
 HOSTS = (
     "greenhouse.io",
-    "jobs.lever.co",
+    "lever.co",
     "jobs.ashbyhq.com",
     "jobs.smartrecruiters.com",
     "bamboohr.com",
@@ -131,7 +132,11 @@ def test_the_cursor_takes_the_next_slice_and_wraps() -> None:
 def test_the_cursor_covers_every_query_across_runs_and_wraps(tmp_path: Path) -> None:
     conn = _search_db(tmp_path)
     config = {
-        "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "queries_per_run": 4},
+        "discovery": {
+            "searxng_url": "http://127.0.0.1:8888/search",
+            "result_pages": 1,
+            "queries_per_run": 4,
+        },
         "search": {
             "target_titles": ["One", "Two"],
             "location_rules": {"onsite_hybrid": ["Example City"]},
@@ -175,7 +180,7 @@ def test_no_titles_makes_no_request(tmp_path: Path) -> None:
     outcome = discover.run(
         conn,
         {
-            "discovery": {"searxng_url": "http://127.0.0.1:8888/search"},
+            "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "result_pages": 1},
             "search": {"locations": ["Example City"]},
         },
         today="2026-11-02",
@@ -229,7 +234,11 @@ def test_a_miss_writes_nothing(tmp_path: Path) -> None:
     conn = db.connect(tmp_path / "search.db")
     db.migrate(conn, "search")
     config = {
-        "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "career_hosts": []},
+        "discovery": {
+            "searxng_url": "http://127.0.0.1:8888/search",
+            "result_pages": 1,
+            "career_hosts": [],
+        },
         "search": {"target_titles": ["One"], "locations": ["Example City"]},
     }
     down = _Talk(b"", status=0, fail_at=1)
@@ -754,7 +763,11 @@ def _search_db(tmp_path: Path) -> sqlite3.Connection:
 
 
 _SEARCH = {
-    "discovery": {"searxng_url": "http://127.0.0.1:8888/search", "career_hosts": []},
+    "discovery": {
+        "searxng_url": "http://127.0.0.1:8888/search",
+        "result_pages": 1,
+        "career_hosts": [],
+    },
     "search": {"target_titles": ["One"], "locations": ["Example City"]},
 }
 _GOOD = "https://job-boards.greenhouse.io/newrobotics/jobs/42"
@@ -1217,6 +1230,7 @@ def test_approving_a_board_whose_stored_site_differs_is_refused(tmp_path: Path) 
 _ETIQUETTE = {
     "discovery": {
         "searxng_url": "http://127.0.0.1:8888/search",
+        "result_pages": 1,
         "queries_per_run": 3,
         "query_delay_seconds": 7,
         "interval_minutes": 60,
@@ -1497,10 +1511,25 @@ def test_two_claims_inside_the_gap_cannot_both_win(tmp_path: Path) -> None:
 def test_the_pauses_of_a_pass_must_fit_its_share_of_the_watch_run() -> None:
     from careerhunter.config import validate_config
 
-    doc = {"discovery": {"queries_per_run": 40, "query_delay_seconds": 5}}
+    doc = {"discovery": {"queries_per_run": 40, "query_delay_seconds": 5, "result_pages": 1}}
     assert any("must be at most 120 seconds" in p for p in validate_config(doc))
-    doc = {"discovery": {"queries_per_run": 24, "query_delay_seconds": 5}}
+    doc = {"discovery": {"queries_per_run": 24, "query_delay_seconds": 5, "result_pages": 1}}
     assert not any("discovery" in p for p in validate_config(doc))
+    # Each result page is a request: the default 2 pages count twice.
+    doc = {"discovery": {"queries_per_run": 24, "query_delay_seconds": 5}}
+    assert any("result_pages times" in p for p in validate_config(doc))
+    doc = {"discovery": {"queries_per_run": 12, "query_delay_seconds": 5}}
+    assert not any("discovery" in p for p in validate_config(doc))
+    doc = {"discovery": {"queries_per_run": 8, "query_delay_seconds": 5, "result_pages": 3}}
+    assert not any("discovery" in p for p in validate_config(doc))
+
+
+@pytest.mark.parametrize("pages", [0, 4, "2", True, None])
+def test_result_pages_is_an_integer_from_1_to_3(pages: object) -> None:
+    from careerhunter.config import validate_config
+
+    problems = validate_config({"discovery": {"result_pages": pages}})
+    assert any("discovery.result_pages must be an integer from 1 to 3" in p for p in problems)
 
 
 def test_the_engine_record_must_be_a_json_array(tmp_path: Path) -> None:

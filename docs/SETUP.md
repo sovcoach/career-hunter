@@ -162,7 +162,7 @@ created  $CAREERHUNTER_DATA_DIR/imports
 created  $CAREERHUNTER_DATA_DIR/config.yaml (from config.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/exclusions.yaml (from exclusions.example.yaml; edit it before seeding)
 created  $CAREERHUNTER_DATA_DIR/seed.yaml (from seed.example.yaml; edit it before seeding)
-database $CAREERHUNTER_DATA_DIR/search.db at schema version 36
+database $CAREERHUNTER_DATA_DIR/search.db at schema version 37
 no active EI claim (set ei.active_claim in config.yaml; see docs/SETUP.md)
 ```
 
@@ -253,7 +253,7 @@ The model never sees these numbers, and its sampling settings are fixed, with a 
 
 `search.max_posting_age_days` (default 7) skips a posting the board says was posted more than that many days ago, as `too_old`. A board that gives no date uses the day the posting was first seen, and the watch log says so for that posting.
 
-A Workday board needs three values on its watchlist entry, all from its careers page address `https://<tenant>.<wdN>.myworkdayjobs.com/<site>`: `ats_slug` is the tenant, `ats_host` the `wdN` part and `ats_site` the site. A BambooHR board's `ats_slug` is the company's `bamboohr.com` subdomain, and a SmartRecruiters board's is the company identifier after `jobs.smartrecruiters.com/`.
+A Workday board needs three values on its watchlist entry, all from its careers page address `https://<tenant>.<wdN>.myworkdayjobs.com/<site>`: `ats_slug` is the tenant, `ats_host` the `wdN` part and `ats_site` the site. A BambooHR board's `ats_slug` is the company's `bamboohr.com` subdomain, and a SmartRecruiters board's is the company identifier after `jobs.smartrecruiters.com/`. A Lever board in Lever's EU region (its page is on `jobs.eu.lever.co`) also needs `ats_region: eu`, so it is read from `api.eu.lever.co` and its links stay on `jobs.eu.lever.co`; `ats_region` is for Lever entries only, and discovery sets it by itself for a board it finds on the EU host. A Greenhouse board on `job-boards.eu.greenhouse.io` needs nothing extra: it is read through the usual Greenhouse API.
 
 A Workday board can also be filtered on the board itself with `ats_facets`, so its list holds only the postings you'd keep and fits in fewer pages. Give each facet and value by the name the board shows in its search filters, never by an id:
 
@@ -416,7 +416,7 @@ With the template files, the prompt names Example Staffing Mill, the title keywo
 
 SearXNG runs on this Mac and listens on `127.0.0.1` only. Leave `public_instance` and `image_proxy` off, leave the limiter off, and add `json` to `search.formats`. Leave engines that need an API key disabled. Set `discovery.searxng_url` to that loopback URL, for example `http://127.0.0.1:8888/search`. A null URL leaves discovery off.
 
-Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`. A pass sends the next `discovery.queries_per_run` site-restricted queries (default 12), `discovery.query_delay_seconds` apart (default 5), and the next pass carries on from there, so over several passes every title, place and host is asked. Titles come from your lanes, places from `search.location_rules`, and hosts are each supported ATS plus `discovery.career_hosts`. A posting URL in the results is fetched once from its ATS and goes through the same gates, scoring and digest as a watched posting, with no approval. A board is queued only after one request to its API confirms it exists, with the company name that reply gives; a board that does not exist is never queued again, and a company in `exclusions.companies` is never queued. Each posting found on a queued board that passes your gates (no skip) is linked to it, and only a board with such a posting is ever sent to you. Career pages are not queued. A down server prints `discovery miss: unreachable`, and one that answers with an error or a reply that is not a result list prints `discovery miss: bad-reply`; either stores nothing; HTTP 429 from SearXNG stops the pass. One engine that SearXNG reports as rate limited, asking for a CAPTCHA or suspended doesn't: the pass goes on while other engines answer, names the throttled engines in its log line, and fails only when no query got an answer. After a failed pass the next one waits one `discovery.interval_minutes`, doubled for each further failure in a row, up to 24 hours. `doctor` shows the backoff with the command that ends it early, `careerhunter discover clear-backoff`. `careerhunter discover` runs one pass by hand and prints each new pending row. `careerhunter discover list` prints the pending rows again.
+Discovery runs inside the watch agent, at most once per `discovery.interval_minutes`. A pass sends the next `discovery.queries_per_run` site-restricted queries (default 12), `discovery.query_delay_seconds` apart (default 5), and the next pass carries on from there, so over several passes every title, place and host is asked. Each query reads up to `discovery.result_pages` result pages (1 to 3, default 2), each one more request after the same pause. A query stops paging early when a page brings no new results or fails, and the watch log says so by the query's number in the pass, never its text; HTTP 429 on any page still stops the pass. The pauses of one pass, queries times pages times the delay, must be at most 120 seconds, so a pass with 2 pages sends at most 12 queries 5 seconds apart. Discovery recognizes the EU board hosts of Greenhouse and Lever, and the embed addresses of Greenhouse, Lever (`api.lever.co/v0/postings/<company>?mode=iframe`) and Ashby (`jobs.ashbyhq.com/<company>/embed`). Titles come from your lanes, places from `search.location_rules`, and hosts are each supported ATS plus `discovery.career_hosts`. A posting URL in the results is fetched once from its ATS and goes through the same gates, scoring and digest as a watched posting, with no approval. A board is queued only after one request to its API confirms it exists, with the company name that reply gives; a board that does not exist is never queued again, and a company in `exclusions.companies` is never queued. Each posting found on a queued board that passes your gates (no skip) is linked to it, and only a board with such a posting is ever sent to you. Career pages are not queued. A down server prints `discovery miss: unreachable`, and one that answers with an error or a reply that is not a result list prints `discovery miss: bad-reply`; either stores nothing; HTTP 429 from SearXNG stops the pass. One engine that SearXNG reports as rate limited, asking for a CAPTCHA or suspended doesn't: the pass goes on while other engines answer, names the throttled engines in its log line, and fails only when no query got an answer. After a failed pass the next one waits one `discovery.interval_minutes`, doubled for each further failure in a row, up to 24 hours. `doctor` shows the backoff with the command that ends it early, `careerhunter discover clear-backoff`. `careerhunter discover` runs one pass by hand and prints each new pending row. `careerhunter discover list` prints the pending rows again.
 
 ```bash
 make discover
@@ -461,7 +461,7 @@ uv run careerhunter migrate
 Expected output (the label and date will be yours):
 
 ```text
-search.db: applied nothing; schema version 36
+search.db: applied nothing; schema version 37
 ei_record_2026-27.db: created; schema version 4
 EI claim 2026-27 (from 2026-08-02)
 ```
@@ -480,7 +480,7 @@ config.yaml     OK
 exclusions.yaml OK
 ei claim        OK  2026-27 active (from 2026-08-02)
 timezone        OK  UTC
-search.db       OK  schema version 36
+search.db       OK  schema version 37
 search.db       OK  0600
 resume          --  not imported (optional: careerhunter resume import)
 lanes           OK  2 lanes; off-lane postings alert at high fit or better
@@ -1263,7 +1263,7 @@ Follow the nine steps above with the tag `v0.5.0` (`git checkout v0.5.0` in the 
 | `import file has N problem(s)` | The import file isn't a version 1 file, or isn't valid JSON | Each line names the problem. Compare with `import.example.json` |
 | `refusing to write until these are fixed: … Run: careerhunter claim seal …` | An earlier claim's record isn't sealed yet | See "When a claim ends" |
 | `claim … BAD the active claim has no record file` | You set a claim but haven't created its file | Run `uv run careerhunter migrate` |
-| `search.db BAD schema version 2, expected 36` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
+| `search.db BAD schema version 2, expected 37` | The code was updated and `search.db` hasn't caught up | Follow "Upgrading to a new release": stop the services, back up, then `uv run careerhunter migrate` from the release checkout, and install the services again |
 | `watch: aborted: …` in `logs/watch.log` | The run stopped before it finished: config, database, or the log itself | The rest of the line names the cause. Fix it; the next run starts over |
 | `run budget reached; left for the next run` | The run used its 600 seconds | Nothing to fix. The next run fetches those boards first |
 | `resume BAD the resume file does not match its import` | `resume/current.txt` was edited, or an import was interrupted | Run `uv run careerhunter resume import` again with your file |

@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 37)), "ei_record": [1, 2, 3, 4]}[track]
+    expected = {"search": list(range(1, 38)), "ei_record": [1, 2, 3, 4]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1458,7 +1458,7 @@ def test_search_0036_keeps_postings_and_adds_empty_columns(tmp_path: Path) -> No
             "VALUES (1, 'Analyst', '2026-09-01', 'manual')"
         )
         before = conn.execute("SELECT * FROM postings").fetchall()
-        assert db.migrate(conn, "search") == [36]
+        assert db.migrate(conn, "search", search[:36]) == [36]
         row = conn.execute(
             "SELECT jd_sha256, duplicate_of, referral FROM postings WHERE id = 1"
         ).fetchone()
@@ -1523,5 +1523,62 @@ def test_search_0036_checks_reread_failures(tmp_path: Path) -> None:
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute(insert, bad)
         conn.execute(insert, (1, 2, "http-403", stamp, stamp))
+    finally:
+        conn.close()
+
+
+# --- search 0037: a Lever board's region -------------------------------------------------
+
+
+def test_search_0037_keeps_rows_and_adds_a_null_region(tmp_path: Path) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:36])
+        conn.execute(
+            "INSERT INTO companies (name, ats_type, ats_slug, source) "
+            "VALUES ('Sample Logistics', 'lever', 'samplelogistics', 'manual')"
+        )
+        conn.execute(
+            "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, suggested_name, "
+            "status, first_seen) VALUES ('board', 'https://jobs.lever.co/samplelogistics', "
+            "'lever', 'samplelogistics', 'samplelogistics', 'pending', '2026-11-01')"
+        )
+        companies = [tuple(r) for r in conn.execute("SELECT * FROM companies")]
+        candidates = [tuple(r) for r in conn.execute("SELECT * FROM discovery_candidates")]
+        assert db.migrate(conn, "search") == [37]
+        after = [tuple(r) for r in conn.execute("SELECT * FROM companies")]
+        assert [row[: len(companies[0])] for row in after] == companies
+        after = [tuple(r) for r in conn.execute("SELECT * FROM discovery_candidates")]
+        assert [row[: len(candidates[0])] for row in after] == candidates
+        for table in ("companies", "discovery_candidates"):
+            assert conn.execute(f"SELECT ats_region FROM {table}").fetchone()[0] is None  # noqa: S608
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("table", ["companies", "discovery_candidates"])
+def test_search_0037_allows_eu_only_on_lever(tmp_path: Path, table: str) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search")
+        if table == "companies":
+            insert = (
+                "INSERT INTO companies (name, ats_type, ats_slug, ats_region, source) "
+                "VALUES (?, ?, 'exampleslug', ?, 'manual')"
+            )
+        else:
+            insert = (
+                "INSERT INTO discovery_candidates (url, kind, ats_type, ats_slug, ats_region, "
+                "suggested_name, status, first_seen) VALUES "
+                "(?, 'board', ?, 'exampleslug', ?, 'exampleslug', 'pending', '2026-11-01')"
+            )
+        for n, (ats, region) in enumerate(
+            (("lever", "us"), ("lever", "EU"), ("lever", ""), ("greenhouse", "eu"))
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(insert, (f"https://example.com/{n}", ats, region))
+        conn.execute(insert, ("https://example.com/ok", "lever", "eu"))
+        conn.execute(insert, ("https://example.com/none", "greenhouse", None))
     finally:
         conn.close()

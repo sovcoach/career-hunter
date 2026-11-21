@@ -33,6 +33,7 @@ def home(data_env: Path, probe: SystemProbe, monkeypatch: pytest.MonkeyPatch) ->
     doc = yaml.safe_load(path.read_text())
     doc["watchlist"] = []
     doc["discovery"]["searxng_url"] = "http://127.0.0.1:8888/search"
+    doc["discovery"]["result_pages"] = 1  # one request per query; paging is tested apart
     doc["discovery"]["interval_minutes"] = 60
     doc["discovery"]["queries_per_run"] = 2
     path.write_text(yaml.safe_dump(doc))

@@ -20,6 +20,7 @@ from tests.test_watch_ats import Posted
 CONFIG = {
     "discovery": {
         "searxng_url": "http://127.0.0.1:8888/search",
+        "result_pages": 1,
         "queries_per_run": 1,
         "career_hosts": ["jobs.example.com"],
     },
@@ -190,6 +191,7 @@ def test_the_watch_runs_pass_logs_its_queue_notes(
     doc = yaml.safe_load(path.read_text())
     doc["watchlist"] = []
     doc["discovery"]["searxng_url"] = "http://127.0.0.1:8888/search"
+    doc["discovery"]["result_pages"] = 1
     path.write_text(yaml.safe_dump(doc))
     (data_env / "exclusions.yaml").write_text("companies:\n  - newrobotics\n")
     monkeypatch.setattr(discover, "default_transport", lambda url, **kw: answer(NEW)(url))

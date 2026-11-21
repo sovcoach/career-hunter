@@ -30,15 +30,18 @@ def upsert_company(
     source: str = "manual",
     ats_host: str | None = None,
     ats_site: str | None = None,
+    ats_region: str | None = None,
 ) -> tuple[int, bool]:
     """The company's id, inserting it if new. Returns (id, inserted).
 
-    `ats_host` and `ats_site` are Workday's wdN host and site (search migration 0012).
+    `ats_host` and `ats_site` are Workday's wdN host and site (search migration 0012),
+    and `ats_region` a Lever board's region, None or "eu" (0037).
     """
     cur = conn.execute(
-        "INSERT INTO companies (name, ats_type, ats_slug, ats_host, ats_site, careers_url, "
-        "watchlist, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-        (name, ats_type, ats_slug, ats_host, ats_site, careers_url, watchlist, source),
+        "INSERT INTO companies (name, ats_type, ats_slug, ats_host, ats_site, ats_region, "
+        "careers_url, watchlist, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT DO NOTHING",
+        (name, ats_type, ats_slug, ats_host, ats_site, ats_region, careers_url, watchlist, source),
     )
     found = conn.execute("SELECT id FROM companies WHERE name = ?", (name,)).fetchone()
     return int(found["id"]), cur.rowcount == 1

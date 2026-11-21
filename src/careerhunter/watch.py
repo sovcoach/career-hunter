@@ -357,10 +357,12 @@ class _Aligned:
     stored_slug: str | None = None
     stored_host: str | None = None
     stored_site: str | None = None
+    stored_region: str | None = None
 
 
 class _Entry(NamedTuple):
-    """One watchlist entry. `host`, `site` and `facets` are Workday's only."""
+    """One watchlist entry. `host`, `site` and `facets` are Workday's only, and
+    `region` Lever's only."""
 
     name: str
     ats: str | None
@@ -369,11 +371,12 @@ class _Entry(NamedTuple):
     host: str | None = None
     site: str | None = None
     facets: ats_boards.Facets = ()
+    region: str | None = None
 
     def board(self) -> ats_boards.Board | None:
         if self.ats is None or not self.slug:
             return None
-        return ats_boards.Board(self.ats, self.slug, self.host, self.site)
+        return ats_boards.Board(self.ats, self.slug, self.host, self.site, self.region)
 
 
 def run(
@@ -746,7 +749,7 @@ def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -
         if board is not None:
             seen.add(board.key)
     rows = conn.execute(
-        "SELECT name, ats_type, ats_slug, ats_host, ats_site FROM companies "
+        "SELECT name, ats_type, ats_slug, ats_host, ats_site, ats_region FROM companies "
         "WHERE source = 'discovery' AND watchlist = 1 AND ats_type IS NOT NULL "
         "AND ats_slug IS NOT NULL AND length(trim(ats_slug)) > 0 "
         "ORDER BY id"
@@ -754,7 +757,10 @@ def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -
     for row in rows:
         host = None if row["ats_host"] is None else str(row["ats_host"])
         site = None if row["ats_site"] is None else str(row["ats_site"])
-        board = ats_boards.Board(str(row["ats_type"]), str(row["ats_slug"]).strip(), host, site)
+        region = None if row["ats_region"] is None else str(row["ats_region"])
+        board = ats_boards.Board(
+            str(row["ats_type"]), str(row["ats_slug"]).strip(), host, site, region
+        )
         if ats_boards.list_url(board) is None or board.key in seen:
             continue
         seen.add(board.key)
@@ -765,6 +771,8 @@ def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -
         }
         if board.ats == "workday":
             found.update(ats_host=host, ats_site=site)
+        if region is not None:
+            found.update(ats_region=region)
         items.append(found)
     return items
 
@@ -785,6 +793,7 @@ def _entry(item: object) -> _Entry | None:
         _stripped(item.get("ats_host")),
         _stripped(item.get("ats_site")),
         _facets(item.get("ats_facets")) if ats == "workday" else (),
+        _stripped(item.get("ats_region")) if ats == "lever" else None,
     )
 
 
@@ -836,7 +845,7 @@ def _watch_one(
     if ats == "workday" and not (entry.host and entry.site):
         lines.append(_line(name, ats, "no ats_host or ats_site; skipped"))
         return None
-    board = ats_boards.Board(ats, slug, entry.host, entry.site)
+    board = ats_boards.Board(ats, slug, entry.host, entry.site, entry.region)
     url = ats_boards.list_url(board)
     if url is None:
         why = (
@@ -878,6 +887,8 @@ def _watch_one(
             shown += (
                 f", ats_host={_shown(aligned.stored_host)}, ats_site={_shown(aligned.stored_site)}"
             )
+        if ats == "lever":
+            shown += f", ats_region={_shown(aligned.stored_region)}"
         lines.append(_line(name, ats, f"stored ats identity disagrees ({shown}); skipped"))
         return "failed"
     if ats == "workday":
@@ -1378,7 +1389,8 @@ def _recheck_one(
 # row (0034), is in neither.
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
-    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site "
+    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site, "
+    "c.ats_region "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
@@ -1390,7 +1402,8 @@ _NEVER_SCORED_SQL = (
 )
 _RESCORE_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
-    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site "
+    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site, "
+    "c.ats_region "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
@@ -1540,7 +1553,9 @@ def _posting_ref(row: sqlite3.Row) -> ats_boards.PostingRef | None:
     if ats and slug and key and ats != "workday":
         prefix = f"{ats}:{str(slug).casefold()}:"
         if str(key).startswith(prefix) and len(str(key)) > len(prefix):
-            board = ats_boards.Board(str(ats), str(slug), row["ats_host"], row["ats_site"])
+            board = ats_boards.Board(
+                str(ats), str(slug), row["ats_host"], row["ats_site"], row["ats_region"]
+            )
             return ats_boards.PostingRef(board, str(key)[len(prefix) :])
     return discovered_posting(str(row["url"])) if row["url"] else None
 
@@ -1833,12 +1848,16 @@ def _align(conn: sqlite3.Connection, name: str, board: ats_boards.Board) -> _Ali
 
     A disagreement writes nothing. Source is never changed. The caller runs this only
     after a board parsed, so a failed fetch leaves the company untouched. A Workday
-    company's identity includes its host and site.
+    company's identity includes its host and site, and a Lever company's its region: an
+    empty region is filled, and a stored "eu" for an entry without one is a
+    disagreement, like any other.
     """
     host = board.host if board.ats == "workday" else None
     site = board.site if board.ats == "workday" else None
+    region = board.region if board.ats == "lever" else None
     row = conn.execute(
-        "SELECT id, ats_type, ats_slug, ats_host, ats_site FROM companies WHERE name = ?",
+        "SELECT id, ats_type, ats_slug, ats_host, ats_site, ats_region FROM companies "
+        "WHERE name = ?",
         (name,),
     ).fetchone()
     if row is None:
@@ -1849,22 +1868,29 @@ def _align(conn: sqlite3.Connection, name: str, board: ats_boards.Board) -> _Ali
             ats_slug=board.slug,
             ats_host=host,
             ats_site=site,
+            ats_region=region,
             watchlist=1,
             source="watcher",
         )
         return _Aligned(True)
     stored = [
         value if isinstance(value, str) else None
-        for value in (row["ats_type"], row["ats_slug"], row["ats_host"], row["ats_site"])
+        for value in (
+            row["ats_type"],
+            row["ats_slug"],
+            row["ats_host"],
+            row["ats_site"],
+            row["ats_region"],
+        )
     ]
-    wanted = [board.ats, board.slug, host, site]
+    wanted = [board.ats, board.slug, host, site, region]
     if any(have is not None and have != want for have, want in zip(stored, wanted, strict=True)):
         return _Aligned(False, *stored)
     conn.execute(
         "UPDATE companies SET ats_type = coalesce(ats_type, ?), ats_slug = coalesce(ats_slug, ?), "
         "ats_host = coalesce(ats_host, ?), ats_site = coalesce(ats_site, ?), "
-        "watchlist = 1 WHERE id = ?",
-        (board.ats, board.slug, host, site, row["id"]),
+        "ats_region = coalesce(ats_region, ?), watchlist = 1 WHERE id = ?",
+        (board.ats, board.slug, host, site, region, row["id"]),
     )
     return _Aligned(True)
 
