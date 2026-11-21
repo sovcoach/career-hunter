@@ -936,6 +936,30 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
 
+## Upgrading from 0.10.0 to 0.11.0
+
+Follow the nine steps above with the tag `v0.11.0` (`git checkout v0.11.0` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 2:** after the backup, also take a read-only snapshot with the new release and check it, before any migration touches the data folder. Use a folder on an encrypted volume, outside the data folder and outside any git checkout:
+
+  ```bash
+  uv run careerhunter db snapshot --to /Volumes/ExampleDrive/Snapshots
+  ```
+
+  Every database line must say `integrity ok`; any other result stops the command, and the upgrade waits until it is fixed.
+- **Step 4:** no change is needed. If `discovery.queries_per_run` times `discovery.query_delay_seconds` is more than 60 seconds, the config is refused until you add `discovery.result_pages: 1` or ask fewer queries, since each query now reads 2 result pages by default.
+- **Step 6:** `migrate` applies search migrations 0036 and 0037 and EI migration 0005:
+
+  ```text
+  search.db: applied [36, 37]; schema version 37
+  ei_record_2026-27.db: applied [5]; schema version 5
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+- **Step 7:** optional, each once the upgrade is done: `uv run careerhunter locations fill --dry-run` lists the blank stored locations the kept files name, and `uv run careerhunter lanes reassign --dry-run` shows which stored titles the new Developer rule moves. Run either without `--dry-run` to write.
+
+Postings alerted before the upgrade have no kept job description: their `JD` button says so. Two postings of the same role stored before the upgrade are never merged.
+
 ## Upgrading from 0.9.0 to 0.10.0
 
 Follow the nine steps above with the tag `v0.10.0` (`git checkout v0.10.0` in the release checkout, then `uv sync --locked`). These steps differ:
