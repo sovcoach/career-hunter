@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 36)), "ei_record": [1, 2, 3, 4]}[track]
+    expected = {"search": list(range(1, 37)), "ei_record": [1, 2, 3, 4]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1419,7 +1419,7 @@ def test_search_0035_starts_with_no_board_status_and_checks_it(tmp_path: Path) -
         db.migrate(conn, "search", search[:34])
         conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
         companies = conn.execute("SELECT * FROM companies").fetchall()
-        assert db.migrate(conn, "search") == [35]
+        assert db.migrate(conn, "search", search[:35]) == [35]
         assert conn.execute("SELECT * FROM companies").fetchall() == companies
         assert conn.execute("SELECT count(*) FROM board_status").fetchone()[0] == 0
         insert = "INSERT INTO board_status VALUES (?, ?, ?, ?)"
@@ -1440,5 +1440,88 @@ def test_search_0035_starts_with_no_board_status_and_checks_it(tmp_path: Path) -
             "UPDATE board_status SET facet_status = 'unmatched', unmatched = "
             "'[\"Region: North\"]' WHERE company_id = 1"
         )
+    finally:
+        conn.close()
+
+
+# --- search 0036: re-read failures, the kept JD's hash, duplicates, referrals --------------
+
+
+def test_search_0036_keeps_postings_and_adds_empty_columns(tmp_path: Path) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:35])
+        conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (1, 'Analyst', '2026-09-01', 'manual')"
+        )
+        before = conn.execute("SELECT * FROM postings").fetchall()
+        assert db.migrate(conn, "search") == [36]
+        row = conn.execute(
+            "SELECT jd_sha256, duplicate_of, referral FROM postings WHERE id = 1"
+        ).fetchone()
+        assert tuple(row) == (None, None, 0)
+        after = conn.execute("SELECT * FROM postings").fetchall()
+        assert [tuple(r)[: len(tuple(before[0]))] for r in after] == [tuple(r) for r in before]
+        assert conn.execute("SELECT count(*) FROM reread_failures").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_search_0036_checks_the_new_columns(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search")
+        conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
+        for req in ("R-1", "R-2"):
+            conn.execute(
+                "INSERT INTO postings (company_id, title, requisition_id, first_seen, source) "
+                "VALUES (1, 'Analyst', ?, '2026-09-01', 'manual')",
+                (req,),
+            )
+        for bad_hash in ("abc", "A" * 64, "0f" * 32 + "0"):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute("UPDATE postings SET jd_sha256 = ? WHERE id = 1", (bad_hash,))
+        for bad in (
+            "UPDATE postings SET duplicate_of = 1 WHERE id = 1",
+            "UPDATE postings SET duplicate_of = 99 WHERE id = 2",
+            "UPDATE postings SET referral = 2 WHERE id = 1",
+            "UPDATE postings SET referral = NULL WHERE id = 1",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(bad)
+        conn.execute("UPDATE postings SET jd_sha256 = ? WHERE id IN (1, 2)", ("0f" * 32,))
+        conn.execute("UPDATE postings SET duplicate_of = 1, referral = 1 WHERE id = 2")
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(postings)")}
+        assert "ix_postings_duplicate_of" in indexes
+    finally:
+        conn.close()
+
+
+def test_search_0036_checks_reread_failures(tmp_path: Path) -> None:
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search")
+        conn.execute("INSERT INTO companies (name, source) VALUES ('Example Robotics', 'manual')")
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (1, 'Analyst', '2026-09-01', 'manual')"
+        )
+        insert = "INSERT INTO reread_failures VALUES (?, ?, ?, ?, ?)"
+        stamp = "2026-09-01T10:00:00Z"
+        for bad in (
+            (1, 0, "http-403", stamp, None),
+            (1, 1, "http-404", stamp, None),
+            (1, 1, "http-429", stamp, None),
+            (1, 1, "forbidden", stamp, None),
+            (1, 1, "http-403", "yesterday", None),
+            (1, 1, "http-403", stamp, "soon"),
+            (99, 1, "http-403", stamp, None),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(insert, bad)
+        conn.execute(insert, (1, 2, "http-403", stamp, stamp))
     finally:
         conn.close()
