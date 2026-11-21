@@ -317,6 +317,7 @@ def stale_run(doc: Mapping[str, Any] | None) -> dt.timedelta:
 
 
 LOCATION_UNKNOWN = "Location unknown"  # a posting whose board or page gave no location
+REFERRAL = "Referral"  # a posting the operator marked as a referral: local, needs no location
 _CAPS = {"company": 80, "title": 120, "location": 80, "lane": 60, "requirement": 60}
 MAX_URL = 1000
 _SCHEDULE_WORDS = {"on_call": "on call", "over_weekend_limit": "weekend days over your limit"}
@@ -357,8 +358,10 @@ def _digest_row(numbered: _Numbered) -> str:
     facts = []
     if fields.location.strip():
         facts.append(_clip(fields.location, _CAPS["location"]))
-    else:
+    elif not fields.referral:
         facts.append(LOCATION_UNKNOWN)
+    if fields.referral:
+        facts.append(REFERRAL)
     if numbered.entry.order.lane_line:
         facts.append(_clip(numbered.entry.order.lane_line, _CAPS["lane"]))
     facts.append(f"Fit: {_fit_label(fields.fit)}")
@@ -562,18 +565,31 @@ class _Stitch:
     parts: list[str]
     last: dt.datetime
     location: str | None = None
+    referral: bool = False
 
 
 _LOCATION_FIELD = re.compile(r"^location\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
 
 
-def _labelled_fields(extra: list[str]) -> tuple[list[str], str | None]:
-    """The positional fields after the link, and the `location: <city>` one, which may
-    go anywhere after the link. Only one location; an empty one is refused."""
+def _labelled_fields(extra: list[str]) -> tuple[list[str], str | None, bool]:
+    """The positional fields after the link, the `location: <city>` one and the
+    `referral` one, which may go anywhere after the link.
+
+    `referral` in the method's place of a full line (`| referral | today`) is the method,
+    which marks the posting as a referral anyway. Only one location and one referral;
+    an empty location is refused."""
+    unlabelled = [part for part in extra if _LOCATION_FIELD.match(part) is None]
+    method_slot = 0 if len(unlabelled) >= 2 and unlabelled[0].casefold() == "referral" else -1
     positional: list[str] = []
     location: str | None = None
+    referral = False
     for part in extra:
         match = _LOCATION_FIELD.match(part)
+        if match is None and part.casefold() == "referral" and len(positional) != method_slot:
+            if referral:
+                raise Refusal("Give referral once only.")
+            referral = True
+            continue
         if match is None:
             positional.append(part)
             continue
@@ -582,7 +598,7 @@ def _labelled_fields(extra: list[str]) -> tuple[list[str], str | None]:
         location = " ".join(match.group(1).split())
         if not location:
             raise Refusal("The location after location: is empty.")
-    return positional, location
+    return positional, location, referral
 
 
 def _log_format_problem(url: str, extra: list[str]) -> str | None:
@@ -616,7 +632,10 @@ def _log_fields(raw: object) -> dict[str, str]:
         raise Refusal("That button isn't recognized.")
     if not raw["url"] or not raw["company"] or not raw["title"]:
         raise Refusal("That button isn't recognized.")
-    return {k: str(raw[k]) for k in keys}
+    referral = raw.get("referral", "")  # absent on a button sent before Batch R
+    if referral not in ("", "1"):
+        raise Refusal("That button isn't recognized.")
+    return {**{k: str(raw[k]) for k in keys}, "referral": str(referral)}
 
 
 class Bot:
@@ -1277,6 +1296,7 @@ class Bot:
             doc,
             jd,
             stitch.location,
+            stitch.referral,
         )
         return "log:stitched"
 
@@ -1383,7 +1403,7 @@ class Bot:
         """
         parts = [p.strip() for p in rest.split("|")]
         url, extra = parts[0], parts[1:]
-        extra, location = _labelled_fields(extra)
+        extra, location, referral = _labelled_fields(extra)
         problem = _log_format_problem(url, extra)
         if problem is not None:
             raise Refusal(f"{problem} {LOG_USAGE}")
@@ -1406,12 +1426,12 @@ class Bot:
             raise Refusal(LINKEDIN_REFUSAL)
         if body is not None and method is not None and dating is not None:
             self._stitch = _Stitch(
-                url, method, dating, company, title, [body], self.clock(), location
+                url, method, dating, company, title, [body], self.clock(), location, referral
             )
             return
         jd = self._document_jd(document) if document is not None else None
         if method is not None and dating is not None:
-            self._log_now(url, method, dating, company, title, doc, jd, location)
+            self._log_now(url, method, dating, company, title, doc, jd, location, referral)
             return
         posting = self._describe(url, today, company, title, location)
         found = {
@@ -1419,6 +1439,7 @@ class Bot:
             "company": posting.company,
             "title": posting.title,
             "location": posting.location,
+            "referral": "1" if referral else "",
         }
         if method is None or dating is None:
             rows = [
@@ -1464,6 +1485,7 @@ class Bot:
         doc: dict[str, Any],
         jd: jobdesc.JobDescription | None,
         location: str | None = None,
+        referral: bool = False,
     ) -> None:
         """Fetch what the page shows, then record the /log with its JD, if any."""
         posting = self._describe(url, self._today(doc), company, title, location)
@@ -1472,6 +1494,7 @@ class Bot:
             "company": posting.company,
             "title": posting.title,
             "location": posting.location,
+            "referral": "1" if referral else "",
         }
         self._finish_log(found, method, dating, doc, jd)
 
@@ -1980,6 +2003,7 @@ class Bot:
                     self.fetcher,
                     jd,
                     lane_config=doc,
+                    referral=found.get("referral") == "1",
                 )
             except selfsourced.LogError as exc:
                 raise Refusal(str(exc)) from None
@@ -1997,6 +2021,7 @@ class Bot:
                 earlier=logged.earlier,
                 jd=state,
                 location=logged.location,
+                referral=logged.referral,
             )
 
     def _confirm(
@@ -2010,6 +2035,7 @@ class Bot:
         jd: str,
         earlier: str | None = None,
         location: str | None = None,
+        referral: bool = False,
     ) -> None:
         """`Recorded: … (ref aN).`, then the request for the JD when none was saved.
         With `location` (a /log), a `Location:` line follows, `unknown` when blank.
@@ -2029,6 +2055,8 @@ class Bot:
             text += " Job description saved."
         if location is not None:
             text += f"\nLocation: {location or 'unknown'}"
+        if referral:
+            text += f"\n{REFERRAL}"
         if earlier:
             text += "\n" + earlier
         message_id = self.send(text)

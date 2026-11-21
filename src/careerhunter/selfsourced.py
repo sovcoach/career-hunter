@@ -89,6 +89,7 @@ class Logged:
     jd_saved: bool = False  # a JD with text is in the record
     jd_file_without_text: bool = False  # a file was kept as the ad, but had no text
     location: str = ""  # the posting's location after this log; blank when unknown
+    referral: bool = False  # the posting is marked as a referral
 
 
 def earlier_line(search: sqlite3.Connection, company: str, title: str) -> str | None:
@@ -200,12 +201,15 @@ def record(
     jd: JobDescription | None = None,
     notes: str | None = None,
     lane_config: Mapping[str, Any] | None = None,
+    referral: bool = False,
 ) -> Logged:
     """Record the application, and the posting with it, in one ledger call.
 
     `jd` is a pasted or uploaded JD; without one, it is fetched when the host allows.
     `notes` go to search.db only (the import's notes). `lane_config` (config.yaml)
-    checks the posting against `search.lanes`, as the watcher would.
+    checks the posting against `search.lanes`, as the watcher would. `referral`, or the
+    method `referral`, marks the posting as a referral; the label never changes the
+    method.
     """
     if method not in enums.METHODS:
         raise LogError("That method isn't recognized.")
@@ -249,6 +253,9 @@ def record(
     if shown is not None and posting.location.strip():
         search_store.fill_posting_location(search, posting_id, posting.location)
         shown = search_store.posting_by_id(search, posting_id)
+    if referral or method == "referral":
+        search_store.mark_referral(search, posting_id)
+    marked = search.execute("SELECT referral FROM postings WHERE id = ?", (posting_id,)).fetchone()
     return Logged(
         company=shown.company if shown else posting.company,
         title=shown.title if shown else posting.title,
@@ -259,6 +266,7 @@ def record(
         jd_saved=saved is not None and saved.has_text,
         jd_file_without_text=saved is not None and not saved.has_text,
         location=shown.location if shown else posting.location,
+        referral=bool(marked and marked[0]),
     )
 
 

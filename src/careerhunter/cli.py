@@ -482,6 +482,7 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
                 fetch_page,
                 jd,
                 lane_config=doc,
+                referral=args.referral,
             )
     except jobdesc.JobDescError as exc:
         _err(f"error: {exc} Nothing was recorded.")
@@ -495,6 +496,8 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
     where = f"EI claim {logged.ei_claim}" if logged.ei_claim else "search.db only, no active claim"
     print(f"Recorded: {logged.company} — {logged.title} ({where}).")
     print(f"Location: {logged.location or 'unknown'}")
+    if logged.referral:
+        print("Referral: it counts as local and needs no location.")
     print("Job ad saved." if logged.snapshot_saved else "No copy of the job ad was saved.")
     if logged.jd_saved:
         print("Job description saved.")
@@ -1727,6 +1730,48 @@ def cmd_db(
     return EXIT_OK
 
 
+def cmd_referral(datadir: DataDir, args: argparse.Namespace) -> int:
+    """`referral --posting ID | --url LINK`: mark a stored posting as a referral. It then
+    counts as local and needs no location, and its alert says Referral. Writes
+    search.db only; a skip already stored for the posting stays."""
+    if (args.posting is None) == (args.url is None):
+        _err("error: give --posting or --url, not both")
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    conn = db.connect(datadir.search_db_path)
+    try:
+        db.migrate(conn, "search")
+        posting_id = (
+            args.posting
+            if args.posting is not None
+            else search_store.posting_id_by_link(conn, args.url)
+        )
+        row = (
+            None
+            if posting_id is None
+            else conn.execute(
+                "SELECT c.name AS company, p.title, p.referral, "
+                "(SELECT reason FROM skips s WHERE s.posting_id = p.id) AS skipped "
+                "FROM postings p JOIN companies c ON c.id = p.company_id WHERE p.id = ?",
+                (posting_id,),
+            ).fetchone()
+        )
+        if row is None or posting_id is None:
+            _err("error: no stored posting has that id or link")
+            return EXIT_ERROR
+        with db.transaction(conn):
+            marked = search_store.mark_referral(conn, posting_id)
+    finally:
+        conn.close()
+    what = f"posting {posting_id} ({row['company']} — {row['title']})"
+    print(f"{what} {'is now marked' if marked else 'was already marked'} as a referral.")
+    if row["skipped"]:
+        print(f"Its skip ({row['skipped']}) stays: a referral never undoes a skip.")
+    return EXIT_OK
+
+
 def cmd_locations(datadir: DataDir, args: argparse.Namespace) -> int:
     """`locations fill [--dry-run]`: blank stored locations, from the kept job ads and
     job descriptions (`locationfill`). Nothing is fetched. A dry run reads only. Without
@@ -2595,6 +2640,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--location",
         help="where the job is, when the page doesn't say or says it wrong (optional)",
     )
+    p.add_argument(
+        "--referral",
+        action="store_true",
+        help="mark the posting as a referral: it counts as local and needs no location",
+    )
     jd = p.add_mutually_exclusive_group()
     jd.add_argument(
         "--jd-file", metavar="PATH", help="the job description, as a PDF, HTML or text file"
@@ -2718,6 +2768,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="an existing folder outside the data folder and outside any git checkout",
     )
+    p = sub.add_parser(
+        "referral",
+        help="mark a stored posting as a referral: it counts as local and needs no location",
+    )
+    p.add_argument("--posting", type=int, metavar="ID", help="the posting's id in search.db")
+    p.add_argument("--url", help="the posting's link")
     p = sub.add_parser("locations", help="stored postings' locations")
     locations_sub = p.add_subparsers(dest="locations_action", required=True)
     p = locations_sub.add_parser(
@@ -2775,6 +2831,7 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "scout-prompt": cmd_scout_prompt,
     "lanes": cmd_lanes,
     "locations": cmd_locations,
+    "referral": cmd_referral,
     "resume": cmd_resume,
     "embed-eval": cmd_embed_eval,
     "doctor": cmd_doctor,

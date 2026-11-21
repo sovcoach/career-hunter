@@ -987,6 +987,7 @@ class DigestFields:
     fit: str | None
     gap_count: int | None  # None when the stored gaps are not a JSON list
     key_requirements: tuple[str, ...]
+    referral: bool = False
 
 
 def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[int, DigestFields]:
@@ -1002,7 +1003,7 @@ def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[
             SELECT p.id, c.name AS company, p.title, p.location, p.url, p.schedule, p.fit,
                    CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
                         THEN json_array_length(p.gaps) END AS gap_count,
-                   p.key_requirements
+                   p.key_requirements, p.referral
             FROM postings p JOIN companies c ON c.id = p.company_id
             WHERE p.id = ?
             """,
@@ -1020,6 +1021,7 @@ def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[
             fit=None if row["fit"] is None else str(row["fit"]),
             gap_count=None if row["gap_count"] is None else int(row["gap_count"]),
             key_requirements=_requirements(row["key_requirements"]),
+            referral=bool(row["referral"]),
         )
     return found
 
@@ -1583,6 +1585,15 @@ def posting_by_id(conn: sqlite3.Connection, posting_id: int) -> Posting | None:
 
 def set_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -> None:
     conn.execute("UPDATE postings SET snapshot_path = ? WHERE id = ?", (path, posting_id))
+
+
+def mark_referral(conn: sqlite3.Connection, posting_id: int) -> bool:
+    """Mark the posting as a referral (search migration 0036). True when it was not yet
+    one; a posting already marked is left as it is."""
+    cur = conn.execute(
+        "UPDATE postings SET referral = 1 WHERE id = ? AND referral = 0", (posting_id,)
+    )
+    return cur.rowcount == 1
 
 
 def fill_posting_location(conn: sqlite3.Connection, posting_id: int, location: str) -> bool:

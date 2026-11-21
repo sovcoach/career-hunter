@@ -1322,7 +1322,7 @@ def _recheck(
     roles = _roles(watchlist)
     rows = conn.execute(
         "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, "
-        "p.requisition_id, p.schedule, p.posted_date, p.first_seen FROM postings p "
+        "p.requisition_id, p.schedule, p.posted_date, p.first_seen, p.referral FROM postings p "
         "JOIN companies c ON c.id = p.company_id "
         "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
@@ -1365,6 +1365,7 @@ def _recheck_one(
             location=row["location"],
             work_model=row["work_model"],
             requisition_id=row["requisition_id"],
+            referral=bool(row["referral"]),
         ),
         config=config,
         exclusions=exclusions,
@@ -1396,6 +1397,7 @@ def _recheck_one(
 # row (0034), is in neither.
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
+    "p.referral, "
     "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site, "
     "c.ats_region "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
@@ -1409,6 +1411,7 @@ _NEVER_SCORED_SQL = (
 )
 _RESCORE_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
+    "p.referral, "
     "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site, "
     "c.ats_region "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
@@ -1446,6 +1449,7 @@ def _stored_text(row: sqlite3.Row) -> PostingText:
         location=row["location"],
         work_model=row["work_model"],
         requisition_id=row["requisition_id"],
+        referral=bool(row["referral"]),
     )
 
 
@@ -1613,6 +1617,7 @@ def _described(
         work_model=row["work_model"],
         description=job.description or "",  # read: an empty one is all the board has
         requisition_id=row["requisition_id"],
+        referral=bool(row["referral"]),
     )
 
 

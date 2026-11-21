@@ -38,9 +38,12 @@ against the location lists or a watchlist entry's `locations`, so neither skips 
 is scored and alerted as usual, and its alert says `Location unknown`. The same holds
 for a location that names only a country (with no remote or hybrid stated anywhere) or
 only a building, such as "Example Tower" (Batch R); their alerts show the location as
-given. Its description
-is still checked for office days elsewhere. (`empty_location` was a skip reason before
-0.10.0; skips already stored with it stay.)
+given. Its description is still checked for office days elsewhere. (`empty_location`
+was a skip reason before 0.10.0; skips already stored with it stay.)
+
+A referral (`postings.referral`, set by the operator) counts as local: inside the
+configured office area. The location rules, a watchlist entry's `locations` and the
+office-days check never skip it, and it needs no location.
 
 Seniority words match whole words of the title, ignoring case. The description is
 checked too only when `seniority_in_description` is true. `title_exceptions` and
@@ -158,6 +161,7 @@ class PostingText:
     work_model: str | None = None
     description: str | None = None
     requisition_id: str | None = None
+    referral: bool = False  # marked by the operator: counts as local, needs no location
 
 
 @dataclass(frozen=True)
@@ -411,7 +415,7 @@ def location_unknown(posting: PostingText) -> bool:
 
 
 def _location(posting: PostingText, rules: Mapping[str, Any]) -> str | None:
-    if not rules:
+    if not rules or posting.referral:  # a referral counts as local (Batch R)
         return None
     if not location_unknown(posting) and not _place_allowed(posting, rules):
         return "location_rule"
@@ -487,7 +491,12 @@ def _role(posting: PostingText, filters: Mapping[str, Any] | None) -> str | None
     if models and work_model is not None and work_model not in models:
         return "role_filter"
     places = _strings(filters.get("locations"))
-    if places and not location_unknown(posting) and not _any(posting.location, places):
+    if (
+        places
+        and not posting.referral
+        and not location_unknown(posting)
+        and not _any(posting.location, places)
+    ):
         return "role_filter"  # an unknown location is never a reason (Batch Q, R)
     return None
 
