@@ -196,3 +196,22 @@ def loose_match(title: str, variant: str) -> bool:
         len(words) > size and tuple(words[-size - 1 : -1]) == core and words[-1] in ROLE_WORDS
         for words in _segments(title)
     )
+
+
+# The "Junior/Entry ... Developer" rule (Batch R): a lane variant that is a junior or
+# entry-level word and "Developer" ("Junior Developer", "Entry Level Developer")
+# matches a title with such a word, then up to DEVELOPER_GAP words, then "Developer":
+# "Junior Java Developer", "Entry-Level Full Stack Developer", "Jr. .NET Developer".
+DEVELOPER_GAP = 3
+_JUNIOR = r"(?:junior|jr\.?|entry[\s-]+level|entry)"
+_JUNIOR_VARIANT = re.compile(rf"^\s*{_JUNIOR}\s+developer\s*$", re.IGNORECASE)
+_JUNIOR_TITLE = re.compile(
+    rf"(?<![\w-]){_JUNIOR}(?:\s+[\w+#./]+(?:-[\w+#./]+)*){{0,{DEVELOPER_GAP}}}?\s+developer(?![\w-])",
+    re.IGNORECASE,
+)
+
+
+def junior_developer_match(title: str, variant: str) -> bool:
+    """True when `variant` is a junior or entry-level Developer and `title` is one too,
+    with up to DEVELOPER_GAP words between the level word and "Developer"."""
+    return bool(_JUNIOR_VARIANT.match(variant)) and _JUNIOR_TITLE.search(title) is not None
