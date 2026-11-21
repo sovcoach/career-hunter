@@ -170,6 +170,9 @@ DATE_BUTTONS = [
     ("Other date", "other"),
 ]
 LATER_STATUSES = [s for s in enums.STATUSES if s != "applied"]
+STATUS_WORDS = "The statuses are: " + ", ".join(s.replace("_", " ") for s in LATER_STATUSES) + "."
+STATUS_PAGE = 10  # applications per /status picker page
+DATE_SHAPE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # Telegram refusing one posting sent alone this many times gives it up (#42).
 REFUSALS_TO_GIVE_UP = 3
@@ -1551,39 +1554,130 @@ class Bot:
             raise Refusal(str(exc)) from None
 
     def _cmd_status(self, rest: str) -> None:
+        """`/status <ref> <status> [YYYY-MM-DD]`, or the application named by company or
+        title words in place of the ref (Batch R), or just `/status` for a picker that
+        pages through every application. Words that match more than one application, or
+        no status word, get the matching applications as buttons, with the status words."""
         parts = rest.split()
+        if not parts:
+            self._status_page(0)
+            return
+        ref = parts[0].lower()
         with self._search() as search:
-            if not parts:
-                rows = search_store.recent_applications(search, 10)
-                if not rows:
-                    raise Refusal("No applications yet.")
-                buttons = [
-                    [
-                        (
-                            f"{self._ref(search, int(r['id']))} {r['company']} — {r['title']}"[:60],
-                            "status_pick",
-                            {"application_id": int(r["id"])},
-                        )
-                    ]
-                    for r in rows
-                ]
-                self._keyboard(search, "Which application?", buttons, STEP_TTL)
-                return
-            if len(parts) not in (2, 3):
+            application_id = self._resolve_ref(search, ref)
+            if application_id is None and REF_SHAPE.fullmatch(ref):
                 raise Refusal(
-                    "Send: /status <ref> <status> [YYYY-MM-DD], or just /status to choose."
+                    "I don't know that reference. Send /recent for current ones, or "
+                    "/status <company or title words>."
                 )
-            ref, status = parts[0].lower(), enums.normalize(parts[1])
+            if application_id is not None and len(parts) == 1:  # the ref alone
+                rows = [
+                    [(_words(s), "status_set", {"application_id": application_id, "status": s})]
+                    for s in LATER_STATUSES
+                ]
+                self._keyboard(search, "New status?", rows, STEP_TTL)
+                return
+        if application_id is not None and len(parts) in (2, 3):
+            status = enums.normalize(parts[1])
             if status not in LATER_STATUSES:
                 raise Refusal("The status must be one of: " + ", ".join(LATER_STATUSES))
-            application_id = self._resolve_ref(search, ref)
-        if application_id is None:
-            raise Refusal("I don't know that reference. Send /recent for current ones.")
-        day = None
-        if len(parts) == 3:
-            dating = parse_date(parts[2], self._today(self._config()))
-            day = dt.date.fromisoformat(str(dating.day))
-        self._finish_status(application_id, status, day)
+            day = self._status_day(parts[2]) if len(parts) == 3 else None
+            self._finish_status(application_id, status, day)
+            return
+        self._status_by_words(rest)
+
+    def _status_day(self, text: str) -> dt.date:
+        dating = parse_date(text, self._today(self._config()))
+        return dt.date.fromisoformat(str(dating.day))
+
+    def _status_page(self, offset: int) -> None:
+        """STATUS_PAGE applications, newest first, from `offset`, with More… after them."""
+        with self._search() as search:
+            rows = search_store.recent_applications(search, STATUS_PAGE, offset)
+            total = search_store.application_count(search)
+            if not rows:
+                raise Refusal("No applications yet." if offset == 0 else "No more applications.")
+            buttons = self._status_buttons(search, rows, None, None)
+            if offset + STATUS_PAGE < total:
+                buttons.append([("More…", "status_page", {"offset": offset + STATUS_PAGE})])
+            shown = f"{offset + 1} to {offset + len(rows)} of {total}"
+            self._keyboard(
+                search,
+                f"Which application? ({shown}; or send /status <company or title words>)",
+                buttons,
+                STEP_TTL,
+            )
+
+    def _status_buttons(
+        self,
+        search: sqlite3.Connection,
+        rows: list[sqlite3.Row],
+        status: str | None,
+        day: dt.date | None,
+    ) -> list[list[tuple[str, str, dict[str, Any]]]]:
+        """One button per application: to the status buttons, or, with a status already
+        given, straight to recording it."""
+        buttons = []
+        for r in rows:
+            label = f"{self._ref(search, int(r['id']))} {r['company']} — {r['title']}"[:60]
+            payload: dict[str, Any] = {"application_id": int(r["id"])}
+            if day is not None:
+                payload["day"] = day.isoformat()
+            if status is None:
+                buttons.append([(label, "status_pick", payload)])
+            else:
+                buttons.append([(label, "status_set", {**payload, "status": status})])
+        return buttons
+
+    def _status_by_words(self, rest: str) -> None:
+        """The application named by words, with an optional status word and date."""
+        status, day, words = self._status_parts(rest)
+        with self._search() as search:
+            found = search_store.matching_applications(search, words)
+            best = [row for row, score in found if score == len(words)]
+            if status is not None and len(best) == 1 and words:
+                application_id = int(best[0]["id"])
+            else:
+                application_id = None
+                rows = [row for row, _ in found[:STATUS_PAGE]]
+                if not rows:
+                    raise Refusal(
+                        "No application matches those words. Send /status to choose, or "
+                        "/status <ref> <status>. " + STATUS_WORDS
+                    )
+                if status is None:
+                    text = "Which application? " + STATUS_WORDS
+                else:
+                    text = f"Which application gets {_words(status)}?"
+                self._keyboard(
+                    search, text, self._status_buttons(search, rows, status, day), STEP_TTL
+                )
+        if application_id is not None and status is not None:
+            self._finish_status(application_id, status, day)
+
+    def _status_parts(self, rest: str) -> tuple[str | None, dt.date | None, list[str]]:
+        """The status word (one word or two, as `position closed`), the date and the
+        other words of a free-text /status line. Punctuation around words is dropped."""
+        tokens = [t.strip(".,;:!?()[]\"'") for t in rest.split()]
+        tokens = [t for t in tokens if t]
+        status: str | None = None
+        day: dt.date | None = None
+        used: set[int] = set()
+        for i in range(len(tokens)):
+            for width in (3, 2, 1):
+                if status is not None or i + width > len(tokens):
+                    continue
+                candidate = enums.normalize(" ".join(tokens[i : i + width]))
+                if candidate in LATER_STATUSES:
+                    status = candidate
+                    used.update(range(i, i + width))
+        for i, token in enumerate(tokens):
+            if i not in used and DATE_SHAPE.fullmatch(token):
+                day = self._status_day(token)
+                used.add(i)
+                break
+        words = [t for i, t in enumerate(tokens) if i not in used]
+        return status, day, words
 
     def _cmd_activity(self, rest: str) -> None:
         kind_text, _, remainder = rest.partition(" ")
@@ -1927,14 +2021,19 @@ class Bot:
                         {"posting_id": p["posting_id"], "skip_id": skip_id},
                     )
         elif action == "status_pick":
-            rows = [
-                [(_words(s), "status_set", {"application_id": p["application_id"], "status": s})]
-                for s in LATER_STATUSES
-            ]
+            kept: dict[str, Any] = {k: p[k] for k in ("application_id", "day") if k in p}
+            rows = [[(_words(s), "status_set", {**kept, "status": s})] for s in LATER_STATUSES]
             with self._search() as search:
                 self._keyboard(search, "New status?", rows, STEP_TTL)
         elif action == "status_set":
-            self._finish_status(int(p["application_id"]), str(p["status"]))
+            day = p.get("day")
+            when = dt.date.fromisoformat(day) if isinstance(day, str) else None
+            self._finish_status(int(p["application_id"]), str(p["status"]), when)
+        elif action == "status_page":
+            offset = p.get("offset")
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise Refusal("That button isn't recognized.")
+            self._status_page(offset)
         elif action in ("discover_approve", "discover_reject"):
             decision = "approve" if action == "discover_approve" else "reject"
             self._finish_discovery(p.get("candidate_id"), decision)

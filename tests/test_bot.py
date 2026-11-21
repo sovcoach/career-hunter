@@ -941,10 +941,10 @@ def test_status_by_reference_lands_in_both_layers(env: Env) -> None:
     ("command", "message"),
     [
         ("/status a99 offer", "I don't know that reference"),
-        ("/status 1 offer", "I don't know that reference"),  # never a database id
+        ("/status 1 offer", "No application matches those words"),  # never a database id
         ("/status a1 ghosted", "The status must be one of"),
         ("/status a1 applied", "The status must be one of"),
-        ("/status a1", "Send: /status <ref> <status>"),
+        ("/status a1", "New status?"),  # the ref alone: its status buttons (Batch R)
     ],
 )
 def test_bad_status_requests(env: Env, command: str, message: str) -> None:

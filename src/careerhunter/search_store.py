@@ -1801,8 +1801,11 @@ def set_embedding_score(conn: sqlite3.Connection, posting_id: int, score: float 
     )
 
 
-def recent_applications(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row]:
-    """The latest applications, newest first, with company, title and current status."""
+def recent_applications(
+    conn: sqlite3.Connection, limit: int = 10, offset: int = 0
+) -> list[sqlite3.Row]:
+    """The latest applications, newest first, with company, title and current status;
+    `offset` skips that many first, for a picker's next page."""
     rows: list[sqlite3.Row] = conn.execute(
         """
         SELECT a.id, a.correlation_id, a.ei_claim, c.name AS company, p.title, p.url,
@@ -1811,11 +1814,40 @@ def recent_applications(conn: sqlite3.Connection, limit: int = 10) -> list[sqlit
         FROM applications a
         JOIN postings p ON p.id = a.posting_id
         JOIN companies c ON c.id = p.company_id
-        ORDER BY a.id DESC LIMIT ?
+        ORDER BY a.id DESC LIMIT ? OFFSET ?
         """,
-        (limit,),
+        (limit, offset),
     ).fetchall()
     return rows
+
+
+def application_count(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT count(*) FROM applications").fetchone()[0])
+
+
+_WORD = re.compile(r"[\w&+#.-]+")
+
+
+def _folded_words(text: str) -> set[str]:
+    return {w.strip(".-").casefold() for w in _WORD.findall(text) if w.strip(".-")}
+
+
+def matching_applications(
+    conn: sqlite3.Connection, words: Sequence[str]
+) -> list[tuple[sqlite3.Row, int]]:
+    """Applications whose company or title has any of `words` (case folded), each with
+    how many of the words it has: the most first, then the newest."""
+    wanted = [w.casefold() for w in words if w.strip()]
+    if not wanted:
+        return []
+    found: list[tuple[sqlite3.Row, int]] = []
+    for row in recent_applications(conn, limit=-1):
+        have = _folded_words(f"{row['company']} {row['title']}")
+        score = sum(1 for w in wanted if w in have)
+        if score:
+            found.append((row, score))
+    found.sort(key=lambda item: (-item[1], -int(item[0]["id"])))
+    return found
 
 
 def application_summary(conn: sqlite3.Connection, application_id: int) -> sqlite3.Row | None:
