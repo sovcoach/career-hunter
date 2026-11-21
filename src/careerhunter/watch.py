@@ -144,12 +144,12 @@ import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, NoReturn, Self, SupportsIndex
 
 from careerhunter import ats as ats_boards
-from careerhunter import db, filters, lanes, loopback, search_store
+from careerhunter import db, duplicates, filters, jobdesc, lanes, locations, loopback, search_store
 from careerhunter import discover as discovery
 from careerhunter.ats import (
     BoardHTTPError,
@@ -194,6 +194,10 @@ PARSE_FAILURES_TO_GIVE_UP = 3
 # Scoring calls for one posting that timed out in a row before the watcher sets it aside
 # (search migration 0034), until `careerhunter rescore --set-aside`.
 TIMEOUTS_TO_SET_ASIDE = 2
+# Failed re-reads of a posting's board page in a row (anything but HTTP 404, 410 or 429)
+# before it is set aside (search migration 0036), until `careerhunter rescore
+# --set-aside`; a re-read that works clears the count.
+REREADS_TO_SET_ASIDE = 2
 # A run whose scoring calls all timed out records an lm_studio failure from this many.
 TIMEOUT_RUN_CALLS = 2
 # Inline scoring of new postings stops once less than this is left of the budget.
@@ -279,6 +283,7 @@ class _State:
     # Ashby boards read this run for a description, by board key: the jobs by their id.
     # In memory only, like every description.
     ashby: dict[str, dict[str, Job]] = field(default_factory=dict)
+    data_dir: Path | None = None  # where a kept job description is saved (snapshots/)
     # Stored postings met on their board this run, with the description it sent.
     met: dict[int, PostingText] = field(default_factory=dict)
 
@@ -357,10 +362,12 @@ class _Aligned:
     stored_slug: str | None = None
     stored_host: str | None = None
     stored_site: str | None = None
+    stored_region: str | None = None
 
 
 class _Entry(NamedTuple):
-    """One watchlist entry. `host`, `site` and `facets` are Workday's only."""
+    """One watchlist entry. `host`, `site` and `facets` are Workday's only, and
+    `region` Lever's only."""
 
     name: str
     ats: str | None
@@ -369,11 +376,12 @@ class _Entry(NamedTuple):
     host: str | None = None
     site: str | None = None
     facets: ats_boards.Facets = ()
+    region: str | None = None
 
     def board(self) -> ats_boards.Board | None:
         if self.ats is None or not self.slug:
             return None
-        return ats_boards.Board(self.ats, self.slug, self.host, self.site)
+        return ats_boards.Board(self.ats, self.slug, self.host, self.site, self.region)
 
 
 def run(
@@ -432,6 +440,7 @@ def run(
         lanes_on=lanes.configured(rules) is not None,
         max_age=max_posting_age_days(rules),
         today=today,
+        data_dir=data_dir,
         score_timeout=float(scoring_timeout_seconds(rules)),
         boards=boards_budget,
     )
@@ -746,7 +755,7 @@ def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -
         if board is not None:
             seen.add(board.key)
     rows = conn.execute(
-        "SELECT name, ats_type, ats_slug, ats_host, ats_site FROM companies "
+        "SELECT name, ats_type, ats_slug, ats_host, ats_site, ats_region FROM companies "
         "WHERE source = 'discovery' AND watchlist = 1 AND ats_type IS NOT NULL "
         "AND ats_slug IS NOT NULL AND length(trim(ats_slug)) > 0 "
         "ORDER BY id"
@@ -754,7 +763,10 @@ def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -
     for row in rows:
         host = None if row["ats_host"] is None else str(row["ats_host"])
         site = None if row["ats_site"] is None else str(row["ats_site"])
-        board = ats_boards.Board(str(row["ats_type"]), str(row["ats_slug"]).strip(), host, site)
+        region = None if row["ats_region"] is None else str(row["ats_region"])
+        board = ats_boards.Board(
+            str(row["ats_type"]), str(row["ats_slug"]).strip(), host, site, region
+        )
         if ats_boards.list_url(board) is None or board.key in seen:
             continue
         seen.add(board.key)
@@ -765,6 +777,8 @@ def _with_discovery_boards(conn: sqlite3.Connection, watchlist: Sequence[Any]) -
         }
         if board.ats == "workday":
             found.update(ats_host=host, ats_site=site)
+        if region is not None:
+            found.update(ats_region=region)
         items.append(found)
     return items
 
@@ -785,6 +799,7 @@ def _entry(item: object) -> _Entry | None:
         _stripped(item.get("ats_host")),
         _stripped(item.get("ats_site")),
         _facets(item.get("ats_facets")) if ats == "workday" else (),
+        _stripped(item.get("ats_region")) if ats == "lever" else None,
     )
 
 
@@ -836,7 +851,7 @@ def _watch_one(
     if ats == "workday" and not (entry.host and entry.site):
         lines.append(_line(name, ats, "no ats_host or ats_site; skipped"))
         return None
-    board = ats_boards.Board(ats, slug, entry.host, entry.site)
+    board = ats_boards.Board(ats, slug, entry.host, entry.site, entry.region)
     url = ats_boards.list_url(board)
     if url is None:
         why = (
@@ -878,6 +893,8 @@ def _watch_one(
             shown += (
                 f", ats_host={_shown(aligned.stored_host)}, ats_site={_shown(aligned.stored_site)}"
             )
+        if ats == "lever":
+            shown += f", ats_region={_shown(aligned.stored_region)}"
         lines.append(_line(name, ats, f"stored ats identity disagrees ({shown}); skipped"))
         return "failed"
     if ats == "workday":
@@ -1173,6 +1190,13 @@ def _record_jobs(
                 _line(name, ats, f"{item.title!r} has neither a url nor a requisition id; skipped")
             )
             continue
+        if not item.location.strip() and item.description:
+            found_location = locations.from_text(item.description)
+            if found_location:  # the board gave none: its description's Location: line
+                item = replace(item, location=found_location)
+                lines.append(
+                    _line(name, ats, f"{item.title!r}: location read from its description")
+                )
         company, differed = _company_name(item.company_field, name)
         if differed is not None and differed.casefold() not in mismatches:
             mismatches.add(differed.casefold())
@@ -1304,7 +1328,7 @@ def _recheck(
     roles = _roles(watchlist)
     rows = conn.execute(
         "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, "
-        "p.requisition_id, p.schedule, p.posted_date, p.first_seen FROM postings p "
+        "p.requisition_id, p.schedule, p.posted_date, p.first_seen, p.referral FROM postings p "
         "JOIN companies c ON c.id = p.company_id "
         "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
@@ -1347,6 +1371,7 @@ def _recheck_one(
             location=row["location"],
             work_model=row["work_model"],
             requisition_id=row["requisition_id"],
+            referral=bool(row["referral"]),
         ),
         config=config,
         exclusions=exclusions,
@@ -1375,10 +1400,12 @@ def _recheck_one(
 # re-score passes keep never-tried first, then the oldest attempt, then the oldest
 # posting. A posting given up after PARSE_FAILURES_TO_GIVE_UP replies that did not
 # parse (search migration 0023), or set aside after TIMEOUTS_TO_SET_ASIDE timeouts in a
-# row (0034), is in neither.
+# row (0034) or REREADS_TO_SET_ASIDE failed re-reads in a row (0036), is in neither.
 _NEVER_SCORED_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
-    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site "
+    "p.referral, "
+    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site, "
+    "c.ats_region "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
@@ -1386,20 +1413,27 @@ _NEVER_SCORED_SQL = (
     "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
     "AND NOT EXISTS (SELECT 1 FROM score_timeouts t "
     "WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL) "
+    "AND NOT EXISTS (SELECT 1 FROM reread_failures r "
+    "WHERE r.posting_id = p.id AND r.set_aside_at IS NOT NULL) "
     "ORDER BY coalesce(p.score_attempted_at, p.created_at), p.id"
 )
 _RESCORE_SQL = (
     "SELECT p.id, c.name AS company, p.title, p.location, p.work_model, p.requisition_id, "
-    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site "
+    "p.referral, "
+    "p.schedule, p.url, p.ats_key, c.ats_type, c.ats_slug, c.ats_host, c.ats_site, "
+    "c.ats_region "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of) "
     "AND NOT EXISTS (SELECT 1 FROM score_parse_failures f "
     "WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) "
     "AND NOT EXISTS (SELECT 1 FROM score_timeouts t "
     "WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL) "
+    "AND NOT EXISTS (SELECT 1 FROM reread_failures r "
+    "WHERE r.posting_id = p.id AND r.set_aside_at IS NOT NULL) "
     "ORDER BY p.score_attempted_at IS NOT NULL, p.score_attempted_at, p.first_seen, p.id"
 )
 _NEEDS_RESCORE_SQL = (
@@ -1407,7 +1441,8 @@ _NEEDS_RESCORE_SQL = (
     "WHERE p.id = ? AND p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
     "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
-    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)"
+    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of)"
 )
 
 
@@ -1426,6 +1461,7 @@ def _stored_text(row: sqlite3.Row) -> PostingText:
         location=row["location"],
         work_model=row["work_model"],
         requisition_id=row["requisition_id"],
+        referral=bool(row["referral"]),
     )
 
 
@@ -1540,7 +1576,9 @@ def _posting_ref(row: sqlite3.Row) -> ats_boards.PostingRef | None:
     if ats and slug and key and ats != "workday":
         prefix = f"{ats}:{str(slug).casefold()}:"
         if str(key).startswith(prefix) and len(str(key)) > len(prefix):
-            board = ats_boards.Board(str(ats), str(slug), row["ats_host"], row["ats_site"])
+            board = ats_boards.Board(
+                str(ats), str(slug), row["ats_host"], row["ats_site"], row["ats_region"]
+            )
             return ats_boards.PostingRef(board, str(key)[len(prefix) :])
     return discovered_posting(str(row["url"])) if row["url"] else None
 
@@ -1570,14 +1608,20 @@ def _described(
     except BoardHTTPError as exc:
         if exc.status in (404, 410):
             job = None
-        else:
-            if exc.status == 429:
-                gate.blocked.add(urllib.parse.urlsplit(exc.url).hostname or host)
+        elif exc.status == 429:
+            gate.blocked.add(urllib.parse.urlsplit(exc.url).hostname or host)
             state.lines.append(_line(name, ats, f"{title}: HTTP {exc.status}; {_UNREAD}"))
             return None
+        else:
+            reason = _reread_reason(exc.status)
+            _reread_failed(conn, state, posting_id, reason, name, ats, title, f"HTTP {exc.status}")
+            return None
     except (FetchError, BoardParseError) as exc:
-        state.lines.append(_line(name, ats, f"{title}: {type(exc).__name__}; {_UNREAD}"))
+        reason = "parse" if isinstance(exc, BoardParseError) else "fetch-error"
+        _reread_failed(conn, state, posting_id, reason, name, ats, title, type(exc).__name__)
         return None
+    with db.transaction(conn):
+        search_store.clear_reread_failures(conn, posting_id)
     if job is None:
         with db.transaction(conn):
             if not search_store.posting_has_skip(conn, posting_id):
@@ -1591,10 +1635,47 @@ def _described(
         work_model=row["work_model"],
         description=job.description or "",  # read: an empty one is all the board has
         requisition_id=row["requisition_id"],
+        referral=bool(row["referral"]),
     )
 
 
 _UNREAD = "description not read; left for the next run"
+
+
+def _reread_reason(status: int) -> str:
+    if status == 403:
+        return "http-403"
+    return "http-5xx" if status >= 500 else "http-4xx"
+
+
+def _reread_failed(
+    conn: sqlite3.Connection,
+    state: _State,
+    posting_id: int,
+    reason: str,
+    name: str,
+    ats: str | None,
+    title: str,
+    what: str,
+) -> None:
+    """Count a failed re-read (not gone, not throttled), shown in the log as `what`.
+    After REREADS_TO_SET_ASIDE in a row the posting is set aside, not counted as gone,
+    until `rescore --set-aside`."""
+    with db.transaction(conn):
+        aside = search_store.record_reread_failure(
+            conn, posting_id, reason, _iso(state.now()), set_aside_after=REREADS_TO_SET_ASIDE
+        )
+    if aside:
+        state.lines.append(
+            _line(
+                name,
+                ats,
+                f"{title}: {what}; set aside after {REREADS_TO_SET_ASIDE} failed re-reads "
+                f"({reason}), not counted as gone, until careerhunter rescore --set-aside",
+            )
+        )
+    else:
+        state.lines.append(_line(name, ats, f"{title}: {what}; {_UNREAD}"))
 
 
 def _read_again(
@@ -1769,9 +1850,54 @@ def _attempt(
             lines.append(_line(name, ats, f"{title} skipped (gap_tier)"))
         elif rescore:
             lines.append(_line(name, ats, f"{title} re-scored"))
+        if fit in ("medium", "high") and not result.excluded:
+            _keep_jd(conn, state, posting_id, posting, name, ats, title)
     reason = embedder.attach(posting_id, posting)
     if reason is not None:
         lines.append(miss_line(posting_id, reason))
+
+
+def _keep_jd(
+    conn: sqlite3.Connection,
+    state: _State,
+    posting_id: int,
+    posting: PostingText,
+    name: str,
+    ats: str | None,
+    title: str,
+) -> None:
+    """Keep the description a posting the bot may alert was scored on (Batch R), as a
+    `.txt` snapshot with its normalized hash, so the alert's JD button and an Applied
+    tap have it. Kept again only when its text changed. A failed write is logged and
+    changes nothing else."""
+    text = (posting.description or "").strip()
+    if state.data_dir is None or not text:
+        return
+    digest = jobdesc.normalized_sha256(text)
+    kept = search_store.kept_jd(conn, posting_id)
+    if kept is not None and kept[1] == digest:
+        return
+    try:
+        jd = jobdesc.from_paste(text)
+        saved = jobdesc.save(
+            state.data_dir,
+            replace(jd, source="fetched"),
+            dt.date.fromisoformat(state.today) if state.today else state.now().date(),
+        )
+    except (jobdesc.JobDescError, OSError, ValueError) as exc:
+        state.lines.append(
+            _line(name, ats, f"{title}: job description not kept ({type(exc).__name__})")
+        )
+        return
+    with db.transaction(conn):
+        search_store.keep_jd(conn, posting_id, saved.path, digest)
+        original = duplicates.find_original(conn, state.data_dir, posting_id, text)
+        if original is not None:
+            duplicates.mark(conn, posting_id, original)
+    if original is not None:
+        state.lines.append(
+            _line(name, ats, f"{title}: the same role as posting {original}; alerted with it")
+        )
 
 
 def _type_of(exc: BaseException) -> str:
@@ -1833,12 +1959,16 @@ def _align(conn: sqlite3.Connection, name: str, board: ats_boards.Board) -> _Ali
 
     A disagreement writes nothing. Source is never changed. The caller runs this only
     after a board parsed, so a failed fetch leaves the company untouched. A Workday
-    company's identity includes its host and site.
+    company's identity includes its host and site, and a Lever company's its region: an
+    empty region is filled, and a stored "eu" for an entry without one is a
+    disagreement, like any other.
     """
     host = board.host if board.ats == "workday" else None
     site = board.site if board.ats == "workday" else None
+    region = board.region if board.ats == "lever" else None
     row = conn.execute(
-        "SELECT id, ats_type, ats_slug, ats_host, ats_site FROM companies WHERE name = ?",
+        "SELECT id, ats_type, ats_slug, ats_host, ats_site, ats_region FROM companies "
+        "WHERE name = ?",
         (name,),
     ).fetchone()
     if row is None:
@@ -1849,22 +1979,29 @@ def _align(conn: sqlite3.Connection, name: str, board: ats_boards.Board) -> _Ali
             ats_slug=board.slug,
             ats_host=host,
             ats_site=site,
+            ats_region=region,
             watchlist=1,
             source="watcher",
         )
         return _Aligned(True)
     stored = [
         value if isinstance(value, str) else None
-        for value in (row["ats_type"], row["ats_slug"], row["ats_host"], row["ats_site"])
+        for value in (
+            row["ats_type"],
+            row["ats_slug"],
+            row["ats_host"],
+            row["ats_site"],
+            row["ats_region"],
+        )
     ]
-    wanted = [board.ats, board.slug, host, site]
+    wanted = [board.ats, board.slug, host, site, region]
     if any(have is not None and have != want for have, want in zip(stored, wanted, strict=True)):
         return _Aligned(False, *stored)
     conn.execute(
         "UPDATE companies SET ats_type = coalesce(ats_type, ?), ats_slug = coalesce(ats_slug, ?), "
         "ats_host = coalesce(ats_host, ?), ats_site = coalesce(ats_site, ?), "
-        "watchlist = 1 WHERE id = ?",
-        (board.ats, board.slug, host, site, row["id"]),
+        "ats_region = coalesce(ats_region, ?), watchlist = 1 WHERE id = ?",
+        (board.ats, board.slug, host, site, region, row["id"]),
     )
     return _Aligned(True)
 

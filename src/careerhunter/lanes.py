@@ -15,7 +15,10 @@ matches a posting with that core and any role word of the group, ignoring level 
 (junior, senior, I to IV, "level N", ...) and after comma inversion ("Analyst, Client
 Experience" is "Client Experience Analyst"). The role word must end the title or come
 before a separator (comma, dash, bracket), so "IT Support Associate Manager" is not an
-"IT Support Specialist". A one-word core ("Data Analyst") only matches literally.
+"IT Support Specialist". A one-word core ("Data Analyst") only matches literally. A
+variant that is a junior or entry-level word and "Developer" ("Junior Developer")
+matches a title with such a word, up to three words, then "Developer" ("Junior Java
+Developer", "Entry-Level Full Stack Developer"), by `titles.junior_developer_match`.
 
 A stored lane moves only through `careerhunter lanes reassign` (`plan_reassign`,
 `reassign`): it recomputes every checked posting's lane against the current config and
@@ -54,7 +57,7 @@ from careerhunter.config import LANE_GROUPS, max_posting_age_days, off_lane_min_
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import has_phrase, too_old
 from careerhunter.search_store import PendingAlert
-from careerhunter.titles import loose_match
+from careerhunter.titles import junior_developer_match, loose_match
 
 GROUPS = LANE_GROUPS
 _LABELS = {"primary": "", "career_change": " (career change)", "stopgap": " (stopgap)"}
@@ -98,7 +101,13 @@ def match(title: str, doc: Mapping[str, Any] | None) -> Lane | None:
     raw = search.get("lanes") if isinstance(search, Mapping) else None
     if not isinstance(raw, list):
         return None
-    return _best(title, raw, has_phrase) or _best(title, raw, loose_match)
+    return _best(title, raw, has_phrase) or _best(title, raw, _normalized)
+
+
+def _normalized(title: str, variant: str) -> bool:
+    """The rules tried when no lane matches literally: `titles.loose_match`, and the
+    "Junior/Entry ... Developer" rule (`titles.junior_developer_match`)."""
+    return loose_match(title, variant) or junior_developer_match(title, variant)
 
 
 def _best(title: str, raw: list[Any], test: Callable[[str, str], bool]) -> Lane | None:

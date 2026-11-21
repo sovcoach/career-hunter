@@ -50,6 +50,7 @@ from careerhunter.config import (
     discovery_interval_minutes,
     discovery_queries_per_run,
     discovery_query_delay_seconds,
+    discovery_result_pages,
 )
 from careerhunter.deadline import Deadline
 from careerhunter.fetch import FetchError
@@ -76,7 +77,18 @@ _TIMEOUT = 20.0
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 _LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-_GREENHOUSE = frozenset({"boards.greenhouse.io", "job-boards.greenhouse.io"})
+# job-boards.eu.greenhouse.io is Greenhouse's EU board host. Greenhouse doesn't
+# document it, or an EU API host: on 2026-11-21 a live public board on it was read
+# through boards-api.greenhouse.io (the same jobs as its board page, each linking back
+# to the EU host), and boards-api.eu.greenhouse.io did not resolve. So an EU board is
+# read through the usual API, and its postings keep the links the API gives.
+_GREENHOUSE = frozenset(
+    {"boards.greenhouse.io", "job-boards.greenhouse.io", "job-boards.eu.greenhouse.io"}
+)
+# Lever's hosts, by region (Lever's postings API README): the board pages, and the API
+# that also serves the iframe embed (`/v0/postings/<slug>?mode=iframe`).
+_LEVER_BOARD_HOSTS = {"jobs.lever.co": None, "jobs.eu.lever.co": "eu"}
+_LEVER_API_HOSTS = {"api.lever.co": None, "api.eu.lever.co": "eu"}
 _SMARTRECRUITERS = frozenset({"jobs.smartrecruiters.com", "careers.smartrecruiters.com"})
 _SMARTRECRUITERS_POSTING = re.compile(r"^[0-9]+(?:-.*)?$")
 # BambooHR subdomains that are BambooHR's own, not a company's careers site.
@@ -85,10 +97,11 @@ _WORKDAY_HOST = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.(wd[0-9]{1,3})\.myworkdayjobs\.com$"
 )
 _LOCALE = re.compile(r"^[a-z]{2}-[A-Z]{2}$")
-# One query per host. `greenhouse.io` covers both board hosts in one query.
+# One query per host. `greenhouse.io` covers every Greenhouse board host in one query,
+# and `lever.co` both of Lever's regions.
 _QUERY_HOSTS = (
     "greenhouse.io",
-    "jobs.lever.co",
+    "lever.co",
     "jobs.ashbyhq.com",
     "jobs.smartrecruiters.com",
     "bamboohr.com",
@@ -97,6 +110,7 @@ _QUERY_HOSTS = (
 _BOARD_URL = {
     "greenhouse": "https://boards.greenhouse.io/{slug}",
     "lever": "https://jobs.lever.co/{slug}",
+    "lever-eu": "https://jobs.eu.lever.co/{slug}",
     "ashby": "https://jobs.ashbyhq.com/{slug}",
     "smartrecruiters": "https://jobs.smartrecruiters.com/{slug}",
     "bamboohr": "https://{slug}.bamboohr.com/careers",
@@ -126,6 +140,7 @@ class Hit:
     suggested_name: str
     ats_host: str | None = None
     ats_site: str | None = None
+    ats_region: str | None = None
 
 
 @dataclass(frozen=True)
@@ -188,8 +203,9 @@ class Pass:
     postings: tuple[PostingRef, ...] = ()
 
 
-def request_url(base: str, query: str) -> str:
-    """The loopback search URL for one query. Raises DiscoverError for any other host."""
+def request_url(base: str, query: str, page: int = 1) -> str:
+    """The loopback search URL for one query's result page (SearXNG's `pageno`, sent
+    only past the first page). Raises DiscoverError for any other host."""
     try:
         parts = urllib.parse.urlsplit(base)
         port = parts.port
@@ -214,7 +230,10 @@ def request_url(base: str, query: str) -> str:
         path = "/search"
     else:
         path = f"{trimmed}/search"
-    qs = urllib.parse.urlencode({"q": query, "format": "json"})
+    params: dict[str, str | int] = {"q": query, "format": "json"}
+    if page > 1:
+        params["pageno"] = page
+    qs = urllib.parse.urlencode(params)
     return urllib.parse.urlunsplit(("http", parts.netloc, path, qs, ""))
 
 
@@ -305,9 +324,10 @@ def classify(url: str, career_hosts: Sequence[str]) -> Hit | None:
         return None
     board = _board(host, segments, parts.query)
     if board is not None:
-        ats, slug, wd_host, site = board
-        url = _BOARD_URL[ats].format(slug=slug, host=wd_host, site=site)
-        return Hit("board", url, ats, slug, slug, wd_host, site)
+        ats, slug, wd_host, site, region = board
+        form = f"{ats}-{region}" if region else ats
+        url = _BOARD_URL[form].format(slug=slug, host=wd_host, site=site)
+        return Hit("board", url, ats, slug, slug, wd_host, site, region)
     allowed = {item.casefold() for item in career_hosts if isinstance(item, str)}
     if host not in allowed:
         return None
@@ -511,15 +531,19 @@ def run(
     talk = transport or default_transport
     career_hosts = _career_hosts(config)
     delay = discovery_query_delay_seconds(config)
+    pages = discovery_result_pages(config)
     hits: list[Hit] = []
     seen: set[tuple[str, ...]] = set()
     postings: dict[str, PostingRef] = {}  # by the posting's URL, first one kept
     pause = sleep or _sleep
     suspended: set[str] = set()
+    paging: list[str] = []
     answered = blocked = 0
+    asked = 0
     for index, query in enumerate(queries):
-        if index:
+        if asked:
             pause(delay)
+        asked += 1
         answer = _ask(talk, base, query)
         if isinstance(answer, str):
             _record_failure(conn, config, clock(), answer, sorted(suspended))
@@ -533,7 +557,31 @@ def run(
             continue
         blocked = 0
         answered += 1
-        for raw in found:
+        results = list(found)
+        urls = set(found)
+        for page in range(2, pages + 1):
+            pause(delay)
+            asked += 1
+            more = _ask(talk, base, query, page)
+            if more == THROTTLED:
+                _record_failure(conn, config, clock(), more, sorted(suspended))
+                return Outcome(more, ())
+            if isinstance(more, str):
+                paging.append(
+                    f"discovery: query {index + 1} page {page}: {more}; stopped paging it"
+                )
+                break
+            suspended.update(more[1])
+            new = [raw for raw in more[0] if raw not in urls]
+            if not new:
+                paging.append(
+                    f"discovery: query {index + 1} page {page} had no new results; "
+                    "stopped paging it"
+                )
+                break
+            urls.update(new)
+            results.extend(new)
+        for raw in results:
             ref = posting(raw)
             if ref is not None:
                 postings.setdefault(posting_url(ref) or raw, ref)
@@ -568,7 +616,10 @@ def run(
         names={_hit_key(hit): name for hit, name in accepted if name},
     )
     return Outcome(
-        None, tuple(stored), tuple(postings.values()), (*_suspended_notes(engines), *notes)
+        None,
+        tuple(stored),
+        tuple(postings.values()),
+        (*_suspended_notes(engines), *paging, *notes),
     )
 
 
@@ -639,7 +690,7 @@ def _confirmed(
             notes.append(f"{who}: not confirmed this pass; not queued")
             continue
         asked += 1
-        board = Board(ats_type, slug, hit.ats_host, hit.ats_site)
+        board = Board(ats_type, slug, hit.ats_host, hit.ats_site, hit.ats_region)
         try:
             answer = confirm(board)
         except (FetchError, BoardHTTPError, BoardParseError) as exc:
@@ -686,7 +737,7 @@ def posting(url: str) -> PostingRef | None:
     ref: str | None = None
     if hit.ats_type == "greenhouse" and len(segments) == 3 and segments[1] == "jobs":
         ref = segments[2]
-    elif hit.ats_type in ("lever", "ashby") and len(segments) == 2:
+    elif hit.ats_type in ("lever", "ashby") and len(segments) == 2 and segments[1] != "embed":
         ref = segments[1]
     elif hit.ats_type == "smartrecruiters" and len(segments) == 2:
         ref = segments[1].split("-", 1)[0]
@@ -697,12 +748,14 @@ def posting(url: str) -> PostingRef | None:
         ref = "/" + "/".join(urllib.parse.quote(part, safe="") for part in segments[at:])
     if ref is None:
         return None
-    board = Board(hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site)
+    board = Board(hit.ats_type, hit.ats_slug, hit.ats_host, hit.ats_site, hit.ats_region)
     found = PostingRef(board, ref)
     return found if posting_url(found) is not None else None
 
 
-def _ask(talk: Transport, base: str, query: str) -> tuple[list[str], list[str]] | str:
+def _ask(
+    talk: Transport, base: str, query: str, page: int = 1
+) -> tuple[list[str], list[str]] | str:
     """One query's result URLs and the engines SearXNG reported as throttled, or the
     closed line that ends the pass.
 
@@ -712,7 +765,7 @@ def _ask(talk: Transport, base: str, query: str) -> tuple[list[str], list[str]] 
     from the results whether the query was answered.
     """
     try:
-        status, body = talk(request_url(base, query))
+        status, body = talk(request_url(base, query, page))
     except (DiscoverError, OSError, http.client.HTTPException):
         return MISS
     if status == 429:
@@ -935,28 +988,40 @@ def _segments(path: str) -> list[str] | None:
     return segments
 
 
-_Board = tuple[str, str, str | None, str | None]  # ats_type, slug, Workday host, site
+# ats_type, slug, Workday host, Workday site, Lever region
+_Board = tuple[str, str, str | None, str | None, str | None]
 
 
 def _board(host: str, segments: list[str], query: str) -> _Board | None:
     if host in _GREENHOUSE:
         if segments == ["embed", "job_board"]:
             slug = _query_slug(query)
-            return ("greenhouse", slug, None, None) if slug else None
+            return ("greenhouse", slug, None, None, None) if slug else None
         slug = _greenhouse_slug(segments)
-        return ("greenhouse", slug, None, None) if slug else None
-    if host == "jobs.lever.co":
+        return ("greenhouse", slug, None, None, None) if slug else None
+    if host in _LEVER_BOARD_HOSTS:
         slug = _one_or_two(segments)
-        return ("lever", slug, None, None) if slug else None
+        return ("lever", slug, None, None, _LEVER_BOARD_HOSTS[host]) if slug else None
+    if host in _LEVER_API_HOSTS:
+        # The iframe embed: `/v0/postings/<slug>`, a whole board, never one posting.
+        if len(segments) != 3 or segments[:2] != ["v0", "postings"]:
+            return None
+        slug = _slug(segments[2])
+        return ("lever", slug, None, None, _LEVER_API_HOSTS[host]) if slug else None
     if host == "jobs.ashbyhq.com":
+        if len(segments) == 2 and segments[1] == "embed":
+            # The embed script (Ashby's docs: `/<slug>/embed?version=2`): a whole board.
+            if ASHBY_SLUG.fullmatch(segments[0]) is None:
+                return None
+            return ("ashby", segments[0], None, None, None)
         slug = _one_or_two(segments, ASHBY_SLUG)
-        return ("ashby", slug, None, None) if slug else None
+        return ("ashby", slug, None, None, None) if slug else None
     if host in _SMARTRECRUITERS:
         slug = _smartrecruiters_slug(segments)
-        return ("smartrecruiters", slug, None, None) if slug else None
+        return ("smartrecruiters", slug, None, None, None) if slug else None
     if host.endswith(".bamboohr.com"):
         slug = _bamboohr_slug(host.removesuffix(".bamboohr.com"), segments)
-        return ("bamboohr", slug, None, None) if slug else None
+        return ("bamboohr", slug, None, None, None) if slug else None
     if host.endswith(".myworkdayjobs.com"):
         return _workday(host, segments)
     return None
@@ -992,7 +1057,7 @@ def _workday(host: str, segments: list[str]) -> _Board | None:
         return None
     if len(rest) > 1 and (rest[1] != "job" or len(rest) < 3):
         return None
-    return ("workday", match.group(1).casefold(), match.group(2), rest[0])
+    return ("workday", match.group(1).casefold(), match.group(2), rest[0], None)
 
 
 def _greenhouse_slug(segments: list[str]) -> str | None:
@@ -1109,14 +1174,15 @@ def _store(
         for hit in gone:
             conn.execute(
                 "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, ats_host, "
-                "ats_site, suggested_name, status, first_seen) "
-                "VALUES ('board', ?, ?, ?, ?, ?, ?, 'gone', ?)",
+                "ats_site, ats_region, suggested_name, status, first_seen) "
+                "VALUES ('board', ?, ?, ?, ?, ?, ?, ?, 'gone', ?)",
                 (
                     hit.url,
                     hit.ats_type,
                     hit.ats_slug,
                     hit.ats_host,
                     hit.ats_site,
+                    hit.ats_region,
                     hit.suggested_name,
                     today,
                 ),
@@ -1135,8 +1201,8 @@ def _store(
                 known_careers.add(hit.url)
             cur = conn.execute(
                 "INSERT INTO discovery_candidates (kind, url, ats_type, ats_slug, ats_host, "
-                "ats_site, suggested_name, status, first_seen, display_name) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                "ats_site, ats_region, suggested_name, status, first_seen, display_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (
                     hit.kind,
                     hit.url,
@@ -1144,6 +1210,7 @@ def _store(
                     hit.ats_slug,
                     hit.ats_host,
                     hit.ats_site,
+                    hit.ats_region,
                     hit.suggested_name,
                     today,
                     (names or {}).get(_hit_key(hit)),
@@ -1202,8 +1269,8 @@ def _watch_items(config: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 def _pending_row(conn: sqlite3.Connection, candidate_id: int) -> sqlite3.Row:
     row: sqlite3.Row | None = conn.execute(
-        "SELECT id, kind, url, ats_type, ats_slug, ats_host, ats_site, suggested_name, status "
-        "FROM discovery_candidates WHERE id = ?",
+        "SELECT id, kind, url, ats_type, ats_slug, ats_host, ats_site, ats_region, "
+        "suggested_name, status FROM discovery_candidates WHERE id = ?",
         (candidate_id,),
     ).fetchone()
     if row is None or candidate_id < 1:
@@ -1230,9 +1297,11 @@ def _approve_board(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
         raise DiscoverError(f"discovery candidate {int(row['id'])} was not found")
     host = row["ats_host"]
     site = row["ats_site"]
+    region = row["ats_region"]
     name = str(row["suggested_name"])
     existing = conn.execute(
-        "SELECT id, ats_type, ats_slug, ats_host, ats_site FROM companies WHERE name = ?",
+        "SELECT id, ats_type, ats_slug, ats_host, ats_site, ats_region FROM companies "
+        "WHERE name = ?",
         (name,),
     ).fetchone()
     if existing is None:
@@ -1243,6 +1312,7 @@ def _approve_board(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
             ats_slug=slug,
             ats_host=host,
             ats_site=site,
+            ats_region=region,
             watchlist=1,
             source="discovery",
         )
@@ -1252,16 +1322,17 @@ def _approve_board(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
         existing["ats_slug"],
         existing["ats_host"],
         existing["ats_site"],
+        existing["ats_region"],
     )
-    if _ats_disagrees(stored, (ats, slug, host, site)):
+    if _ats_disagrees(stored, (ats, slug, host, site, region)):
         raise DiscoverError(
             f"discovery candidate {int(row['id'])} disagrees with the stored company"
         )
     conn.execute(
         "UPDATE companies SET ats_type = coalesce(ats_type, ?), ats_slug = coalesce(ats_slug, ?), "
         "ats_host = coalesce(ats_host, ?), ats_site = coalesce(ats_site, ?), "
-        "watchlist = 1 WHERE id = ?",
-        (ats, slug, host, site, existing["id"]),
+        "ats_region = coalesce(ats_region, ?), watchlist = 1 WHERE id = ?",
+        (ats, slug, host, site, region, existing["id"]),
     )
 
 

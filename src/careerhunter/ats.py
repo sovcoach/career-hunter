@@ -51,6 +51,12 @@ SMARTRECRUITERS_PAGE = 100
 WORKDAY_PAGE = 20
 
 BOARDS = ("greenhouse", "lever", "ashby", "smartrecruiters", "bamboohr", "workday")
+# Lever's EU accounts live on their own hosts, named in Lever's postings API README
+# (github.com/lever/postings-api): api.eu.lever.co and jobs.eu.lever.co. A Lever board's
+# region (search migration 0037) is None for the global hosts or "eu".
+LEVER_REGIONS = ("eu",)
+_LEVER_API = {None: "https://api.lever.co", "eu": "https://api.eu.lever.co"}
+_LEVER_JOBS = {None: "https://jobs.lever.co", "eu": "https://jobs.eu.lever.co"}
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 # An Ashby board name may contain dots, such as a company's domain (`example.com`): runs
 # of slug characters with single dots between them. Never a lone or leading dot, and
@@ -119,12 +125,15 @@ TooOld = Callable[[Job], bool]  # a posting already too old from its list date
 
 @dataclass(frozen=True)
 class Board:
-    """One board's identity. Only Workday has a host and a site."""
+    """One board's identity. Only Workday has a host and a site, and only Lever a region
+    (None or "eu"). The region picks Lever's hosts and is not part of the key, so a
+    board's postings keep their keys."""
 
     ats: str
     slug: str
     host: str | None = None
     site: str | None = None
+    region: str | None = None
 
     @property
     def key(self) -> str:
@@ -232,6 +241,15 @@ class Client:
 
 def list_url(board: Board) -> str | None:
     """The (first) list URL for a board, or None when its identity is not safe to use."""
+    if board.region is not None and (board.ats != "lever" or board.region not in LEVER_REGIONS):
+        return None
+    if board.ats == "lever":
+        base = board_url(board.ats, board.slug)
+        return (
+            None
+            if base is None
+            else f"{_LEVER_API[board.region]}/v0/postings/{board.slug}?mode=json"
+        )
     if board.ats != "workday":
         return board_url(board.ats, board.slug)
     if (
@@ -309,7 +327,7 @@ def posting_url(posting: PostingRef) -> str | None:
         return None
     return {
         "greenhouse": f"https://boards.greenhouse.io/{board.slug}/jobs/{ref}",
-        "lever": f"https://jobs.lever.co/{board.slug}/{ref}",
+        "lever": f"{_LEVER_JOBS[board.region]}/{board.slug}/{ref}",
         "ashby": f"https://jobs.ashbyhq.com/{board.slug}/{ref}",
         "smartrecruiters": f"https://jobs.smartrecruiters.com/{board.slug}/{ref}",
         "bamboohr": f"https://{board.slug}.bamboohr.com/careers/{ref}",
@@ -335,8 +353,10 @@ def read_posting(posting: PostingRef, client: Client, *, today: dt.date | None =
         )
         found = _greenhouse_job(data, board.slug)
     elif board.ats == "lever":
-        data = client.get_json(f"https://api.lever.co/v0/postings/{board.slug}/{ref}?mode=json")
-        found = _lever_job(data, board.slug)
+        data = client.get_json(
+            f"{_LEVER_API[board.region]}/v0/postings/{board.slug}/{ref}?mode=json"
+        )
+        found = _lever_job(data, board.slug, board.region)
     elif board.ats == "ashby":
         jobs = read(board, client).jobs
         matches = [job for job in jobs if isinstance(job, Job) and job.requisition_id == ref]
@@ -453,7 +473,7 @@ def confirm_board(board: Board, client: Client) -> Confirmed:
             return Confirmed(True, (name,) if name else ())
         if board.ats == "lever":
             data = client.get_json(
-                f"https://api.lever.co/v0/postings/{board.slug}?mode=json&limit=1"
+                f"{_LEVER_API[board.region]}/v0/postings/{board.slug}?mode=json&limit=1"
             )
             if not isinstance(data, list):
                 raise BoardParseError("unexpected JSON shape")
@@ -554,7 +574,7 @@ def read(
         found.notes[:0] = notes
         found.facets = check
         return found
-    return BoardRead(_parse(board.ats, board.slug, client.get_json(url)))
+    return BoardRead(_parse(board.ats, board.slug, client.get_json(url), board.region))
 
 
 def _with_details(
@@ -1040,11 +1060,11 @@ def _workday_detail(stub: Job, data: object) -> Job:
     )
 
 
-def _parse(ats: str, slug: str, data: object) -> list[Job | Skip]:
+def _parse(ats: str, slug: str, data: object, region: str | None = None) -> list[Job | Skip]:
     if ats == "lever":
         if not isinstance(data, list):
             raise BoardParseError("unexpected JSON shape")
-        return [_lever_job(item, slug) for item in data]
+        return [_lever_job(item, slug, region) for item in data]
     jobs = data.get("jobs") if isinstance(data, dict) else None
     if not isinstance(jobs, list):
         raise BoardParseError("unexpected JSON shape")
@@ -1091,7 +1111,7 @@ def _greenhouse_text(content: object) -> str | None:
     return htmltext.to_text(text, escaped=True) or None
 
 
-def _lever_job(item: object, slug: str) -> Job | Skip:
+def _lever_job(item: object, slug: str, region: str | None = None) -> Job | Skip:
     job = _mapping(item)
     if job is None:
         return Skip("a job was not an object")
@@ -1103,7 +1123,7 @@ def _lever_job(item: object, slug: str) -> Job | Skip:
         location=_nested_text(job.get("categories"), "location"),
         work_model=_mapped(job.get("workplaceType"), _LEVER_WORK),
         url=_http_url(job.get("hostedUrl"))
-        or _built(f"https://jobs.lever.co/{slug}/", job.get("id")),
+        or _built(f"{_LEVER_JOBS[region]}/{slug}/", job.get("id")),
         requisition_id=_id_text(job.get("id")),
         company_field=None,
         description=_lever_text(job),

@@ -18,7 +18,10 @@ The work model. A board that gives one (Lever, Ashby) is used as given. With non
 otherwise the location rules treat the posting as on-site. On-site and hybrid must
 match `search.location_rules.onsite_hybrid`, remote must match `remote`. An inferred
 remote posting may match either list, because "Example City or Remote" can be
-either. A list that is unset or empty does not constrain its work models.
+either. With no work model and no "remote" in the location, a title with the whole
+word "remote" is read as remote too (Batch R), and the `remote` list may then match the
+location or the title ("Analyst - Countrywide - Remote" at "Example City"). A list
+that is unset or empty does not constrain its work models.
 
 Travel never skips a posting: offsites, retreats, conferences, client or customer
 visits, required travel. A posting is skipped as `office_days_elsewhere` when its
@@ -29,12 +32,18 @@ posting is not an on-site or hybrid one whose own location is one. "Up to 25% tr
 or "occasional visits to head office" has no cadence and never skips. The rule is always
 on whenever `onsite_hybrid` is set; there is no setting for it.
 
-An empty location is never a reason to skip (Batch Q). A posting with blank location
-text, whatever its work model, has nothing to match against the location lists or a
-watchlist entry's `locations`, so neither skips it: it is scored and alerted as usual,
-and its alert says `Location unknown`. Its description is still checked for office days
-elsewhere. (`empty_location` was a skip reason before 0.10.0; skips already stored with
-it stay.)
+An unknown location is never a reason to skip (Batch Q, `locations.unknown`). A
+posting with blank location text, whatever its work model, has nothing to match
+against the location lists or a watchlist entry's `locations`, so neither skips it: it
+is scored and alerted as usual, and its alert says `Location unknown`. The same holds
+for a location that names only a country (with no remote or hybrid stated anywhere) or
+only a building, such as "Example Tower" (Batch R); their alerts show the location as
+given. Its description is still checked for office days elsewhere. (`empty_location`
+was a skip reason before 0.10.0; skips already stored with it stay.)
+
+A referral (`postings.referral`, set by the operator) counts as local: inside the
+configured office area. The location rules, a watchlist entry's `locations` and the
+office-days check never skip it, and it needs no location.
 
 Seniority words match whole words of the title, ignoring case. The description is
 checked too only when `seniority_in_description` is true. `title_exceptions` and
@@ -65,6 +74,8 @@ import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+
+from careerhunter import locations
 
 _FOLD = re.compile(r"[\s_\-\u2010-\u2015]+")
 _WEEKEND_COUNT = re.compile(r"\b(\d+)\s+weekend")
@@ -150,6 +161,7 @@ class PostingText:
     work_model: str | None = None
     description: str | None = None
     requisition_id: str | None = None
+    referral: bool = False  # marked by the operator: counts as local, needs no location
 
 
 @dataclass(frozen=True)
@@ -396,11 +408,16 @@ def _not_pay_before(before: str) -> bool:
     return _NOT_PAY_BEFORE.search(window) is not None
 
 
+def location_unknown(posting: PostingText) -> bool:
+    """Blank, only a country (with no remote or hybrid stated), or only a building: no
+    place the location rules can check (`locations.unknown`)."""
+    return locations.unknown(posting.location, title=posting.title, work_model=posting.work_model)
+
+
 def _location(posting: PostingText, rules: Mapping[str, Any]) -> str | None:
-    if not rules:
+    if not rules or posting.referral:  # a referral counts as local (Batch R)
         return None
-    blank = not posting.location.strip()
-    if not blank and not _place_allowed(posting, rules):
+    if not location_unknown(posting) and not _place_allowed(posting, rules):
         return "location_rule"
     if _office_days_elsewhere(posting, rules):
         return "office_days_elsewhere"
@@ -418,6 +435,15 @@ def _place_allowed(posting: PostingText, rules: Mapping[str, Any]) -> bool:
     if posting.work_model is None and inferred_remote(posting.location):
         # Inferred, not given: "Example City or Remote" may be either kind of job.
         return not remote or _any(posting.location, remote) or _any(posting.location, onsite)
+    if posting.work_model is None and inferred_remote(posting.title):
+        # "Remote" only in the title ("Analyst - Countrywide - Remote" at "Example
+        # City"): read as remote, and the remote region may be named in either.
+        return (
+            not remote
+            or _any(posting.location, remote)
+            or _any(posting.title, remote)
+            or _any(posting.location, onsite)
+        )
     # No work model from the board and no "remote": treated as on-site.
     return not onsite or _any(posting.location, onsite)
 
@@ -431,7 +457,9 @@ def _role_work_model(posting: PostingText) -> str | None:
     """The board's work model, or remote when inferred; None when unknown."""
     if posting.work_model is not None:
         return posting.work_model
-    return "remote" if inferred_remote(posting.location) else None
+    if inferred_remote(posting.location) or inferred_remote(posting.title):
+        return "remote"
+    return None
 
 
 def _office_days_elsewhere(posting: PostingText, rules: Mapping[str, Any]) -> bool:
@@ -463,8 +491,13 @@ def _role(posting: PostingText, filters: Mapping[str, Any] | None) -> str | None
     if models and work_model is not None and work_model not in models:
         return "role_filter"
     places = _strings(filters.get("locations"))
-    if places and posting.location.strip() and not _any(posting.location, places):
-        return "role_filter"  # an empty location is never a reason (Batch Q)
+    if (
+        places
+        and not posting.referral
+        and not location_unknown(posting)
+        and not _any(posting.location, places)
+    ):
+        return "role_filter"  # an unknown location is never a reason (Batch Q, R)
     return None
 
 

@@ -8,6 +8,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from careerhunter import duplicates, locations
 from careerhunter.criteria import REASONS as CRITERIA_REASONS
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import title_key
@@ -30,15 +31,18 @@ def upsert_company(
     source: str = "manual",
     ats_host: str | None = None,
     ats_site: str | None = None,
+    ats_region: str | None = None,
 ) -> tuple[int, bool]:
     """The company's id, inserting it if new. Returns (id, inserted).
 
-    `ats_host` and `ats_site` are Workday's wdN host and site (search migration 0012).
+    `ats_host` and `ats_site` are Workday's wdN host and site (search migration 0012),
+    and `ats_region` a Lever board's region, None or "eu" (0037).
     """
     cur = conn.execute(
-        "INSERT INTO companies (name, ats_type, ats_slug, ats_host, ats_site, careers_url, "
-        "watchlist, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-        (name, ats_type, ats_slug, ats_host, ats_site, careers_url, watchlist, source),
+        "INSERT INTO companies (name, ats_type, ats_slug, ats_host, ats_site, ats_region, "
+        "careers_url, watchlist, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT DO NOTHING",
+        (name, ats_type, ats_slug, ats_host, ats_site, ats_region, careers_url, watchlist, source),
     )
     found = conn.execute("SELECT id FROM companies WHERE name = ?", (name,)).fetchone()
     return int(found["id"]), cur.rowcount == 1
@@ -432,7 +436,8 @@ def set_posting_schedule(conn: sqlite3.Connection, posting_id: int, schedule: st
 def rescore_candidates(
     conn: sqlite3.Connection, posting_ids: Sequence[int] = (), gap_text: str | None = None
 ) -> list[sqlite3.Row]:
-    """Scored watcher or discovery postings with no skip and no application: those with
+    """Scored watcher or discovery postings with no skip and no application, their own
+    or (for a duplicate) their group's: those with
     these ids, or those whose stored gaps or key requirements contain `gap_text`
     (ignoring case). Each with its company, title, fit and whether it was alerted."""
     rows = conn.execute(
@@ -441,6 +446,7 @@ def rescore_candidates(
         "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
         "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of) "
         "ORDER BY p.id"
     ).fetchall()
     wanted = set(posting_ids)
@@ -544,6 +550,24 @@ def set_score_attempted_at(conn: sqlite3.Connection, posting_id: int, stamp: str
     conn.execute("UPDATE postings SET score_attempted_at = ? WHERE id = ?", (stamp, posting_id))
 
 
+def location_unknown_count(conn: sqlite3.Connection) -> int:
+    """Watcher and discovery postings with no skip whose location gives no place the
+    location rules can check (`locations.unknown`): blank, a country only, a building
+    only. Read now, for doctor's `watch held` line."""
+    rows = conn.execute(
+        "SELECT p.title, p.location, p.work_model FROM postings p "
+        "WHERE p.source IN ('watcher', 'discovery') "
+        "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)"
+    )
+    return sum(
+        1
+        for row in rows
+        if locations.unknown(
+            str(row["location"] or ""), title=str(row["title"]), work_model=row["work_model"]
+        )
+    )
+
+
 @dataclass(frozen=True)
 class HeldCounts:
     """Watcher and discovery postings with no skip held back from alerts, by why."""
@@ -567,7 +591,9 @@ def held_counts(conn: sqlite3.Connection, *, off_lane_min_fit: str | None = None
             SELECT 1 FROM score_parse_failures f
             WHERE f.posting_id = p.id AND f.given_up_at IS NOT NULL) AND NOT EXISTS (
             SELECT 1 FROM score_timeouts t
-            WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL)), 0) AS unscored,
+            WHERE t.posting_id = p.id AND t.set_aside_at IS NOT NULL) AND NOT EXISTS (
+            SELECT 1 FROM reread_failures r
+            WHERE r.posting_id = p.id AND r.set_aside_at IS NOT NULL)), 0) AS unscored,
           coalesce(sum(p.llm_output IS NOT NULL AND p.fit IS NULL AND p.alerted_at IS NULL), 0)
             AS no_fit
         FROM postings p
@@ -922,6 +948,7 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
           AND p.llm_output IS NOT NULL
           AND p.fit IN ('medium', 'high')
           AND p.alerted_at IS NULL
+          AND p.duplicate_of IS NULL
           AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id)
           AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id)
           AND NOT EXISTS (SELECT 1 FROM alert_refusals r
@@ -965,6 +992,8 @@ class DigestFields:
     fit: str | None
     gap_count: int | None  # None when the stored gaps are not a JSON list
     key_requirements: tuple[str, ...]
+    referral: bool = False
+    also: tuple[str, ...] = ()  # the requisitions of the same role posted again (Batch R)
 
 
 def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[int, DigestFields]:
@@ -980,7 +1009,7 @@ def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[
             SELECT p.id, c.name AS company, p.title, p.location, p.url, p.schedule, p.fit,
                    CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
                         THEN json_array_length(p.gaps) END AS gap_count,
-                   p.key_requirements
+                   p.key_requirements, p.referral
             FROM postings p JOIN companies c ON c.id = p.company_id
             WHERE p.id = ?
             """,
@@ -998,8 +1027,17 @@ def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[
             fit=None if row["fit"] is None else str(row["fit"]),
             gap_count=None if row["gap_count"] is None else int(row["gap_count"]),
             key_requirements=_requirements(row["key_requirements"]),
+            referral=bool(row["referral"]),
+            also=_also(conn, posting_id),
         )
     return found
+
+
+def _also(conn: sqlite3.Connection, posting_id: int) -> tuple[str, ...]:
+    """How the other postings of this one's group are named (`duplicates.requisition`),
+    for its digest row. Empty when it is in no group."""
+    members = duplicates.group(conn, posting_id)
+    return tuple(dict.fromkeys(duplicates.requisition(conn, i) for i in members if i != posting_id))
 
 
 def _requirements(raw: object) -> tuple[str, ...]:
@@ -1112,27 +1150,71 @@ def set_aside_count(conn: sqlite3.Connection) -> int:
 
 
 def set_aside_postings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """The postings set aside after timeouts, each with its company, title, fit and
-    whether it was alerted, by id."""
+    """The postings set aside after timeouts (0034) or failed re-reads (0036), each
+    with its company, title, fit, whether it was alerted, and why (`aside`: `timeouts`,
+    or the re-read's reason such as `http-403`), by id. A posting set aside for both is
+    listed once, for its timeouts."""
     return conn.execute(
-        "SELECT p.id, c.name AS company, p.title, p.fit, p.alerted_at "
-        "FROM score_timeouts t JOIN postings p ON p.id = t.posting_id "
-        "JOIN companies c ON c.id = p.company_id "
-        "WHERE t.set_aside_at IS NOT NULL ORDER BY p.id"
+        "SELECT p.id, c.name AS company, p.title, p.fit, p.alerted_at, "
+        "CASE WHEN t.posting_id IS NOT NULL THEN 'timeouts' ELSE r.reason END AS aside "
+        "FROM postings p JOIN companies c ON c.id = p.company_id "
+        "LEFT JOIN score_timeouts t ON t.posting_id = p.id AND t.set_aside_at IS NOT NULL "
+        "LEFT JOIN reread_failures r ON r.posting_id = p.id AND r.set_aside_at IS NOT NULL "
+        "WHERE t.posting_id IS NOT NULL OR r.posting_id IS NOT NULL ORDER BY p.id"
     ).fetchall()
 
 
 def release_set_aside(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> int:
-    """Clear these postings' timeouts, so the next watch run sends them to the model
-    again. How many were set aside."""
+    """Clear these postings' timeouts and failed re-reads, so the next watch run reads
+    them and sends them to the model again. How many were set aside."""
     count = 0
     for posting_id in posting_ids:
-        count += conn.execute(
-            "DELETE FROM score_timeouts WHERE posting_id = ? AND set_aside_at IS NOT NULL",
-            (posting_id,),
-        ).rowcount
+        aside = conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM score_timeouts WHERE posting_id = ? "
+            "AND set_aside_at IS NOT NULL) OR EXISTS (SELECT 1 FROM reread_failures "
+            "WHERE posting_id = ? AND set_aside_at IS NOT NULL)",
+            (posting_id, posting_id),
+        ).fetchone()[0]
+        count += int(bool(aside))
         conn.execute("DELETE FROM score_timeouts WHERE posting_id = ?", (posting_id,))
+        conn.execute("DELETE FROM reread_failures WHERE posting_id = ?", (posting_id,))
     return count
+
+
+def record_reread_failure(
+    conn: sqlite3.Connection, posting_id: int, reason: str, stamp: str, *, set_aside_after: int
+) -> bool:
+    """Count one failed re-read of this posting's board page (search migration 0036),
+    with its fixed reason. True when this one reached `set_aside_after` in a row, so
+    the posting is now set aside."""
+    conn.execute(
+        "INSERT INTO reread_failures (posting_id, failures, reason, last_failed_at) "
+        "VALUES (?, 1, ?, ?) ON CONFLICT (posting_id) DO UPDATE SET failures = failures + 1, "
+        "reason = excluded.reason, last_failed_at = excluded.last_failed_at",
+        (posting_id, reason, stamp),
+    )
+    cur = conn.execute(
+        "UPDATE reread_failures SET set_aside_at = ? "
+        "WHERE posting_id = ? AND set_aside_at IS NULL AND failures >= ?",
+        (stamp, posting_id, set_aside_after),
+    )
+    return cur.rowcount == 1
+
+
+def clear_reread_failures(conn: sqlite3.Connection, posting_id: int) -> None:
+    """A re-read of the posting worked: its failures are no longer in a row."""
+    conn.execute("DELETE FROM reread_failures WHERE posting_id = ?", (posting_id,))
+
+
+def reread_set_aside(conn: sqlite3.Connection) -> dict[str, int]:
+    """Postings set aside after failed re-reads, counted by reason."""
+    return {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            "SELECT reason, count(*) FROM reread_failures WHERE set_aside_at IS NOT NULL "
+            "GROUP BY reason ORDER BY reason"
+        )
+    }
 
 
 @dataclass(frozen=True)
@@ -1177,6 +1259,29 @@ def facet_statuses(conn: sqlite3.Connection) -> list[FacetStatus]:
         "JOIN companies c ON c.id = b.company_id ORDER BY c.name"
     )
     return [FacetStatus(str(row[0]), tuple(json.loads(row[1])), str(row[2])) for row in rows]
+
+
+def given_up_postings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The postings given up after replies that did not parse (search migration 0023),
+    each with its company, title, fit and whether it was alerted, by id."""
+    return conn.execute(
+        "SELECT p.id, c.name AS company, p.title, p.fit, p.alerted_at "
+        "FROM score_parse_failures f JOIN postings p ON p.id = f.posting_id "
+        "JOIN companies c ON c.id = p.company_id "
+        "WHERE f.given_up_at IS NOT NULL ORDER BY p.id"
+    ).fetchall()
+
+
+def release_given_up(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> int:
+    """Forget these postings' unparseable replies, so the next watch run sends them to
+    the model again. How many were given up."""
+    count = 0
+    for posting_id in posting_ids:
+        count += conn.execute(
+            "DELETE FROM score_parse_failures WHERE posting_id = ? AND given_up_at IS NOT NULL",
+            (posting_id,),
+        ).rowcount
+    return count
 
 
 def parse_given_up_count(conn: sqlite3.Connection) -> int:
@@ -1252,8 +1357,9 @@ def is_handled_repost(conn: sqlite3.Connection, company_id: int, title: str) -> 
 
 
 def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Watcher and discovery postings not alerted, with no skip and no application, that
-    repeat a role the operator already logged or skipped. Oldest id first."""
+    """Watcher and discovery postings not alerted, with no skip and no application (their
+    own, or for a duplicate their group's: it is covered, never skipped), that repeat a
+    role the operator already logged or skipped. Oldest id first."""
     keys = handled_title_keys(conn)
     if not keys:
         return []
@@ -1263,6 +1369,7 @@ def unhandled_reposts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         "WHERE p.source IN ('watcher', 'discovery') AND p.alerted_at IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
         "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of) "
         "ORDER BY p.id"
     ).fetchall()
     return [
@@ -1563,6 +1670,46 @@ def set_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -
     conn.execute("UPDATE postings SET snapshot_path = ? WHERE id = ?", (path, posting_id))
 
 
+def keep_jd(conn: sqlite3.Connection, posting_id: int, path: str, jd_sha256: str) -> None:
+    """Record the job description kept for a posting the bot may alert (search
+    migration 0036): its file as the posting's snapshot, and its hash. A posting that
+    already has a snapshot that is not a kept JD (a job ad saved earlier) is left as it
+    is, so `snapshot_path` with a `jd_sha256` is always the kept JD."""
+    conn.execute(
+        "UPDATE postings SET snapshot_path = ?, jd_sha256 = ? "
+        "WHERE id = ? AND (snapshot_path IS NULL OR jd_sha256 IS NOT NULL)",
+        (path, jd_sha256, posting_id),
+    )
+
+
+def kept_jd(conn: sqlite3.Connection, posting_id: int) -> tuple[str, str] | None:
+    """The kept job description's file and hash, or None when none was kept."""
+    row = conn.execute(
+        "SELECT snapshot_path, jd_sha256 FROM postings WHERE id = ?", (posting_id,)
+    ).fetchone()
+    if row is None or row["jd_sha256"] is None or row["snapshot_path"] is None:
+        return None
+    return str(row["snapshot_path"]), str(row["jd_sha256"])
+
+
+def mark_referral(conn: sqlite3.Connection, posting_id: int) -> bool:
+    """Mark the posting as a referral (search migration 0036). True when it was not yet
+    one; a posting already marked is left as it is."""
+    cur = conn.execute(
+        "UPDATE postings SET referral = 1 WHERE id = ? AND referral = 0", (posting_id,)
+    )
+    return cur.rowcount == 1
+
+
+def fill_posting_location(conn: sqlite3.Connection, posting_id: int, location: str) -> bool:
+    """Set the posting's location only when it is blank. True when it was set."""
+    cur = conn.execute(
+        "UPDATE postings SET location = ? WHERE id = ? AND trim(location) = ''",
+        (location, posting_id),
+    )
+    return cur.rowcount == 1
+
+
 def fill_posting_snapshot(conn: sqlite3.Connection, posting_id: int, path: str) -> None:
     """Set the posting's snapshot only when it has none."""
     conn.execute(
@@ -1658,8 +1805,11 @@ def set_embedding_score(conn: sqlite3.Connection, posting_id: int, score: float 
     )
 
 
-def recent_applications(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row]:
-    """The latest applications, newest first, with company, title and current status."""
+def recent_applications(
+    conn: sqlite3.Connection, limit: int = 10, offset: int = 0
+) -> list[sqlite3.Row]:
+    """The latest applications, newest first, with company, title and current status;
+    `offset` skips that many first, for a picker's next page."""
     rows: list[sqlite3.Row] = conn.execute(
         """
         SELECT a.id, a.correlation_id, a.ei_claim, c.name AS company, p.title, p.url,
@@ -1668,11 +1818,40 @@ def recent_applications(conn: sqlite3.Connection, limit: int = 10) -> list[sqlit
         FROM applications a
         JOIN postings p ON p.id = a.posting_id
         JOIN companies c ON c.id = p.company_id
-        ORDER BY a.id DESC LIMIT ?
+        ORDER BY a.id DESC LIMIT ? OFFSET ?
         """,
-        (limit,),
+        (limit, offset),
     ).fetchall()
     return rows
+
+
+def application_count(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT count(*) FROM applications").fetchone()[0])
+
+
+_WORD = re.compile(r"[\w&+#.-]+")
+
+
+def _folded_words(text: str) -> set[str]:
+    return {w.strip(".-").casefold() for w in _WORD.findall(text) if w.strip(".-")}
+
+
+def matching_applications(
+    conn: sqlite3.Connection, words: Sequence[str]
+) -> list[tuple[sqlite3.Row, int]]:
+    """Applications whose company or title has any of `words` (case folded), each with
+    how many of the words it has: the most first, then the newest."""
+    wanted = [w.casefold() for w in words if w.strip()]
+    if not wanted:
+        return []
+    found: list[tuple[sqlite3.Row, int]] = []
+    for row in recent_applications(conn, limit=-1):
+        have = _folded_words(f"{row['company']} {row['title']}")
+        score = sum(1 for w in wanted if w in have)
+        if score:
+            found.append((row, score))
+    found.sort(key=lambda item: (-item[1], -int(item[0]["id"])))
+    return found
 
 
 def application_summary(conn: sqlite3.Connection, application_id: int) -> sqlite3.Row | None:

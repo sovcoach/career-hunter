@@ -424,7 +424,8 @@ def test_log_in_one_step_records_the_posting_and_the_application(env: Env) -> No
     """/log <link> | method | date: one message, one ledger call, both layers (#34)."""
     env.say(f"/log {AD_URL} | Company site | 2026-10-21")
     assert env.api.texts()[-2:] == [
-        "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved.",
+        "Recorded: Example Robotics — Synthetic Analyst (ref a1). Job ad saved.\n"
+        "Location: Example City",  # from the page's JSON-LD
         botmod.JD_REQUEST,  # the page has no JD to fetch
     ]
     s, e = env.search(), env.ei()
@@ -492,7 +493,9 @@ def test_log_without_details_on_the_page_asks_for_them(env: Env) -> None:
     assert "/log <link> | method | date | Company | Title" in env.api.texts()[-1]
     assert env.counts()["search.postings"] == 0
     env.say(f"/log {SHELL_URL} | email | 2026-10-21 | Sample Logistics | Synthetic Clerk")
-    assert env.api.texts()[-2] == "Recorded: Sample Logistics — Synthetic Clerk (ref a1)."
+    assert env.api.texts()[-2] == (
+        "Recorded: Sample Logistics — Synthetic Clerk (ref a1).\nLocation: unknown"
+    )
     assert env.api.texts()[-1] == botmod.JD_REQUEST  # a JD file is the copy of the ad too
 
 
@@ -506,6 +509,7 @@ def test_a_repost_logged_again_names_only_the_earlier_date(env: Env) -> None:
     env.say(f"/log {ROLE_AD}b | email | 2026-10-27 | Example Robotics | Analyst (R67890)")
     assert env.api.texts()[-2] == (
         "Recorded: Example Robotics — Analyst (R67890) (ref a2).\n"
+        "Location: unknown\n"
         "You logged an application to this role on 2026-10-20."
     )
     assert env.api.texts()[-1] == botmod.JD_REQUEST
@@ -759,10 +763,11 @@ def test_skip_by_link_and_a_second_skip_is_refused(env: Env) -> None:
     assert _skip_reasons(env) == ["synthetic reason"]
     env.say("/skip https://jobs.example.com/ads/1")
     assert env.api.texts()[-1] == "Already skipped."
+    # A link career-hunter doesn't have is stored first (Batch R); this one can't be
+    # read, so nothing is stored.
     env.say("/skip https://jobs.example.com/ads/404")
-    assert env.api.texts()[-1] == (
-        "I don't know that link. Send /skip to choose from recent alerts."
-    )
+    assert env.api.texts()[-1] == "I couldn't read that link: not found."
+    assert env.counts()["search.postings"] == 1
     assert _skip_reasons(env) == ["synthetic reason"]
 
 
@@ -936,10 +941,10 @@ def test_status_by_reference_lands_in_both_layers(env: Env) -> None:
     ("command", "message"),
     [
         ("/status a99 offer", "I don't know that reference"),
-        ("/status 1 offer", "I don't know that reference"),  # never a database id
+        ("/status 1 offer", "No application matches those words"),  # never a database id
         ("/status a1 ghosted", "The status must be one of"),
         ("/status a1 applied", "The status must be one of"),
-        ("/status a1", "Send: /status <ref> <status>"),
+        ("/status a1", "New status?"),  # the ref alone: its status buttons (Batch R)
     ],
 )
 def test_bad_status_requests(env: Env, command: str, message: str) -> None:
@@ -1284,6 +1289,7 @@ def test_the_log_filter_redacts_the_token(env: Env) -> None:
 class FakeReply:
     def __init__(self, body: bytes) -> None:
         self.body = body
+        self.asked: int | None = None
 
     def __enter__(self) -> FakeReply:
         return self
@@ -1291,8 +1297,9 @@ class FakeReply:
     def __exit__(self, *exc: object) -> None:
         pass
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, amt: int | None = None) -> bytes:
+        self.asked = amt
+        return self.body if amt is None else self.body[:amt]
 
 
 def test_the_client_parses_replies_and_downloads(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1359,6 +1366,34 @@ def test_a_refusal_carries_the_method_code_and_description(
     assert exc.value.method == "sendMessage" and exc.value.error_code == 400
     assert exc.value.description == "Bad Request: synthetic for <token>"
     assert exc.value.detail() == "sendMessage 400: Bad Request: synthetic for <token>"
+
+
+def test_a_reply_over_the_cap_is_not_read_past_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    reply = FakeReply(b"x" * (telegram.MAX_REPLY + 10))
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: reply)
+    with pytest.raises(telegram.TelegramTooLarge) as exc:
+        telegram.HttpTelegram(TOKEN).call("getUpdates")
+    assert reply.asked == telegram.MAX_REPLY + 1
+    assert exc.value.method == "getUpdates"
+    assert TOKEN not in str(exc.value)
+
+
+def test_a_reply_at_the_cap_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = json.dumps({"ok": True, "result": []}).encode()
+    body += b" " * (telegram.MAX_REPLY - len(body))
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: FakeReply(body))
+    assert telegram.HttpTelegram(TOKEN).call("getUpdates") == []
+
+
+def test_a_download_stops_at_its_own_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    reply = FakeReply(b"%PDF" + b"x" * 100)
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: reply)
+    with pytest.raises(telegram.TelegramError, match="larger than 50 bytes"):
+        telegram.HttpTelegram(TOKEN).download("documents/file_1.pdf", 50)
+    assert reply.asked == 51
+    small = FakeReply(b"%PDF" + b"x" * 46)
+    monkeypatch.setattr(telegram, "_urlopen", lambda request, timeout, context: small)
+    assert telegram.HttpTelegram(TOKEN).download("documents/file_1.pdf", 50) == small.body
 
 
 def test_an_ok_false_reply_carries_its_code_and_description(
@@ -1669,8 +1704,8 @@ def test_a_scored_watcher_posting_is_alerted_once(env: Env, keep_umask: None) ->
     ]
     keyboard = sends[0]["reply_markup"]["inline_keyboard"]
     assert [[b["text"] for b in row] for row in keyboard] == [
-        ["Applied 1", "Skipped 1"],
-        ["Applied 2", "Skipped 2"],
+        ["Applied 1", "Skipped 1", "JD 1"],
+        ["Applied 2", "Skipped 2", "JD 2"],
     ]
     sent = env.api.everything_sent()
     for hidden in (

@@ -7,6 +7,31 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **A location at intake.** `careerhunter log` and `/log` read the location from the page's structured data (a remote job with the countries it is open to reads as `Remote, <country>`), then the board's own data, then a `Location:` line in the job description. `--location` and `| location: <city>` give it by hand; neither is required, and the reply says `Location: unknown` when none was found. The watcher reads a `Location:` line when a board gives none. `careerhunter locations fill [--dry-run]` fills blank stored locations from the kept job ads and job descriptions.
+- **A referral label.** `--referral`, `| referral` and the method `referral` mark a posting as a referral, and `careerhunter referral --posting ID | --url LINK` marks a stored one. A referral counts as local, needs no location, and its alert says `Referral`.
+- **The job description of every posting that may alert is kept**, and each digest row has a `JD` button that sends it. An `Applied` tap records it as the application's job description.
+- **One role posted more than once is alerted once**, with `Also posted as <requisitions>`. `Applied` records one application whose EI entry names every requisition; `Skipped` skips them all (ADR-030).
+- **`/skip <link>` on a link career-hunter doesn't have yet** stores the posting first, from its page, then records the skip. No EI entry.
+- **`/status` by company or title words**, a picker that pages through every application, and a reply with the matching applications and the status words when a line can't be read.
+- **`careerhunter db snapshot --to DIR`**: a read-only, checked copy of `search.db` and every EI record, on an encrypted volume only.
+- **`careerhunter rescore --given-up`** releases postings given up after unparseable replies; `--posting` does too.
+- **Discovery** recognizes the EU board hosts of Greenhouse and Lever and the Lever and Ashby embed addresses, and reads up to `discovery.result_pages` result pages per query (default 2). A Lever board in the EU region is read from Lever's EU hosts (`ats_region: eu`, set by discovery itself).
+- A "Junior/Entry … Developer" title rule in the lane matcher.
+
+### Changed
+- A location that names only a country (with no remote or hybrid stated) or only a building is treated like a missing one: scored and alerted, never skipped by the location rules, and shown as given.
+- A title with the whole word "remote" is read as remote when the location and the board say nothing.
+- A re-read that keeps failing (HTTP 403 and the like, not gone or throttled) is set aside after 2 tries, not retried forever and not counted as gone; `rescore --set-aside` releases it.
+- Requirement text is cut where a phrase ends, never mid-phrase, within the same 60 characters.
+- `discovery.queries_per_run` times `discovery.result_pages` times `discovery.query_delay_seconds` must be at most 120 seconds. A config with more than 12 queries 5 seconds apart needs `result_pages: 1`, or fewer queries.
+
+### Fixed
+- Telegram API replies and file downloads are read only up to a size cap (#46).
+
+### Upgrading
+- `search.db` moves from schema version 35 to 37, and the EI record from 4 to 5. See "Upgrading from 0.10.0 to 0.11.0" in `docs/SETUP.md`.
+
 ## [0.10.0] - 2026-11-20
 
 ### Changed

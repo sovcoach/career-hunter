@@ -59,8 +59,9 @@ host is a hostname only. discovery.interval_minutes is optional. Missing or null
 means 1440 minutes, and a set value is an integer of at least 60. Discovery runs
 inside the watch agent, and the interval is the least time between two passes.
 discovery.queries_per_run (1 to 40, default 12) and discovery.query_delay_seconds (2
-to 30, default 5) are optional; together the pauses of one pass are at most 120
-seconds. Every problem is reported in one pass.
+to 30, default 5) are optional, and so is discovery.result_pages (1 to 3, default 2),
+the result pages read per query. Together the pauses of one pass (queries times
+pages times delay) are at most 120 seconds. Every problem is reported in one pass.
 
 schedule.timezone is the only place a time zone is set. It takes an IANA name
 (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); a fixed offset doesn't
@@ -95,6 +96,9 @@ QUERIES_PER_RUN_LIMITS = (1, 40)
 DEFAULT_QUERY_DELAY_SECONDS = 5
 QUERY_DELAY_LIMITS = (2, 30)
 MAX_PASS_PAUSES = 120
+# discovery.result_pages: how many result pages one query reads (SearXNG's pageno).
+DEFAULT_RESULT_PAGES = 2
+RESULT_PAGES_LIMITS = (1, 3)
 # discovery.max_candidates_per_day: discovery candidates the bot sends in one day.
 DEFAULT_CANDIDATES_PER_DAY = 3
 CANDIDATES_PER_DAY_LIMITS = (1, 20)
@@ -262,6 +266,7 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
         "interval_minutes",
         "queries_per_run",
         "query_delay_seconds",
+        "result_pages",
         "max_candidates_per_day",
     }
     if extra:
@@ -288,6 +293,14 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
             f"discovery.queries_per_run must be an integer from {low} to {high} "
             f"(default {DEFAULT_QUERIES_PER_RUN})"
         )
+    low, high = RESULT_PAGES_LIMITS
+    if not _int(pages := section.get("result_pages", DEFAULT_RESULT_PAGES)) or not (
+        low <= pages <= high
+    ):
+        problems.append(
+            f"discovery.result_pages must be an integer from {low} to {high} "
+            f"(default {DEFAULT_RESULT_PAGES})"
+        )
     low, high = QUERY_DELAY_LIMITS
     if not _int(value := section.get("query_delay_seconds", DEFAULT_QUERY_DELAY_SECONDS)) or not (
         low <= value <= high
@@ -296,12 +309,17 @@ def _validate_discovery(section: Any, problems: list[str]) -> None:
             f"discovery.query_delay_seconds must be an integer from {low} to {high} "
             f"(default {DEFAULT_QUERY_DELAY_SECONDS})"
         )
-    elif discovery_queries_per_run({"discovery": section}) * value > MAX_PASS_PAUSES:
-        # The pauses of one pass must leave time for the queries inside its share of
-        # the watch run (discover.PASS_SECONDS).
+    elif (
+        discovery_queries_per_run({"discovery": section})
+        * discovery_result_pages({"discovery": section})
+        * value
+        > MAX_PASS_PAUSES
+    ):
+        # The pauses of one pass must leave time for the requests inside its share of
+        # the watch run (discover.PASS_SECONDS). Each result page is one request.
         problems.append(
-            "discovery.queries_per_run times discovery.query_delay_seconds must be at most "
-            f"{MAX_PASS_PAUSES} seconds"
+            "discovery.queries_per_run times discovery.result_pages times "
+            f"discovery.query_delay_seconds must be at most {MAX_PASS_PAUSES} seconds"
         )
 
 
@@ -476,6 +494,8 @@ def _validate_seniority(gates: dict[str, Any], problems: list[str]) -> None:
 
 
 _WORKDAY_HOST = re.compile(r"wd[0-9]{1,3}")
+# A Lever board's region: its EU accounts use api.eu.lever.co and jobs.eu.lever.co.
+LEVER_REGIONS = ("eu",)
 _WORKDAY_SITE = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -484,6 +504,11 @@ def _validate_watchlist_item(item: dict[str, Any], where: str, problems: list[st
     if ats is not None and ats not in ATS_TYPES:
         problems.append(f"{where}.ats_type must be one of {list(ATS_TYPES)}")
     _validate_workday_identity(item, where, problems)
+    if "ats_region" in item:
+        if ats != "lever":
+            problems.append(f"{where}.ats_region is for ats_type lever only")
+        elif item["ats_region"] not in LEVER_REGIONS:
+            problems.append(f"{where}.ats_region must be one of {list(LEVER_REGIONS)}")
     if not isinstance(item.get("agency", False), bool):
         problems.append(f"{where}.agency must be true or false")
     filters = _optional_mapping(item, "role_filters", where, problems)
@@ -963,6 +988,14 @@ def discovery_queries_per_run(doc: Mapping[str, Any] | None) -> int:
     value = section.get("queries_per_run") if isinstance(section, Mapping) else None
     low, high = QUERIES_PER_RUN_LIMITS
     return value if _int(value) and low <= value <= high else DEFAULT_QUERIES_PER_RUN
+
+
+def discovery_result_pages(doc: Mapping[str, Any] | None) -> int:
+    """How many result pages one discovery query reads. 2 when it is not set."""
+    section = doc.get("discovery") if isinstance(doc, Mapping) else None
+    value = section.get("result_pages") if isinstance(section, Mapping) else None
+    low, high = RESULT_PAGES_LIMITS
+    return value if _int(value) and low <= value <= high else DEFAULT_RESULT_PAGES
 
 
 def discovery_candidates_per_day(doc: Mapping[str, Any] | None) -> int:

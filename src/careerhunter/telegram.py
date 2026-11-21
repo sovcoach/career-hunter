@@ -44,6 +44,9 @@ TOKEN_SHAPE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
 # Telegram's own description of a refusal, as logged: one line, no token, capped.
 MAX_DESCRIPTION = 200
 MAX_ERROR_BODY = 4096  # of an HTTP error's body, read to find Telegram's description
+# The most a Bot API reply may hold. A full getUpdates batch (100 updates of the
+# largest messages) is well under it; anything bigger is not read past the cap.
+MAX_REPLY = 4 * 1024 * 1024
 # How long one of the host's addresses gets to open a connection before the next is
 # tried. Without it, an IPv6 address whose connection hangs held a call for the whole
 # timeout (65 seconds) before IPv4 was tried, and a tap's answer arrived too late.
@@ -96,6 +99,10 @@ class TelegramRejected(TelegramError):
 
 class TelegramBadReply(TelegramError):
     """An answer that is not the Bot API's JSON."""
+
+
+class TelegramTooLarge(TelegramBadReply):
+    """An answer larger than the cap; it was not read past the cap."""
 
 
 def redact(text: str, token: str | None = None) -> str:
@@ -225,15 +232,27 @@ class HttpTelegram:
         self._context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
     def _open(
-        self, request: urllib.request.Request, what: str, timeout: float | None = None
+        self,
+        request: urllib.request.Request,
+        what: str,
+        timeout: float | None = None,
+        *,
+        max_bytes: int = MAX_REPLY,
     ) -> bytes:
+        """The reply's body. One byte past `max_bytes` is read to tell a reply over the
+        cap, which raises TelegramTooLarge; nothing more is read."""
         try:
             with _urlopen(  # fixed https:// API host
                 request,
                 timeout=self._timeout if timeout is None else timeout,
                 context=self._context,
             ) as response:
-                return bytes(response.read())
+                data = bytes(response.read(max_bytes + 1))
+            if len(data) > max_bytes:
+                raise TelegramTooLarge(
+                    f"{what}: the reply is larger than {max_bytes} bytes", method=what
+                )
+            return data
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read(MAX_ERROR_BODY).decode("utf-8", "replace")
@@ -288,7 +307,7 @@ class HttpTelegram:
         if not re.fullmatch(r"[A-Za-z0-9_./-]{1,256}", file_path) or ".." in file_path:
             raise TelegramError("download: Telegram returned an unexpected file path")
         request = urllib.request.Request(f"{API}/file/bot{self._token}/{file_path}")  # noqa: S310
-        data = self._open(request, "download")
-        if len(data) > max_bytes:
-            raise TelegramError(f"download: the file is larger than {max_bytes} bytes")
-        return data
+        try:
+            return self._open(request, "download", max_bytes=max_bytes)
+        except TelegramTooLarge:
+            raise TelegramError(f"download: the file is larger than {max_bytes} bytes") from None

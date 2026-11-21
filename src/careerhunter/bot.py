@@ -74,10 +74,12 @@ import yaml
 from careerhunter import (
     claims,
     db,
+    duplicates,
     enums,
     jobdesc,
     lanes,
     ledger,
+    phrases,
     search_store,
     selfsourced,
     snapshots,
@@ -169,14 +171,18 @@ DATE_BUTTONS = [
     ("Other date", "other"),
 ]
 LATER_STATUSES = [s for s in enums.STATUSES if s != "applied"]
+STATUS_WORDS = "The statuses are: " + ", ".join(s.replace("_", " ") for s in LATER_STATUSES) + "."
+STATUS_PAGE = 10  # applications per /status picker page
+DATE_SHAPE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # Telegram refusing one posting sent alone this many times gives it up (#42).
 REFUSALS_TO_GIVE_UP = 3
 
 LOG_USAGE = (
     "Send: /log <link> | method | date, or just /log <link>. "
-    "Add | Company | Title when the page doesn't show them. For example: "
-    "/log https://jobs.example.com/123 | company_site | 2026-11-10"
+    "Add | Company | Title when the page doesn't show them, and | location: <city> "
+    "when it doesn't say where. For example: "
+    "/log https://jobs.example.com/123 | company_site | 2026-11-10 | location: Example City"
 )
 LINKEDIN_REFUSAL = (
     "LinkedIn links are never fetched, so give the company and title: "
@@ -206,7 +212,8 @@ JD_LATE = (
 HELP = (
     "Commands:\n"
     "/log <link> | method | date: record a job you applied to yourself, in one step "
-    "(or /log <link> to be asked; add | Company | Title if the page doesn't show them). "
+    "(or /log <link> to be asked; add | Company | Title if the page doesn't show them, "
+    "and | location: <city> if it doesn't say where). "
     "Paste the job description on the lines after it, or send its PDF, HTML or text "
     "file with the /log line as the caption\n"
     "/status <ref> <status> [YYYY-MM-DD]: update an application (dated today unless a "
@@ -214,7 +221,8 @@ HELP = (
     "/activity <type> [YYYY-MM-DD] <description>: a recruiter call, agency "
     "registration and so on\n"
     "/recent: your latest applications\n"
-    "/skip: skip a posting whose buttons are spent, or /skip <link>"
+    "/skip: skip a posting whose buttons are spent, or /skip <link> (a posting career-hunter "
+    "doesn't have yet is stored first; add | Company | Title if the page doesn't show them)"
 )
 # /skip lists the postings alerted this long ago or less.
 SKIP_WINDOW = dt.timedelta(days=14)
@@ -315,6 +323,15 @@ def stale_run(doc: Mapping[str, Any] | None) -> dt.timedelta:
 
 
 LOCATION_UNKNOWN = "Location unknown"  # a posting whose board or page gave no location
+REFERRAL = "Referral"  # a posting the operator marked as a referral: local, needs no location
+# The JD button (Batch R): the kept job description, in at most JD_MESSAGES messages.
+JD_MESSAGES = 4
+JD_CHUNK = 3900  # characters per message, under Telegram's 4096
+JD_REST = "… the rest is in the posting."
+JD_NONE = (
+    "No job description was kept for this posting (it was alerted before job "
+    "descriptions were kept, or its board sent none)."
+)
 _CAPS = {"company": 80, "title": 120, "location": 80, "lane": 60, "requirement": 60}
 MAX_URL = 1000
 _SCHEDULE_WORDS = {"on_call": "on call", "over_weekend_limit": "weekend days over your limit"}
@@ -355,21 +372,25 @@ def _digest_row(numbered: _Numbered) -> str:
     facts = []
     if fields.location.strip():
         facts.append(_clip(fields.location, _CAPS["location"]))
-    else:
+    elif not fields.referral:
         facts.append(LOCATION_UNKNOWN)
+    if fields.referral:
+        facts.append(REFERRAL)
     if numbered.entry.order.lane_line:
         facts.append(_clip(numbered.entry.order.lane_line, _CAPS["lane"]))
     facts.append(f"Fit: {_fit_label(fields.fit)}")
     if fields.gap_count is not None:
         facts.append(f"{fields.gap_count} gap" + ("" if fields.gap_count == 1 else "s"))
     lines.append(" | ".join(facts))
+    if fields.also:  # the same role, posted again under other requisitions (Batch R)
+        lines.append(_clip("Also posted as " + ", ".join(fields.also), _CAPS["location"] * 2))
     if fields.schedule:
         words = [_SCHEDULE_WORDS.get(mark, "") for mark in fields.schedule.split()]
         shown = [word for word in words if word]
         if shown:
             lines.append("Schedule: " + ", ".join(shown))
     if fields.key_requirements:
-        needs = [_clip(item, _CAPS["requirement"]) for item in fields.key_requirements[:3]]
+        needs = [phrases.cut(item, _CAPS["requirement"]) for item in fields.key_requirements[:3]]
         lines.append("Needs: " + "; ".join(needs))
     if fields.url and len(fields.url) <= MAX_URL and fields.url.isprintable():
         lines.append(fields.url)
@@ -559,6 +580,61 @@ class _Stitch:
     title: str | None
     parts: list[str]
     last: dt.datetime
+    location: str | None = None
+    referral: bool = False
+
+
+_LOCATION_FIELD = re.compile(r"^location\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def _labelled_fields(extra: list[str]) -> tuple[list[str], str | None, bool]:
+    """The positional fields after the link, the `location: <city>` one and the
+    `referral` one, which may go anywhere after the link.
+
+    `referral` in the method's place of a full line (`| referral | today`) is the method,
+    which marks the posting as a referral anyway. Only one location and one referral;
+    an empty location is refused."""
+    unlabelled = [part for part in extra if _LOCATION_FIELD.match(part) is None]
+    method_slot = 0 if len(unlabelled) >= 2 and unlabelled[0].casefold() == "referral" else -1
+    positional: list[str] = []
+    location: str | None = None
+    referral = False
+    for part in extra:
+        match = _LOCATION_FIELD.match(part)
+        if match is None and part.casefold() == "referral" and len(positional) != method_slot:
+            if referral:
+                raise Refusal("Give referral once only.")
+            referral = True
+            continue
+        if match is None:
+            positional.append(part)
+            continue
+        if location is not None:
+            raise Refusal("Give one location only.")
+        location = " ".join(match.group(1).split())
+        if not location:
+            raise Refusal("The location after location: is empty.")
+    return positional, location, referral
+
+
+def _jd_messages(text: str) -> list[str]:
+    """`text` in at most JD_MESSAGES messages of JD_CHUNK characters, cut at a
+    paragraph, else a line, else a space; JD_REST ends the last one when text is left."""
+    parts: list[str] = []
+    rest = text.strip()
+    while rest and len(parts) < JD_MESSAGES:
+        if len(rest) <= JD_CHUNK:
+            parts.append(rest)
+            rest = ""
+            break
+        room = JD_CHUNK - len(JD_REST) - 1 if len(parts) == JD_MESSAGES - 1 else JD_CHUNK
+        cut = max(rest.rfind("\n\n", 0, room), 0) or max(rest.rfind("\n", 0, room), 0)
+        cut = cut or max(rest.rfind(" ", 0, room), 0) or room
+        parts.append(rest[:cut].rstrip())
+        rest = rest[cut:].strip()
+    if rest:
+        parts[-1] = f"{parts[-1]}\n{JD_REST}"
+    return parts
 
 
 def _log_format_problem(url: str, extra: list[str]) -> str | None:
@@ -592,7 +668,10 @@ def _log_fields(raw: object) -> dict[str, str]:
         raise Refusal("That button isn't recognized.")
     if not raw["url"] or not raw["company"] or not raw["title"]:
         raise Refusal("That button isn't recognized.")
-    return {k: str(raw[k]) for k in keys}
+    referral = raw.get("referral", "")  # absent on a button sent before Batch R
+    if referral not in ("", "1"):
+        raise Refusal("That button isn't recognized.")
+    return {**{k: str(raw[k]) for k in keys}, "referral": str(referral)}
 
 
 class Bot:
@@ -951,12 +1030,17 @@ class Bot:
                     keyboards.append(keyboard_id)
                     payload = json.dumps({"posting_id": numbered.entry.fields.posting_id})
                     buttons = []
-                    for label, action in (("Applied", "apply"), ("Skipped", "skip")):
+                    for label, action in (("Applied", "apply"), ("Skipped", "skip"), ("JD", "jd")):
                         token = secrets.token_urlsafe(16)
+                        # The JD button is on a keyboard of its own: reading the JD is not
+                        # a decision, so it never spends the row's Applied and Skipped.
+                        board = keyboard_id if action != "jd" else secrets.token_urlsafe(9)
+                        if board != keyboard_id:
+                            keyboards.append(board)
                         search.execute(
                             "INSERT INTO bot_tokens (token, keyboard, chat_id, action, payload, "
                             "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-                            (token, keyboard_id, self.chat_id, action, payload, expires),
+                            (token, board, self.chat_id, action, payload, expires),
                         )
                         buttons.append(
                             {"text": f"{label} {numbered.number}", "callback_data": token}
@@ -1245,7 +1329,15 @@ class Bot:
                 raise Refusal(f"Not recorded: {exc}") from None
         doc = self._read_config()
         self._log_now(
-            stitch.url, stitch.method, stitch.dating, stitch.company, stitch.title, doc, jd
+            stitch.url,
+            stitch.method,
+            stitch.dating,
+            stitch.company,
+            stitch.title,
+            doc,
+            jd,
+            stitch.location,
+            stitch.referral,
         )
         return "log:stitched"
 
@@ -1352,6 +1444,7 @@ class Bot:
         """
         parts = [p.strip() for p in rest.split("|")]
         url, extra = parts[0], parts[1:]
+        extra, location, referral = _labelled_fields(extra)
         problem = _log_format_problem(url, extra)
         if problem is not None:
             raise Refusal(f"{problem} {LOG_USAGE}")
@@ -1373,18 +1466,21 @@ class Bot:
         if urls.no_fetch(url) and not (company and title):
             raise Refusal(LINKEDIN_REFUSAL)
         if body is not None and method is not None and dating is not None:
-            self._stitch = _Stitch(url, method, dating, company, title, [body], self.clock())
+            self._stitch = _Stitch(
+                url, method, dating, company, title, [body], self.clock(), location, referral
+            )
             return
         jd = self._document_jd(document) if document is not None else None
         if method is not None and dating is not None:
-            self._log_now(url, method, dating, company, title, doc, jd)
+            self._log_now(url, method, dating, company, title, doc, jd, location, referral)
             return
-        posting = self._describe(url, today, company, title)
+        posting = self._describe(url, today, company, title, location)
         found = {
             "url": posting.url or url,
             "company": posting.company,
             "title": posting.title,
             "location": posting.location,
+            "referral": "1" if referral else "",
         }
         if method is None or dating is None:
             rows = [
@@ -1402,10 +1498,17 @@ class Bot:
         self._finish_log(found, method, dating, doc)
 
     def _describe(
-        self, url: str, today: dt.date, company: str | None, title: str | None
+        self,
+        url: str,
+        today: dt.date,
+        company: str | None,
+        title: str | None,
+        location: str | None = None,
     ) -> Posting:
         try:
-            return selfsourced.describe(url, self.fetcher, today, company=company, title=title)
+            return selfsourced.describe(
+                url, self.fetcher, today, company=company, title=title, location=location
+            )
         except selfsourced.LinkedInNamesMissing:
             raise Refusal(LINKEDIN_REFUSAL) from None
         except selfsourced.NamesMissing as exc:
@@ -1422,14 +1525,17 @@ class Bot:
         title: str | None,
         doc: dict[str, Any],
         jd: jobdesc.JobDescription | None,
+        location: str | None = None,
+        referral: bool = False,
     ) -> None:
         """Fetch what the page shows, then record the /log with its JD, if any."""
-        posting = self._describe(url, self._today(doc), company, title)
+        posting = self._describe(url, self._today(doc), company, title, location)
         found = {
             "url": posting.url or url,
             "company": posting.company,
             "title": posting.title,
             "location": posting.location,
+            "referral": "1" if referral else "",
         }
         self._finish_log(found, method, dating, doc, jd)
 
@@ -1449,39 +1555,130 @@ class Bot:
             raise Refusal(str(exc)) from None
 
     def _cmd_status(self, rest: str) -> None:
+        """`/status <ref> <status> [YYYY-MM-DD]`, or the application named by company or
+        title words in place of the ref (Batch R), or just `/status` for a picker that
+        pages through every application. Words that match more than one application, or
+        no status word, get the matching applications as buttons, with the status words."""
         parts = rest.split()
+        if not parts:
+            self._status_page(0)
+            return
+        ref = parts[0].lower()
         with self._search() as search:
-            if not parts:
-                rows = search_store.recent_applications(search, 10)
-                if not rows:
-                    raise Refusal("No applications yet.")
-                buttons = [
-                    [
-                        (
-                            f"{self._ref(search, int(r['id']))} {r['company']} — {r['title']}"[:60],
-                            "status_pick",
-                            {"application_id": int(r["id"])},
-                        )
-                    ]
-                    for r in rows
-                ]
-                self._keyboard(search, "Which application?", buttons, STEP_TTL)
-                return
-            if len(parts) not in (2, 3):
+            application_id = self._resolve_ref(search, ref)
+            if application_id is None and REF_SHAPE.fullmatch(ref):
                 raise Refusal(
-                    "Send: /status <ref> <status> [YYYY-MM-DD], or just /status to choose."
+                    "I don't know that reference. Send /recent for current ones, or "
+                    "/status <company or title words>."
                 )
-            ref, status = parts[0].lower(), enums.normalize(parts[1])
+            if application_id is not None and len(parts) == 1:  # the ref alone
+                rows = [
+                    [(_words(s), "status_set", {"application_id": application_id, "status": s})]
+                    for s in LATER_STATUSES
+                ]
+                self._keyboard(search, "New status?", rows, STEP_TTL)
+                return
+        if application_id is not None and len(parts) in (2, 3):
+            status = enums.normalize(parts[1])
             if status not in LATER_STATUSES:
                 raise Refusal("The status must be one of: " + ", ".join(LATER_STATUSES))
-            application_id = self._resolve_ref(search, ref)
-        if application_id is None:
-            raise Refusal("I don't know that reference. Send /recent for current ones.")
-        day = None
-        if len(parts) == 3:
-            dating = parse_date(parts[2], self._today(self._config()))
-            day = dt.date.fromisoformat(str(dating.day))
-        self._finish_status(application_id, status, day)
+            day = self._status_day(parts[2]) if len(parts) == 3 else None
+            self._finish_status(application_id, status, day)
+            return
+        self._status_by_words(rest)
+
+    def _status_day(self, text: str) -> dt.date:
+        dating = parse_date(text, self._today(self._config()))
+        return dt.date.fromisoformat(str(dating.day))
+
+    def _status_page(self, offset: int) -> None:
+        """STATUS_PAGE applications, newest first, from `offset`, with More… after them."""
+        with self._search() as search:
+            rows = search_store.recent_applications(search, STATUS_PAGE, offset)
+            total = search_store.application_count(search)
+            if not rows:
+                raise Refusal("No applications yet." if offset == 0 else "No more applications.")
+            buttons = self._status_buttons(search, rows, None, None)
+            if offset + STATUS_PAGE < total:
+                buttons.append([("More…", "status_page", {"offset": offset + STATUS_PAGE})])
+            shown = f"{offset + 1} to {offset + len(rows)} of {total}"
+            self._keyboard(
+                search,
+                f"Which application? ({shown}; or send /status <company or title words>)",
+                buttons,
+                STEP_TTL,
+            )
+
+    def _status_buttons(
+        self,
+        search: sqlite3.Connection,
+        rows: list[sqlite3.Row],
+        status: str | None,
+        day: dt.date | None,
+    ) -> list[list[tuple[str, str, dict[str, Any]]]]:
+        """One button per application: to the status buttons, or, with a status already
+        given, straight to recording it."""
+        buttons = []
+        for r in rows:
+            label = f"{self._ref(search, int(r['id']))} {r['company']} — {r['title']}"[:60]
+            payload: dict[str, Any] = {"application_id": int(r["id"])}
+            if day is not None:
+                payload["day"] = day.isoformat()
+            if status is None:
+                buttons.append([(label, "status_pick", payload)])
+            else:
+                buttons.append([(label, "status_set", {**payload, "status": status})])
+        return buttons
+
+    def _status_by_words(self, rest: str) -> None:
+        """The application named by words, with an optional status word and date."""
+        status, day, words = self._status_parts(rest)
+        with self._search() as search:
+            found = search_store.matching_applications(search, words)
+            best = [row for row, score in found if score == len(words)]
+            if status is not None and len(best) == 1 and words:
+                application_id = int(best[0]["id"])
+            else:
+                application_id = None
+                rows = [row for row, _ in found[:STATUS_PAGE]]
+                if not rows:
+                    raise Refusal(
+                        "No application matches those words. Send /status to choose, or "
+                        "/status <ref> <status>. " + STATUS_WORDS
+                    )
+                if status is None:
+                    text = "Which application? " + STATUS_WORDS
+                else:
+                    text = f"Which application gets {_words(status)}?"
+                self._keyboard(
+                    search, text, self._status_buttons(search, rows, status, day), STEP_TTL
+                )
+        if application_id is not None and status is not None:
+            self._finish_status(application_id, status, day)
+
+    def _status_parts(self, rest: str) -> tuple[str | None, dt.date | None, list[str]]:
+        """The status word (one word or two, as `position closed`), the date and the
+        other words of a free-text /status line. Punctuation around words is dropped."""
+        tokens = [t.strip(".,;:!?()[]\"'") for t in rest.split()]
+        tokens = [t for t in tokens if t]
+        status: str | None = None
+        day: dt.date | None = None
+        used: set[int] = set()
+        for i in range(len(tokens)):
+            for width in (3, 2, 1):
+                if status is not None or i + width > len(tokens):
+                    continue
+                candidate = enums.normalize(" ".join(tokens[i : i + width]))
+                if candidate in LATER_STATUSES:
+                    status = candidate
+                    used.update(range(i, i + width))
+        for i, token in enumerate(tokens):
+            if i not in used and DATE_SHAPE.fullmatch(token):
+                day = self._status_day(token)
+                used.add(i)
+                break
+        words = [t for i, t in enumerate(tokens) if i not in used]
+        return status, day, words
 
     def _cmd_activity(self, rest: str) -> None:
         kind_text, _, remainder = rest.partition(" ")
@@ -1535,12 +1732,55 @@ class Bot:
                 ]
                 self._keyboard(search, "Which posting?", buttons, STEP_TTL)
                 return
-            posting_id = search_store.posting_id_by_link(search, rest.split()[0])
-            if posting_id is None:
-                raise Refusal("I don't know that link. Send /skip to choose from recent alerts.")
+            parts = [p.strip() for p in rest.split("|")]
+            link = parts[0].split()[0] if parts[0] else ""
+            posting_id = search_store.posting_id_by_link(search, link) if link else None
+        if posting_id is None:
+            posting_id = self._store_for_skip(link, parts[1:])
+        with self._search() as search:
             if search_store.has_operator_skip(search, posting_id):
                 raise Refusal("Already skipped.")
             self._skip_reasons(search, posting_id)
+
+    def _store_for_skip(self, link: str, names: list[str]) -> int:
+        """A posting career-hunter doesn't have yet, stored so it can be skipped (Batch
+        R): `self_sourced`, with the company, title and JD the link gives (the same
+        fetch as /log), or `| Company | Title` given after it. No EI record entry."""
+        if not link or len(link) > selfsourced.MAX_URL:
+            raise Refusal("Send /skip <link>, or /skip to choose from recent alerts.")
+        if len(names) not in (0, 2) or any(not n for n in names):
+            raise Refusal("Send /skip <link>, or /skip <link> | Company | Title.")
+        company, title = (names[0], names[1]) if names else (None, None)
+        doc = self._read_config()
+        today = self._today(doc)
+        if urls.no_fetch(link) and not (company and title):
+            raise Refusal(
+                "LinkedIn links are never fetched, so give the company and title: "
+                "/skip <link> | Company | Title"
+            )
+        try:
+            posting = selfsourced.describe(link, self.fetcher, today, company=company, title=title)
+        except selfsourced.NamesMissing:
+            raise Refusal(
+                "I couldn't find the company and title on that page. "
+                "Send: /skip <link> | Company | Title"
+            ) from None
+        except selfsourced.LogError as exc:
+            raise Refusal(str(exc)) from None
+        got = jobdesc.Fetched(None)
+        if posting.url and not urls.no_fetch(posting.url):
+            got = jobdesc.fetched_with_location(posting.url, self.fetcher)
+        if not posting.location and got.location:
+            posting = replace(posting, location=got.location)
+        saved = jobdesc.save(self.datadir.root, got.jd, today) if got.jd is not None else None
+        with self._search() as search, db.transaction(search):
+            _, posting_id, _, _ = search_store.find_or_create_posting(
+                search, posting, Dating("exact", day=today.isoformat())
+            )
+            if saved is not None:
+                digest = jobdesc.normalized_sha256(saved.description.text)
+                search_store.keep_jd(search, posting_id, saved.path, digest)
+        return posting_id
 
     def _skip_reasons(self, search: sqlite3.Connection, posting_id: int) -> None:
         rows = [
@@ -1590,6 +1830,8 @@ class Bot:
                 )
             if taken != 1:
                 return None
+            if row["action"] == "jd":  # never spent: it stays until the row expires
+                search.execute("UPDATE bot_tokens SET used_at = NULL WHERE token = ?", (data,))
             payload = json.loads(row["payload"])
         return str(row["action"]), payload if isinstance(payload, dict) else {}
 
@@ -1647,6 +1889,9 @@ class Bot:
         # answer only leaves the button's spinner on: the tap is still acted on.
         self._answer(query.get("id"))
         action, payload = taken
+        if action == "jd":  # read only: no buttons change
+            self._send_jd(payload)
+            return "callback:jd"
         try:
             self._dispatch(action, payload)
         except discovery.DiscoverError as exc:
@@ -1656,6 +1901,30 @@ class Bot:
         finally:
             self._take_off_buttons(message)
         return f"callback:{action}"
+
+    def _send_jd(self, payload: Mapping[str, Any]) -> None:
+        """The kept job description of an alerted posting, split at paragraphs into at
+        most JD_MESSAGES messages; JD_NONE when none was kept."""
+        posting_id = payload.get("posting_id")
+        text: str | None = None
+        heading = ""
+        if isinstance(posting_id, int) and not isinstance(posting_id, bool):
+            with self._search() as search:
+                kept = search_store.kept_jd(search, posting_id)
+                shown = search_store.posting_by_id(search, posting_id)
+            data = snapshots.read_kept(self.datadir.root, kept[0]) if kept else None
+            if data is not None:
+                try:
+                    text = jobdesc.from_file(data).text.strip() or None
+                except jobdesc.JobDescError:
+                    text = None
+            if shown is not None:
+                heading = f"Job description: {shown.company} — {shown.title}\n\n"
+        if text is None:
+            self.send(JD_NONE)
+            return
+        for part in _jd_messages(heading + text):
+            self.send(part)
 
     def _answer(self, query_id: Any, text: str | None = None) -> None:
         """answerCallbackQuery, quickly. A failure is logged, never raised."""
@@ -1753,14 +2022,19 @@ class Bot:
                         {"posting_id": p["posting_id"], "skip_id": skip_id},
                     )
         elif action == "status_pick":
-            rows = [
-                [(_words(s), "status_set", {"application_id": p["application_id"], "status": s})]
-                for s in LATER_STATUSES
-            ]
+            kept: dict[str, Any] = {k: p[k] for k in ("application_id", "day") if k in p}
+            rows = [[(_words(s), "status_set", {**kept, "status": s})] for s in LATER_STATUSES]
             with self._search() as search:
                 self._keyboard(search, "New status?", rows, STEP_TTL)
         elif action == "status_set":
-            self._finish_status(int(p["application_id"]), str(p["status"]))
+            day = p.get("day")
+            when = dt.date.fromisoformat(day) if isinstance(day, str) else None
+            self._finish_status(int(p["application_id"]), str(p["status"]), when)
+        elif action == "status_page":
+            offset = p.get("offset")
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise Refusal("That button isn't recognized.")
+            self._status_page(offset)
         elif action in ("discover_approve", "discover_reject"):
             decision = "approve" if action == "discover_approve" else "reject"
             self._finish_discovery(p.get("candidate_id"), decision)
@@ -1887,23 +2161,47 @@ class Bot:
                 captured = snapshots.capture(posting.url, self.fetcher)
                 if captured is not None:
                     path = snapshots.save(self.datadir.root, captured.data, captured.ext, today)
-            app = Application(replace(posting, snapshot_path=path), dating, method)
+            saved = self._kept_jd(search, posting_id)
+            members = duplicates.group(search, posting_id)
+            app = Application(
+                replace(posting, snapshot_path=path),
+                dating,
+                method,
+                requisitions=duplicates.requisitions(search, members),
+            )
             try:
-                recorded = ledger.record_application(search, active, app, lane_config=doc)
+                recorded = ledger.record_application(search, active, app, saved, lane_config=doc)
             except sqlite3.IntegrityError:
                 raise Refusal("That application is already recorded.") from None
             if path and posting.snapshot_path is None:
                 search_store.set_posting_snapshot(search, posting_id, path)
-            # The watcher keeps no description (it is used in memory for the filters and
-            # scoring only), so an application from an alert always asks for its JD.
+            # One application for the group: its other postings are covered by it through
+            # duplicate_of (Batch R), never skipped, so skip counts and reasons don't see
+            # them. They are never alerted (pending_alerts) or re-scored.
+            # The JD kept when the posting was scored is the application's JD (Batch R);
+            # an alert from before JDs were kept asks for it.
             self._confirm(
                 search,
                 recorded.correlation_id,
                 posting.company,
                 posting.title,
                 bool(path),
-                jd="missing",
+                jd="saved" if saved is not None else "missing",
             )
+
+    def _kept_jd(self, search: sqlite3.Connection, posting_id: int) -> jobdesc.SavedJd | None:
+        """The job description kept when the posting was scored, as a saved JD."""
+        kept = search_store.kept_jd(search, posting_id)
+        data = snapshots.read_kept(self.datadir.root, kept[0]) if kept else None
+        if kept is None or data is None:
+            return None
+        try:
+            found = jobdesc.from_file(data)
+        except jobdesc.JobDescError:
+            return None
+        if not found.has_text:
+            return None
+        return jobdesc.SavedJd(replace(found, source="fetched"), kept[0])
 
     def _finish_log(
         self,
@@ -1938,6 +2236,7 @@ class Bot:
                     self.fetcher,
                     jd,
                     lane_config=doc,
+                    referral=found.get("referral") == "1",
                 )
             except selfsourced.LogError as exc:
                 raise Refusal(str(exc)) from None
@@ -1954,6 +2253,8 @@ class Bot:
                 logged.snapshot_saved,
                 earlier=logged.earlier,
                 jd=state,
+                location=logged.location,
+                referral=logged.referral,
             )
 
     def _confirm(
@@ -1966,8 +2267,11 @@ class Bot:
         *,
         jd: str,
         earlier: str | None = None,
+        location: str | None = None,
+        referral: bool = False,
     ) -> None:
         """`Recorded: … (ref aN).`, then the request for the JD when none was saved.
+        With `location` (a /log), a `Location:` line follows, `unknown` when blank.
 
         `jd` is `saved`, `missing` or `no_text`, for /log and for Applied alike. A saved
         JD can be replaced by replying to the Recorded message; otherwise the JD is asked
@@ -1982,6 +2286,10 @@ class Bot:
             text += " Job ad saved."
         if jd == "saved":
             text += " Job description saved."
+        if location is not None:
+            text += f"\nLocation: {location or 'unknown'}"
+        if referral:
+            text += f"\n{REFERRAL}"
         if earlier:
             text += "\n" + earlier
         message_id = self.send(text)
@@ -2010,7 +2318,17 @@ class Bot:
                 raise Refusal("That posting isn't in search.db any more.")
             if search_store.has_operator_skip(search, posting_id):
                 raise Refusal("Already skipped.")
-            skip_id = ledger.record_skip(search, posting, self._today(doc).isoformat(), reason)
+            day = self._today(doc).isoformat()
+            skip_id = ledger.record_skip(search, posting, day, reason)
+            # The same role posted again is skipped with it, for the same reason.
+            for other in duplicates.group(search, posting_id):
+                shown = search_store.posting_by_id(search, other)
+                if (
+                    other != posting_id
+                    and shown is not None
+                    and not search_store.has_operator_skip(search, other)
+                ):
+                    ledger.record_skip(search, shown, day, reason)
         if reply:
             self.send(f"Skipped: {posting.company} — {posting.title}.")
         return skip_id
@@ -2024,9 +2342,18 @@ class Bot:
             return
         doc = self._config()
         with self._writable(doc) as (search, _):
-            posting = search_store.posting_by_id(search, int(payload["posting_id"]))
+            posting_id = int(payload["posting_id"])
+            posting = search_store.posting_by_id(search, posting_id)
             if posting is None or not ledger.set_skip_reason(search, skip_id, reason):
                 raise Refusal("That skip isn't in search.db any more.")
+            for other in duplicates.group(search, posting_id):  # skipped with it as `other`
+                row = search.execute(
+                    "SELECT id FROM skips WHERE posting_id = ? AND by_operator = 1 "
+                    "AND reason = 'other' ORDER BY id DESC LIMIT 1",
+                    (other,),
+                ).fetchone()
+                if other != posting_id and row is not None:
+                    ledger.set_skip_reason(search, int(row["id"]), reason)
         self.send(f"Skipped: {posting.company} — {posting.title}.")
 
     def _finish_status(self, application_id: int, status: str, day: dt.date | None = None) -> None:

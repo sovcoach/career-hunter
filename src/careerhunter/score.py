@@ -99,7 +99,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from careerhunter import loopback
+from careerhunter import loopback, phrases
 from careerhunter.config import DEFAULT_CHAT_MODEL, GAP_TYPE_NAMES, chat_model, requirement_tiers
 from careerhunter.criteria import Criteria, Rule
 from careerhunter.deadline import Deadline
@@ -1068,13 +1068,9 @@ def _repeats(needle: str, haystack: str) -> bool:
 
 
 def _capped(phrase: str) -> str:
-    """At most MAX_REQUIREMENT characters, cut at a word, with "…" when cut."""
-    if len(phrase) <= MAX_REQUIREMENT:
-        return phrase
-    cut = phrase[: MAX_REQUIREMENT - 1]
-    if " " in cut:
-        cut = cut[: cut.rindex(" ")]
-    return cut.rstrip(" ,;:-") + "…"
+    """At most MAX_REQUIREMENT characters, cut at a clause break or a word, never
+    mid-phrase, with "…" when cut (`phrases.cut`)."""
+    return phrases.cut(phrase, MAX_REQUIREMENT)
 
 
 def _apply_tiers(

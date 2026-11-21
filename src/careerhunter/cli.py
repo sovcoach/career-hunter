@@ -35,6 +35,7 @@ from careerhunter import (
     claims,
     criteria,
     db,
+    dbsnapshot,
     demo,
     discover,
     embed,
@@ -43,6 +44,7 @@ from careerhunter import (
     jobdesc,
     lanes,
     ledger,
+    locationfill,
     resume,
     search_store,
     secrets_store,
@@ -461,7 +463,12 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
         dating = selfsourced.parse_day(args.date, today)
         jd = _jd_argument(args)
         posting = selfsourced.describe(
-            args.url, fetch_page, today, company=args.company, title=args.title
+            args.url,
+            fetch_page,
+            today,
+            company=args.company,
+            title=args.title,
+            location=args.location,
         )
         with _writable(datadir) as w:
             logged = selfsourced.record(
@@ -475,6 +482,7 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
                 fetch_page,
                 jd,
                 lane_config=doc,
+                referral=args.referral,
             )
     except jobdesc.JobDescError as exc:
         _err(f"error: {exc} Nothing was recorded.")
@@ -487,6 +495,9 @@ def cmd_log(datadir: DataDir, args: argparse.Namespace) -> int:
         return EXIT_ERROR
     where = f"EI claim {logged.ei_claim}" if logged.ei_claim else "search.db only, no active claim"
     print(f"Recorded: {logged.company} — {logged.title} ({where}).")
+    print(f"Location: {logged.location or 'unknown'}")
+    if logged.referral:
+        print("Referral: it counts as local and needs no location.")
     print("Job ad saved." if logged.snapshot_saved else "No copy of the job ad was saved.")
     if logged.jd_saved:
         print("Job description saved.")
@@ -629,10 +640,15 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
     writes nothing.
 
     `--set-aside` releases every posting the watcher set aside after scoring timeouts
-    in a row (search migration 0034), scored or not, so the next run sends it to the
-    model again; a `--posting` id that is set aside is released too."""
-    if not args.posting and not args.gap and not args.set_aside:
-        _err("error: give --posting, --gap or --set-aside")
+    in a row (search migration 0034) or failed re-reads of its board page in a row
+    (0036), scored or not, so the next run reads it and sends it to the model again; a
+    `--posting` id that is set aside is released too.
+
+    `--given-up` releases every posting given up after replies from the model that did
+    not parse (search migration 0023), so the next run sends it again; a `--posting` id
+    that was given up is released too."""
+    if not args.posting and not args.gap and not args.set_aside and not args.given_up:
+        _err("error: give --posting, --gap, --set-aside or --given-up")
         return EXIT_ERROR
     if not datadir.search_db_path.is_file():
         _err("error: search.db is missing; run careerhunter init")
@@ -651,7 +667,17 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
             for row in search_store.set_aside_postings(conn)
             if args.set_aside or int(row["id"]) in picked
         ]
-        missing = sorted(picked - {int(r["id"]) for r in rows} - {int(r["id"]) for r in aside})
+        given_up = [
+            row
+            for row in search_store.given_up_postings(conn)
+            if args.given_up or int(row["id"]) in picked
+        ]
+        missing = sorted(
+            picked
+            - {int(r["id"]) for r in rows}
+            - {int(r["id"]) for r in aside}
+            - {int(r["id"]) for r in given_up}
+        )
         for row in rows:
             alerted = "alerted" if row["alerted_at"] else "not alerted"
             print(
@@ -659,13 +685,21 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
             )
         for row in aside:
             alerted = "alerted" if row["alerted_at"] else "not alerted"
+            why = "timeouts" if row["aside"] == "timeouts" else f"failed re-reads ({row['aside']})"
             print(
                 f"{int(row['id']):5} {row['company']} — {row['title']}: set aside after "
-                f"timeouts, fit {row['fit']}, {alerted}"
+                f"{why}, fit {row['fit']}, {alerted}"
+            )
+        for row in given_up:
+            alerted = "alerted" if row["alerted_at"] else "not alerted"
+            print(
+                f"{int(row['id']):5} {row['company']} — {row['title']}: given up after "
+                f"replies that did not parse, fit {row['fit']}, {alerted}"
             )
         for posting_id in missing:
             print(f"{posting_id:5} not queued: not a scored posting without a skip or application")
         releasing = bool(aside) or args.set_aside
+        reviving = bool(given_up) or args.given_up
         if args.dry_run:
             would = []
             if picked or args.gap:
@@ -675,11 +709,17 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
                     f"{plural(len(aside), 'set-aside posting', 'set-aside postings')} "
                     "would be released."
                 )
+            if reviving:
+                would.append(
+                    f"{plural(len(given_up), 'given-up posting', 'given-up postings')} "
+                    "would be released."
+                )
             print(f"dry run: nothing is written. {' '.join(would)}")
             return EXIT_OK
         with db.transaction(conn):
             count = search_store.mark_for_rescore(conn, [int(r["id"]) for r in rows])
             released = search_store.release_set_aside(conn, [int(r["id"]) for r in aside])
+            revived = search_store.release_given_up(conn, [int(r["id"]) for r in given_up])
     finally:
         conn.close()
     if picked or args.gap:
@@ -690,6 +730,11 @@ def cmd_rescore(datadir: DataDir, args: argparse.Namespace) -> int:
         print(
             f"{plural(released, 'set-aside posting', 'set-aside postings')} released; "
             f"the next watch run sends {'it' if released == 1 else 'them'} again."
+        )
+    if reviving:
+        print(
+            f"{plural(revived, 'given-up posting', 'given-up postings')} released; "
+            f"the next watch run sends {'it' if revived == 1 else 'them'} to the model again."
         )
     return EXIT_OK if not missing else EXIT_ERROR
 
@@ -1690,6 +1735,115 @@ def cmd_embed_eval(datadir: DataDir, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_db(
+    datadir: DataDir,
+    args: argparse.Namespace,
+    probe: SystemProbe,
+    *,
+    clock: Clock | None = None,
+) -> int:
+    """`db snapshot --to DIR`: a read-only copy of search.db and every EI record.
+
+    Each database is opened read-only and copied with SQLite's backup API into a new
+    owner-only folder under DIR, then checked with `PRAGMA integrity_check`. DIR must be
+    on a volume diskutil reports as encrypted, and outside the data folder and any git
+    checkout. Nothing in the data folder is written.
+    """
+    if args.db_action != "snapshot":  # pragma: no cover - argparse limits the choices
+        return EXIT_ERROR
+    now = clock() if clock is not None else dt.datetime.now(dt.UTC)
+    try:
+        folder, copied = dbsnapshot.snapshot(args.dest, datadir, probe, now)
+    except dbsnapshot.SnapshotError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    print(f"snapshot: {folder}")
+    for item in copied:
+        print(f"  {item.name}: integrity {item.integrity}")
+    print("Open the copies read-only (PRAGMA query_only=1); delete the folder when done.")
+    return EXIT_OK
+
+
+def cmd_referral(datadir: DataDir, args: argparse.Namespace) -> int:
+    """`referral --posting ID | --url LINK`: mark a stored posting as a referral. It then
+    counts as local and needs no location, and its alert says Referral. Writes
+    search.db only; a skip already stored for the posting stays."""
+    if (args.posting is None) == (args.url is None):
+        _err("error: give --posting or --url, not both")
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    conn = db.connect(datadir.search_db_path)
+    try:
+        db.migrate(conn, "search")
+        posting_id = (
+            args.posting
+            if args.posting is not None
+            else search_store.posting_id_by_link(conn, args.url)
+        )
+        row = (
+            None
+            if posting_id is None
+            else conn.execute(
+                "SELECT c.name AS company, p.title, p.referral, "
+                "(SELECT reason FROM skips s WHERE s.posting_id = p.id) AS skipped "
+                "FROM postings p JOIN companies c ON c.id = p.company_id WHERE p.id = ?",
+                (posting_id,),
+            ).fetchone()
+        )
+        if row is None or posting_id is None:
+            _err("error: no stored posting has that id or link")
+            return EXIT_ERROR
+        with db.transaction(conn):
+            marked = search_store.mark_referral(conn, posting_id)
+    finally:
+        conn.close()
+    what = f"posting {posting_id} ({row['company']} — {row['title']})"
+    print(f"{what} {'is now marked' if marked else 'was already marked'} as a referral.")
+    if row["skipped"]:
+        print(f"Its skip ({row['skipped']}) stays: a referral never undoes a skip.")
+    return EXIT_OK
+
+
+def cmd_locations(datadir: DataDir, args: argparse.Namespace) -> int:
+    """`locations fill [--dry-run]`: blank stored locations, from the kept job ads and
+    job descriptions (`locationfill`). Nothing is fetched. A dry run reads only. Without
+    `--dry-run`, search.db gets the locations in one transaction; the EI records are
+    only read."""
+    if args.locations_action != "fill":  # pragma: no cover - argparse limits the choices
+        return EXIT_ERROR
+    if not datadir.search_db_path.is_file():
+        _err("error: search.db is missing; run careerhunter init")
+        return EXIT_ERROR
+    if args.dry_run:
+        conn = db.connect_read_only(datadir.search_db_path)
+        try:
+            _require_current(conn, "search", "search.db")
+            planned = locationfill.plan(conn, datadir)
+        finally:
+            conn.close()
+        print("dry run: nothing is written.")
+    else:
+        conn = db.connect(datadir.search_db_path)
+        try:
+            db.migrate(conn, "search")
+            planned = locationfill.plan(conn, datadir)
+            written = locationfill.apply(conn, planned)
+        finally:
+            conn.close()
+    for item in planned:
+        print(
+            f"{item.posting_id:6} {item.company} — {item.title}: {item.location} "
+            f"(from its {item.source})"
+        )
+    if args.dry_run:
+        print(f"{len(planned)} blank locations would be filled.")
+    else:
+        print(f"{written} blank locations filled.")
+    return EXIT_OK
+
+
 def cmd_lanes(datadir: DataDir, args: argparse.Namespace) -> int:
     """`lanes reassign [--dry-run]`: recompute every checked posting's lane, and check
     every posting not checked yet.
@@ -1902,6 +2056,9 @@ def _doctor_watch_runs(
         if config_doc is not None and off_lane_min_fit(config_doc) == "never"
         else f"{finished['held_off_lane']} off-lane below the threshold"
     )
+    unknown = search_store.location_unknown_count(search)
+    if unknown:
+        detail += f", {unknown} with location unknown (scored and alerted as usual)"
     if finished["budget_reached"]:
         detail += "; that run's budget left work for the next one"
     if finished["held_no_fit"]:
@@ -2167,10 +2324,31 @@ def _doctor_refusals(report: _Report, search: sqlite3.Connection) -> None:
             "WARN",
             f"{plural(unparsed, 'posting', 'postings')} got a model reply that did not "
             f"parse {watch.PARSE_FAILURES_TO_GIVE_UP} times; given up and never scored "
-            "(see logs/watch.log)",
+            "(see logs/watch.log; retry: careerhunter rescore --given-up)",
         )
     if not given_up and not unparsed:
         report.line("bot refusals", "OK", "no posting given up")
+
+
+def _doctor_rereads(report: _Report, search: sqlite3.Connection) -> None:
+    """Postings set aside after failed re-reads of their board page (search migration
+    0036), by reason. No line when there are none."""
+    counts = search_store.reread_set_aside(search)
+    if not counts:
+        return
+    total = sum(counts.values())
+    reasons = ", ".join(
+        f"{n} {reason.replace('http-', 'HTTP ')}"
+        if len(counts) > 1
+        else reason.replace("http-", "HTTP ")
+        for reason, n in counts.items()
+    )
+    report.line(
+        "re-reads",
+        "WARN",
+        f"{plural(total, 'posting', 'postings')} set aside after failed re-reads ({reasons}); "
+        "retry: careerhunter rescore --set-aside",
+    )
 
 
 def _doctor_set_aside(report: _Report, search: sqlite3.Connection) -> None:
@@ -2407,6 +2585,7 @@ def cmd_doctor(datadir: DataDir, args: argparse.Namespace, *, clock: Clock | Non
         _doctor_alert_hold(report, search)
         _doctor_refusals(report, search)
         _doctor_set_aside(report, search)
+        _doctor_rereads(report, search)
         _doctor_facets(report, search, config_doc)
         _doctor_job_descriptions(report, search)
 
@@ -2513,6 +2692,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--date", required=True, help="YYYY-MM-DD, today or yesterday")
     p.add_argument("--company", help="the employer, when the page doesn't say (with --title)")
     p.add_argument("--title", help="the role, when the page doesn't say (with --company)")
+    p.add_argument(
+        "--location",
+        help="where the job is, when the page doesn't say or says it wrong (optional)",
+    )
+    p.add_argument(
+        "--referral",
+        action="store_true",
+        help="mark the posting as a referral: it counts as local and needs no location",
+    )
     jd = p.add_mutually_exclusive_group()
     jd.add_argument(
         "--jd-file", metavar="PATH", help="the job description, as a PDF, HTML or text file"
@@ -2543,7 +2731,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--set-aside",
         action="store_true",
-        help="release the postings set aside after scoring timeouts, to be tried again",
+        help="release the postings set aside after scoring timeouts or failed re-reads",
+    )
+    p.add_argument(
+        "--given-up",
+        action="store_true",
+        help="release the postings given up after replies that did not parse",
     )
     p.add_argument("--dry-run", action="store_true", help="list them; write nothing")
     p = sub.add_parser(
@@ -2621,6 +2814,35 @@ def build_parser() -> argparse.ArgumentParser:
         "scout-prompt",
         help="print a scout prompt from exclusions and the hard gates the watcher skips on",
     )
+    p = sub.add_parser("db", help="read-only copies of the databases, for investigations")
+    db_sub = p.add_subparsers(dest="db_action", required=True)
+    p = db_sub.add_parser(
+        "snapshot",
+        help="copy search.db and every EI record into a new folder under --to, read-only, "
+        "with an integrity check; the folder must be on an encrypted volume",
+    )
+    p.add_argument(
+        "--to",
+        dest="dest",
+        type=Path,
+        required=True,
+        metavar="DIR",
+        help="an existing folder outside the data folder and outside any git checkout",
+    )
+    p = sub.add_parser(
+        "referral",
+        help="mark a stored posting as a referral: it counts as local and needs no location",
+    )
+    p.add_argument("--posting", type=int, metavar="ID", help="the posting's id in search.db")
+    p.add_argument("--url", help="the posting's link")
+    p = sub.add_parser("locations", help="stored postings' locations")
+    locations_sub = p.add_subparsers(dest="locations_action", required=True)
+    p = locations_sub.add_parser(
+        "fill",
+        help="fill blank locations from the kept job ads and job descriptions; "
+        "fetches nothing, writes search.db only",
+    )
+    p.add_argument("--dry-run", action="store_true", help="list each location that would be filled")
     p = sub.add_parser("lanes", help="manage the title lanes stored on postings")
     lanes_sub = p.add_subparsers(dest="lanes_action", required=True)
     p = lanes_sub.add_parser(
@@ -2669,6 +2891,8 @@ COMMANDS: dict[str, Callable[[DataDir, argparse.Namespace], int]] = {
     "discover": cmd_discover,
     "scout-prompt": cmd_scout_prompt,
     "lanes": cmd_lanes,
+    "locations": cmd_locations,
+    "referral": cmd_referral,
     "resume": cmd_resume,
     "embed-eval": cmd_embed_eval,
     "doctor": cmd_doctor,
@@ -2696,6 +2920,8 @@ def main(
     try:
         if args.command == "doctor":
             return cmd_doctor(datadir, args, clock=clock)
+        if args.command == "db":
+            return cmd_db(datadir, args, probe, clock=clock)
         return COMMANDS[args.command](datadir, args)
     except (
         SeedError,

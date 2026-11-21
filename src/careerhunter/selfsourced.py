@@ -39,7 +39,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from careerhunter import enums, jobdesc, ledger, search_store, snapshots, urls
+from careerhunter import enums, jobdesc, ledger, locations, search_store, snapshots, urls
 from careerhunter.claims import ActiveClaim, Verdict, check_dating
 from careerhunter.fetch import FetchError
 from careerhunter.filters import title_key
@@ -88,6 +88,8 @@ class Logged:
     earlier: str | None = None  # the repeat line, when this role was logged before
     jd_saved: bool = False  # a JD with text is in the record
     jd_file_without_text: bool = False  # a file was kept as the ad, but had no text
+    location: str = ""  # the posting's location after this log; blank when unknown
+    referral: bool = False  # the posting is marked as a referral
 
 
 def earlier_line(search: sqlite3.Connection, company: str, title: str) -> str | None:
@@ -152,10 +154,11 @@ def describe(
     *,
     company: str | None = None,
     title: str | None = None,
+    location: str | None = None,
 ) -> Posting:
     """The posting behind `url`: the page's company, title and location, unless the
-    company and title are given. A page that can't be read is a refusal only when they
-    are not given."""
+    company and title are given. A given location wins over the page's. A page that
+    can't be read is a refusal only when the company and title are not given."""
     if not url or len(url) > MAX_URL:
         raise LogError("That link is empty or too long.")
     url = urls.canonical(url)
@@ -180,7 +183,7 @@ def describe(
         company=found_company,
         title=found_title,
         first_seen=today.isoformat(),
-        location=info.location or "",
+        location=_given_location(location) or info.location or "",
         url=url,
         source="self_sourced",
     )
@@ -198,12 +201,15 @@ def record(
     jd: JobDescription | None = None,
     notes: str | None = None,
     lane_config: Mapping[str, Any] | None = None,
+    referral: bool = False,
 ) -> Logged:
     """Record the application, and the posting with it, in one ledger call.
 
     `jd` is a pasted or uploaded JD; without one, it is fetched when the host allows.
     `notes` go to search.db only (the import's notes). `lane_config` (config.yaml)
-    checks the posting against `search.lanes`, as the watcher would.
+    checks the posting against `search.lanes`, as the watcher would. `referral`, or the
+    method `referral`, marks the posting as a referral; the label never changes the
+    method.
     """
     if method not in enums.METHODS:
         raise LogError("That method isn't recognized.")
@@ -219,8 +225,14 @@ def record(
         captured = snapshots.capture(posting.url, fetcher)
         if captured is not None:
             path = snapshots.save(data_dir, captured.data, captured.ext, today)
+    ats_location: str | None = None
     if jd is None and posting.url and fetchable:
-        jd = jobdesc.fetched(posting.url, fetcher)
+        got = jobdesc.fetched_with_location(posting.url, fetcher)
+        jd, ats_location = got.jd, got.location
+    if not posting.location.strip():
+        # The page's JSON-LD gave none: the ATS JSON's, then a `Location:` line.
+        found = ats_location or locations.from_text(jd.text if jd is not None else None)
+        posting = replace(posting, location=found or "")
     saved = jobdesc.save(data_dir, jd, today) if jd is not None else None
     app = Application(replace(posting, snapshot_path=path), dating, method, notes=notes)
     try:
@@ -238,6 +250,12 @@ def record(
     shown = search_store.posting_by_id(search, posting_id)
     if shown is not None and path is not None and shown.snapshot_path is None:
         search_store.set_posting_snapshot(search, posting_id, path)  # a posting stored before
+    if shown is not None and posting.location.strip():
+        search_store.fill_posting_location(search, posting_id, posting.location)
+        shown = search_store.posting_by_id(search, posting_id)
+    if referral or method == "referral":
+        search_store.mark_referral(search, posting_id)
+    marked = search.execute("SELECT referral FROM postings WHERE id = ?", (posting_id,)).fetchone()
     return Logged(
         company=shown.company if shown else posting.company,
         title=shown.title if shown else posting.title,
@@ -247,7 +265,19 @@ def record(
         earlier=earlier,
         jd_saved=saved is not None and saved.has_text,
         jd_file_without_text=saved is not None and not saved.has_text,
+        location=shown.location if shown else posting.location,
+        referral=bool(marked and marked[0]),
     )
+
+
+def _given_location(text: str | None) -> str | None:
+    """A location given by hand, on one line and at most MAX_LOCATION characters."""
+    if text is None:
+        return None
+    clean = " ".join(text.split())
+    if len(clean) > locations.MAX_LOCATION:
+        raise LogError(f"That location is longer than {locations.MAX_LOCATION} characters.")
+    return clean or None
 
 
 def _stored(search: sqlite3.Connection, url: str | None) -> tuple[int, str | None, str] | None:

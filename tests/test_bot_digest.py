@@ -410,16 +410,21 @@ def test_one_rows_tap_leaves_the_other_rows_buttons_valid(env: Env, keep_umask: 
     _post(env, "Third")
     assert _poll(env) == 0
     assert _tap(env, "Applied 1") == "callback:apply"
-    assert _edits(env)[-1] == [["Applied 2", "Skipped 2"], ["Applied 3", "Skipped 3"]]
+    # A row's JD button is not a decision: it stays until the row's buttons expire.
+    assert _edits(env)[-1] == [
+        ["JD 1"],
+        ["Applied 2", "Skipped 2", "JD 2"],
+        ["Applied 3", "Skipped 3", "JD 3"],
+    ]
     assert _tap(env, "Skipped 2") == "callback:skip"
-    assert _edits(env)[-1] == [["Applied 3", "Skipped 3"]]
+    assert _edits(env)[-1] == [["JD 1"], ["JD 2"], ["Applied 3", "Skipped 3", "JD 3"]]
     # Row 1's other button was spent with its row.
     before = len(env.api.calls)
     assert _tap(env, "Skipped 1") == "callback:rejected"
     answers = [p for m, p in env.api.calls[before:] if m == "answerCallbackQuery"]
     assert answers[-1]["text"] == "That button has expired."
     assert _tap(env, "Applied 3") == "callback:apply"
-    assert _edits(env)[-1] == []
+    assert _edits(env)[-1] == [["JD 1"], ["JD 2"], ["JD 3"]]
 
 
 def test_a_forged_button_in_the_echoed_keyboard_is_dropped(env: Env, keep_umask: None) -> None:
@@ -435,7 +440,7 @@ def test_a_forged_button_in_the_echoed_keyboard_is_dropped(env: Env, keep_umask:
     update = env.callback(first, message_id)
     update["callback_query"]["message"]["reply_markup"] = markup
     env.bot.handle_safely(update)
-    assert _edits(env)[-1] == [["Applied 2", "Skipped 2"]]
+    assert _edits(env)[-1] == [["JD 1"], ["Applied 2", "Skipped 2", "JD 2"]]
 
 
 # --- failures -------------------------------------------------------------------------------------

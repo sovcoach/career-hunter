@@ -57,6 +57,7 @@ APPLICATION_COLUMNS = (
     "current_status",
     "status_history",
     "posting_url",
+    "requisitions",
     "job_description",
 )
 ACTIVITY_COLUMNS = ("date", "date_precision", "type", "description", "related_company")
@@ -102,12 +103,25 @@ def _sort_key(row: dict[str, Any]) -> tuple[int, str]:
     return (1 if row["date_precision"] == "unknown" else 0, row["_sort_date"] or "")
 
 
+_APPS_WITH_REQUISITIONS = (
+    "SELECT id, correlation_id, employer, role, location, work_model, date_applied, "
+    "date_precision, week_of, method, posting_url, requisitions "
+    "FROM applications WHERE voided = 0"
+)
+_APPS_BEFORE_REQUISITIONS = (
+    "SELECT id, correlation_id, employer, role, location, work_model, date_applied, "
+    "date_precision, week_of, method, posting_url, NULL AS requisitions "
+    "FROM applications WHERE voided = 0"
+)
+
+
 def collect_applications(
     conn: sqlite3.Connection, start: dt.date, end: dt.date
 ) -> list[dict[str, Any]]:
+    # A sealed claim's file may still be at EI 0004, before `requisitions` (0005).
+    columns = {str(r[1]) for r in conn.execute("PRAGMA table_info(applications)")}
     apps = conn.execute(
-        "SELECT id, correlation_id, employer, role, location, work_model, date_applied, "
-        "date_precision, week_of, method, posting_url FROM applications WHERE voided = 0"
+        _APPS_WITH_REQUISITIONS if "requisitions" in columns else _APPS_BEFORE_REQUISITIONS
     ).fetchall()
     expected = ei_store.jd_expected(conn)
     current = ei_store.current_job_descriptions(conn)
@@ -140,6 +154,10 @@ def collect_applications(
                     for e in events
                 ),
                 "posting_url": a["posting_url"] or "",
+                "requisitions": a["requisitions"] or "",
+                # The PDF names the requisitions under the role, when there are any.
+                "role_shown": a["role"]
+                + (f" (requisitions: {a['requisitions']})" if a["requisitions"] else ""),
                 "job_description": ei_store.jd_reference(
                     jd.text_sha256 if jd else None,
                     jd.source if jd else None,
@@ -245,7 +263,7 @@ def _write_pdf(
 
     app_cols = [
         ("employer", "Employer", 1.3),
-        ("role", "Role", 1.5),
+        ("role_shown", "Role", 1.5),
         ("location", "Location", 1.0),
         ("date_applied", "Date applied", 0.95),
         ("method", "Method", 0.9),
@@ -304,6 +322,7 @@ def _jd_text(row: dict[str, Any], jd: EiJobDescription) -> str:
     header = [
         f"Employer: {row['employer']}",
         f"Role: {row['role']}",
+        *([f"Requisitions: {row['requisitions']}"] if row.get("requisitions") else []),
         f"Date applied: {row['date_applied']}",
         f"Reference: {row['job_description']}",
         f"SHA-256 of the text: {jd.text_sha256}",

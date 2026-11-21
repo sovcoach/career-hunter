@@ -396,6 +396,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-015: Telegram is a cloud service: bot messages are kept minimal
 
+> **Amended by [ADR-030](#adr-030-one-role-posted-more-than-once-is-alerted-once-and-the-jd-of-every-posting-that-may-alert-is-kept) (batch R).** A digest row has a `JD` button. A tap sends the job description kept for that posting when it was scored, which came from its own public board, in at most 4 messages. The bot sends a job description only then, and never one the operator pasted or sent. A row for a role posted more than once adds `Also posted as <requisitions>`.
+
 > **Amended by [ADR-029](#adr-029-the-tier-is-computed-in-code-from-the-postings-classed-requirements-alerts-go-by-lane-group) (batch Q).** Alerts now go by lane group first (primary, then career change, then stopgap, then off-lane), then fit, then lane priority, then the oldest; this replaces every order stated below. The lane line reads `Lane: <name> (career change)` or `Lane: <name> (stopgap)` for those groups. With `search.off_lane_min_fit: never`, no off-lane posting is alerted. A posting whose fit is `low` is stored and never alerted.
 
 > **Amended by [ADR-024](#adr-024-each-application-keeps-its-job-description).** A job description goes through Telegram one way: pasted after the `/log` line (a long paste is stitched from the messages Telegram split it into), sent as a file captioned with the `/log` line, or sent as a reply when the bot asks for it. It is never sent back. Replies say only `Job description saved.` or ask for it, and the bot log counts the messages a JD was made of, never their text. A LinkedIn link is never fetched, so `/log` refuses one without `| Company | Title`.
@@ -898,3 +900,16 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - The classing is the model's judgment, and the tests use fake replies. A change of model needs the calibration set run again by hand.
 - The summary is found by a heading. A resume without a roles heading has no summary, and only the prompt's rule applies to it.
 - Stored scores keep their old tier names until they are re-scored. Postings that already have a fit keep it.
+
+## ADR-030: One role posted more than once is alerted once, and the JD of every posting that may alert is kept
+
+**Status:** accepted (batch R, 0.11.0).
+
+**Context.** Two postings of the same role under different requisition numbers were alerted twice, and recording both made two EI entries for what was one application. An alerted posting kept no description, so an Applied tap always asked for one, and the alert offered nothing to check once the posting was gone.
+
+**Decision.**
+- When the watcher scores a posting at a medium or high fit that is not excluded, it keeps the description it scored as an owner-only `.txt` snapshot (ADR-024's retention), with the SHA-256 of its normalized text (NFKC, case folded, digit runs of 4 or more removed, whitespace collapsed) in `postings.jd_sha256`. It keeps it again only when that changes, and never over a job-ad snapshot saved earlier. An Applied tap records it as the application's JD.
+- Two postings are one role when they have the same company, the same `filters.title_key`, the same known location once normalized, and an equal JD hash or a `difflib` ratio of 0.97 or more. Requisition ids are ignored. A posting with an unknown location or no kept JD is never merged, so one application never covers two places. `postings.duplicate_of` points at the group's first posting.
+- A duplicate is never alerted on its own; the first posting's row lists the other requisitions. Applied records one application for the group, and the EI entry names every requisition in `applications.requisitions` (EI migration 0005: nullable, set only for a group, fixed once written by a trigger). The group's other postings are covered by that application through `duplicate_of`, never skipped, so skip counts, skip reasons and the location skips never see them; they are never alerted, re-scored or treated as reposts. Skipped skips every posting in the group, with the same reason.
+
+**Consequences.** The EI record states which postings one application covered without a second entry. Postings alerted before 0.11.0 have no kept JD; their JD button says so. A merge is decided once, when the later posting's JD is kept; it is never undone, and two postings at an unknown place stay apart even when they are the same role.
