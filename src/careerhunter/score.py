@@ -78,8 +78,9 @@ that passes wins over a cap. A reply with a cap is stored as canonical gaps too.
 Structured output and sampling. Every request asks for a reply that follows a JSON
 schema (`response_format` of type `json_schema`, strict), which LM Studio enforces as it
 generates. A reply that breaks it anyway does not parse, as before. The sampling
-settings and the seed are the fixed SAMPLING and SEED: a thinking model's preset, never
-temperature 0, and never configurable.
+settings and the seed come from `scoring.sampling` (`config.scoring_sampling`); each
+unset key is its default, SAMPLING and SEED: a thinking model's preset, never
+temperature 0.
 
 Reasoning models. The chat model may think before it answers. Its thinking is removed
 before anything is parsed or stored (`strip_reasoning`), and a reply whose thinking
@@ -100,7 +101,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from careerhunter import loopback, phrases
-from careerhunter.config import DEFAULT_CHAT_MODEL, GAP_TYPE_NAMES, chat_model, requirement_tiers
+from careerhunter.config import (
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_SAMPLING,
+    DEFAULT_SEED,
+    GAP_TYPE_NAMES,
+    chat_model,
+    requirement_tiers,
+    scoring_sampling,
+)
 from careerhunter.criteria import Criteria, Rule
 from careerhunter.deadline import Deadline
 from careerhunter.filters import PostingText, has_phrase, mentions
@@ -134,22 +143,15 @@ _THINK_BLOCK = re.compile(rf"<({_THINK_TAGS})>.*?</\1\s*>", re.IGNORECASE | re.D
 _THINK_OPEN = re.compile(rf"<(?:{_THINK_TAGS})>", re.IGNORECASE)
 _THINK_CLOSE = re.compile(rf"</(?:{_THINK_TAGS})\s*>", re.IGNORECASE)
 Transport = Callable[[str, bytes], tuple[int, bytes]]
-# Sampling, sent with every scoring request and not configurable. The scorer is a
-# thinking model: greedy decoding (temperature 0) can make one repeat itself until the
-# timeout, so the request uses the thinking-mode preset for precise tasks (temperature
-# 0.6, top_p 0.95, top_k 20, min_p 0) with a fixed seed, so that the same request gives
-# the same reply where the server honours the seed. That preset alone still looped in its
-# thinking on some postings (calibration, Batch Q), so presence_penalty is 1.5, the
-# model maker's setting against endless repetition.
-SAMPLING: dict[str, float | int] = {
-    "temperature": 0.6,
-    "top_p": 0.95,
-    "top_k": 20,
-    "min_p": 0.0,
-    "presence_penalty": 1.5,
-    "repeat_penalty": 1.0,
-}
-SEED = 20261119
+# The default sampling, sent with every scoring request unless scoring.sampling sets a
+# key. The scorer is a thinking model: greedy decoding (temperature 0) can make one
+# repeat itself until the timeout, so the request uses the thinking-mode preset for
+# precise tasks (temperature 0.6, top_p 0.95, top_k 20, min_p 0) with a fixed seed, so
+# that the same request gives the same reply where the server honours the seed. That
+# preset alone still looped in its thinking on some postings (calibration, Batch Q), so
+# presence_penalty is 1.5, the model maker's setting against endless repetition.
+SAMPLING: dict[str, float | int] = DEFAULT_SAMPLING
+SEED = DEFAULT_SEED
 SCHEMA_NAME = "posting_fit"
 MAX_QUOTE = 200  # what the model is asked for; a longer quote is still checked
 MIN_QUOTE = 8  # characters after `normalized`: shorter shows no match
@@ -661,8 +663,7 @@ def _request_body(
     }
     payload = {
         "model": chat_model(config),
-        **SAMPLING,
-        "seed": SEED,
+        **scoring_sampling(config),
         "response_format": {
             "type": "json_schema",
             "json_schema": {

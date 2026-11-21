@@ -46,6 +46,10 @@ LaunchAgent runs, default 60 and at least 15.
   local server, text of 1 to 200 characters with no control characters. chat_model
   defaults to `local-model`; with no embedding_model, embeddings are off (no request
   is sent). The server URLs are not config.
+- scoring.sampling: optional temperature (above 0 to 2), top_p (above 0 to 1), top_k
+  (an integer from 1 to 1000), min_p (0 to 1), presence_penalty (-2 to 2),
+  repeat_penalty (1 to 2) and seed (an integer from 0 to 2147483647) for the scoring
+  request. Each unset key keeps its default (DEFAULT_SAMPLING, DEFAULT_SEED).
 
 With lanes present, search.target_titles becomes optional; with requirement_tiers
 present, the fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
@@ -123,7 +127,31 @@ HEALTH_KEYS = ("unproductive_runs", "failure_runs")
 # local server. The URLs are loopback constants in score.py and embed.py, never config.
 DEFAULT_CHAT_MODEL = "local-model"
 MODEL_KEYS = ("chat_model", "embedding_model")
-SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds", "run_minutes")
+SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds", "run_minutes", "sampling")
+# scoring.sampling: the sampling settings and seed sent with every scoring request. Each
+# key is optional and falls back to its default here, the thinking-mode preset for
+# precise tasks with presence_penalty 1.5 against looping (ADR-029). The order is the
+# order they are sent in. Each range is (low, high, low_included, integer only).
+DEFAULT_SAMPLING: dict[str, float | int] = {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repeat_penalty": 1.0,
+}
+DEFAULT_SEED = 20261119
+SAMPLING_RANGES: dict[str, tuple[float, float, bool, bool]] = {
+    # Never 0: greedy decoding can make a thinking model repeat itself until the timeout.
+    "temperature": (0.0, 2.0, False, False),
+    "top_p": (0.0, 1.0, False, False),
+    "top_k": (1, 1000, True, True),
+    "min_p": (0.0, 1.0, True, False),
+    "presence_penalty": (-2.0, 2.0, True, False),
+    # Below 1 would reward repetition.
+    "repeat_penalty": (1.0, 2.0, True, False),
+    "seed": (0, 2**31 - 1, True, True),
+}
 MAX_MODEL_ID = 200
 # scoring.timeout_seconds: the most one scoring call may take. A reasoning model thinks
 # before it answers, and the request does not stream. The upper bound leaves room in
@@ -688,6 +716,34 @@ def _validate_scoring(section: Any, problems: list[str]) -> None:
             f"scoring.timeout_seconds must be an integer from {MIN_SCORE_TIMEOUT_SECONDS} "
             f"to {MAX_SCORE_TIMEOUT_SECONDS}"
         )
+    _validate_sampling(section.get("sampling"), problems)
+
+
+def _validate_sampling(section: Any, problems: list[str]) -> None:
+    """scoring.sampling, when set, is a mapping of known keys, each within its range."""
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        problems.append("scoring.sampling must be a mapping")
+        return
+    extra = set(section) - set(SAMPLING_RANGES)
+    if extra:
+        problems.append(f"scoring.sampling has unknown keys: {sorted(extra)}")
+    for key, (low, high, low_included, integer) in SAMPLING_RANGES.items():
+        value = section.get(key)
+        if value is not None and not _sampling_value_ok(key, value):
+            kind = "an integer" if integer else "a number"
+            above = "from" if low_included else "above"
+            problems.append(f"scoring.sampling.{key} must be {kind} {above} {low} to {high}")
+
+
+def _sampling_value_ok(key: str, value: Any) -> bool:
+    low, high, low_included, integer = SAMPLING_RANGES[key]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    if integer and not isinstance(value, int):
+        return False
+    return (low <= value if low_included else low < value) and value <= high
 
 
 def _validate_telegram(section: Any, problems: list[str]) -> None:
@@ -933,6 +989,19 @@ def scoring_timeout_seconds(doc: Mapping[str, Any] | None) -> int:
     if _int(value) and MIN_SCORE_TIMEOUT_SECONDS <= value <= MAX_SCORE_TIMEOUT_SECONDS:
         return int(value)
     return DEFAULT_SCORE_TIMEOUT_SECONDS
+
+
+def scoring_sampling(doc: Mapping[str, Any] | None) -> dict[str, float | int]:
+    """The sampling settings and seed for a scoring request, in the order they are sent:
+    each from scoring.sampling when set and valid, else its default."""
+    section = doc.get("scoring") if isinstance(doc, Mapping) else None
+    given = section.get("sampling") if isinstance(section, Mapping) else None
+    given = given if isinstance(given, Mapping) else {}
+    defaults: dict[str, float | int] = {**DEFAULT_SAMPLING, "seed": DEFAULT_SEED}
+    return {
+        key: given[key] if _sampling_value_ok(key, given.get(key)) else default
+        for key, default in defaults.items()
+    }
 
 
 def scoring_run_minutes(doc: Mapping[str, Any] | None) -> int:

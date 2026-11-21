@@ -873,6 +873,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-029: The tier is computed in code from the posting's classed requirements; alerts go by lane group
 
+> **Amended: sampling in config (batch R2).** The sampling settings and the seed below are now the defaults of an optional `scoring.sampling` section (temperature, top_p, top_k, min_p, presence_penalty, repeat_penalty, seed), so another model's preset, or another seed for a calibration run, needs no code change. Unset, the request is the same, byte for byte. Each key has a range, and temperature 0 is still refused. A change can move tiers, so it goes through calibration like a prompt change.
+
 **Context.**
 - The tier was a bare count of the gaps the model listed: 0 to 2 gaps was High whatever their kind, and the model saw the thresholds. A re-score that merged or dropped one gap crossed the line between High and Medium.
 - The model read a junior posting's duty list as requirements, so a posting that offers training lost to a senior one with a few sharp requirements.

@@ -235,7 +235,7 @@ The local model reads the posting and your resume and lists only the gaps: each 
 
   Two core gaps, a core gap in the role's main function, or a seniority gap make it Low. One other core gap makes it Medium. With no core gap it's High up to `high_max_minor` minor gaps, and Medium beyond that: minor gaps alone never make a posting Low. The gap types are experience, skill, tool, education, certification, licence, language, seniority and other. Every key is optional and has the default shown, except `exempt_types`, which defaults to none.
 
-The model never sees these numbers, and its sampling settings are fixed, with a fixed seed, so the same posting and resume give the same reply.
+The model never sees these numbers. Its sampling settings and seed stay the same from call to call (the defaults, or what `scoring.sampling` sets), so the same posting and resume give the same reply.
 
 **After you change `search.lanes`, or upgrade to a release that matches titles differently,** run `uv run careerhunter lanes reassign --dry-run`. It lists each stored posting whose lane would change, with its id, title, and old and new lane (`off-lane` for none), and each posting not checked against the lanes yet (`not checked -> <lane>`), then the counts and how many held postings would become alertable. It writes nothing. If the list looks right, run `uv run careerhunter lanes reassign` to apply exactly those moves; each is logged in `search.db`. Released postings alert at the bot's next poll, within `alerts.max_per_poll`, and one older than `search.max_posting_age_days` is skipped as `too_old` instead. Without `search.lanes` it refuses.
 
