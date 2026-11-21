@@ -323,7 +323,7 @@ your phone ──▶ Telegram's servers ◀── getUpdates (long poll) ── 
 
 ## Phase roadmap
 
-Only what is on `main` is listed. The latest release is v0.11.0.
+Only what is on `main` is listed. The latest release is v0.11.1.
 
 | Phase | Scope | Status |
 |---|---|---|
