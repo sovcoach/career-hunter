@@ -132,8 +132,8 @@ fit_rubric:
 # voting is true or false; unset or false, each posting gets one scoring call, as
 # before. True: up to three calls, with the seed above and then 20261122 and 20261123,
 # vote on whether the posting alerts. Two that agree settle it; otherwise the third
-# decides. A call that fails or doesn't parse is retried once with the next spare seed
-# (20261124 on), and the watch log says so. Scoring takes 2 to 3 times as long.
+# decides. A call that times out or doesn't parse is retried once with the next spare
+# seed (20261124 on), and the watch log says so. Scoring takes 2 to 3 times as long.
 scoring:
   chat_model: null             # e.g. example-chat-model
   embedding_model: null        # e.g. example-embedding-model

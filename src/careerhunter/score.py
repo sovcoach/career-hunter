@@ -87,10 +87,14 @@ each a full call with its own seed: the scoring.sampling seed, then VOTE_SEEDS. 
 draw's alert decision is whether its score alone would alert (`alerts`). When the
 first two agree there is no third; otherwise the third is made and the majority
 decides. The score returned is the first draw that matches the majority, with its own
-gaps, tier, veto and cap. A draw that errors or does not parse is replaced once, by the
-next unused seed in SPARE_SEEDS; the posting fails as it does with one draw only when
-that replacement fails too. `Score.replaced` names the replaced draws' failures, for
-the run log. Off, the request and the result are what one draw gives, byte for byte.
+gaps, tier, veto and cap. A draw that does not parse or times out is replaced once, by
+the next unused seed in SPARE_SEEDS; the posting fails as it does with one draw only
+when that replacement fails too. Any other failure (no answer, a refused token) fails
+it at once, with no replacement. No draw after the first, a vote or a replacement,
+starts once the watch run has less than scoring.timeout_seconds left: the ScoreError
+then has kind `budget`, and the posting waits for the next run. `Score.replaced` names
+the replaced draws' failures, for the run log. Off, the request and the result are
+what one draw gives, byte for byte.
 
 Reasoning models. The chat model may think before it answers. Its thinking is removed
 before anything is parsed or stored (`strip_reasoning`), and a reply whose thinking
@@ -121,6 +125,7 @@ from careerhunter.config import (
     chat_model,
     requirement_tiers,
     scoring_sampling,
+    scoring_timeout_seconds,
     scoring_voting,
 )
 from careerhunter.criteria import Criteria, Rule
@@ -218,7 +223,11 @@ CRITERIA_INSTRUCTION = (
 )
 
 
-KINDS = ("unreachable", "unauthorized", "timeout")
+# `budget`: with scoring.voting, the run had too little time left to start another draw.
+KINDS = ("unreachable", "unauthorized", "timeout", "budget")
+# The failures a voting draw is replaced for: the model answered, or was only slow.
+REPLACED_FOR = ("unparseable", "timeout")
+OUT_OF_BUDGET = "the run's time budget is spent; the posting waits for the next run"
 TIMED_OUT = "the local model took longer than the timeout"
 UNREACHED = "the local model could not be reached"
 
@@ -457,6 +466,7 @@ def score_posting(
     resume: Resume | None = None,
     examples: Sequence[Example] = (),
     criteria: Criteria | None = None,
+    budget: Deadline | None = None,
 ) -> Score | None:
     """The score, or None when the reply does not parse.
 
@@ -474,7 +484,10 @@ def score_posting(
     it.
 
     With scoring.voting true, the draws vote on the alert decision (see the module
-    docstring); a ScoreError or None then means a draw and its replacement both failed.
+    docstring). A timeout or None then means a draw and its replacement both failed;
+    any other ScoreError is the first draw's that failed. `budget` is the watch run's:
+    no draw after the first starts with less than scoring.timeout_seconds of it left,
+    and the ScoreError raised then has kind `budget`. One draw ignores it.
     """
     rubric = _rubric(config)
     if rubric is None:
@@ -487,7 +500,7 @@ def score_posting(
 
     if not scoring_voting(config):
         return draw(config)
-    return _vote(config, draw)
+    return _vote(config, draw, budget)
 
 
 def alerts(score: Score) -> bool:
@@ -512,24 +525,39 @@ def _with_seed(config: Mapping[str, Any], seed: int) -> dict[str, Any]:
 
 
 def _vote(
-    config: Mapping[str, Any], draw: Callable[[Mapping[str, Any]], Score | None]
+    config: Mapping[str, Any],
+    draw: Callable[[Mapping[str, Any]], Score | None],
+    budget: Deadline | None,
 ) -> Score | None:
     """Up to three draws vote on the alert decision; the first two agreeing settle it.
-    A failed draw is replaced once by the next spare seed; a failed replacement fails
-    the posting as one draw would (its ScoreError raised, or None)."""
+    A draw that does not parse or times out is replaced once by the next spare seed; a
+    failed replacement fails the posting as one draw would (None, or its ScoreError).
+    Any other ScoreError fails it at once. No draw after the first starts once the run
+    has less than one call's time left."""
     spares = iter(SPARE_SEEDS)
     replaced: list[str] = []
+    room = float(scoring_timeout_seconds(config))
+    started = 0
+
+    def call(seed: int) -> Score | None:
+        nonlocal started
+        if started and budget is not None and budget.remaining() < room:
+            raise ScoreError(OUT_OF_BUDGET, kind="budget")
+        started += 1
+        return draw(_with_seed(config, seed))
 
     def one(seed: int) -> Score | None:
         try:
-            got = draw(_with_seed(config, seed))
+            got = call(seed)
         except ScoreError as exc:
+            if exc.kind not in REPLACED_FOR:
+                raise
             replaced.append(exc.kind)
         else:
             if got is not None:
                 return got
             replaced.append("unparseable")
-        return draw(_with_seed(config, next(spares)))
+        return call(next(spares))
 
     seeds = (int(scoring_sampling(config)["seed"]), *VOTE_SEEDS)
     votes: list[Score] = []

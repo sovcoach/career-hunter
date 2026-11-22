@@ -1757,8 +1757,10 @@ def _attempt(
     try:
         result = scorer(posting)
     except (ScoreError, OSError) as exc:
-        cut = state.out_of_time()
         kind = getattr(exc, "kind", "unreachable")
+        # A voting scorer that had no time left for another draw (ADR-031) is a budget
+        # cut too: the posting waits for the next run.
+        cut = state.out_of_time() or kind == "budget"
         kept = "; old score kept" if rescore else ""
         if not cut and kind == "timeout":
             _timed_out(conn, state, posting_id, exc, timed, _line(name, ats, title), kept)

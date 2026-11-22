@@ -131,8 +131,8 @@ DEFAULT_CHAT_MODEL = "local-model"
 MODEL_KEYS = ("chat_model", "embedding_model")
 SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds", "run_minutes", "sampling", "voting")
 # scoring.voting (ADR-031): off by default, so one draw with the scoring.sampling seed.
-# On, the first draw uses that seed and the next two use VOTE_SEEDS; a draw that errors
-# or does not parse is replaced once, by the next unused seed in SPARE_SEEDS.
+# On, the first draw uses that seed and the next two use VOTE_SEEDS; a draw that times
+# out or does not parse is replaced once, by the next unused seed in SPARE_SEEDS.
 VOTE_SEEDS = (20261122, 20261123)
 SPARE_SEEDS = (20261124, 20261125, 20261126)
 # scoring.sampling: the sampling settings and seed sent with every scoring request. Each

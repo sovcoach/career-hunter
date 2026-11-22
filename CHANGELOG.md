@@ -8,7 +8,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- **`scoring.voting`**, off by default. When `true`, each posting is scored by up to three draws with fixed seeds (the `scoring.sampling` seed, then 20261122 and 20261123) that vote on whether it alerts: two that agree settle it, otherwise the majority decides, and the first draw that matches the majority is stored with its own gaps, tier and veto. A draw that errors or doesn't parse is replaced once by the next spare seed (20261124 on), and the watch log names each replaced draw; the posting fails as before only when the replacement fails too. Scoring takes about 2.3 calls a posting. Off, the request and the result are unchanged (ADR-031).
+- **`scoring.voting`**, off by default. When `true`, each posting is scored by up to three draws with fixed seeds (the `scoring.sampling` seed, then 20261122 and 20261123) that vote on whether it alerts: two that agree settle it, otherwise the majority decides, and the first draw that matches the majority is stored with its own gaps, tier and veto. A draw that doesn't parse or times out is replaced once by the next spare seed (20261124 on), and the watch log names each replaced draw; the posting fails as before only when the replacement fails too. Any other failure fails the posting at once, with no replacement. No extra draw starts once the run has less than `scoring.timeout_seconds` left: the posting waits for the next run. Scoring takes about 2.3 calls a posting. Off, the request and the result are unchanged (ADR-031).
 
 ## [0.11.1] - 2026-11-21
 

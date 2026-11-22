@@ -1402,6 +1402,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
                 resume=loaded,
                 examples=examples,
                 criteria=stated,
+                budget=budget,
             )
 
         watch.run(

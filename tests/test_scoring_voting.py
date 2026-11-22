@@ -20,8 +20,9 @@ from careerhunter.config import (
     scoring_voting,
     validate_config,
 )
+from careerhunter.deadline import Deadline
 from careerhunter.score import Cap, Score, ScoreError, Veto, alerts, score_posting
-from tests.fakes import fit_reply, requirement
+from tests.fakes import FakeClock, fit_reply, requirement
 from tests.test_criteria_veto_watch import SLUG, _boards, _logged
 from tests.test_rescore import OLD, Recorder, row, run
 from tests.test_score import RUBRIC, posting, reply
@@ -155,7 +156,6 @@ def test_the_first_draw_uses_the_configured_seed() -> None:
     [
         (BAD, "unparseable"),
         (ScoreError("x", kind="timeout"), "timeout"),
-        (ScoreError("x"), "unreachable"),
     ],
 )
 def test_a_failed_draw_is_replaced_once_by_the_next_spare_seed(failure: Step, kind: str) -> None:
@@ -187,13 +187,107 @@ def test_a_failed_replacement_fails_the_posting_as_one_draw_would() -> None:
     assert seeds == [DEFAULT_SEED, SPARE_SEEDS[0]]
 
 
-def test_an_unauthorized_replacement_keeps_its_kind() -> None:
+def test_an_unreachable_model_makes_one_call_and_fails_at_once() -> None:
+    transport, seeds = _scripted(ScoreError("x"), HIGH, HIGH)
+    with pytest.raises(ScoreError) as raised:
+        score_posting(posting(), _voting(), transport=transport)
+    assert raised.value.kind == "unreachable"
+    assert seeds == [DEFAULT_SEED]
+
+
+def test_a_refused_token_makes_one_call_and_fails_at_once() -> None:
+    calls: list[bytes] = []
+
     def transport(url: str, payload: bytes) -> tuple[int, bytes]:
+        calls.append(payload)
         return reply("", status=401)
 
     with pytest.raises(ScoreError) as raised:
         score_posting(posting(), _voting(), transport=transport)
     assert raised.value.kind == "unauthorized"
+    assert len(calls) == 1
+
+
+def test_an_unreachable_second_draw_is_not_replaced() -> None:
+    transport, seeds = _scripted(HIGH, ScoreError("x"), HIGH)
+    with pytest.raises(ScoreError) as raised:
+        score_posting(posting(), _voting(), transport=transport)
+    assert raised.value.kind == "unreachable"
+    assert seeds == [DEFAULT_SEED, VOTE_SEEDS[0]]
+
+
+def _timed(clock: FakeClock, cost: float, *steps: Step) -> tuple[Any, list[int]]:
+    """A scripted transport whose every call takes `cost` seconds on `clock`."""
+    transport, seeds = _scripted(*steps)
+
+    def slow(url: str, payload: bytes) -> tuple[int, bytes]:
+        clock.advance(cost)
+        return transport(url, payload)
+
+    return slow, seeds
+
+
+# scoring.timeout_seconds is 300 by default: a draw needs that much of the run left.
+@pytest.mark.parametrize(
+    ("steps", "seeds_sent"),
+    [
+        ((HIGH, LOW, HIGH), [DEFAULT_SEED]),  # no second vote
+        ((BAD, HIGH, HIGH), [DEFAULT_SEED]),  # no replacement
+    ],
+)
+def test_no_extra_draw_starts_once_the_run_budget_is_spent(
+    steps: tuple[Step, ...], seeds_sent: list[int]
+) -> None:
+    clock = FakeClock()
+    transport, seeds = _timed(clock, 150.0, *steps)
+    budget = Deadline(400.0, clock)  # 250 s left after the first draw: under 300
+    with pytest.raises(ScoreError) as raised:
+        score_posting(posting(), _voting(), transport=transport, budget=budget)
+    assert raised.value.kind == "budget"
+    assert seeds == seeds_sent
+
+
+def test_a_third_draw_needs_the_budget_too() -> None:
+    clock = FakeClock()
+    transport, seeds = _timed(clock, 150.0, HIGH, LOW, HIGH)
+    budget = Deadline(550.0, clock)  # 400 s left after one draw, 250 after two
+    with pytest.raises(ScoreError) as raised:
+        score_posting(posting(), _voting(), transport=transport, budget=budget)
+    assert raised.value.kind == "budget"
+    assert seeds == [DEFAULT_SEED, VOTE_SEEDS[0]]
+
+
+def test_with_enough_budget_the_vote_runs_as_usual() -> None:
+    clock = FakeClock()
+    transport, seeds = _timed(clock, 150.0, HIGH, LOW, HIGH)
+    budget = Deadline(1000.0, clock)
+    result = score_posting(posting(), _voting(), transport=transport, budget=budget)
+    assert result is not None and result.draws == 3
+    assert seeds == [DEFAULT_SEED, *VOTE_SEEDS]
+
+
+def test_one_draw_ignores_the_budget() -> None:
+    clock = FakeClock()
+    transport, seeds = _timed(clock, 150.0, HIGH)
+    budget = Deadline(10.0, clock)
+    assert score_posting(posting(), RUBRIC, transport=transport, budget=budget) is not None
+    assert seeds == [DEFAULT_SEED]
+
+
+def test_a_vote_out_of_budget_leaves_the_posting_for_the_next_run(
+    search: sqlite3.Connection,
+) -> None:
+    scorer = Recorder()
+    scorer.replies["Coordinator"] = ScoreError(score.OUT_OF_BUDGET, kind="budget")
+    lines = run(search, _boards(("r1", "Coordinator")), (SLUG,), scorer=scorer, resume=OLD)
+    assert _logged(lines, ": 'Coordinator' left for the next run (run budget reached)")
+    text = "\n".join(lines)
+    assert "model unreachable" not in text and "given up" not in text
+    assert row(search, "Coordinator")["score_attempted_at"] is None  # its place is kept
+    assert row(search, "Coordinator")["llm_output"] is None
+    again = Recorder()
+    run(search, _boards(("r1", "Coordinator")), (SLUG,), scorer=again, resume=OLD)
+    assert [c.title for c in again.calls] == ["Coordinator"]  # scored on the next run
 
 
 def _score(tier: str | None = "high", **fields: Any) -> Score:
