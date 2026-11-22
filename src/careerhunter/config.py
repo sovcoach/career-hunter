@@ -50,6 +50,8 @@ LaunchAgent runs, default 60 and at least 15.
   (an integer from 1 to 1000), min_p (0 to 1), presence_penalty (-2 to 2),
   repeat_penalty (1 to 2) and seed (an integer from 0 to 2147483647) for the scoring
   request. Each unset key keeps its default (DEFAULT_SAMPLING, DEFAULT_SEED).
+- scoring.voting: true or false, default false. When true, each posting is scored by
+  up to three draws that vote on the alert decision (VOTE_SEEDS, SPARE_SEEDS).
 
 With lanes present, search.target_titles becomes optional; with requirement_tiers
 present, the fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
@@ -127,7 +129,12 @@ HEALTH_KEYS = ("unproductive_runs", "failure_runs")
 # local server. The URLs are loopback constants in score.py and embed.py, never config.
 DEFAULT_CHAT_MODEL = "local-model"
 MODEL_KEYS = ("chat_model", "embedding_model")
-SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds", "run_minutes", "sampling")
+SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds", "run_minutes", "sampling", "voting")
+# scoring.voting (ADR-031): off by default, so one draw with the scoring.sampling seed.
+# On, the first draw uses that seed and the next two use VOTE_SEEDS; a draw that errors
+# or does not parse is replaced once, by the next unused seed in SPARE_SEEDS.
+VOTE_SEEDS = (20261122, 20261123)
+SPARE_SEEDS = (20261124, 20261125, 20261126)
 # scoring.sampling: the sampling settings and seed sent with every scoring request. Each
 # key is optional and falls back to its default here, the thinking-mode preset for
 # precise tasks with presence_penalty 1.5 against looping (ADR-029). The order is the
@@ -717,6 +724,9 @@ def _validate_scoring(section: Any, problems: list[str]) -> None:
             f"to {MAX_SCORE_TIMEOUT_SECONDS}"
         )
     _validate_sampling(section.get("sampling"), problems)
+    voting = section.get("voting")
+    if voting is not None and not isinstance(voting, bool):
+        problems.append("scoring.voting must be true or false")
 
 
 def _validate_sampling(section: Any, problems: list[str]) -> None:
@@ -1002,6 +1012,12 @@ def scoring_sampling(doc: Mapping[str, Any] | None) -> dict[str, float | int]:
         key: given[key] if _sampling_value_ok(key, given.get(key)) else default
         for key, default in defaults.items()
     }
+
+
+def scoring_voting(doc: Mapping[str, Any] | None) -> bool:
+    """True only when scoring.voting is true: the draws vote on the alert decision."""
+    section = doc.get("scoring") if isinstance(doc, Mapping) else None
+    return isinstance(section, Mapping) and section.get("voting") is True
 
 
 def scoring_run_minutes(doc: Mapping[str, Any] | None) -> int:

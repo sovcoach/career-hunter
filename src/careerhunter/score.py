@@ -82,6 +82,16 @@ settings and the seed come from `scoring.sampling` (`config.scoring_sampling`); 
 unset key is its default, SAMPLING and SEED: a thinking model's preset, never
 temperature 0.
 
+Voting (ADR-031). With `scoring.voting` true, a posting is scored by up to three draws,
+each a full call with its own seed: the scoring.sampling seed, then VOTE_SEEDS. Each
+draw's alert decision is whether its score alone would alert (`alerts`). When the
+first two agree there is no third; otherwise the third is made and the majority
+decides. The score returned is the first draw that matches the majority, with its own
+gaps, tier, veto and cap. A draw that errors or does not parse is replaced once, by the
+next unused seed in SPARE_SEEDS; the posting fails as it does with one draw only when
+that replacement fails too. `Score.replaced` names the replaced draws' failures, for
+the run log. Off, the request and the result are what one draw gives, byte for byte.
+
 Reasoning models. The chat model may think before it answers. Its thinking is removed
 before anything is parsed or stored (`strip_reasoning`), and a reply whose thinking
 never closes does not parse. The body may be up to MAX_REPLY bytes, since the thinking
@@ -106,12 +116,16 @@ from careerhunter.config import (
     DEFAULT_SAMPLING,
     DEFAULT_SEED,
     GAP_TYPE_NAMES,
+    SPARE_SEEDS,
+    VOTE_SEEDS,
     chat_model,
     requirement_tiers,
     scoring_sampling,
+    scoring_voting,
 )
 from careerhunter.criteria import Criteria, Rule
 from careerhunter.deadline import Deadline
+from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import PostingText, has_phrase, mentions
 from careerhunter.resume import Resume
 from careerhunter.search_store import Example
@@ -289,6 +303,10 @@ class Score:
     cap: Cap | None = None
     # The reply flagged the posting as junior or entry level with a quote found in it.
     entry_level: bool = False
+    # With scoring.voting: how many draws voted (2 or 3), and the failure of each draw
+    # that was replaced ("unparseable" or a ScoreError kind), in order. One draw: 1, ().
+    draws: int = dataclasses.field(default=1, compare=False)
+    replaced: tuple[str, ...] = dataclasses.field(default=(), compare=False)
 
     @property
     def vetoed(self) -> bool:
@@ -454,12 +472,90 @@ def score_posting(
     Raises ScoreError when the model does not answer, with kind `timeout` when the call
     reached its time limit. None leaves the posting unscored. The caller does not alert
     it.
+
+    With scoring.voting true, the draws vote on the alert decision (see the module
+    docstring); a ScoreError or None then means a draw and its replacement both failed.
     """
     rubric = _rubric(config)
     if rubric is None:
         return None
     send = default_transport if transport is None else transport
     require_loopback(url)
+
+    def draw(doc: Mapping[str, Any]) -> Score | None:
+        return _draw(posting, doc, rubric, url, send, resume, examples, criteria)
+
+    if not scoring_voting(config):
+        return draw(config)
+    return _vote(config, draw)
+
+
+def alerts(score: Score) -> bool:
+    """This score's alert decision on its own: not vetoed or excluded, and a fit of
+    medium or high once any cap is applied. The gates and the lane are the same on
+    every draw, so they are not part of it."""
+    if score.vetoed or score.excluded or score.tier not in FIT_LEVELS:
+        return False
+    fit = score.tier
+    if score.capped in FIT_LEVELS:
+        fit = min(fit, score.capped, key=FIT_LEVELS.index)
+    return fit in ("medium", "high")
+
+
+def _with_seed(config: Mapping[str, Any], seed: int) -> dict[str, Any]:
+    """The config with scoring.sampling.seed set to `seed`; nothing else changes."""
+    section = config.get("scoring")
+    scoring = dict(section) if isinstance(section, Mapping) else {}
+    sampling = scoring.get("sampling")
+    scoring["sampling"] = {**(sampling if isinstance(sampling, Mapping) else {}), "seed": seed}
+    return {**config, "scoring": scoring}
+
+
+def _vote(
+    config: Mapping[str, Any], draw: Callable[[Mapping[str, Any]], Score | None]
+) -> Score | None:
+    """Up to three draws vote on the alert decision; the first two agreeing settle it.
+    A failed draw is replaced once by the next spare seed; a failed replacement fails
+    the posting as one draw would (its ScoreError raised, or None)."""
+    spares = iter(SPARE_SEEDS)
+    replaced: list[str] = []
+
+    def one(seed: int) -> Score | None:
+        try:
+            got = draw(_with_seed(config, seed))
+        except ScoreError as exc:
+            replaced.append(exc.kind)
+        else:
+            if got is not None:
+                return got
+            replaced.append("unparseable")
+        return draw(_with_seed(config, next(spares)))
+
+    seeds = (int(scoring_sampling(config)["seed"]), *VOTE_SEEDS)
+    votes: list[Score] = []
+    for seed in seeds:
+        if len(votes) == 2 and alerts(votes[0]) == alerts(votes[1]):
+            break
+        got = one(seed)
+        if got is None:
+            return None
+        votes.append(got)
+    majority = sum(alerts(v) for v in votes) * 2 > len(votes)
+    chosen = next(v for v in votes if alerts(v) == majority)
+    return dataclasses.replace(chosen, draws=len(votes), replaced=tuple(replaced))
+
+
+def _draw(
+    posting: PostingText,
+    config: Mapping[str, Any],
+    rubric: Mapping[str, Any],
+    url: str,
+    send: Transport,
+    resume: Resume | None,
+    examples: Sequence[Example],
+    criteria: Criteria | None,
+) -> Score | None:
+    """One call to the model and its score, or None when the reply does not parse."""
     try:
         status, body = send(url, _request_body(posting, config, resume, examples, criteria))
     except (ScoreError, OSError, http.client.HTTPException) as exc:

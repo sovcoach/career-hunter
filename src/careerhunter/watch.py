@@ -1727,7 +1727,8 @@ def _attempt(
     the call gives it back too. A call that timed out keeps the stamp, so the posting
     goes behind the others, and is counted (set aside after TIMEOUTS_TO_SET_ASIDE in a
     row); scoring carries on. A reply that does not parse keeps the stamp too, and
-    leaves the stored score as it was.
+    leaves the stored score as it was. With scoring.voting, a draw the scorer replaced
+    gets a line of its own.
     """
     lines = state.lines
     state.attempted.add(posting_id)
@@ -1781,6 +1782,13 @@ def _attempt(
             )
         return
     state.scorer_answered = True
+    if result is not None and result.replaced:
+        # scoring.voting (ADR-031): a draw failed and its replacement answered.
+        failures = ", ".join(result.replaced)
+        noun = "draw" if len(result.replaced) == 1 else "draws"
+        lines.append(
+            _line(name, ats, f"{title} {noun} replaced ({failures}); {result.draws} draws voted")
+        )
     if result is not None and result.vetoed and result.veto is not None:
         # A criteria rule vetoed it (ADR-028): skipped, never alerted; the stored score,
         # fit and gaps stay as they were. An alerted one is withdrawn by the bot.
