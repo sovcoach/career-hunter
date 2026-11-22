@@ -915,3 +915,20 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - A duplicate is never alerted on its own; the first posting's row lists the other requisitions. Applied records one application for the group, and the EI entry names every requisition in `applications.requisitions` (EI migration 0005: nullable, set only for a group, fixed once written by a trigger). The group's other postings are covered by that application through `duplicate_of`, never skipped, so skip counts, skip reasons and the location skips never see them; they are never alerted, re-scored or treated as reposts. Skipped skips every posting in the group, with the same reason.
 
 **Consequences.** The EI record states which postings one application covered without a second entry. Postings alerted before 0.11.0 have no kept JD; their JD button says so. A merge is decided once, when the later posting's JD is kept; it is never undone, and two postings at an unknown place stay apart even when they are the same role.
+
+## ADR-031: Up to three draws vote on the alert decision, behind scoring.voting
+
+**Status:** accepted (batch R2).
+
+**Context.** For a fixed seed the scorer gives the same reply every time, but another seed can give another alert decision for the same posting. In calibration (18 cases, 3 seeds each) 3 to 7 cases changed their alert decision between seeds, on every model tried. Every flip comes from requirements listed on some draws and not others, or from one requirement changing class (met partly or no, its years, the main-function flag). One gap is enough to cross the Medium/Low line. A different model or sampling preset moves the flips to other postings without removing them.
+
+**Decision.**
+- `scoring.voting`, true or false, default false. Off, a posting gets one draw with the `scoring.sampling` seed: the request and the result are what they were, byte for byte.
+- On, the scorer makes up to three draws, each a full call: the `scoring.sampling` seed (20261119 by default), then 20261122 and 20261123. A draw's alert decision is whether its score alone would alert: not vetoed, not excluded, and a fit of medium or high once any cap is applied. The gates and the lane are the same for every draw and stay outside the vote.
+- When the first two draws agree there is no third. Otherwise the third is made and the majority decides. The score stored is the first draw that matches the majority, with its own gaps, tier, veto and cap; nothing is merged across draws.
+- A draw that raises a scoring error (a timeout, no answer, a refused token) or does not parse is replaced once, by the next unused spare seed: 20261124, then 20261125, then 20261126. The posting fails as it does with one draw (the error raised, or an unparseable reply) only when that replacement fails too. Each replaced draw gets a line in the watch log: `draw replaced (<failure>); <n> draws voted`.
+
+**Consequences.**
+- Scoring costs about 2.3 calls a posting on the calibration set (2 when the first two agree, 3 otherwise), plus any replacements, so fewer postings are scored within `scoring.run_minutes`. A timeout is counted per posting only when the replacement times out too.
+- The seeds are fixed: the same posting, resume and config still give the same result. Turning voting on can change stored decisions, so it goes through calibration first.
+- A replaced draw shows only when the posting is scored. When the replacement fails as well, the log has the usual failure line.

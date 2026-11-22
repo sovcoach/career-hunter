@@ -129,11 +129,17 @@ fit_rubric:
 # temperature is above 0 to 2 (never 0), top_p above 0 to 1, top_k an integer from 1
 # to 1000, min_p 0 to 1, presence_penalty -2 to 2, repeat_penalty 1 to 2, seed an
 # integer from 0 to 2147483647. A change can move tiers: run calibration after one.
+# voting is true or false; unset or false, each posting gets one scoring call, as
+# before. True: up to three calls, with the seed above and then 20261122 and 20261123,
+# vote on whether the posting alerts. Two that agree settle it; otherwise the third
+# decides. A call that fails or doesn't parse is retried once with the next spare seed
+# (20261124 on), and the watch log says so. Scoring takes 2 to 3 times as long.
 scoring:
   chat_model: null             # e.g. example-chat-model
   embedding_model: null        # e.g. example-embedding-model
   timeout_seconds: null        # e.g. 300
   run_minutes: null            # e.g. 20
+  # voting: true              # up to three draws vote on the alert; unset: one draw
   # sampling:
   #   temperature: 0.6
   #   top_p: 0.95
