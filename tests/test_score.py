@@ -89,7 +89,7 @@ def test_the_prompt_uses_only_the_rubric_and_the_posting() -> None:
     assert result.excluded is False
     text = seen["body"].decode()
     assert seen["url"] == DEFAULT_URL.encode()
-    assert "operations" in text and "Canada" in text
+    assert "operations" not in text and "Canada" not in text  # lanes, location rules (R2)
     assert "hard_gates" not in text and "Senior" not in text  # the gates ran already
     assert "A synthetic posting." in text
     assert "DO-NOT-LEAK-NOTES" not in text
@@ -996,7 +996,30 @@ def test_no_threshold_or_tier_reaches_the_model() -> None:
     for word in ("requirement_tiers", "high_max_minor", "exclude_at_core", "gap_tiers", "max_gaps"):
         assert word not in text
     view = json.loads(json.loads(seen["body"])["messages"][1]["content"])
-    assert list(view) == ["lanes", "location_rules", "posting"]
+    assert list(view) == ["posting"]
+
+
+def test_lanes_and_location_rules_are_not_sent() -> None:
+    config = {
+        "search": {
+            "lanes": [{"name": "example_lane", "priority": 1, "titles": ["Example Analyst"]}],
+            "location_rules": {"onsite_hybrid": ["Example Town"], "remote": ["Exampleland"]},
+        }
+    }
+    body = scoring._request_body(posting(), config, _RESUME)
+    text = body.decode()
+    for word in ("example_lane", "Example Analyst", "Exampleland", "Example Town", "lanes"):
+        assert word not in text
+    assert "location_rules" not in text
+    view = json.loads(json.loads(body)["messages"][1]["content"])
+    assert list(view) == ["resume", "posting"]
+
+
+def test_the_prompt_defines_main_function() -> None:
+    prompt = scoring.SYSTEM_PROMPT
+    assert 'met, "no" or "partly", judged only against the resume.' in prompt
+    assert "main_function: true only when the qualification is doing the role's main job" in prompt
+    assert "never for a tool, a degree, a certification" in prompt
 
 
 # --- experience only from roles and skills (Batch Q) ----------------------------------------

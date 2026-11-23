@@ -6,8 +6,8 @@ ad and wrong for a model on this Mac. This client allows only `http` to `127.0.0
 constant, not a config field. The model id is `scoring.chat_model` (default
 `local-model`).
 
-The prompt is built from lanes and location rules, the posting fields,
-and the resume when one is in use, the parts that are the same on every call first and
+The prompt is built from the posting fields, the criteria rules and labelled examples
+when present, and the resume when one is in use, the parts that are the same on every call first and
 the posting last, so the server can reuse its cached prefix. The model is asked to
 reason briefly and to list only the gaps: each qualification the posting requires or
 prefers that the resume doesn't meet (`no`) or meets only partly (`partly`), as a short
@@ -197,8 +197,9 @@ SYSTEM_PROMPT = (
     "experience in that field's job functions (for example FP&A, accounting, M&A or "
     "brokerage). years: the minimum years of experience it asks for, 0 when none. "
     "core: true when it is central to the role's main function or is a minimum number "
-    "of years of experience. main_function: true only when it is the role's main job "
-    "function itself. type: one of the listed types. quote: at most "
+    "of years of experience. main_function: true only when the qualification is doing "
+    "the role's main job itself; never for a tool, a degree, a certification, a field of "
+    "background or a number of years. type: one of the listed types. quote: at most "
     f"{MAX_GAP_QUOTE_WORDS} words copied from the posting that state it. entry_level: "
     "when the posting says it is junior or entry level, or welcomes candidates without "
     'every qualification (such as recent graduates, "we\'ll train you", or "apply '
@@ -756,11 +757,9 @@ def _request_body(
     criteria: Criteria | None = None,
 ) -> bytes:
     # Everything that is the same on every call comes first and the posting last, so the
-    # server can reuse its cached processing of the shared prefix (Batch Q).
-    view: dict[str, Any] = {
-        "lanes": _section(config, "search", "lanes"),
-        "location_rules": _section(config, "search", "location_rules"),
-    }
+    # server can reuse its cached processing of the shared prefix (Batch Q). Lanes and the
+    # location rules are not sent: code decides both, and no reply field uses them (R2).
+    view: dict[str, Any] = {}
     if criteria is not None:
         view["criteria"] = [
             {"rule": rule.number, "kind": rule.kind, "text": rule.text}
@@ -885,10 +884,6 @@ def unstated_language(phrase: str, posting: PostingText, config: Mapping[str, An
         part for part in (posting.title, posting.location, posting.description) if part
     )
     return not any(mentions(text, term) for term in terms)
-
-
-def _section(config: Mapping[str, Any], parent: str, key: str) -> Any:
-    return _mapping(config.get(parent)).get(key)
 
 
 def _rubric(config: Mapping[str, Any]) -> Mapping[str, Any] | None:

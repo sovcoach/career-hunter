@@ -875,6 +875,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 > **Amended: sampling in config (batch R2).** The sampling settings and the seed below are now the defaults of an optional `scoring.sampling` section (temperature, top_p, top_k, min_p, presence_penalty, repeat_penalty, seed), so another model's preset, or another seed for a calibration run, needs no code change. Unset, the request is the same, byte for byte. Each key has a range, and temperature 0 is still refused. A change can move tiers, so it goes through calibration like a prompt change.
 
+> **Amended: a shorter prompt (batch R2).** The request no longer carries the lanes or the location rules. Code matches the lane and applies the location rules, and no reply field uses either, so they were the largest unchanging block sent on every call for nothing. The `main_function` wording is sharper: it is true only when the qualification is doing the role's main job itself, never for a tool, a degree, a certification, a field of background or a number of years. A sharper `met` wording was calibrated too and dropped: it let related work count as partly meeting a required number of years, which is never a seniority gap. Calibration ran on the change before it was kept.
+
 **Context.**
 - The tier was a bare count of the gaps the model listed: 0 to 2 gaps was High whatever their kind, and the model saw the thresholds. A re-score that merged or dropped one gap crossed the line between High and Medium.
 - The model read a junior posting's duty list as requirements, so a posting that offers training lost to a senior one with a few sharp requirements.
