@@ -1123,9 +1123,9 @@ def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
         else:
             continue
         name = gap_name(" ".join(item.text.split()[:MAX_GAP_WORDS]))
-        if not name or name.casefold() in seen:
+        if not name or gap_key(name) in seen:
             continue
-        seen.add(name.casefold())
+        seen.add(gap_key(name))
         gaps.append(
             _Gap(
                 name,
@@ -1135,9 +1135,19 @@ def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
                 seniority=seniority,
             )
         )
-    if senior_title(title) and SENIOR_TITLE_GAP.casefold() not in seen:
+    if senior_title(title) and gap_key(SENIOR_TITLE_GAP) not in seen:
         gaps.append(_Gap(SENIOR_TITLE_GAP, "core", "seniority", seniority=True))
     return gaps
+
+
+_TRAILING_PUNCTUATION = ".,;:!?…"
+
+
+def gap_key(name: str) -> str:
+    """The key two gap names are compared by: case, surrounding whitespace and trailing
+    punctuation (. , ; : ! ? …) ignored. A trailing + or # is kept, so "A+" and "A",
+    or "C#" and "C", stay apart."""
+    return name.casefold().strip().rstrip(_TRAILING_PUNCTUATION).strip()
 
 
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z][a-z])")

@@ -883,6 +883,45 @@ def test_gap_names_are_one_style_and_types_a_fixed_list() -> None:
     ]
 
 
+def test_a_gap_differing_only_in_case_spacing_or_a_trailing_full_stop_counts_once() -> None:
+    result = _titled(
+        "IT Support Specialist",
+        requirement("CompTIA A+ certification", type="certification", core=True),
+        requirement("compTIA A+ certification.", type="certification", core=True),
+        requirement("Network+ certification ;", type="certification", core=True),
+    )
+    assert json.loads(result.gaps) == [
+        {"name": "CompTIA A+ certification", "kind": "core", "type": "certification"},
+        {"name": "Network+ certification ;", "kind": "core", "type": "certification"},
+    ]
+    assert result.tier == "low"  # two core gaps, not three: the posting is not excluded
+
+
+def test_a_trailing_plus_or_hash_keeps_two_gaps_apart() -> None:
+    assert scoring.gap_key("  CompTIA A+. ") == "comptia a+"
+    assert scoring.gap_key("Excel!?…") == "excel"
+    content = fit_reply(
+        items=(
+            requirement("CompTIA A+", type="certification"),
+            requirement("CompTIA A", type="certification"),
+            requirement("C#", type="skill"),
+            requirement("C", type="skill"),
+        )
+    )
+    assert [gap["name"] for gap in json.loads(_scored(content).gaps)] == [
+        "CompTIA A+",
+        "CompTIA A",
+        "C#",
+        "C",
+    ]
+
+
+def test_a_listed_senior_title_gap_with_a_full_stop_is_not_added_twice() -> None:
+    item = requirement("Senior or lead title.", type="seniority", core=True)
+    names = [gap["name"] for gap in json.loads(_titled("Senior Analyst", item).gaps)]
+    assert len(names) == 1
+
+
 def test_entry_level_counts_only_with_a_quote_found_in_the_posting() -> None:
     assert _scored(fit_reply(entry_level="Apply anyway.")).entry_level is True
     assert _scored(fit_reply(entry_level="we'll train")).entry_level is False  # not in it

@@ -19,6 +19,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The digest row shows `N core, M minor`** in place of `N gaps`, leaving out the gap types in `fit_rubric.requirement_tiers.exempt_types`, so the counts match how the tier is worked out. Postings scored before 0.10.0, whose gaps have no kind, still show `N gaps`.
 - **A shorter scoring prompt.** The request no longer sends the lanes or the location rules: code decides both, and the model's reply never used them. The `main_function` wording is sharper: it is true only for doing the role's main job itself, never for a tool, a degree, a certification, a field of background or a number of years. Tiers can move, so the change went through calibration (ADR-029).
 
+### Fixed
+- **A gap listed twice counts once** when the two names differ only in case, surrounding whitespace or trailing punctuation (`.`, `,`, `;`, `:`, `!`, `?`, `…`), as in "CompTIA A+ certification" and "compTIA A+ certification.". Before, each counted as a core gap, which could exclude the posting. A trailing `+` or `#` still counts, so "A+" and "A", or "C#" and "C", stay two gaps.
+
 ## [0.11.1] - 2026-11-21
 
 ### Fixed
