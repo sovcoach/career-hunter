@@ -380,7 +380,7 @@ Some postings you won't take can't be caught by a field or a gate word: a short 
    1. veto: No night-shift roles at a warehouse.
    2. veto [short contract]: No contract under 6 months unless a path to permanent is stated.
    3. cap medium [needs a car]: A role that needs a car for daily site visits.
-   4. met: a forklift certificate (covers forklift and lift-truck requirements)
+   4. met: the candidate holds a forklift certificate (covers forklift and lift-truck requirements)
    ```
 
 3. Set this in `config.yaml`:
@@ -392,7 +392,7 @@ Some postings you won't take can't be caught by a field or a gate word: a short 
 
 The path is relative to the data folder and must stay inside it, even through a symlink. The file must be UTF-8 text that only you can read: at most 20 rules, each at most 300 characters, and 4,000 characters in all. A label is 1 to 40 characters with no brackets inside; an empty, longer or unclosed one makes the file unusable, as a rule without its kind does. Only this file is read: other notes in the data folder never reach the scorer. Leave the key out, or set it to `null`, to send no criteria.
 
-**How a `met:` rule works.** A `met:` rule states something about you that the resume doesn't show, such as a certificate. When a posting asks for exactly what the rule names, the model counts that requirement as met and lists no gap for it. It covers only what it names, never anything similar or broader, so say in the rule what it covers. A `met:` rule never skips a posting or holds one down. Changing the file re-scores nothing: the rules apply to postings scored after the change.
+**How a `met:` rule works.** A `met:` rule states a fact you have that the resume doesn't show, such as a certificate. Word it as a fact, as in `the candidate holds …` or `the candidate is eligible for …`. When a posting asks for what the rule names, the model counts that requirement as met and lists no gap for it at all, not even a partly met one. It covers only what it names, never anything similar or broader, so say in the rule what it covers. A `met:` rule never skips a posting or holds one down. Changing the file re-scores nothing: the rules apply to postings scored after the change.
 
 **How a rule skips a posting.** When the model finds that a posting meets a rule, it names the rule and quotes the words in the posting that show it. The quote is checked against the title and description that were sent, ignoring case and spacing. If the words are there, the posting is skipped with the reason `criteria: 2. short contract` (the rule's number and label) and never alerted. A rule without a label is named by its first six words, with `…` when it goes on: `criteria: 2. No contract under 6 months unless…`. The log says `watch: <company>: '<title>' skipped (criteria 2)`. If the quote isn't in the posting, is too short, or names a rule the file doesn't have, the veto is rejected and the posting is scored as usual: `veto rejected (quote not found, rule 2); scored`. The quote itself is never stored or logged. Something the rule allows is not a match: an exception the rule names that the posting states, or the allowed side of a limit it sets.
 

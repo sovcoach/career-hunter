@@ -18,11 +18,14 @@ from tests.test_score import RUBRIC, reply
 
 TEXT = (
     "1. veto: No synthetic night shifts.\n"
-    "2. met: a forklift certificate (covers forklift and lift-truck requirements)\n"
+    "2. met: the candidate holds a forklift certificate (covers forklift and lift-truck "
+    "requirements)\n"
     "3. cap medium: A synthetic contract with only an extension."
 )
 RULES = criteria.Criteria(TEXT, len(TEXT), criteria.parse_rules(TEXT))
-FORKLIFT = "a forklift certificate (covers forklift and lift-truck requirements)"
+FORKLIFT = (
+    "the candidate holds a forklift certificate (covers forklift and lift-truck requirements)"
+)
 
 
 @pytest.mark.parametrize(
@@ -63,9 +66,10 @@ def test_the_met_rule_is_sent_with_its_kind() -> None:
 
 def test_the_instruction_keeps_a_met_rule_narrow() -> None:
     system = _request()["messages"][0]["content"]
-    assert '"met" (a fact about the candidate)' in system
-    assert "exactly what the rule names, never anything similar or broader" in system
-    assert "list no gap for it, and never use a met rule as a veto or a cap" in system
+    assert '"met" (a fact the candidate has, even when the resume doesn\'t show it)' in system
+    assert "A requirement a met rule names is met: never list it as a gap" in system
+    assert "covers only what it names, never anything similar or broader" in system
+    assert "and is never a veto or a cap" in system
 
 
 def _score(**extra: Any) -> Any:

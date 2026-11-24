@@ -7,7 +7,7 @@ kind (ADR-028):
     1. veto: No night-shift roles at a warehouse.
     2. cap medium: A contract whose only stated path is a possible extension.
     3. veto [no car]: No role that needs a car for daily site visits.
-    4. met: a forklift certificate (covers forklift and lift-truck requirements)
+    4. met: the candidate holds a forklift certificate (covers forklift and lift-truck requirements)
 
 A rule may carry a short label in square brackets after its kind, as in rule 3: at most
 MAX_LABEL characters, with no brackets inside. The label names the rule in the skip
@@ -19,10 +19,10 @@ that the code checks, is skipped with reason `criteria: N. <label>`, or without 
 `criteria: N. <the rule's first words>`, ending in `…` when the rule goes on.
 A cap rule (`cap low`, `cap medium` or `cap high`, a fit level) lowers the posting's
 fit to at most that level and never skips it. A met rule (`met`, batch R2) states a
-fact about the candidate: when a posting asks for what it names, the model counts that
-qualification as met and lists no gap for it. It covers only what it names, never
-anything similar or broader, and never vetoes or caps. Unset means no criteria are
-sent.
+fact the candidate has, worded as one: a requirement it names is met, and the model
+lists no gap for it at all, not even a partly met one. It covers only what it names,
+never anything similar or broader, and never vetoes or caps. Unset means no criteria
+are sent.
 
 A line that is not a numbered rule, numbers out of order, a rule with no valid kind or
 a bad label (`no-kind`: a kind other than veto, cap low|medium|high or met; a label

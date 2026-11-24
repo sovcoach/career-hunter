@@ -212,10 +212,11 @@ SYSTEM_PROMPT = (
 CRITERIA_INSTRUCTION = (
     " criteria, when present, are numbered rules in the candidate's own words, each of "
     'kind "veto" (postings the candidate won\'t take), "cap" (postings whose fit is '
-    'at most the rule\'s cap level) or "met" (a fact about the candidate). A met rule '
-    "counts as met only a qualification the posting asks for that is exactly what the "
-    "rule names, never anything similar or broader: list no gap for it, and never use a "
-    "met rule as a veto or a cap. If this posting clearly meets a veto rule, set "
+    'at most the rule\'s cap level) or "met" (a fact the candidate has, even when the '
+    "resume doesn't show it). A requirement a met rule names is met: never list it as a "
+    "gap, partly met or not. A met rule covers only what it names, never anything "
+    "similar or broader, and is never a veto or a cap. If this posting clearly meets a "
+    "veto rule, set "
     '"veto" to {"rule":N,"quote":"..."}; if it clearly meets a cap rule, set "cap" to '
     '{"rule":N,"quote":"..."}. N is that rule\'s number, and quote is copied '
     f"exactly from the posting's title or description, at most {MAX_QUOTE} characters, "
