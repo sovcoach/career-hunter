@@ -531,6 +531,16 @@ def _validate_seniority(gates: dict[str, Any], problems: list[str]) -> None:
 _WORKDAY_HOST = re.compile(r"wd[0-9]{1,3}")
 # A Lever board's region: its EU accounts use api.eu.lever.co and jobs.eu.lever.co.
 LEVER_REGIONS = ("eu",)
+# Q11 (ADR-032): a watchlist entry's sector, set by the operator, and its words on the
+# alert row. A support or noc_network posting at one of these companies is raised one
+# tier (`score.sector_raise`). Unset or null: no sector, no raise.
+SECTORS = {
+    "security_vendor": "security vendor",
+    "mssp": "MSSP",
+    "fintech": "fintech",
+    "automation_consultancy": "automation consultancy",
+    "it_consultancy": "IT consultancy",
+}
 _WORKDAY_SITE = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -546,6 +556,9 @@ def _validate_watchlist_item(item: dict[str, Any], where: str, problems: list[st
             problems.append(f"{where}.ats_region must be one of {list(LEVER_REGIONS)}")
     if not isinstance(item.get("agency", False), bool):
         problems.append(f"{where}.agency must be true or false")
+    sector = item.get("sector")
+    if sector is not None and (not isinstance(sector, str) or sector not in SECTORS):
+        problems.append(f"{where}.sector must be one of {list(SECTORS)}")
     filters = _optional_mapping(item, "role_filters", where, problems)
     if filters:
         extra = set(filters) - {"role_families", "work_models", "locations"}
@@ -1012,6 +1025,20 @@ def scoring_sampling(doc: Mapping[str, Any] | None) -> dict[str, float | int]:
         key: given[key] if _sampling_value_ok(key, given.get(key)) else default
         for key, default in defaults.items()
     }
+
+
+def watchlist_sector(doc: Mapping[str, Any] | None, company: str) -> str | None:
+    """The sector of the watchlist entry named `company` (ignoring case), when it is one
+    of SECTORS; else None. Matched by name, the same way as an entry's role filters."""
+    entries = doc.get("watchlist") if isinstance(doc, Mapping) else None
+    if not isinstance(entries, list):
+        return None
+    folded = company.casefold()
+    for item in entries:
+        if isinstance(item, Mapping) and str(item.get("name", "")).casefold() == folded:
+            sector = item.get("sector")
+            return sector if isinstance(sector, str) and sector in SECTORS else None
+    return None
 
 
 def scoring_voting(doc: Mapping[str, Any] | None) -> bool:

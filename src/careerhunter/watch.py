@@ -1835,6 +1835,10 @@ def _attempt(
         cap = result.cap
         level = result.capped
         stored_meta: dict[str, Any] = {"tier": result.tier}
+        if result.sector is not None:  # Q11 (ADR-032): shown on the alert row
+            stored_meta["sector"] = result.sector
+        if result.raised_from is not None:
+            stored_meta["raised_from"] = result.raised_from
         if level is not None and cap is not None:
             stored_meta["cap_rule"] = cap.rule
         metadata = None if result.tier is None else json.dumps(stored_meta)
@@ -1876,6 +1880,15 @@ def _attempt(
             why = REJECTED[cap.rejected]
             rule = "" if cap.rule is None else f", rule {cap.rule}"
             lines.append(_line(name, ats, f"{title} cap rejected ({why}{rule}); scored"))
+        if result.raised_from is not None and result.sector is not None:
+            lines.append(
+                _line(
+                    name,
+                    ats,
+                    f"{title} raised from {result.raised_from} to {result.tier} "
+                    f"(sector {result.sector})",
+                )
+            )
         if result.excluded:
             lines.append(_line(name, ats, f"{title} skipped (gap_tier)"))
         elif rescore:

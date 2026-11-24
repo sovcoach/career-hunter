@@ -927,6 +927,7 @@ class PendingAlert:
     run_id: int | None = None  # the watch run that scored it (search migration 0011)
     run_finished: bool = False  # that run has finished its watch_runs row
     run_started_at: str | None = None
+    sector: str | None = None  # Q11 (ADR-032): the sector its score was raised for
 
 
 def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
@@ -942,7 +943,9 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
     rows = conn.execute(
         """
         SELECT p.id, p.company_id, p.title, p.fit, p.lane, p.lane_checked, p.first_seen,
-               p.score_run_id, r.finished_at, r.started_at
+               p.score_run_id, r.finished_at, r.started_at,
+               CASE WHEN json_valid(p.scout_metadata)
+                    THEN json_extract(p.scout_metadata, '$.sector') END AS sector
         FROM postings p LEFT JOIN watch_runs r ON r.id = p.score_run_id
         WHERE p.source IN ('watcher', 'discovery')
           AND p.llm_output IS NOT NULL
@@ -974,6 +977,7 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
             run_id=None if row["score_run_id"] is None else int(row["score_run_id"]),
             run_finished=row["finished_at"] is not None,
             run_started_at=None if row["started_at"] is None else str(row["started_at"]),
+            sector=row["sector"] if isinstance(row["sector"], str) else None,
         )
         for row in rows
     ]

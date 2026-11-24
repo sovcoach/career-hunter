@@ -87,7 +87,7 @@ def test_watch_sends_the_stored_token_and_never_prints_it(
 
     def run(*_args: object, **kwargs: Any) -> list[str]:
         seen["embed"] = kwargs["embed_transport"].keywords.get("token")
-        kwargs["scorer"](object())
+        kwargs["scorer"](PostingText("Example Co", "Example Analyst", "Example City"))
         return []
 
     def local_score(posting: object, config: object, **kwargs: Any) -> Score:

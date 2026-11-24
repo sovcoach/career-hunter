@@ -113,7 +113,7 @@ def test_watch_gives_the_scorer_the_configured_timeout(
     seen: dict[str, Any] = {}
 
     def run(*_args: object, **kwargs: Any) -> list[str]:
-        kwargs["scorer"](object())
+        kwargs["scorer"](PostingText("Example Co", "Example Analyst", "Example City"))
         return []
 
     def local_score(posting: object, config: object, **kwargs: Any) -> Score:

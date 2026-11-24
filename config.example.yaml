@@ -180,6 +180,11 @@ watchlist: []
 #     ats_type: greenhouse
 #     ats_slug: examplerobotics
 #     careers_url: https://example.com/careers
+#     sector: mssp               # optional: security_vendor, mssp, fintech,
+#                                # automation_consultancy or it_consultancy. A support
+#                                # or noc_network posting here goes up one tier (Low to
+#                                # Medium, Medium to High), never above High or a cap
+#                                # rule, never off-lane, vetoed or excluded. Unset: none.
 #   - name: Sample Logistics
 #     ats_type: lever
 #     ats_slug: samplelogistics

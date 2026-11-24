@@ -84,7 +84,7 @@ from careerhunter.models import Dating
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.runlog import RunLog, RunLogError
 from careerhunter.score import UNAUTHORIZED as SCORE_UNAUTHORIZED
-from careerhunter.score import Score, ScoreError, probe_models, score_posting
+from careerhunter.score import Score, ScoreError, probe_models, score_posting, sector_raise
 from careerhunter.score import default_transport as score_transport
 from careerhunter.scout_prompt import render
 from careerhunter.seed import SeedError, Tally, import_seed
@@ -1403,6 +1403,7 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
                 examples=examples,
                 criteria=stated,
                 budget=budget,
+                sector=sector_raise(posting, doc),
             )
 
         watch.run(

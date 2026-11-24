@@ -114,7 +114,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from careerhunter import loopback, phrases
+from careerhunter import lanes, loopback, phrases
 from careerhunter.config import (
     DEFAULT_CHAT_MODEL,
     DEFAULT_SAMPLING,
@@ -127,6 +127,7 @@ from careerhunter.config import (
     scoring_sampling,
     scoring_timeout_seconds,
     scoring_voting,
+    watchlist_sector,
 )
 from careerhunter.criteria import Criteria, Rule
 from careerhunter.deadline import Deadline
@@ -317,6 +318,10 @@ class Score:
     # that was replaced ("unparseable" or a ScoreError kind), in order. One draw: 1, ().
     draws: int = dataclasses.field(default=1, compare=False)
     replaced: tuple[str, ...] = dataclasses.field(default=(), compare=False)
+    # Q11 (ADR-032): the watchlist sector that applies to this posting, and the tier it
+    # had before the raise when the raise moved it. None, None: no sector applies.
+    sector: str | None = None
+    raised_from: str | None = None
 
     @property
     def vetoed(self) -> bool:
@@ -468,8 +473,12 @@ def score_posting(
     examples: Sequence[Example] = (),
     criteria: Criteria | None = None,
     budget: Deadline | None = None,
+    sector: str | None = None,
 ) -> Score | None:
     """The score, or None when the reply does not parse.
+
+    `sector` is the watchlist sector that raises this posting (`sector_raise`), or None.
+    It is applied to each draw before any vote, and is never sent to the model.
 
     `criteria` is the operator's criteria file (search.criteria_file): its numbered
     rules are sent, and a veto in the reply is checked against them and the posting
@@ -497,11 +506,41 @@ def score_posting(
     require_loopback(url)
 
     def draw(doc: Mapping[str, Any]) -> Score | None:
-        return _draw(posting, doc, rubric, url, send, resume, examples, criteria)
+        return _raised(_draw(posting, doc, rubric, url, send, resume, examples, criteria), sector)
 
     if not scoring_voting(config):
         return draw(config)
     return _vote(config, draw, budget)
+
+
+# Q11 (ADR-032): the lanes a listed sector raises.
+RAISED_LANES = ("support", "noc_network")
+
+
+def sector_raise(posting: PostingText, config: Mapping[str, Any]) -> str | None:
+    """The sector that raises this posting one tier: its title is in a RAISED_LANES lane
+    and its company's watchlist entry names one of SECTORS. None off-lane, in any other
+    lane, or with no sector."""
+    found = lanes.match(posting.title, config)
+    if found is None or found.name not in RAISED_LANES:
+        return None
+    return watchlist_sector(config, posting.company)
+
+
+def _raised(score: Score | None, sector: str | None) -> Score | None:
+    """The score one tier up for its sector, never above high. Never for a vetoed or
+    excluded posting. A cap still applies after it (`capped`), so the raise never lifts
+    a posting above a cap rule's level."""
+    if score is None or sector is None or score.vetoed or score.excluded:
+        return score
+    if score.tier not in FIT_LEVELS:
+        return score
+    index = FIT_LEVELS.index(score.tier)
+    if index + 1 >= len(FIT_LEVELS):
+        return dataclasses.replace(score, sector=sector)
+    return dataclasses.replace(
+        score, tier=FIT_LEVELS[index + 1], sector=sector, raised_from=score.tier
+    )
 
 
 def alerts(score: Score) -> bool:
