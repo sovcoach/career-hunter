@@ -7,6 +7,7 @@ kind (ADR-028):
     1. veto: No night-shift roles at a warehouse.
     2. cap medium: A contract whose only stated path is a possible extension.
     3. veto [no car]: No role that needs a car for daily site visits.
+    4. met: a forklift certificate (covers forklift and lift-truck requirements)
 
 A rule may carry a short label in square brackets after its kind, as in rule 3: at most
 MAX_LABEL characters, with no brackets inside. The label names the rule in the skip
@@ -17,13 +18,17 @@ request. A posting the model shows meets a veto rule, with a quote from the post
 that the code checks, is skipped with reason `criteria: N. <label>`, or without a label
 `criteria: N. <the rule's first words>`, ending in `…` when the rule goes on.
 A cap rule (`cap low`, `cap medium` or `cap high`, a fit level) lowers the posting's
-fit to at most that level and never skips it. Unset means no criteria are sent.
+fit to at most that level and never skips it. A met rule (`met`, batch R2) states a
+fact about the candidate: when a posting asks for what it names, the model counts that
+qualification as met and lists no gap for it. It covers only what it names, never
+anything similar or broader, and never vetoes or caps. Unset means no criteria are
+sent.
 
 A line that is not a numbered rule, numbers out of order, a rule with no valid kind or
-a bad label (`no-kind`: empty, over MAX_LABEL characters, not closed or holding a
-bracket), a rule over MAX_RULE characters or more than MAX_RULES rules make the file
-unusable, so a file still written as prose, or as rules without kinds, is refused
-rather than guessed.
+a bad label (`no-kind`: a kind other than veto, cap low|medium|high or met; a label
+empty, over MAX_LABEL characters, not closed or holding a bracket), a rule over
+MAX_RULE characters or more than MAX_RULES rules make the file unusable, so a file
+still written as prose, or as rules without kinds, is refused rather than guessed.
 
 The file is read only when it is inside the data folder once every symlink is
 resolved, is a regular file readable by its owner only, is UTF-8, and is not empty
@@ -52,8 +57,10 @@ MAX_RULES = 20
 MAX_LABEL = 40
 CONFIG_KEY = "search.criteria_file"
 _RULE = re.compile(r"(\d{1,3})\.\s+(\S.*)")
-_KIND = re.compile(r"(veto|cap\s+(low|medium|high))\s*(\[[^\]]*\]?)?\s*:\s*(\S.*)", re.IGNORECASE)
-KINDS = ("veto", "cap")
+_KIND = re.compile(
+    r"(veto|met|cap\s+(low|medium|high))\s*(\[[^\]]*\]?)?\s*:\s*(\S.*)", re.IGNORECASE
+)
+KINDS = ("veto", "cap", "met")
 
 REASONS = {
     "outside": "the path is outside the data folder",
@@ -67,8 +74,8 @@ REASONS = {
     "out-of-order": "the rules are not numbered 1, 2, 3 in order",
     "rule-too-long": f"a rule is over {MAX_RULE} characters",
     "too-many-rules": f"it has more than {MAX_RULES} rules",
-    "no-kind": "a rule has no kind or a bad label (start each rule with veto: or "
-    "cap low|medium|high:, a label as veto [label]:)",
+    "no-kind": "a rule has no kind or a bad label (start each rule with veto:, "
+    "cap low|medium|high: or met:, a label as veto [label]:)",
 }
 
 
@@ -205,7 +212,8 @@ def parse_rules(text: str) -> tuple[Rule, ...]:
         if len(body) > MAX_RULE:
             raise CriteriaError("rule-too-long", chars=len(text))
         cap = kind.group(2).casefold() if kind.group(2) else None
-        rules.append(Rule(len(rules) + 1, body, "cap" if cap else "veto", cap, label))
+        named = "cap" if cap else kind.group(1).casefold()
+        rules.append(Rule(len(rules) + 1, body, named, cap, label))
         if len(rules) > MAX_RULES:
             raise CriteriaError("too-many-rules", chars=len(text))
     if not rules:

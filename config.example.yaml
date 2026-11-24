@@ -61,8 +61,9 @@ search:
   resume: null
   # Optional. A text file in the data folder with your own criteria (e.g.
   # criteria.md), sent with each scoring call: one rule per line, numbered in order,
-  # each with its kind: "1. veto: ..." or "2. cap medium: ..." (cap low, medium or
-  # high); blank lines and lines starting with # are ignored. A posting the model
+  # each with its kind: "1. veto: ...", "2. cap medium: ..." (cap low, medium or
+  # high) or "3. met: ..." (a fact about you, counted as met when a posting asks for
+  # exactly that); blank lines and lines starting with # are ignored. A posting the model
   # shows meets a veto rule, quoting the posting, is skipped for that rule (an alerted
   # one is withdrawn in Telegram); one that meets a cap rule has its fit lowered to
   # at most that level.

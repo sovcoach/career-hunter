@@ -12,6 +12,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`sector` on a watchlist entry** (Q11): `security_vendor`, `mssp`, `fintech`, `automation_consultancy` or `it_consultancy`. A `support` or `noc_network` posting at that company goes up one tier after scoring (Low to Medium, Medium to High), never above High or a cap rule's level, and never for an off-lane, vetoed or excluded posting. Its alert row names the sector, as in `Lane: support (stopgap, MSSP)`. The model never sees it (ADR-032).
 
+- **`met:` criteria rules.** A rule `N. met: …` states something about the candidate that the resume doesn't show, such as a certificate. The model counts a requirement that is exactly what the rule names as met and lists no gap for it; it covers nothing similar or broader, and never vetoes or caps (ADR-028).
+
 ### Changed
 - **A bare "Remote" is a remote job in an unknown region.** A location that says Remote and names no place is no longer dropped by `search.location_rules.remote`. A `Location:` line in its description is read for the region, which the rules then check. With none, the alert says `Remote (region unknown)`, as it does for a blank location the board marks remote.
 - **The digest row shows `N core, M minor`** in place of `N gaps`, leaving out the gap types in `fit_rubric.requirement_tiers.exempt_types`, so the counts match how the tier is worked out. Postings scored before 0.10.0, whose gaps have no kind, still show `N gaps`.
