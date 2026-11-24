@@ -994,7 +994,10 @@ def test_the_tier_follows_core_and_minor_gaps(
 
 def test_a_core_gap_in_the_main_function_is_low() -> None:
     main = requirement("Analyst work in this function", core=True, main_function=True)
-    assert _tier(fit_reply(items=(main,))).tier == "low"
+    analyst = PostingText("Example Automate", "Automation Analyst", "Example City", "remote")
+    assert _tier(fit_reply(items=(main,)), analyst).tier == "low"
+    # TRAINING has a junior title: there it's an ordinary core gap (test_junior_main_function)
+    assert _tier(fit_reply(items=(main,))).tier == "medium"
     # Met, it isn't listed at all: no gap.
     assert _tier(fit_reply()).tier == "high"
 

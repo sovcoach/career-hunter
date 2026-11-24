@@ -673,7 +673,9 @@ def _draw(
     veto = None if criteria is None else _veto(content, posting, criteria)
     cap = None if criteria is None else _cap(content, posting, criteria)
     entry_level = _entry_level(content, posting)
-    counted, tier, excluded = _apply_tiers(parsed, rubric, entry_level=entry_level)
+    counted, tier, excluded = _apply_tiers(
+        parsed, rubric, entry_level=entry_level, junior=junior_title(posting.title)
+    )
     if tier is None and not excluded and not (veto is not None and veto.rejected is None):
         return None
     # D-A1: with a resume in the prompt, the reply itself is never stored. Nor is a
@@ -1289,14 +1291,20 @@ def _capped(phrase: str) -> str:
 
 
 def _apply_tiers(
-    gaps: list[_Gap], rubric: Mapping[str, Any], *, entry_level: bool = False
+    gaps: list[_Gap],
+    rubric: Mapping[str, Any],
+    *,
+    entry_level: bool = False,
+    junior: bool = False,
 ) -> tuple[list[_Gap], str | None, bool]:
     """The gaps that count, the tier, and whether the core gaps exclude the posting.
 
     In code, never sent to the model (`fit_rubric.requirement_tiers`):
     - `exclude_at_core` or more core gaps: excluded (a `gap_tier` skip);
     - two or more core gaps, or a core gap in the role's main function, or a seniority
-      gap (4 or more years asked, or a senior or lead title): low;
+      gap (4 or more years asked, or a senior or lead title): low. On a junior or entry
+      posting (a `junior` title, or `entry_level` grounded by a quote) a main-function
+      gap is an ordinary core gap instead;
     - one other core gap: medium;
     - no core gap: high with at most `high_max_minor` minor gaps (plus
       `entry_level_extra_minor` when the posting is grounded as entry level), else
@@ -1308,7 +1316,8 @@ def _apply_tiers(
     minor = len(counted) - len(core)
     if len(core) >= rubric["exclude_at_core"]:
         return counted, None, True
-    if len(core) >= 2 or any(gap.main_function or gap.seniority for gap in core):
+    forces_low = not (junior or entry_level)
+    if len(core) >= 2 or any((gap.main_function and forces_low) or gap.seniority for gap in core):
         return counted, "low", False
     if core:
         return counted, "medium", False
