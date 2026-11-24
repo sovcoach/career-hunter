@@ -930,6 +930,8 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 
 ## ADR-031: Up to three draws vote on the alert decision, behind scoring.voting
 
+> **Amended: doctor and the longest draw (batch R2).** A voted call's `duration_ms` is all its draws together, so doctor's `scoring calls` line could warn that the longest call was close to `scoring.timeout_seconds` when no single draw was. Search migration 0038 adds `draw_calls` and `longest_draw_ms` to `score_calls`, filled for every voted call that returns a score or fails with a model error, and doctor compares the longest single draw with the timeout. A voted call whose replacement draw also does not parse returns no score and records NULL. Scoring is unchanged.
+
 **Status:** accepted (batch R2).
 
 **Context.** For a fixed seed the scorer gives the same reply every time, but another seed can give another alert decision for the same posting. In calibration (18 cases, 3 seeds each) 3 to 7 cases changed their alert decision between seeds, on every model tried. Every flip comes from requirements listed on some draws and not others, or from one requirement changing class (met partly or no, its years, the main-function flag). One gap is enough to cross the Medium/Low line. A different model or sampling preset moves the flips to other postings without removing them.

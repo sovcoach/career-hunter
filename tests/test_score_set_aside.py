@@ -91,7 +91,9 @@ def test_score_call_stats_count_timeouts_apart(search: sqlite3.Connection) -> No
         search, 1, one, "2026-09-01T10:00:00Z", "2026-09-01T10:00:01Z", 3, "unreachable"
     )
     stats = search_store.score_call_stats(search, "2026-09-01T00:00:00Z")
-    assert stats == search_store.ScoreCallStats((120000,), not_answered=1, timed_out=2)
+    assert stats == search_store.ScoreCallStats(
+        (120000,), not_answered=1, timed_out=2, longest_draw_ms=120000
+    )
 
 
 def test_a_timeout_is_a_health_failure_kind(search: sqlite3.Connection) -> None:

@@ -1754,6 +1754,8 @@ def _attempt(
     title = repr(posting.title)
     clock = state.monotonic
     began = clock()
+    # With scoring.voting: the draws sent and the longest one (search migration 0038).
+    drew: list[int | None] = [None, None]
 
     def timed(outcome: str) -> None:
         """Record this call's end and duration, in the caller's transaction."""
@@ -1766,11 +1768,14 @@ def _attempt(
                 _iso(state.now()),
                 round((clock() - began) * 1000),
                 outcome,
+                draw_calls=drew[0],
+                longest_draw_ms=drew[1],
             )
 
     try:
         result = scorer(posting)
     except (ScoreError, OSError) as exc:
+        drew[:] = [getattr(exc, "draw_calls", None), getattr(exc, "longest_draw_ms", None)]
         kind = getattr(exc, "kind", "unreachable")
         # A voting scorer that had no time left for another draw (ADR-031) is a budget
         # cut too: the posting waits for the next run.
@@ -1798,6 +1803,8 @@ def _attempt(
             )
         return
     state.scorer_answered = True
+    if result is not None:
+        drew[:] = [result.draw_calls, result.longest_draw_ms]
     if result is not None and result.replaced:
         # scoring.voting (ADR-031): a draw failed and its replacement answered.
         failures = ", ".join(result.replaced)

@@ -24,6 +24,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A new resume re-scores nothing.** `resume import` no longer queues every scored posting: the new resume applies to postings scored after it, and existing scores stay. `careerhunter rescore` still queues chosen postings (ADR-023).
 
 ### Fixed
+- **`doctor`'s `scoring calls` line with voting** compares the longest single draw with `scoring.timeout_seconds`, not the whole voted call, and shows it when it differs (`longest draw N s`). Search migration 0038 adds `draw_calls` and `longest_draw_ms` to `score_calls`; existing rows keep NULL. `search.db` goes to 38 (ADR-031).
 - **A gap listed twice counts once** when the two names differ only in case, surrounding whitespace or trailing punctuation (`.`, `,`, `;`, `:`, `!`, `?`, `…`), as in "CompTIA A+ certification" and "compTIA A+ certification.". Before, each counted as a core gap, which could exclude the posting. A trailing `+` or `#` still counts, so "A+" and "A", or "C#" and "C", stay two gaps.
 
 ## [0.11.1] - 2026-11-21

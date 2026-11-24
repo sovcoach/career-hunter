@@ -108,6 +108,7 @@ import dataclasses
 import http.client
 import json
 import re
+import time
 import unicodedata
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
@@ -267,6 +268,10 @@ class ScoreError(Exception):
         super().__init__(message)
         self.kind = kind if kind in KINDS else "unreachable"
         self.type_name = type_name
+        # With scoring.voting: the draws sent before the posting failed, and the
+        # longest of them (search migration 0038). None for one draw.
+        self.draw_calls: int | None = None
+        self.longest_draw_ms: int | None = None
 
 
 def _transport_failure(exc: BaseException) -> ScoreError:
@@ -335,6 +340,10 @@ class Score:
     # that was replaced ("unparseable" or a ScoreError kind), in order. One draw: 1, ().
     draws: int = dataclasses.field(default=1, compare=False)
     replaced: tuple[str, ...] = dataclasses.field(default=(), compare=False)
+    # With scoring.voting: the draws sent (replacements included) and the longest one in
+    # milliseconds, which scoring.timeout_seconds limits (search migration 0038).
+    draw_calls: int | None = dataclasses.field(default=None, compare=False)
+    longest_draw_ms: int | None = dataclasses.field(default=None, compare=False)
     # Q11 (ADR-032): the watchlist sector that applies to this posting, and the tier it
     # had before the raise when the raise moved it. None, None: no sector applies.
     sector: str | None = None
@@ -491,6 +500,7 @@ def score_posting(
     criteria: Criteria | None = None,
     budget: Deadline | None = None,
     sector: str | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Score | None:
     """The score, or None when the reply does not parse.
 
@@ -527,7 +537,7 @@ def score_posting(
 
     if not scoring_voting(config):
         return draw(config)
-    return _vote(config, draw, budget)
+    return _vote(config, draw, budget, clock)
 
 
 # Q11 (ADR-032): the lanes a listed sector raises.
@@ -585,23 +595,30 @@ def _vote(
     config: Mapping[str, Any],
     draw: Callable[[Mapping[str, Any]], Score | None],
     budget: Deadline | None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Score | None:
     """Up to three draws vote on the alert decision; the first two agreeing settle it.
     A draw that does not parse or times out is replaced once by the next spare seed; a
     failed replacement fails the posting as one draw would (None, or its ScoreError).
     Any other ScoreError fails it at once. No draw after the first starts once the run
-    has less than one call's time left."""
+    has less than one call's time left. The result, or the ScoreError, carries how many
+    draws were sent and the longest one's milliseconds."""
     spares = iter(SPARE_SEEDS)
     replaced: list[str] = []
     room = float(scoring_timeout_seconds(config))
     started = 0
+    longest = 0
 
     def call(seed: int) -> Score | None:
-        nonlocal started
+        nonlocal started, longest
         if started and budget is not None and budget.remaining() < room:
             raise ScoreError(OUT_OF_BUDGET, kind="budget")
         started += 1
-        return draw(_with_seed(config, seed))
+        began = clock()
+        try:
+            return draw(_with_seed(config, seed))
+        finally:
+            longest = max(longest, round((clock() - began) * 1000))
 
     def one(seed: int) -> Score | None:
         try:
@@ -618,16 +635,26 @@ def _vote(
 
     seeds = (int(scoring_sampling(config)["seed"]), *VOTE_SEEDS)
     votes: list[Score] = []
-    for seed in seeds:
-        if len(votes) == 2 and alerts(votes[0]) == alerts(votes[1]):
-            break
-        got = one(seed)
-        if got is None:
-            return None
-        votes.append(got)
+    try:
+        for seed in seeds:
+            if len(votes) == 2 and alerts(votes[0]) == alerts(votes[1]):
+                break
+            got = one(seed)
+            if got is None:
+                return None
+            votes.append(got)
+    except ScoreError as exc:
+        exc.draw_calls, exc.longest_draw_ms = started, longest
+        raise
     majority = sum(alerts(v) for v in votes) * 2 > len(votes)
     chosen = next(v for v in votes if alerts(v) == majority)
-    return dataclasses.replace(chosen, draws=len(votes), replaced=tuple(replaced))
+    return dataclasses.replace(
+        chosen,
+        draws=len(votes),
+        replaced=tuple(replaced),
+        draw_calls=started,
+        longest_draw_ms=longest,
+    )
 
 
 def _draw(

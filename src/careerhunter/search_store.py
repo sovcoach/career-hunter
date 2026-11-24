@@ -827,12 +827,25 @@ def record_score_call(
     finished_at: str,
     duration_ms: int,
     outcome: str,
+    *,
+    draw_calls: int | None = None,
+    longest_draw_ms: int | None = None,
 ) -> None:
-    """One scoring call's timing (search migration 0026). No prompt, reply or text."""
+    """One scoring call's timing (search migration 0026). No prompt, reply or text. A
+    voted call also records its draws sent and its longest single draw (0038)."""
     conn.execute(
         "INSERT INTO score_calls (run_id, posting_id, started_at, finished_at, duration_ms, "
-        "outcome) VALUES (?, ?, ?, ?, ?, ?)",
-        (run_id, posting_id, started_at, finished_at, max(0, duration_ms), outcome),
+        "outcome, draw_calls, longest_draw_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            run_id,
+            posting_id,
+            started_at,
+            finished_at,
+            max(0, duration_ms),
+            outcome,
+            draw_calls,
+            None if longest_draw_ms is None else max(0, longest_draw_ms),
+        ),
     )
 
 
@@ -844,15 +857,25 @@ class ScoreCallStats:
     answered_ms: tuple[int, ...]
     not_answered: int
     timed_out: int = 0
+    # The longest single draw of an answered call: a voted call's longest draw (a
+    # replaced one included), or a one-draw call's duration. What
+    # scoring.timeout_seconds limits (search migration 0038).
+    longest_draw_ms: int | None = None
 
 
 def score_call_stats(conn: sqlite3.Connection, since: str) -> ScoreCallStats:
     rows = conn.execute(
-        "SELECT duration_ms, outcome FROM score_calls WHERE started_at >= ?", (since,)
+        "SELECT duration_ms, outcome, longest_draw_ms FROM score_calls WHERE started_at >= ?",
+        (since,),
     ).fetchall()
     answered = tuple(sorted(int(r[0]) for r in rows if r[1] in ANSWERED_OUTCOMES))
     timed_out = sum(1 for r in rows if r[1] == "timeout")
-    return ScoreCallStats(answered, len(rows) - len(answered) - timed_out, timed_out)
+    draws = [
+        int(r[2]) if r[2] is not None else int(r[0]) for r in rows if r[1] in ANSWERED_OUTCOMES
+    ]
+    return ScoreCallStats(
+        answered, len(rows) - len(answered) - timed_out, timed_out, max(draws, default=None)
+    )
 
 
 @dataclass(frozen=True)
