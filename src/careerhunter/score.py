@@ -1098,10 +1098,37 @@ def senior_title(title: str) -> bool:
     return any(has_phrase(title, word) for word in _SENIOR_TITLE)
 
 
+_CREDENTIAL_TYPES = frozenset({"certification", "licence"})
+_CREDENTIAL_NAME = re.compile(
+    r"\b(?:certifications?|certificates?|licen[cs]es?|clearances?)\b", re.IGNORECASE
+)
+# A licence the job manages or checks, not one the candidate holds: software seats,
+# or licences reviewed as documents.
+_LICENSING = re.compile(
+    r"\blicen[cs](?:e|es|ing)\s+(?:administration|admin|management|tracking|provisioning|"
+    r"compliance|keys?|seats?|renewals?|assignments?|audits?)\b"
+    r"|\b(?:software|saas|seat|user|application|app|product|business|vendor)\s+licen[cs]es?\b"
+    r"|\b(?:review\w*|verif\w*|check\w*)\b.*\blicen[cs]es?\b",
+    re.IGNORECASE,
+)
+
+
+def required_credential(item: Requirement) -> bool:
+    """True for a certification, licence or clearance gap: typed `certification` or
+    `licence`, or named with certification, certificate, licence, license or clearance.
+    A licence the job administers or reviews (software licences, licences checked as
+    documents) is not one."""
+    if _LICENSING.search(item.text):
+        return False
+    return item.type in _CREDENTIAL_TYPES or bool(_CREDENTIAL_NAME.search(item.text))
+
+
 def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
     """The gaps, in code, from the reply's unmet or partly met qualifications. A `core`
     one not met at all is a core gap; anything else, a partly met one included, is
-    minor.
+    minor. A required credential (`required_credential`) not met at all is a core gap
+    whatever the reply's `core` says, and any years the reply attached to it are ignored;
+    a preferred one is handled like any other gap.
 
     The seniority line comes first for an item that asks for years: SENIOR_YEARS or more,
     not met at all, is a core seniority gap whatever the reply's `core` says; fewer is
@@ -1112,15 +1139,17 @@ def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
     junior = junior_title(title)
     for item in items:
         seniority = False
-        if item.kind in GAP_KINDS and item.years >= SENIOR_YEARS:
+        credential = item.kind == "required" and required_credential(item)
+        years = 0 if credential else item.years
+        if item.kind in GAP_KINDS and years >= SENIOR_YEARS:
             kind = "core" if item.met == "no" else "minor"
             seniority = item.met == "no"
-        elif item.kind in GAP_KINDS and item.years > 0:
+        elif item.kind in GAP_KINDS and years > 0:
             if junior:
                 continue
             kind = "minor"
         elif item.kind in GAP_KINDS:
-            kind = "core" if item.core and item.met == "no" else "minor"
+            kind = "core" if (item.core or credential) and item.met == "no" else "minor"
         else:
             continue
         name = gap_name(" ".join(item.text.split()[:MAX_GAP_WORDS]))
@@ -1132,7 +1161,7 @@ def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
                 name,
                 kind,
                 "seniority" if seniority else item.type,
-                main_function=item.main_function and item.years == 0,
+                main_function=item.main_function and years == 0 and not credential,
                 seniority=seniority,
             )
         )

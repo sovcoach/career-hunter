@@ -577,7 +577,7 @@ LANGUAGES = {**RUBRIC, "hard_gates": {"required_languages": ["Examplish", "fran√
 PHANTOM = {
     "gaps": [
         requirement("Examplish language proficiency", type="language", core=True),
-        requirement("Forklift licence"),
+        requirement("Forklift licence", "preferred"),  # a required one is a core gap
     ],
     "key_requirements": ["Examplish language required", "Forklift licence", "Remote in Canada"],
     "entry_level": "",

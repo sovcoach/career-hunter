@@ -95,7 +95,7 @@ class FakeModel:
         if view["posting"]["company"] == "Example Robotics":
             content = (
                 f"From the resume ({SENTINEL}) I see one gap: "
-                '{"gaps":[{"name":"Forklift licence","kind":"required",'
+                '{"gaps":[{"name":"Forklift licence","kind":"preferred",'
                 '"type":"certification","core":false,"main_function":false,"years":0,'
                 '"met":"no","quote":""}],'
                 f'"key_requirements":["Knows {SENTINEL}","Forklift licence course",'
