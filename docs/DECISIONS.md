@@ -936,3 +936,21 @@ Until step 4, no direct pushes to `main` is a convention, not something GitHub e
 - Scoring costs about 2.3 calls a posting on the calibration set (2 when the first two agree, 3 otherwise), plus any replacements, so fewer postings are scored within `scoring.run_minutes`. A timeout is counted per posting only when the replacement times out too. Near the end of a run a posting can be left for the next run after its first draw, so that draw's model time is spent for nothing.
 - The seeds are fixed: the same posting, resume and config still give the same result. Turning voting on can change stored decisions, so it goes through calibration first.
 - A replaced draw shows only when the posting is scored. When the replacement fails as well, the log has the usual failure line.
+
+## ADR-032: A listed sector raises a support or NOC posting one tier
+
+**Status:** accepted (batch R2).
+
+**Context.** The scorer judges a posting against the resume alone. The same support or NOC role can be worth more at some kinds of company than at others, and the operator knows which companies those are. The request carries only the company's name, and nothing in the score used what kind of company it is.
+
+**Decision.**
+- An optional `sector` on a watchlist entry, one of `security_vendor`, `mssp`, `fintech`, `automation_consultancy` or `it_consultancy`. The operator sets it; nothing infers it, and discovered companies have none. Unset or null means no sector. Any other value is a config error naming the entry. There is no `other`: a blank sector already means no raise.
+- A posting whose title is in the `support` or `noc_network` lane, at a company whose watchlist entry (matched by name, ignoring case, as for `role_filters`) names one of these sectors, goes up one tier after scoring: Low to Medium, Medium to High. High stays High.
+- Never for an off-lane posting, a vetoed one, or one excluded at `exclude_at_core`. A cap rule still applies after the raise, so the raise never lifts a posting above the cap's level.
+- The raise is applied to each draw before any vote (ADR-031), so voting decides on the raised tier.
+- The sector is never sent to the model. The stored `scout_metadata` keeps it as `sector`, and `raised_from` when the tier moved. The watch log says `raised from low to medium (sector mssp)`, and the alert row names the sector in words: `Lane: support (stopgap, MSSP)`.
+
+**Consequences.**
+- No migration: the sector is config only, read on each run.
+- A posting stored before its company got a sector keeps its score until it is re-scored.
+- A board whose company name differs from the watchlist name gets no raise, the same as its role filters.
