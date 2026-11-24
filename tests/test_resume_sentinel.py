@@ -190,7 +190,7 @@ def test_the_resume_reaches_the_model_and_nothing_else(
     # the gap were dropped; the gap is a count, never its name.
     digest = sent[0]["text"]
     assert digest.startswith("New postings: 1\n\n1. Example Robotics")
-    assert "| 1 gap" in digest and "Needs: Weekend shifts" in digest
+    assert "| 0 core, 1 minor" in digest and "Needs: Weekend shifts" in digest
     assert "Forklift" not in digest
     assert_absent("a Telegram message", json.dumps([params for _m, params in api.calls]))
 

@@ -135,9 +135,9 @@ def test_demo_output_is_deterministic(capsys: pytest.CaptureFixture[str]) -> Non
     assert "watch: 2 boards fetched, 0 failed, 0 left" in text
     assert "New postings: 3" in text
     assert "1. Example Robotics — Operations Coordinator" in text
-    assert "Example City | Lane: operations | Fit: High | 1 gap" in text
-    assert "Remote - Example Region | Lane: operations | Fit: Medium | 2 gaps" in text
-    assert "Example City | Off-lane | Fit: High | 0 gaps" in text
+    assert "Example City | Lane: operations | Fit: High | 0 core, 1 minor" in text
+    assert "Remote - Example Region | Lane: operations | Fit: Medium | 1 core, 1 minor" in text
+    assert "Example City | Off-lane | Fit: High | 0 core, 0 minor" in text
     assert "forklift certificate" not in text.split("== Applied ==")[0].split("digest")[1]
     assert "  employer: Example Robotics" in text
     assert "  method: Company site" in text

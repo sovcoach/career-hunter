@@ -983,6 +983,13 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
     ]
 
 
+def _kind_counts(row: sqlite3.Row) -> dict[str, int | None]:
+    """The core and minor counts, or None for both when any stored gap has no kind."""
+    if row["core_count"] is None or row["minor_count"] is None or row["loose_count"]:
+        return {"core_count": None, "minor_count": None}
+    return {"core_count": int(row["core_count"]), "minor_count": int(row["minor_count"])}
+
+
 @dataclass(frozen=True)
 class DigestFields:
     """What one digest row shows. Never the gap names, the model text or notes."""
@@ -998,27 +1005,50 @@ class DigestFields:
     key_requirements: tuple[str, ...]
     referral: bool = False
     also: tuple[str, ...] = ()  # the requisitions of the same role posted again (Batch R)
+    # The core and minor gaps, exempt types left out (R2); None, None when a stored gap
+    # has no kind (scored before 0.10.0) or the gaps are not a JSON list.
+    core_count: int | None = None
+    minor_count: int | None = None
     work_model: str | None = None  # the board's, when it gave one
 
 
-def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[int, DigestFields]:
+def digest_fields(
+    conn: sqlite3.Connection, posting_ids: Sequence[int], exempt_types: Sequence[str] = ()
+) -> dict[int, DigestFields]:
     """The digest fields of these postings, by id. A posting no longer stored is absent.
 
-    The gap count is read from the stored gap list in SQL, so the gap names themselves
-    never leave the database here.
+    The gap counts are read from the stored gap list in SQL, so the gap names themselves
+    never leave the database here. The core and minor counts leave out gaps whose type
+    is in `exempt_types`, as the tier does.
     """
     found: dict[int, DigestFields] = {}
+    exempt = json.dumps([str(item) for item in exempt_types])
     for posting_id in posting_ids:
         row = conn.execute(
             """
             SELECT p.id, c.name AS company, p.title, p.location, p.url, p.schedule, p.fit,
                    CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
                         THEN json_array_length(p.gaps) END AS gap_count,
+                   CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array' THEN (
+                        SELECT COALESCE(SUM(json_extract(g.value, '$.kind') = 'core'
+                               AND COALESCE(json_extract(g.value, '$.type'), '')
+                                   NOT IN (SELECT e.value FROM json_each(:exempt) e)), 0)
+                        FROM json_each(p.gaps) g WHERE g.type = 'object') END AS core_count,
+                   CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array' THEN (
+                        SELECT COALESCE(SUM(json_extract(g.value, '$.kind') = 'minor'
+                               AND COALESCE(json_extract(g.value, '$.type'), '')
+                                   NOT IN (SELECT e.value FROM json_each(:exempt) e)), 0)
+                        FROM json_each(p.gaps) g WHERE g.type = 'object') END AS minor_count,
+                   CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array' THEN (
+                        SELECT COUNT(*) FROM json_each(p.gaps) g
+                        WHERE g.type != 'object' OR NOT EXISTS (
+                            SELECT 1 FROM json_each(g.value) k
+                            WHERE g.type = 'object' AND k.key = 'kind')) END AS loose_count,
                    p.key_requirements, p.referral, p.work_model
             FROM postings p JOIN companies c ON c.id = p.company_id
-            WHERE p.id = ?
+            WHERE p.id = :posting_id
             """,
-            (posting_id,),
+            {"exempt": exempt, "posting_id": posting_id},
         ).fetchone()
         if row is None:
             continue
@@ -1034,6 +1064,7 @@ def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[
             key_requirements=_requirements(row["key_requirements"]),
             referral=bool(row["referral"]),
             also=_also(conn, posting_id),
+            **_kind_counts(row),
             work_model=None if row["work_model"] is None else str(row["work_model"]),
         )
     return found

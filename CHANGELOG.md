@@ -14,6 +14,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 - **A bare "Remote" is a remote job in an unknown region.** A location that says Remote and names no place is no longer dropped by `search.location_rules.remote`. A `Location:` line in its description is read for the region, which the rules then check. With none, the alert says `Remote (region unknown)`, as it does for a blank location the board marks remote.
+- **The digest row shows `N core, M minor`** in place of `N gaps`, leaving out the gap types in `fit_rubric.requirement_tiers.exempt_types`, so the counts match how the tier is worked out. Postings scored before 0.10.0, whose gaps have no kind, still show `N gaps`.
 - **A shorter scoring prompt.** The request no longer sends the lanes or the location rules: code decides both, and the model's reply never used them. The `main_function` wording is sharper: it is true only for doing the role's main job itself, never for a tool, a degree, a certification, a field of background or a number of years. Tiers can move, so the change went through calibration (ADR-029).
 
 ## [0.11.1] - 2026-11-21
