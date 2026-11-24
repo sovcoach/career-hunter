@@ -14,7 +14,7 @@ from careerhunter import search_store
 from careerhunter import watch as w
 from careerhunter.score import Score
 from tests.fakes import FakeClock
-from tests.test_rescore import NEW, OLD, Recorder, board, lever, run, titles
+from tests.test_rescore import NEW, OLD, Recorder, board, lever, queue, run, titles
 from tests.test_watch import DAY, OnBoard, Scripted, minutes
 
 FITS = {"fit_rubric": {"requirement_tiers": {"high_max_minor": 1, "exclude_at_core": 3}}}
@@ -71,15 +71,16 @@ def test_a_re_score_replaces_the_fit_and_a_failed_one_keeps_it(search: sqlite3.C
     jobs = (("a1", "Kept"), ("a2", "Moved"))
     run(search, one_board(*jobs), ("examplea",), scorer=Recorder(), resume=OLD, config=FITS)
     assert (fit_of(search, "Kept"), fit_of(search, "Moved")) == ("high", "high")
+    queue(search, "Kept", "Moved")
     scorer = Recorder()
-    scorer.replies["Kept"] = None  # unparseable: the old score, hash and fit stay
+    scorer.replies["Kept"] = None  # unparseable: the old score and fit stay, still queued
     scorer.replies["Moved"] = scored("medium")
     run(search, one_board(*jobs), ("examplea",), scorer=scorer, resume=NEW, config=FITS)
     assert sorted(titles(scorer)) == ["Kept", "Moved"]
     assert fit_of(search, "Kept") == "high"
     assert fit_of(search, "Moved") == "medium"
     hashes = dict(search.execute("SELECT title, scored_resume_sha256 FROM postings").fetchall())
-    assert hashes == {"Kept": OLD.sha256, "Moved": NEW.sha256}
+    assert hashes == {"Kept": None, "Moved": NEW.sha256}
 
 
 # --- the fill-in for postings scored before fits existed ----------------------------------------

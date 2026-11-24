@@ -59,10 +59,12 @@ Scoring and the resume (ADR-023). The caller loads the resume once and passes it
 or passes the reason it could not be used; then nothing is scored this run, and one
 line says why. Only new postings are scored while the boards are fetched, and that
 stops once less than SCORE_RESERVE seconds of the budget are left, so the passes after
-the boards always get time. A stored posting on a fetched board whose score was made
-with another resume (or none) is queued for re-scoring with its description, which
-stays in memory only. After the boards, under the budget, come never-scored postings,
-then the queued re-scores, then the other re-scores. Never-scored postings
+the boards always get time. A stored posting on a fetched board that is queued for a
+re-score (its resume fingerprint cleared by `careerhunter rescore`, or scored before any
+resume) is queued with its description, which stays in memory only. A score made with
+an earlier resume is kept: a new resume applies only to postings scored after it.
+After the boards, under the budget, come never-scored postings, then the queued
+re-scores, then the other re-scores. Never-scored postings
 go first come, first served: by the last score attempt, or by when the posting was
 stored (`created_at`) if it was never tried, then by id. A posting that keeps failing
 goes behind what was stored before its last attempt, and new arrivals can't push it
@@ -1444,7 +1446,7 @@ _RESCORE_SQL = (
     "c.ats_region "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
-    "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
+    "AND p.scored_resume_sha256 IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of) "
@@ -1459,7 +1461,7 @@ _RESCORE_SQL = (
 _NEEDS_RESCORE_SQL = (
     "SELECT 1 FROM postings p "
     "WHERE p.id = ? AND p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
-    "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
+    "AND p.scored_resume_sha256 IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of)"
@@ -1467,10 +1469,13 @@ _NEEDS_RESCORE_SQL = (
 
 
 def _needs_rescore(conn: sqlite3.Connection, posting_id: int, sha256: str | None) -> bool:
-    """A scored watcher posting with no skip or application, scored with another resume."""
+    """A scored watcher posting with no skip or application, queued for a re-score: its
+    resume fingerprint is cleared (`careerhunter rescore`, or a score made before any
+    resume). A score made with an earlier resume is kept: a new resume applies only to
+    postings scored after it. Nothing is queued while no resume is in use."""
     if sha256 is None:
         return False
-    row = conn.execute(_NEEDS_RESCORE_SQL, (posting_id, sha256)).fetchone()
+    row = conn.execute(_NEEDS_RESCORE_SQL, (posting_id,)).fetchone()
     return row is not None
 
 
@@ -1527,7 +1532,7 @@ def _score_passes(
     ]
     sha256 = state.resume_sha256
     if sha256 is not None:
-        rescores = conn.execute(_RESCORE_SQL, (sha256,)).fetchall()
+        rescores = conn.execute(_RESCORE_SQL).fetchall()
         fresh = [row for row in rescores if int(row["id"]) not in state.attempted]
         work += [
             (row, state.queued[int(row["id"])]) for row in fresh if int(row["id"]) in state.queued

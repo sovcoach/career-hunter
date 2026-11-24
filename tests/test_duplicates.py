@@ -249,8 +249,8 @@ def test_applied_records_one_application_naming_every_requisition(env: Env) -> N
         assert search_store.pending_alerts(conn) == []
         # Not re-scored, not offered for rescore, and not swept up as a repost.
         conn.execute("UPDATE postings SET scored_resume_sha256 = NULL")
-        assert conn.execute(watch._RESCORE_SQL, ("0" * 64,)).fetchall() == []
-        assert conn.execute(watch._NEEDS_RESCORE_SQL, (second, "0" * 64)).fetchone() is None
+        assert conn.execute(watch._RESCORE_SQL).fetchall() == []
+        assert conn.execute(watch._NEEDS_RESCORE_SQL, (second,)).fetchone() is None
         assert search_store.rescore_candidates(conn, [second]) == []
         assert search_store.unhandled_reposts(conn) == []
     finally:
@@ -265,7 +265,7 @@ def test_a_duplicate_is_covered_only_once_its_group_is_applied_to(
     try:
         assert duplicates.covering_application(conn, second) is None  # nothing applied yet
         conn.execute("UPDATE postings SET scored_resume_sha256 = NULL")
-        rescorable = [int(r[0]) for r in conn.execute(watch._RESCORE_SQL, ("0" * 64,))]
+        rescorable = [int(r[0]) for r in conn.execute(watch._RESCORE_SQL)]
         assert second in rescorable
     finally:
         conn.close()

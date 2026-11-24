@@ -360,7 +360,7 @@ search:
   resume: resume/current.txt
 ```
 
-No other value is accepted. The next watch run re-scores the postings you haven't skipped or applied to. Postings still listed on their board are re-scored with the description the board sends, when it sends one, and the rest from what was stored. That can take a few runs: new postings go first, and each run stops at its time budget. A posting you were already alerted about is re-scored but not sent again.
+No other value is accepted. The resume applies to postings scored from then on. A new resume doesn't re-score postings already scored: they keep their scores. To score some of them again with it, use `careerhunter rescore`. The next watch run re-scores what it queued, with the description the board sends when the posting is still listed, and the rest from what was stored. That can take a few runs: new postings go first, and each run stops at its time budget. A posting you were already alerted about is re-scored but not sent again.
 
 Don't edit `resume/current.txt` by hand. If it no longer matches what was imported, scoring and embeddings stop using it and `doctor` says so. Run `resume import` again.
 
