@@ -235,7 +235,7 @@ The local model reads the posting and your resume and lists only the gaps: each 
       exempt_types: [education]  # gap types that never count; leave empty to count them all
   ```
 
-  Two core gaps, a core gap in the role's main function, or a seniority gap make it Low. One other core gap makes it Medium. With no core gap it's High up to `high_max_minor` minor gaps, and Medium beyond that: minor gaps alone never make a posting Low. The gap types are experience, skill, tool, education, certification, licence, language, seniority and other. Every key is optional and has the default shown, except `exempt_types`, which defaults to none.
+  Two core gaps, a core gap in the role's main function, or a seniority gap make it Low. One other core gap makes it Medium. With no core gap it's High up to `high_max_minor` minor gaps, and Medium beyond that: minor gaps alone never make a posting Low. The gap types are experience, skill, tool, education, certification, licence (which includes a security clearance), language, seniority and other. The prompt tells the model what each covers; seniority is set in code. Every key is optional and has the default shown, except `exempt_types`, which defaults to none.
 
 The model never sees these numbers. Its sampling settings and seed stay the same from call to call (the defaults, or what `scoring.sampling` sets), so the same posting and resume give the same reply.
 

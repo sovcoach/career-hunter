@@ -1111,6 +1111,16 @@ def test_the_term_guard_reads_only_tools_and_skills_outside_the_summary() -> Non
     assert [gap["kind"] for gap in json.loads(result.gaps)] == ["core", "core", "core"]
 
 
+def test_the_prompt_lists_every_gap_type_and_what_it_covers() -> None:
+    assert tuple(scoring.GAP_TYPE_GUIDE) == scoring.GAP_TYPES  # the schema's enum, in order
+    prompt = scoring.SYSTEM_PROMPT
+    assert "one of the listed types" not in prompt
+    for name, covers in scoring.GAP_TYPE_GUIDE.items():
+        assert f"{name} ({covers})" in prompt
+    assert "licence (a licence, permit or security clearance the candidate must hold)" in prompt
+    assert "seniority (" not in prompt  # set in code, never by the model
+
+
 def test_the_prompt_states_the_general_experience_rule() -> None:
     assert "Experience counts only where the resume's roles" in scoring.SYSTEM_PROMPT
     assert "is not experience in that field's job functions" in scoring.SYSTEM_PROMPT

@@ -184,6 +184,19 @@ REJECTED = {
 # The reply is kept short (Batch Q, the speed fix): only the gaps, each in a few words.
 MAX_GAP_WORDS = 6
 MAX_GAP_QUOTE_WORDS = 10
+# The gap types the reply may use, in the schema's order, and what each covers. Seniority
+# is set in code, never by the model.
+GAP_TYPE_GUIDE = {
+    "experience": "time spent doing a kind of work",
+    "skill": "an ability or an area of knowledge",
+    "tool": "a named product, software or platform",
+    "education": "a degree, diploma or course of study",
+    "certification": "a certification or certificate earned by an exam or a course",
+    "licence": "a licence, permit or security clearance the candidate must hold",
+    "language": "a spoken or written language",
+    "other": "anything else",
+}
+_TYPE_LIST = ", ".join(f"{name} ({covers})" for name, covers in GAP_TYPE_GUIDE.items())
 SYSTEM_PROMPT = (
     "Think briefly and decide quickly: one short check per qualification, then answer. "
     "Reply with one JSON object only, following the schema. "
@@ -200,7 +213,7 @@ SYSTEM_PROMPT = (
     "core: true when it is central to the role's main function or is a minimum number "
     "of years of experience. main_function: true only when the qualification is doing "
     "the role's main job itself; never for a tool, a degree, a certification, a field of "
-    "background or a number of years. type: one of the listed types. quote: at most "
+    f"background or a number of years. type: one of {_TYPE_LIST}. quote: at most "
     f"{MAX_GAP_QUOTE_WORDS} words copied from the posting that state it. entry_level: "
     "when the posting says it is junior or entry level, or welcomes candidates without "
     'every qualification (such as recent graduates, "we\'ll train you", or "apply '
