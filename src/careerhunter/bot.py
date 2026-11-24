@@ -79,6 +79,7 @@ from careerhunter import (
     jobdesc,
     lanes,
     ledger,
+    locations,
     phrases,
     search_store,
     selfsourced,
@@ -370,7 +371,11 @@ def _digest_row(numbered: _Numbered) -> str:
     company = _clip(numbered.entry.label, _CAPS["company"])
     lines = [f"{numbered.number}. {company} — {_clip(fields.title, _CAPS['title'])}"]
     facts = []
-    if fields.location.strip():
+    if locations.bare_remote(fields.location) or (
+        not fields.location.strip() and fields.work_model == "remote" and not fields.referral
+    ):
+        facts.append(locations.REGION_UNKNOWN)  # a bare Remote: region unknown (R2)
+    elif fields.location.strip():
         facts.append(_clip(fields.location, _CAPS["location"]))
     elif not fields.referral:
         facts.append(LOCATION_UNKNOWN)

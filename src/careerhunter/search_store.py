@@ -994,6 +994,7 @@ class DigestFields:
     key_requirements: tuple[str, ...]
     referral: bool = False
     also: tuple[str, ...] = ()  # the requisitions of the same role posted again (Batch R)
+    work_model: str | None = None  # the board's, when it gave one
 
 
 def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[int, DigestFields]:
@@ -1009,7 +1010,7 @@ def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[
             SELECT p.id, c.name AS company, p.title, p.location, p.url, p.schedule, p.fit,
                    CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
                         THEN json_array_length(p.gaps) END AS gap_count,
-                   p.key_requirements, p.referral
+                   p.key_requirements, p.referral, p.work_model
             FROM postings p JOIN companies c ON c.id = p.company_id
             WHERE p.id = ?
             """,
@@ -1029,6 +1030,7 @@ def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[
             key_requirements=_requirements(row["key_requirements"]),
             referral=bool(row["referral"]),
             also=_also(conn, posting_id),
+            work_model=None if row["work_model"] is None else str(row["work_model"]),
         )
     return found
 

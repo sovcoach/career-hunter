@@ -1190,11 +1190,20 @@ def _record_jobs(
                 _line(name, ats, f"{item.title!r} has neither a url nor a requisition id; skipped")
             )
             continue
-        if not item.location.strip() and item.description:
+        bare = locations.bare_remote(item.location)
+        if (bare or not item.location.strip()) and item.description:
             found_location, not_place = locations.read_text(
                 item.description, locations.configured_places(config)
             )
-            if found_location:  # the board gave none: its description's Location: line
+            if found_location and bare and not locations.bare_remote(found_location):
+                # A bare Remote (R2): its description's Location: line names the region.
+                if not locations.says_remote(found_location):
+                    found_location = f"Remote, {found_location}"
+                item = replace(item, location=found_location[: locations.MAX_LOCATION])
+                lines.append(
+                    _line(name, ats, f"{item.title!r}: remote region read from its description")
+                )
+            elif found_location and not bare:  # the board gave none: its Location: line
                 item = replace(item, location=found_location)
                 lines.append(
                     _line(name, ats, f"{item.title!r}: location read from its description")

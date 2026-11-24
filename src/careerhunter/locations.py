@@ -76,11 +76,24 @@ def stated_remote_or_hybrid(location: str, title: str, work_model: str | None) -
     return any(says_remote(t) or _HYBRID.search(t) for t in (location, title))
 
 
+# What is left of a bare "Remote" once the word is gone: separators, brackets, dashes.
+_NOT_A_PLACE = re.compile("[\\s,;/|()\\[\\].:\u2013\u2014-]*")
+REGION_UNKNOWN = "Remote (region unknown)"  # how the alert shows a bare Remote (R2)
+
+
+def bare_remote(location: str) -> bool:
+    """A location that says Remote and names no place: "Remote", "REMOTE (", "Remote -".
+    Its region is unknown, so the location rules never drop it (R2)."""
+    if not says_remote(location):
+        return False
+    return _NOT_A_PLACE.fullmatch(_REMOTE.sub("", location)) is not None
+
+
 def unknown(location: str, *, title: str = "", work_model: str | None = None) -> bool:
     """Whether the location gives no place the location rules can check."""
     if not location.strip():
         return True
-    if building_only(location):
+    if building_only(location) or bare_remote(location):
         return True
     return country_only(location) and not stated_remote_or_hybrid(location, title, work_model)
 
