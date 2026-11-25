@@ -7,6 +7,26 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`scoring.voting`**, off by default. When `true`, each posting is scored by up to three draws with fixed seeds (the `scoring.sampling` seed, then 20261122 and 20261123) that vote on whether it alerts: two that agree settle it, otherwise the majority decides, and the first draw that matches the majority is stored with its own gaps, tier and veto. A draw that doesn't parse or times out is replaced once by the next spare seed (20261124 on), and the watch log names each replaced draw; the posting fails as before only when the replacement fails too. Any other failure fails the posting at once, with no replacement. No extra draw starts once the run has less than `scoring.timeout_seconds` left: the posting waits for the next run. Scoring takes about 2.3 calls a posting. Off, the request and the result are unchanged (ADR-031).
+
+- **`sector` on a watchlist entry** (Q11): `security_vendor`, `mssp`, `fintech`, `automation_consultancy` or `it_consultancy`. A `support` or `noc_network` posting at that company goes up one tier after scoring (Low to Medium, Medium to High), never above High or a cap rule's level, and never for an off-lane, vetoed or excluded posting. Its alert row names the sector, as in `Lane: support (stopgap, MSSP)`. The model never sees it (ADR-032).
+
+- **`met:` criteria rules.** A rule `N. met: …` states a fact the candidate has that the resume doesn't show, such as `the candidate holds a forklift certificate`. A requirement the rule names is met: the model lists no gap for it at all, not even a partly met one. It covers nothing similar or broader, and never vetoes or caps (ADR-028).
+
+### Changed
+- **A bare "Remote" is a remote job in an unknown region.** A location that says Remote and names no place is no longer dropped by `search.location_rules.remote`. A `Location:` line in its description is read for the region, which the rules then check. With none, the alert says `Remote (region unknown)`, as it does for a blank location the board marks remote.
+- **The digest row shows `N core, M minor`** in place of `N gaps`, leaving out the gap types in `fit_rubric.requirement_tiers.exempt_types`, so the counts match how the tier is worked out. Postings scored before 0.10.0, whose gaps have no kind, still show `N gaps`.
+- **A shorter scoring prompt.** The request no longer sends the lanes or the location rules: code decides both, and the model's reply never used them. The `main_function` wording is sharper: it is true only for doing the role's main job itself, never for a tool, a degree, a certification, a field of background or a number of years. Tiers can move, so the change went through calibration (ADR-029).
+- **A required credential is a core gap.** A certification, licence or clearance the posting requires and the resume doesn't show is a core gap whatever the model's `core` says, and any years attached to it are ignored. It is matched by its type or by a word in its name. A licence the job administers or reviews, such as software licence administration, is not one. Preferred credentials and experience years are unchanged (ADR-029).
+- **The scoring prompt lists the gap types** and what each covers, where it used to say "one of the listed types" without listing them. A security clearance goes under `licence`. The reply's schema is unchanged (ADR-029).
+- **A main-function gap on a junior or entry-level posting is an ordinary core gap**: one makes the posting Medium, not Low. Junior or entry means a junior or entry title, or an entry-level quote found in the posting. Other postings keep the Low rule (ADR-029).
+- **A new resume re-scores nothing.** `resume import` no longer queues every scored posting: the new resume applies to postings scored after it, and existing scores stay. `careerhunter rescore` still queues chosen postings (ADR-023).
+
+### Fixed
+- **`doctor`'s `scoring calls` line with voting** compares the longest single draw with `scoring.timeout_seconds`, not the whole voted call, and shows it when it differs (`longest draw N s`). Search migration 0038 adds `draw_calls` and `longest_draw_ms` to `score_calls`; existing rows keep NULL. `search.db` goes to 38 (ADR-031).
+- **A gap listed twice counts once** when the two names differ only in case, surrounding whitespace or trailing punctuation (`.`, `,`, `;`, `:`, `!`, `?`, `…`), as in "CompTIA A+ certification" and "compTIA A+ certification.". Before, each counted as a core gap, which could exclude the posting. A trailing `+` or `#` still counts, so "A+" and "A", or "C#" and "C", stay two gaps.
+
 ## [0.11.1] - 2026-11-21
 
 ### Fixed

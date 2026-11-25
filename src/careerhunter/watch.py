@@ -59,10 +59,12 @@ Scoring and the resume (ADR-023). The caller loads the resume once and passes it
 or passes the reason it could not be used; then nothing is scored this run, and one
 line says why. Only new postings are scored while the boards are fetched, and that
 stops once less than SCORE_RESERVE seconds of the budget are left, so the passes after
-the boards always get time. A stored posting on a fetched board whose score was made
-with another resume (or none) is queued for re-scoring with its description, which
-stays in memory only. After the boards, under the budget, come never-scored postings,
-then the queued re-scores, then the other re-scores. Never-scored postings
+the boards always get time. A stored posting on a fetched board that is queued for a
+re-score (its resume fingerprint cleared by `careerhunter rescore`, or scored before any
+resume) is queued with its description, which stays in memory only. A score made with
+an earlier resume is kept: a new resume applies only to postings scored after it.
+After the boards, under the budget, come never-scored postings, then the queued
+re-scores, then the other re-scores. Never-scored postings
 go first come, first served: by the last score attempt, or by when the posting was
 stored (`created_at`) if it was never tried, then by id. A posting that keeps failing
 goes behind what was stored before its last attempt, and new arrivals can't push it
@@ -1190,11 +1192,20 @@ def _record_jobs(
                 _line(name, ats, f"{item.title!r} has neither a url nor a requisition id; skipped")
             )
             continue
-        if not item.location.strip() and item.description:
+        bare = locations.bare_remote(item.location)
+        if (bare or not item.location.strip()) and item.description:
             found_location, not_place = locations.read_text(
                 item.description, locations.configured_places(config)
             )
-            if found_location:  # the board gave none: its description's Location: line
+            if found_location and bare and not locations.bare_remote(found_location):
+                # A bare Remote (R2): its description's Location: line names the region.
+                if not locations.says_remote(found_location):
+                    found_location = f"Remote, {found_location}"
+                item = replace(item, location=found_location[: locations.MAX_LOCATION])
+                lines.append(
+                    _line(name, ats, f"{item.title!r}: remote region read from its description")
+                )
+            elif found_location and not bare:  # the board gave none: its Location: line
                 item = replace(item, location=found_location)
                 lines.append(
                     _line(name, ats, f"{item.title!r}: location read from its description")
@@ -1435,7 +1446,7 @@ _RESCORE_SQL = (
     "c.ats_region "
     "FROM postings p JOIN companies c ON c.id = p.company_id "
     "WHERE p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
-    "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
+    "AND p.scored_resume_sha256 IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of) "
@@ -1450,7 +1461,7 @@ _RESCORE_SQL = (
 _NEEDS_RESCORE_SQL = (
     "SELECT 1 FROM postings p "
     "WHERE p.id = ? AND p.source IN ('watcher', 'discovery') AND p.llm_output IS NOT NULL "
-    "AND (p.scored_resume_sha256 IS NULL OR p.scored_resume_sha256 != ?) "
+    "AND p.scored_resume_sha256 IS NULL "
     "AND NOT EXISTS (SELECT 1 FROM skips s WHERE s.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.id) "
     "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.posting_id = p.duplicate_of)"
@@ -1458,10 +1469,13 @@ _NEEDS_RESCORE_SQL = (
 
 
 def _needs_rescore(conn: sqlite3.Connection, posting_id: int, sha256: str | None) -> bool:
-    """A scored watcher posting with no skip or application, scored with another resume."""
+    """A scored watcher posting with no skip or application, queued for a re-score: its
+    resume fingerprint is cleared (`careerhunter rescore`, or a score made before any
+    resume). A score made with an earlier resume is kept: a new resume applies only to
+    postings scored after it. Nothing is queued while no resume is in use."""
     if sha256 is None:
         return False
-    row = conn.execute(_NEEDS_RESCORE_SQL, (posting_id, sha256)).fetchone()
+    row = conn.execute(_NEEDS_RESCORE_SQL, (posting_id,)).fetchone()
     return row is not None
 
 
@@ -1518,7 +1532,7 @@ def _score_passes(
     ]
     sha256 = state.resume_sha256
     if sha256 is not None:
-        rescores = conn.execute(_RESCORE_SQL, (sha256,)).fetchall()
+        rescores = conn.execute(_RESCORE_SQL).fetchall()
         fresh = [row for row in rescores if int(row["id"]) not in state.attempted]
         work += [
             (row, state.queued[int(row["id"])]) for row in fresh if int(row["id"]) in state.queued
@@ -1727,7 +1741,8 @@ def _attempt(
     the call gives it back too. A call that timed out keeps the stamp, so the posting
     goes behind the others, and is counted (set aside after TIMEOUTS_TO_SET_ASIDE in a
     row); scoring carries on. A reply that does not parse keeps the stamp too, and
-    leaves the stored score as it was.
+    leaves the stored score as it was. With scoring.voting, a draw the scorer replaced
+    gets a line of its own.
     """
     lines = state.lines
     state.attempted.add(posting_id)
@@ -1739,6 +1754,8 @@ def _attempt(
     title = repr(posting.title)
     clock = state.monotonic
     began = clock()
+    # With scoring.voting: the draws sent and the longest one (search migration 0038).
+    drew: list[int | None] = [None, None]
 
     def timed(outcome: str) -> None:
         """Record this call's end and duration, in the caller's transaction."""
@@ -1751,13 +1768,18 @@ def _attempt(
                 _iso(state.now()),
                 round((clock() - began) * 1000),
                 outcome,
+                draw_calls=drew[0],
+                longest_draw_ms=drew[1],
             )
 
     try:
         result = scorer(posting)
     except (ScoreError, OSError) as exc:
-        cut = state.out_of_time()
+        drew[:] = [getattr(exc, "draw_calls", None), getattr(exc, "longest_draw_ms", None)]
         kind = getattr(exc, "kind", "unreachable")
+        # A voting scorer that had no time left for another draw (ADR-031) is a budget
+        # cut too: the posting waits for the next run.
+        cut = state.out_of_time() or kind == "budget"
         kept = "; old score kept" if rescore else ""
         if not cut and kind == "timeout":
             _timed_out(conn, state, posting_id, exc, timed, _line(name, ats, title), kept)
@@ -1781,6 +1803,15 @@ def _attempt(
             )
         return
     state.scorer_answered = True
+    if result is not None:
+        drew[:] = [result.draw_calls, result.longest_draw_ms]
+    if result is not None and result.replaced:
+        # scoring.voting (ADR-031): a draw failed and its replacement answered.
+        failures = ", ".join(result.replaced)
+        noun = "draw" if len(result.replaced) == 1 else "draws"
+        lines.append(
+            _line(name, ats, f"{title} {noun} replaced ({failures}); {result.draws} draws voted")
+        )
     if result is not None and result.vetoed and result.veto is not None:
         # A criteria rule vetoed it (ADR-028): skipped, never alerted; the stored score,
         # fit and gaps stay as they were. An alerted one is withdrawn by the bot.
@@ -1816,6 +1847,10 @@ def _attempt(
         cap = result.cap
         level = result.capped
         stored_meta: dict[str, Any] = {"tier": result.tier}
+        if result.sector is not None:  # Q11 (ADR-032): shown on the alert row
+            stored_meta["sector"] = result.sector
+        if result.raised_from is not None:
+            stored_meta["raised_from"] = result.raised_from
         if level is not None and cap is not None:
             stored_meta["cap_rule"] = cap.rule
         metadata = None if result.tier is None else json.dumps(stored_meta)
@@ -1857,6 +1892,15 @@ def _attempt(
             why = REJECTED[cap.rejected]
             rule = "" if cap.rule is None else f", rule {cap.rule}"
             lines.append(_line(name, ats, f"{title} cap rejected ({why}{rule}); scored"))
+        if result.raised_from is not None and result.sector is not None:
+            lines.append(
+                _line(
+                    name,
+                    ats,
+                    f"{title} raised from {result.raised_from} to {result.tier} "
+                    f"(sector {result.sector})",
+                )
+            )
         if result.excluded:
             lines.append(_line(name, ats, f"{title} skipped (gap_tier)"))
         elif rescore:

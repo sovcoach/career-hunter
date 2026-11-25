@@ -46,6 +46,12 @@ LaunchAgent runs, default 60 and at least 15.
   local server, text of 1 to 200 characters with no control characters. chat_model
   defaults to `local-model`; with no embedding_model, embeddings are off (no request
   is sent). The server URLs are not config.
+- scoring.sampling: optional temperature (above 0 to 2), top_p (above 0 to 1), top_k
+  (an integer from 1 to 1000), min_p (0 to 1), presence_penalty (-2 to 2),
+  repeat_penalty (1 to 2) and seed (an integer from 0 to 2147483647) for the scoring
+  request. Each unset key keeps its default (DEFAULT_SAMPLING, DEFAULT_SEED).
+- scoring.voting: true or false, default false. When true, each posting is scored by
+  up to three draws that vote on the alert decision (VOTE_SEEDS, SPARE_SEEDS).
 
 With lanes present, search.target_titles becomes optional; with requirement_tiers
 present, the fit_rubric weights and thresholds do; and schedule.watcher_interval_minutes is always
@@ -123,7 +129,36 @@ HEALTH_KEYS = ("unproductive_runs", "failure_runs")
 # local server. The URLs are loopback constants in score.py and embed.py, never config.
 DEFAULT_CHAT_MODEL = "local-model"
 MODEL_KEYS = ("chat_model", "embedding_model")
-SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds", "run_minutes")
+SCORING_KEYS = (*MODEL_KEYS, "timeout_seconds", "run_minutes", "sampling", "voting")
+# scoring.voting (ADR-031): off by default, so one draw with the scoring.sampling seed.
+# On, the first draw uses that seed and the next two use VOTE_SEEDS; a draw that times
+# out or does not parse is replaced once, by the next unused seed in SPARE_SEEDS.
+VOTE_SEEDS = (20261122, 20261123)
+SPARE_SEEDS = (20261124, 20261125, 20261126)
+# scoring.sampling: the sampling settings and seed sent with every scoring request. Each
+# key is optional and falls back to its default here, the thinking-mode preset for
+# precise tasks with presence_penalty 1.5 against looping (ADR-029). The order is the
+# order they are sent in. Each range is (low, high, low_included, integer only).
+DEFAULT_SAMPLING: dict[str, float | int] = {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repeat_penalty": 1.0,
+}
+DEFAULT_SEED = 20261119
+SAMPLING_RANGES: dict[str, tuple[float, float, bool, bool]] = {
+    # Never 0: greedy decoding can make a thinking model repeat itself until the timeout.
+    "temperature": (0.0, 2.0, False, False),
+    "top_p": (0.0, 1.0, False, False),
+    "top_k": (1, 1000, True, True),
+    "min_p": (0.0, 1.0, True, False),
+    "presence_penalty": (-2.0, 2.0, True, False),
+    # Below 1 would reward repetition.
+    "repeat_penalty": (1.0, 2.0, True, False),
+    "seed": (0, 2**31 - 1, True, True),
+}
 MAX_MODEL_ID = 200
 # scoring.timeout_seconds: the most one scoring call may take. A reasoning model thinks
 # before it answers, and the request does not stream. The upper bound leaves room in
@@ -496,6 +531,16 @@ def _validate_seniority(gates: dict[str, Any], problems: list[str]) -> None:
 _WORKDAY_HOST = re.compile(r"wd[0-9]{1,3}")
 # A Lever board's region: its EU accounts use api.eu.lever.co and jobs.eu.lever.co.
 LEVER_REGIONS = ("eu",)
+# Q11 (ADR-032): a watchlist entry's sector, set by the operator, and its words on the
+# alert row. A support or noc_network posting at one of these companies is raised one
+# tier (`score.sector_raise`). Unset or null: no sector, no raise.
+SECTORS = {
+    "security_vendor": "security vendor",
+    "mssp": "MSSP",
+    "fintech": "fintech",
+    "automation_consultancy": "automation consultancy",
+    "it_consultancy": "IT consultancy",
+}
 _WORKDAY_SITE = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -511,6 +556,9 @@ def _validate_watchlist_item(item: dict[str, Any], where: str, problems: list[st
             problems.append(f"{where}.ats_region must be one of {list(LEVER_REGIONS)}")
     if not isinstance(item.get("agency", False), bool):
         problems.append(f"{where}.agency must be true or false")
+    sector = item.get("sector")
+    if sector is not None and (not isinstance(sector, str) or sector not in SECTORS):
+        problems.append(f"{where}.sector must be one of {list(SECTORS)}")
     filters = _optional_mapping(item, "role_filters", where, problems)
     if filters:
         extra = set(filters) - {"role_families", "work_models", "locations"}
@@ -688,6 +736,37 @@ def _validate_scoring(section: Any, problems: list[str]) -> None:
             f"scoring.timeout_seconds must be an integer from {MIN_SCORE_TIMEOUT_SECONDS} "
             f"to {MAX_SCORE_TIMEOUT_SECONDS}"
         )
+    _validate_sampling(section.get("sampling"), problems)
+    voting = section.get("voting")
+    if voting is not None and not isinstance(voting, bool):
+        problems.append("scoring.voting must be true or false")
+
+
+def _validate_sampling(section: Any, problems: list[str]) -> None:
+    """scoring.sampling, when set, is a mapping of known keys, each within its range."""
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        problems.append("scoring.sampling must be a mapping")
+        return
+    extra = set(section) - set(SAMPLING_RANGES)
+    if extra:
+        problems.append(f"scoring.sampling has unknown keys: {sorted(extra)}")
+    for key, (low, high, low_included, integer) in SAMPLING_RANGES.items():
+        value = section.get(key)
+        if value is not None and not _sampling_value_ok(key, value):
+            kind = "an integer" if integer else "a number"
+            above = "from" if low_included else "above"
+            problems.append(f"scoring.sampling.{key} must be {kind} {above} {low} to {high}")
+
+
+def _sampling_value_ok(key: str, value: Any) -> bool:
+    low, high, low_included, integer = SAMPLING_RANGES[key]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    if integer and not isinstance(value, int):
+        return False
+    return (low <= value if low_included else low < value) and value <= high
 
 
 def _validate_telegram(section: Any, problems: list[str]) -> None:
@@ -933,6 +1012,39 @@ def scoring_timeout_seconds(doc: Mapping[str, Any] | None) -> int:
     if _int(value) and MIN_SCORE_TIMEOUT_SECONDS <= value <= MAX_SCORE_TIMEOUT_SECONDS:
         return int(value)
     return DEFAULT_SCORE_TIMEOUT_SECONDS
+
+
+def scoring_sampling(doc: Mapping[str, Any] | None) -> dict[str, float | int]:
+    """The sampling settings and seed for a scoring request, in the order they are sent:
+    each from scoring.sampling when set and valid, else its default."""
+    section = doc.get("scoring") if isinstance(doc, Mapping) else None
+    given = section.get("sampling") if isinstance(section, Mapping) else None
+    given = given if isinstance(given, Mapping) else {}
+    defaults: dict[str, float | int] = {**DEFAULT_SAMPLING, "seed": DEFAULT_SEED}
+    return {
+        key: given[key] if _sampling_value_ok(key, given.get(key)) else default
+        for key, default in defaults.items()
+    }
+
+
+def watchlist_sector(doc: Mapping[str, Any] | None, company: str) -> str | None:
+    """The sector of the watchlist entry named `company` (ignoring case), when it is one
+    of SECTORS; else None. Matched by name, the same way as an entry's role filters."""
+    entries = doc.get("watchlist") if isinstance(doc, Mapping) else None
+    if not isinstance(entries, list):
+        return None
+    folded = company.casefold()
+    for item in entries:
+        if isinstance(item, Mapping) and str(item.get("name", "")).casefold() == folded:
+            sector = item.get("sector")
+            return sector if isinstance(sector, str) and sector in SECTORS else None
+    return None
+
+
+def scoring_voting(doc: Mapping[str, Any] | None) -> bool:
+    """True only when scoring.voting is true: the draws vote on the alert decision."""
+    section = doc.get("scoring") if isinstance(doc, Mapping) else None
+    return isinstance(section, Mapping) and section.get("voting") is True
 
 
 def scoring_run_minutes(doc: Mapping[str, Any] | None) -> int:

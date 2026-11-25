@@ -16,7 +16,7 @@ from careerhunter import watch as w
 from careerhunter.config import scoring_run_minutes, validate_config
 from careerhunter.deadline import Deadline
 from tests.fakes import FakeClock
-from tests.test_rescore import NEW, OLD, Recorder, board, lever, run, seed
+from tests.test_rescore import NEW, OLD, Recorder, board, lever, queue, run, seed
 from tests.test_watch import Timed
 
 SLUGS = tuple(f"example{c}" for c in "abcdefgh")
@@ -25,6 +25,7 @@ SLUGS = tuple(f"example{c}" for c in "abcdefgh")
 def _seeded(search: sqlite3.Connection) -> dict[str, object]:
     for slug in SLUGS:
         seed(search, slug, (f"{slug}1", f"Role {slug}"), resume=OLD)
+    queue(search, *(f"Role {slug}" for slug in SLUGS))
     return {board(slug): lever(slug, (f"{slug}1", f"Role {slug}")) for slug in SLUGS}
 
 

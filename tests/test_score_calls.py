@@ -130,6 +130,8 @@ def test_no_text_is_stored_with_a_call(search: sqlite3.Connection) -> None:
         "finished_at",
         "duration_ms",
         "outcome",
+        "draw_calls",
+        "longest_draw_ms",
     ]
     with pytest.raises(sqlite3.IntegrityError):
         search.execute(
@@ -191,7 +193,7 @@ def test_doctor_warns_when_the_longest_is_close_to_the_timeout(
     )
     line = _doctor(search, capsys, timeout=200)
     assert line.startswith("scoring calls   WARN 2 answered in 14 days: median 142 s, max 185 s")
-    assert line.endswith("(timeout 200 s); the longest is close to the timeout")
+    assert line.endswith("(timeout 200 s); the longest draw is close to the timeout")
 
 
 def test_doctor_with_no_answered_call(

@@ -61,8 +61,9 @@ search:
   resume: null
   # Optional. A text file in the data folder with your own criteria (e.g.
   # criteria.md), sent with each scoring call: one rule per line, numbered in order,
-  # each with its kind: "1. veto: ..." or "2. cap medium: ..." (cap low, medium or
-  # high); blank lines and lines starting with # are ignored. A posting the model
+  # each with its kind: "1. veto: ...", "2. cap medium: ..." (cap low, medium or
+  # high) or "3. met: the candidate holds ..." (a fact you have: a requirement it names
+  # is never a gap); blank lines and lines starting with # are ignored. A posting the model
   # shows meets a veto rule, quoting the posting, is skipped for that rule (an alerted
   # one is withdrawn in Telegram); one that meets a cap rule has its fit lowered to
   # at most that level.
@@ -124,11 +125,30 @@ fit_rubric:
 # 5 less than a shorter interval. Discovery and the boards keep the first 10 minutes;
 # the scoring passes after them run until run_minutes. 10 gives the old single
 # 10-minute run.
+# sampling is optional: the settings and seed sent with every scoring request. Each
+# key left out keeps the default shown, a thinking model's preset for precise tasks.
+# temperature is above 0 to 2 (never 0), top_p above 0 to 1, top_k an integer from 1
+# to 1000, min_p 0 to 1, presence_penalty -2 to 2, repeat_penalty 1 to 2, seed an
+# integer from 0 to 2147483647. A change can move tiers: run calibration after one.
+# voting is true or false; unset or false, each posting gets one scoring call, as
+# before. True: up to three calls, with the seed above and then 20261122 and 20261123,
+# vote on whether the posting alerts. Two that agree settle it; otherwise the third
+# decides. A call that times out or doesn't parse is retried once with the next spare
+# seed (20261124 on), and the watch log says so. Scoring takes 2 to 3 times as long.
 scoring:
   chat_model: null             # e.g. example-chat-model
   embedding_model: null        # e.g. example-embedding-model
   timeout_seconds: null        # e.g. 300
   run_minutes: null            # e.g. 20
+  # voting: true              # up to three draws vote on the alert; unset: one draw
+  # sampling:
+  #   temperature: 0.6
+  #   top_p: 0.95
+  #   top_k: 20
+  #   min_p: 0.0
+  #   presence_penalty: 1.5
+  #   repeat_penalty: 1.0
+  #   seed: 20261119
 
 schedule:
   # A zone name (Europe/Berlin) or a fixed offset (UTC, UTC+05:30); UTC if unset.
@@ -161,6 +181,11 @@ watchlist: []
 #     ats_type: greenhouse
 #     ats_slug: examplerobotics
 #     careers_url: https://example.com/careers
+#     sector: mssp               # optional: security_vendor, mssp, fintech,
+#                                # automation_consultancy or it_consultancy. A support
+#                                # or noc_network posting here goes up one tier (Low to
+#                                # Medium, Medium to High), never above High or a cap
+#                                # rule, never off-lane, vetoed or excluded. Unset: none.
 #   - name: Sample Logistics
 #     ats_type: lever
 #     ats_slug: samplelogistics

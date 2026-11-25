@@ -20,7 +20,8 @@ Trust boundary (ADR-016):
 Privacy (ADR-015, amended by ADR-019, ADR-020, #39 and #41): watcher and discovery
 postings go out as one digest per watch run. A digest row carries the company, title,
 location, lane,
-fit word (`Fit: High`, `Medium` or `Low`), the number of gaps, the schedule flag in
+fit word (`Fit: High`, `Medium` or `Low`), the gap counts (`2 core, 1 minor`, exempt
+types left out; `N gaps` for a posting scored before 0.10.0), the schedule flag in
 words, up to three key requirements the model took from the posting, and the link.
 /log records a self-sourced application at once (#34) and replies with the company,
 the title and a reference; it sends no alert. Status words and references are sent
@@ -79,6 +80,7 @@ from careerhunter import (
     jobdesc,
     lanes,
     ledger,
+    locations,
     phrases,
     search_store,
     selfsourced,
@@ -93,6 +95,7 @@ from careerhunter.config import (
     discovery_candidates_per_day,
     health_failure_runs,
     load_config,
+    requirement_tiers,
     telegram_chat_id,
     weekly_digest,
 )
@@ -361,6 +364,14 @@ def _clip(text: str, limit: int) -> str:
     return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
 
 
+def _exempt_types(doc: Mapping[str, Any]) -> tuple[str, ...]:
+    """fit_rubric.requirement_tiers.exempt_types: gap types the tier never counts, left
+    out of the row's core and minor counts too."""
+    tiers = requirement_tiers(doc)
+    types = tiers.get("exempt_types") if tiers else None
+    return tuple(str(item) for item in types) if isinstance(types, list) else ()
+
+
 def _digest_row(numbered: _Numbered) -> str:
     """Company, title, location, lane, fit, gap count, schedule, key requirements, URL.
 
@@ -370,7 +381,11 @@ def _digest_row(numbered: _Numbered) -> str:
     company = _clip(numbered.entry.label, _CAPS["company"])
     lines = [f"{numbered.number}. {company} — {_clip(fields.title, _CAPS['title'])}"]
     facts = []
-    if fields.location.strip():
+    if locations.bare_remote(fields.location) or (
+        not fields.location.strip() and fields.work_model == "remote" and not fields.referral
+    ):
+        facts.append(locations.REGION_UNKNOWN)  # a bare Remote: region unknown (R2)
+    elif fields.location.strip():
         facts.append(_clip(fields.location, _CAPS["location"]))
     elif not fields.referral:
         facts.append(LOCATION_UNKNOWN)
@@ -379,7 +394,9 @@ def _digest_row(numbered: _Numbered) -> str:
     if numbered.entry.order.lane_line:
         facts.append(_clip(numbered.entry.order.lane_line, _CAPS["lane"]))
     facts.append(f"Fit: {_fit_label(fields.fit)}")
-    if fields.gap_count is not None:
+    if fields.core_count is not None and fields.minor_count is not None:
+        facts.append(f"{fields.core_count} core, {fields.minor_count} minor")
+    elif fields.gap_count is not None:  # scored before 0.10.0: the gaps have no kind
         facts.append(f"{fields.gap_count} gap" + ("" if fields.gap_count == 1 else "s"))
     lines.append(" | ".join(facts))
     if fields.also:  # the same role, posted again under other requisitions (Batch R)
@@ -421,7 +438,9 @@ def digest_texts(search: sqlite3.Connection, doc: Mapping[str, Any]) -> list[str
     """
     pending = search_store.pending_alerts(search)
     rows = lanes.alert_order(pending, doc)
-    fields = search_store.digest_fields(search, [row.posting_id for row in rows])
+    fields = search_store.digest_fields(
+        search, [row.posting_id for row in rows], _exempt_types(doc)
+    )
     entries = _entries(fields, rows, doc)
     messages = _pack(entries)
     return [
@@ -953,7 +972,9 @@ class Bot:
         """Send one run's digest. False when the poll should stop."""
         try:
             with self._search() as search:
-                fields = search_store.digest_fields(search, [row.posting_id for row in rows])
+                fields = search_store.digest_fields(
+                    search, [row.posting_id for row in rows], _exempt_types(doc)
+                )
         except (OSError, sqlite3.Error) as exc:
             log.warning("alert digest could not be read (%s)", type(exc).__name__)
             return False

@@ -49,7 +49,14 @@ def _score(
     listed = GAPS if gaps is None else gaps
     content: dict[str, Any] = {
         "gaps": [
-            requirement(gap["name"], type=gap["type"], core=gap["kind"] == "core") for gap in listed
+            # a minor gap is sent as preferred: a required licence would be a core gap
+            requirement(
+                gap["name"],
+                "required" if gap["kind"] == "core" else "preferred",
+                type=gap["type"],
+                core=gap["kind"] == "core",
+            )
+            for gap in listed
         ],
         "key_requirements": [],
         "entry_level": "",

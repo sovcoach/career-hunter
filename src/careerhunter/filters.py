@@ -39,7 +39,11 @@ is scored and alerted as usual, and its alert says `Location unknown`. The same 
 for a location that names only a country (with no remote or hybrid stated anywhere) or
 only a building, such as "Example Tower" (Batch R); their alerts show the location as
 given. Its description is still checked for office days elsewhere. (`empty_location`
-was a skip reason before 0.10.0; skips already stored with it stay.)
+was a skip reason before 0.10.0; skips already stored with it stay.) A bare "Remote"
+that names no place ("Remote", "REMOTE (") is an unknown region too (R2): the location
+rules never drop it. The watcher first reads a `Location:` line from its description,
+and a region found there is then checked as usual; otherwise its alert says
+`Remote (region unknown)`.
 
 A referral (`postings.referral`, set by the operator) counts as local: inside the
 configured office area. The location rules, a watchlist entry's `locations` and the

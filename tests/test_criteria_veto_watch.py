@@ -8,7 +8,7 @@ import sqlite3
 
 from careerhunter import search_store
 from careerhunter.score import Cap, Score, Veto
-from tests.test_rescore import NEW, OLD, Recorder, board, lever, row, run, seed
+from tests.test_rescore import NEW, OLD, Recorder, board, lever, queue, row, run, seed
 
 SLUG = "examplerobotics"
 SKIP = "criteria: 2. No contract or term under 12"
@@ -58,6 +58,7 @@ def test_a_veto_on_an_alerted_re_score_is_withdrawn_and_keeps_the_old_score(
     search: sqlite3.Connection,
 ) -> None:
     seed(search, SLUG, ("r1", "Coordinator"), resume=OLD)
+    queue(search, "Coordinator")
     search.execute("UPDATE postings SET alerted_at = '2026-11-01T10:00:00Z', fit = 'high'")
     search.commit()
     before = search.execute(
@@ -122,6 +123,7 @@ def test_veto_calls_count_as_answered_in_the_call_stats(search: sqlite3.Connecti
 
 def test_withdrawals_are_marked_sent_once(search: sqlite3.Connection) -> None:
     seed(search, SLUG, ("r1", "Coordinator"), resume=OLD)
+    queue(search, "Coordinator")
     search.execute("UPDATE postings SET alerted_at = '2026-11-01T10:00:00Z'")
     search.commit()
     scorer = Recorder()
@@ -175,6 +177,7 @@ def test_a_cap_on_an_alerted_re_score_lowers_the_fit_and_withdraws_nothing(
     search: sqlite3.Connection,
 ) -> None:
     seed(search, SLUG, ("r1", "Coordinator"), resume=OLD)
+    queue(search, "Coordinator")
     search.execute("UPDATE postings SET alerted_at = '2026-11-01T10:00:00Z', fit = 'high'")
     search.commit()
     scorer = Recorder()

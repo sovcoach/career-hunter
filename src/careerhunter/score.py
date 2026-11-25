@@ -6,8 +6,8 @@ ad and wrong for a model on this Mac. This client allows only `http` to `127.0.0
 constant, not a config field. The model id is `scoring.chat_model` (default
 `local-model`).
 
-The prompt is built from lanes and location rules, the posting fields,
-and the resume when one is in use, the parts that are the same on every call first and
+The prompt is built from the posting fields, the criteria rules and labelled examples
+when present, and the resume when one is in use, the parts that are the same on every call first and
 the posting last, so the server can reuse its cached prefix. The model is asked to
 reason briefly and to list only the gaps: each qualification the posting requires or
 prefers that the resume doesn't meet (`no`) or meets only partly (`partly`), as a short
@@ -78,8 +78,23 @@ that passes wins over a cap. A reply with a cap is stored as canonical gaps too.
 Structured output and sampling. Every request asks for a reply that follows a JSON
 schema (`response_format` of type `json_schema`, strict), which LM Studio enforces as it
 generates. A reply that breaks it anyway does not parse, as before. The sampling
-settings and the seed are the fixed SAMPLING and SEED: a thinking model's preset, never
-temperature 0, and never configurable.
+settings and the seed come from `scoring.sampling` (`config.scoring_sampling`); each
+unset key is its default, SAMPLING and SEED: a thinking model's preset, never
+temperature 0.
+
+Voting (ADR-031). With `scoring.voting` true, a posting is scored by up to three draws,
+each a full call with its own seed: the scoring.sampling seed, then VOTE_SEEDS. Each
+draw's alert decision is whether its score alone would alert (`alerts`). When the
+first two agree there is no third; otherwise the third is made and the majority
+decides. The score returned is the first draw that matches the majority, with its own
+gaps, tier, veto and cap. A draw that does not parse or times out is replaced once, by
+the next unused seed in SPARE_SEEDS; the posting fails as it does with one draw only
+when that replacement fails too. Any other failure (no answer, a refused token) fails
+it at once, with no replacement. No draw after the first, a vote or a replacement,
+starts once the watch run has less than scoring.timeout_seconds left: the ScoreError
+then has kind `budget`, and the posting waits for the next run. `Score.replaced` names
+the replaced draws' failures, for the run log. Off, the request and the result are
+what one draw gives, byte for byte.
 
 Reasoning models. The chat model may think before it answers. Its thinking is removed
 before anything is parsed or stored (`strip_reasoning`), and a reply whose thinking
@@ -93,16 +108,31 @@ import dataclasses
 import http.client
 import json
 import re
+import time
 import unicodedata
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from careerhunter import loopback, phrases
-from careerhunter.config import DEFAULT_CHAT_MODEL, GAP_TYPE_NAMES, chat_model, requirement_tiers
+from careerhunter import lanes, loopback, phrases
+from careerhunter.config import (
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_SAMPLING,
+    DEFAULT_SEED,
+    GAP_TYPE_NAMES,
+    SPARE_SEEDS,
+    VOTE_SEEDS,
+    chat_model,
+    requirement_tiers,
+    scoring_sampling,
+    scoring_timeout_seconds,
+    scoring_voting,
+    watchlist_sector,
+)
 from careerhunter.criteria import Criteria, Rule
 from careerhunter.deadline import Deadline
+from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import PostingText, has_phrase, mentions
 from careerhunter.resume import Resume
 from careerhunter.search_store import Example
@@ -134,22 +164,15 @@ _THINK_BLOCK = re.compile(rf"<({_THINK_TAGS})>.*?</\1\s*>", re.IGNORECASE | re.D
 _THINK_OPEN = re.compile(rf"<(?:{_THINK_TAGS})>", re.IGNORECASE)
 _THINK_CLOSE = re.compile(rf"</(?:{_THINK_TAGS})\s*>", re.IGNORECASE)
 Transport = Callable[[str, bytes], tuple[int, bytes]]
-# Sampling, sent with every scoring request and not configurable. The scorer is a
-# thinking model: greedy decoding (temperature 0) can make one repeat itself until the
-# timeout, so the request uses the thinking-mode preset for precise tasks (temperature
-# 0.6, top_p 0.95, top_k 20, min_p 0) with a fixed seed, so that the same request gives
-# the same reply where the server honours the seed. That preset alone still looped in its
-# thinking on some postings (calibration, Batch Q), so presence_penalty is 1.5, the
-# model maker's setting against endless repetition.
-SAMPLING: dict[str, float | int] = {
-    "temperature": 0.6,
-    "top_p": 0.95,
-    "top_k": 20,
-    "min_p": 0.0,
-    "presence_penalty": 1.5,
-    "repeat_penalty": 1.0,
-}
-SEED = 20261119
+# The default sampling, sent with every scoring request unless scoring.sampling sets a
+# key. The scorer is a thinking model: greedy decoding (temperature 0) can make one
+# repeat itself until the timeout, so the request uses the thinking-mode preset for
+# precise tasks (temperature 0.6, top_p 0.95, top_k 20, min_p 0) with a fixed seed, so
+# that the same request gives the same reply where the server honours the seed. That
+# preset alone still looped in its thinking on some postings (calibration, Batch Q), so
+# presence_penalty is 1.5, the model maker's setting against endless repetition.
+SAMPLING: dict[str, float | int] = DEFAULT_SAMPLING
+SEED = DEFAULT_SEED
 SCHEMA_NAME = "posting_fit"
 MAX_QUOTE = 200  # what the model is asked for; a longer quote is still checked
 MIN_QUOTE = 8  # characters after `normalized`: shorter shows no match
@@ -162,6 +185,19 @@ REJECTED = {
 # The reply is kept short (Batch Q, the speed fix): only the gaps, each in a few words.
 MAX_GAP_WORDS = 6
 MAX_GAP_QUOTE_WORDS = 10
+# The gap types the reply may use, in the schema's order, and what each covers. Seniority
+# is set in code, never by the model.
+GAP_TYPE_GUIDE = {
+    "experience": "time spent doing a kind of work",
+    "skill": "an ability or an area of knowledge",
+    "tool": "a named product, software or platform",
+    "education": "a degree, diploma or course of study",
+    "certification": "a certification or certificate earned by an exam or a course",
+    "licence": "a licence, permit or security clearance the candidate must hold",
+    "language": "a spoken or written language",
+    "other": "anything else",
+}
+_TYPE_LIST = ", ".join(f"{name} ({covers})" for name, covers in GAP_TYPE_GUIDE.items())
 SYSTEM_PROMPT = (
     "Think briefly and decide quickly: one short check per qualification, then answer. "
     "Reply with one JSON object only, following the schema. "
@@ -176,8 +212,9 @@ SYSTEM_PROMPT = (
     "experience in that field's job functions (for example FP&A, accounting, M&A or "
     "brokerage). years: the minimum years of experience it asks for, 0 when none. "
     "core: true when it is central to the role's main function or is a minimum number "
-    "of years of experience. main_function: true only when it is the role's main job "
-    "function itself. type: one of the listed types. quote: at most "
+    "of years of experience. main_function: true only when the qualification is doing "
+    "the role's main job itself; never for a tool, a degree, a certification, a field of "
+    f"background or a number of years. type: one of {_TYPE_LIST}. quote: at most "
     f"{MAX_GAP_QUOTE_WORDS} words copied from the posting that state it. entry_level: "
     "when the posting says it is junior or entry level, or welcomes candidates without "
     'every qualification (such as recent graduates, "we\'ll train you", or "apply '
@@ -188,8 +225,12 @@ SYSTEM_PROMPT = (
 # Added to the system prompt when the operator's criteria file is sent.
 CRITERIA_INSTRUCTION = (
     " criteria, when present, are numbered rules in the candidate's own words, each of "
-    'kind "veto" (postings the candidate won\'t take) or "cap" (postings whose fit is '
-    "at most the rule's cap level). If this posting clearly meets a veto rule, set "
+    'kind "veto" (postings the candidate won\'t take), "cap" (postings whose fit is '
+    'at most the rule\'s cap level) or "met" (a fact the candidate has, even when the '
+    "resume doesn't show it). A requirement a met rule names is met: never list it as a "
+    "gap, partly met or not. A met rule covers only what it names, never anything "
+    "similar or broader, and is never a veto or a cap. If this posting clearly meets a "
+    "veto rule, set "
     '"veto" to {"rule":N,"quote":"..."}; if it clearly meets a cap rule, set "cap" to '
     '{"rule":N,"quote":"..."}. N is that rule\'s number, and quote is copied '
     f"exactly from the posting's title or description, at most {MAX_QUOTE} characters, "
@@ -202,7 +243,11 @@ CRITERIA_INSTRUCTION = (
 )
 
 
-KINDS = ("unreachable", "unauthorized", "timeout")
+# `budget`: with scoring.voting, the run had too little time left to start another draw.
+KINDS = ("unreachable", "unauthorized", "timeout", "budget")
+# The failures a voting draw is replaced for: the model answered, or was only slow.
+REPLACED_FOR = ("unparseable", "timeout")
+OUT_OF_BUDGET = "the run's time budget is spent; the posting waits for the next run"
 TIMED_OUT = "the local model took longer than the timeout"
 UNREACHED = "the local model could not be reached"
 
@@ -223,6 +268,10 @@ class ScoreError(Exception):
         super().__init__(message)
         self.kind = kind if kind in KINDS else "unreachable"
         self.type_name = type_name
+        # With scoring.voting: the draws sent before the posting failed, and the
+        # longest of them (search migration 0038). None for one draw.
+        self.draw_calls: int | None = None
+        self.longest_draw_ms: int | None = None
 
 
 def _transport_failure(exc: BaseException) -> ScoreError:
@@ -287,6 +336,18 @@ class Score:
     cap: Cap | None = None
     # The reply flagged the posting as junior or entry level with a quote found in it.
     entry_level: bool = False
+    # With scoring.voting: how many draws voted (2 or 3), and the failure of each draw
+    # that was replaced ("unparseable" or a ScoreError kind), in order. One draw: 1, ().
+    draws: int = dataclasses.field(default=1, compare=False)
+    replaced: tuple[str, ...] = dataclasses.field(default=(), compare=False)
+    # With scoring.voting: the draws sent (replacements included) and the longest one in
+    # milliseconds, which scoring.timeout_seconds limits (search migration 0038).
+    draw_calls: int | None = dataclasses.field(default=None, compare=False)
+    longest_draw_ms: int | None = dataclasses.field(default=None, compare=False)
+    # Q11 (ADR-032): the watchlist sector that applies to this posting, and the tier it
+    # had before the raise when the raise moved it. None, None: no sector applies.
+    sector: str | None = None
+    raised_from: str | None = None
 
     @property
     def vetoed(self) -> bool:
@@ -437,8 +498,14 @@ def score_posting(
     resume: Resume | None = None,
     examples: Sequence[Example] = (),
     criteria: Criteria | None = None,
+    budget: Deadline | None = None,
+    sector: str | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Score | None:
     """The score, or None when the reply does not parse.
+
+    `sector` is the watchlist sector that raises this posting (`sector_raise`), or None.
+    It is applied to each draw before any vote, and is never sent to the model.
 
     `criteria` is the operator's criteria file (search.criteria_file): its numbered
     rules are sent, and a veto in the reply is checked against them and the posting
@@ -452,12 +519,155 @@ def score_posting(
     Raises ScoreError when the model does not answer, with kind `timeout` when the call
     reached its time limit. None leaves the posting unscored. The caller does not alert
     it.
+
+    With scoring.voting true, the draws vote on the alert decision (see the module
+    docstring). A timeout or None then means a draw and its replacement both failed;
+    any other ScoreError is the first draw's that failed. `budget` is the watch run's:
+    no draw after the first starts with less than scoring.timeout_seconds of it left,
+    and the ScoreError raised then has kind `budget`. One draw ignores it.
     """
     rubric = _rubric(config)
     if rubric is None:
         return None
     send = default_transport if transport is None else transport
     require_loopback(url)
+
+    def draw(doc: Mapping[str, Any]) -> Score | None:
+        return _raised(_draw(posting, doc, rubric, url, send, resume, examples, criteria), sector)
+
+    if not scoring_voting(config):
+        return draw(config)
+    return _vote(config, draw, budget, clock)
+
+
+# Q11 (ADR-032): the lanes a listed sector raises.
+RAISED_LANES = ("support", "noc_network")
+
+
+def sector_raise(posting: PostingText, config: Mapping[str, Any]) -> str | None:
+    """The sector that raises this posting one tier: its title is in a RAISED_LANES lane
+    and its company's watchlist entry names one of SECTORS. None off-lane, in any other
+    lane, or with no sector."""
+    found = lanes.match(posting.title, config)
+    if found is None or found.name not in RAISED_LANES:
+        return None
+    return watchlist_sector(config, posting.company)
+
+
+def _raised(score: Score | None, sector: str | None) -> Score | None:
+    """The score one tier up for its sector, never above high. Never for a vetoed or
+    excluded posting. A cap still applies after it (`capped`), so the raise never lifts
+    a posting above a cap rule's level."""
+    if score is None or sector is None or score.vetoed or score.excluded:
+        return score
+    if score.tier not in FIT_LEVELS:
+        return score
+    index = FIT_LEVELS.index(score.tier)
+    if index + 1 >= len(FIT_LEVELS):
+        return dataclasses.replace(score, sector=sector)
+    return dataclasses.replace(
+        score, tier=FIT_LEVELS[index + 1], sector=sector, raised_from=score.tier
+    )
+
+
+def alerts(score: Score) -> bool:
+    """This score's alert decision on its own: not vetoed or excluded, and a fit of
+    medium or high once any cap is applied. The gates and the lane are the same on
+    every draw, so they are not part of it."""
+    if score.vetoed or score.excluded or score.tier not in FIT_LEVELS:
+        return False
+    fit = score.tier
+    if score.capped in FIT_LEVELS:
+        fit = min(fit, score.capped, key=FIT_LEVELS.index)
+    return fit in ("medium", "high")
+
+
+def _with_seed(config: Mapping[str, Any], seed: int) -> dict[str, Any]:
+    """The config with scoring.sampling.seed set to `seed`; nothing else changes."""
+    section = config.get("scoring")
+    scoring = dict(section) if isinstance(section, Mapping) else {}
+    sampling = scoring.get("sampling")
+    scoring["sampling"] = {**(sampling if isinstance(sampling, Mapping) else {}), "seed": seed}
+    return {**config, "scoring": scoring}
+
+
+def _vote(
+    config: Mapping[str, Any],
+    draw: Callable[[Mapping[str, Any]], Score | None],
+    budget: Deadline | None,
+    clock: Callable[[], float] = time.monotonic,
+) -> Score | None:
+    """Up to three draws vote on the alert decision; the first two agreeing settle it.
+    A draw that does not parse or times out is replaced once by the next spare seed; a
+    failed replacement fails the posting as one draw would (None, or its ScoreError).
+    Any other ScoreError fails it at once. No draw after the first starts once the run
+    has less than one call's time left. The result, or the ScoreError, carries how many
+    draws were sent and the longest one's milliseconds."""
+    spares = iter(SPARE_SEEDS)
+    replaced: list[str] = []
+    room = float(scoring_timeout_seconds(config))
+    started = 0
+    longest = 0
+
+    def call(seed: int) -> Score | None:
+        nonlocal started, longest
+        if started and budget is not None and budget.remaining() < room:
+            raise ScoreError(OUT_OF_BUDGET, kind="budget")
+        started += 1
+        began = clock()
+        try:
+            return draw(_with_seed(config, seed))
+        finally:
+            longest = max(longest, round((clock() - began) * 1000))
+
+    def one(seed: int) -> Score | None:
+        try:
+            got = call(seed)
+        except ScoreError as exc:
+            if exc.kind not in REPLACED_FOR:
+                raise
+            replaced.append(exc.kind)
+        else:
+            if got is not None:
+                return got
+            replaced.append("unparseable")
+        return call(next(spares))
+
+    seeds = (int(scoring_sampling(config)["seed"]), *VOTE_SEEDS)
+    votes: list[Score] = []
+    try:
+        for seed in seeds:
+            if len(votes) == 2 and alerts(votes[0]) == alerts(votes[1]):
+                break
+            got = one(seed)
+            if got is None:
+                return None
+            votes.append(got)
+    except ScoreError as exc:
+        exc.draw_calls, exc.longest_draw_ms = started, longest
+        raise
+    majority = sum(alerts(v) for v in votes) * 2 > len(votes)
+    chosen = next(v for v in votes if alerts(v) == majority)
+    return dataclasses.replace(
+        chosen,
+        draws=len(votes),
+        replaced=tuple(replaced),
+        draw_calls=started,
+        longest_draw_ms=longest,
+    )
+
+
+def _draw(
+    posting: PostingText,
+    config: Mapping[str, Any],
+    rubric: Mapping[str, Any],
+    url: str,
+    send: Transport,
+    resume: Resume | None,
+    examples: Sequence[Example],
+    criteria: Criteria | None,
+) -> Score | None:
+    """One call to the model and its score, or None when the reply does not parse."""
     try:
         status, body = send(url, _request_body(posting, config, resume, examples, criteria))
     except (ScoreError, OSError, http.client.HTTPException) as exc:
@@ -490,7 +700,9 @@ def score_posting(
     veto = None if criteria is None else _veto(content, posting, criteria)
     cap = None if criteria is None else _cap(content, posting, criteria)
     entry_level = _entry_level(content, posting)
-    counted, tier, excluded = _apply_tiers(parsed, rubric, entry_level=entry_level)
+    counted, tier, excluded = _apply_tiers(
+        parsed, rubric, entry_level=entry_level, junior=junior_title(posting.title)
+    )
     if tier is None and not excluded and not (veto is not None and veto.rejected is None):
         return None
     # D-A1: with a resume in the prompt, the reply itself is never stored. Nor is a
@@ -630,11 +842,9 @@ def _request_body(
     criteria: Criteria | None = None,
 ) -> bytes:
     # Everything that is the same on every call comes first and the posting last, so the
-    # server can reuse its cached processing of the shared prefix (Batch Q).
-    view: dict[str, Any] = {
-        "lanes": _section(config, "search", "lanes"),
-        "location_rules": _section(config, "search", "location_rules"),
-    }
+    # server can reuse its cached processing of the shared prefix (Batch Q). Lanes and the
+    # location rules are not sent: code decides both, and no reply field uses them (R2).
+    view: dict[str, Any] = {}
     if criteria is not None:
         view["criteria"] = [
             {"rule": rule.number, "kind": rule.kind, "text": rule.text}
@@ -661,8 +871,7 @@ def _request_body(
     }
     payload = {
         "model": chat_model(config),
-        **SAMPLING,
-        "seed": SEED,
+        **scoring_sampling(config),
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -760,10 +969,6 @@ def unstated_language(phrase: str, posting: PostingText, config: Mapping[str, An
         part for part in (posting.title, posting.location, posting.description) if part
     )
     return not any(mentions(text, term) for term in terms)
-
-
-def _section(config: Mapping[str, Any], parent: str, key: str) -> Any:
-    return _mapping(config.get(parent)).get(key)
 
 
 def _rubric(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -935,10 +1140,37 @@ def senior_title(title: str) -> bool:
     return any(has_phrase(title, word) for word in _SENIOR_TITLE)
 
 
+_CREDENTIAL_TYPES = frozenset({"certification", "licence"})
+_CREDENTIAL_NAME = re.compile(
+    r"\b(?:certifications?|certificates?|licen[cs]es?|clearances?)\b", re.IGNORECASE
+)
+# A licence the job manages or checks, not one the candidate holds: software seats,
+# or licences reviewed as documents.
+_LICENSING = re.compile(
+    r"\blicen[cs](?:e|es|ing)\s+(?:administration|admin|management|tracking|provisioning|"
+    r"compliance|keys?|seats?|renewals?|assignments?|audits?)\b"
+    r"|\b(?:software|saas|seat|user|application|app|product|business|vendor)\s+licen[cs]es?\b"
+    r"|\b(?:review\w*|verif\w*|check\w*)\b.*\blicen[cs]es?\b",
+    re.IGNORECASE,
+)
+
+
+def required_credential(item: Requirement) -> bool:
+    """True for a certification, licence or clearance gap: typed `certification` or
+    `licence`, or named with certification, certificate, licence, license or clearance.
+    A licence the job administers or reviews (software licences, licences checked as
+    documents) is not one."""
+    if _LICENSING.search(item.text):
+        return False
+    return item.type in _CREDENTIAL_TYPES or bool(_CREDENTIAL_NAME.search(item.text))
+
+
 def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
     """The gaps, in code, from the reply's unmet or partly met qualifications. A `core`
     one not met at all is a core gap; anything else, a partly met one included, is
-    minor.
+    minor. A required credential (`required_credential`) not met at all is a core gap
+    whatever the reply's `core` says, and any years the reply attached to it are ignored;
+    a preferred one is handled like any other gap.
 
     The seniority line comes first for an item that asks for years: SENIOR_YEARS or more,
     not met at all, is a core seniority gap whatever the reply's `core` says; fewer is
@@ -949,33 +1181,45 @@ def derive_gaps(items: Sequence[Requirement], title: str = "") -> list[_Gap]:
     junior = junior_title(title)
     for item in items:
         seniority = False
-        if item.kind in GAP_KINDS and item.years >= SENIOR_YEARS:
+        credential = item.kind == "required" and required_credential(item)
+        years = 0 if credential else item.years
+        if item.kind in GAP_KINDS and years >= SENIOR_YEARS:
             kind = "core" if item.met == "no" else "minor"
             seniority = item.met == "no"
-        elif item.kind in GAP_KINDS and item.years > 0:
+        elif item.kind in GAP_KINDS and years > 0:
             if junior:
                 continue
             kind = "minor"
         elif item.kind in GAP_KINDS:
-            kind = "core" if item.core and item.met == "no" else "minor"
+            kind = "core" if (item.core or credential) and item.met == "no" else "minor"
         else:
             continue
         name = gap_name(" ".join(item.text.split()[:MAX_GAP_WORDS]))
-        if not name or name.casefold() in seen:
+        if not name or gap_key(name) in seen:
             continue
-        seen.add(name.casefold())
+        seen.add(gap_key(name))
         gaps.append(
             _Gap(
                 name,
                 kind,
                 "seniority" if seniority else item.type,
-                main_function=item.main_function and item.years == 0,
+                main_function=item.main_function and years == 0 and not credential,
                 seniority=seniority,
             )
         )
-    if senior_title(title) and SENIOR_TITLE_GAP.casefold() not in seen:
+    if senior_title(title) and gap_key(SENIOR_TITLE_GAP) not in seen:
         gaps.append(_Gap(SENIOR_TITLE_GAP, "core", "seniority", seniority=True))
     return gaps
+
+
+_TRAILING_PUNCTUATION = ".,;:!?…"
+
+
+def gap_key(name: str) -> str:
+    """The key two gap names are compared by: case, surrounding whitespace and trailing
+    punctuation (. , ; : ! ? …) ignored. A trailing + or # is kept, so "A+" and "A",
+    or "C#" and "C", stay apart."""
+    return name.casefold().strip().rstrip(_TRAILING_PUNCTUATION).strip()
 
 
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z][a-z])")
@@ -1074,14 +1318,20 @@ def _capped(phrase: str) -> str:
 
 
 def _apply_tiers(
-    gaps: list[_Gap], rubric: Mapping[str, Any], *, entry_level: bool = False
+    gaps: list[_Gap],
+    rubric: Mapping[str, Any],
+    *,
+    entry_level: bool = False,
+    junior: bool = False,
 ) -> tuple[list[_Gap], str | None, bool]:
     """The gaps that count, the tier, and whether the core gaps exclude the posting.
 
     In code, never sent to the model (`fit_rubric.requirement_tiers`):
     - `exclude_at_core` or more core gaps: excluded (a `gap_tier` skip);
     - two or more core gaps, or a core gap in the role's main function, or a seniority
-      gap (4 or more years asked, or a senior or lead title): low;
+      gap (4 or more years asked, or a senior or lead title): low. On a junior or entry
+      posting (a `junior` title, or `entry_level` grounded by a quote) a main-function
+      gap is an ordinary core gap instead;
     - one other core gap: medium;
     - no core gap: high with at most `high_max_minor` minor gaps (plus
       `entry_level_extra_minor` when the posting is grounded as entry level), else
@@ -1093,7 +1343,8 @@ def _apply_tiers(
     minor = len(counted) - len(core)
     if len(core) >= rubric["exclude_at_core"]:
         return counted, None, True
-    if len(core) >= 2 or any(gap.main_function or gap.seniority for gap in core):
+    forces_low = not (junior or entry_level)
+    if len(core) >= 2 or any((gap.main_function and forces_low) or gap.seniority for gap in core):
         return counted, "low", False
     if core:
         return counted, "medium", False

@@ -84,7 +84,7 @@ from careerhunter.models import Dating
 from careerhunter.platform_checks import SystemProbe
 from careerhunter.runlog import RunLog, RunLogError
 from careerhunter.score import UNAUTHORIZED as SCORE_UNAUTHORIZED
-from careerhunter.score import Score, ScoreError, probe_models, score_posting
+from careerhunter.score import Score, ScoreError, probe_models, score_posting, sector_raise
 from careerhunter.score import default_transport as score_transport
 from careerhunter.scout_prompt import render
 from careerhunter.seed import SeedError, Tally, import_seed
@@ -1402,6 +1402,8 @@ def _watch(datadir: DataDir, log: RunLog) -> int:
                 resume=loaded,
                 examples=examples,
                 criteria=stated,
+                budget=budget,
+                sector=sector_raise(posting, doc),
             )
 
         watch.run(
@@ -2129,7 +2131,9 @@ def _doctor_score_calls(
     now: dt.datetime,
 ) -> None:
     """Median and longest answered scoring call in the window, beside the timeout, so
-    scoring.timeout_seconds can be tuned from data (search migration 0026)."""
+    scoring.timeout_seconds can be tuned from data (search migration 0026). With voting a
+    call is several draws: the longest single draw is shown when it differs, and it is
+    what is compared with the timeout (0038)."""
     since = (now - dt.timedelta(days=SCORE_CALL_DAYS)).astimezone(dt.UTC)
     stats = search_store.score_call_stats(search, since.strftime("%Y-%m-%dT%H:%M:%SZ"))
     timeout = scoring_timeout_seconds(config_doc)
@@ -2144,12 +2148,17 @@ def _doctor_score_calls(
         return
     median = statistics.median(stats.answered_ms) / 1000
     longest = stats.answered_ms[-1] / 1000
+    # A voted call is several draws: the timeout limits each draw, so the longest single
+    # draw is what is compared with it (search migration 0038).
+    draw_ms = stats.longest_draw_ms if stats.longest_draw_ms is not None else stats.answered_ms[-1]
+    draw = draw_ms / 1000
+    longest_draw = f", longest draw {draw:.0f} s" if draw_ms != stats.answered_ms[-1] else ""
     detail = (
         f"{len(stats.answered_ms)} answered in {SCORE_CALL_DAYS} days: median "
-        f"{median:.0f} s, max {longest:.0f} s (timeout {timeout} s){missed}"
+        f"{median:.0f} s, max {longest:.0f} s{longest_draw} (timeout {timeout} s){missed}"
     )
-    if longest >= SCORE_CALL_NEAR * timeout:
-        report.line("scoring calls", "WARN", f"{detail}; the longest is close to the timeout")
+    if draw >= SCORE_CALL_NEAR * timeout:
+        report.line("scoring calls", "WARN", f"{detail}; the longest draw is close to the timeout")
     else:
         report.line("scoring calls", "OK", detail)
 

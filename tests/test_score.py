@@ -89,7 +89,7 @@ def test_the_prompt_uses_only_the_rubric_and_the_posting() -> None:
     assert result.excluded is False
     text = seen["body"].decode()
     assert seen["url"] == DEFAULT_URL.encode()
-    assert "operations" in text and "Canada" in text
+    assert "operations" not in text and "Canada" not in text  # lanes, location rules (R2)
     assert "hard_gates" not in text and "Senior" not in text  # the gates ran already
     assert "A synthetic posting." in text
     assert "DO-NOT-LEAK-NOTES" not in text
@@ -577,7 +577,7 @@ LANGUAGES = {**RUBRIC, "hard_gates": {"required_languages": ["Examplish", "franÃ
 PHANTOM = {
     "gaps": [
         requirement("Examplish language proficiency", type="language", core=True),
-        requirement("Forklift licence"),
+        requirement("Forklift licence", "preferred"),  # a required one is a core gap
     ],
     "key_requirements": ["Examplish language required", "Forklift licence", "Remote in Canada"],
     "entry_level": "",
@@ -883,6 +883,45 @@ def test_gap_names_are_one_style_and_types_a_fixed_list() -> None:
     ]
 
 
+def test_a_gap_differing_only_in_case_spacing_or_a_trailing_full_stop_counts_once() -> None:
+    result = _titled(
+        "IT Support Specialist",
+        requirement("CompTIA A+ certification", type="certification", core=True),
+        requirement("compTIA A+ certification.", type="certification", core=True),
+        requirement("Network+ certification ;", type="certification", core=True),
+    )
+    assert json.loads(result.gaps) == [
+        {"name": "CompTIA A+ certification", "kind": "core", "type": "certification"},
+        {"name": "Network+ certification ;", "kind": "core", "type": "certification"},
+    ]
+    assert result.tier == "low"  # two core gaps, not three: the posting is not excluded
+
+
+def test_a_trailing_plus_or_hash_keeps_two_gaps_apart() -> None:
+    assert scoring.gap_key("  CompTIA A+. ") == "comptia a+"
+    assert scoring.gap_key("Excel!?â€¦") == "excel"
+    content = fit_reply(
+        items=(
+            requirement("CompTIA A+", type="certification"),
+            requirement("CompTIA A", type="certification"),
+            requirement("C#", type="skill"),
+            requirement("C", type="skill"),
+        )
+    )
+    assert [gap["name"] for gap in json.loads(_scored(content).gaps)] == [
+        "CompTIA A+",
+        "CompTIA A",
+        "C#",
+        "C",
+    ]
+
+
+def test_a_listed_senior_title_gap_with_a_full_stop_is_not_added_twice() -> None:
+    item = requirement("Senior or lead title.", type="seniority", core=True)
+    names = [gap["name"] for gap in json.loads(_titled("Senior Analyst", item).gaps)]
+    assert len(names) == 1
+
+
 def test_entry_level_counts_only_with_a_quote_found_in_the_posting() -> None:
     assert _scored(fit_reply(entry_level="Apply anyway.")).entry_level is True
     assert _scored(fit_reply(entry_level="we'll train")).entry_level is False  # not in it
@@ -955,7 +994,10 @@ def test_the_tier_follows_core_and_minor_gaps(
 
 def test_a_core_gap_in_the_main_function_is_low() -> None:
     main = requirement("Analyst work in this function", core=True, main_function=True)
-    assert _tier(fit_reply(items=(main,))).tier == "low"
+    analyst = PostingText("Example Automate", "Automation Analyst", "Example City", "remote")
+    assert _tier(fit_reply(items=(main,)), analyst).tier == "low"
+    # TRAINING has a junior title: there it's an ordinary core gap (test_junior_main_function)
+    assert _tier(fit_reply(items=(main,))).tier == "medium"
     # Met, it isn't listed at all: no gap.
     assert _tier(fit_reply()).tier == "high"
 
@@ -996,7 +1038,30 @@ def test_no_threshold_or_tier_reaches_the_model() -> None:
     for word in ("requirement_tiers", "high_max_minor", "exclude_at_core", "gap_tiers", "max_gaps"):
         assert word not in text
     view = json.loads(json.loads(seen["body"])["messages"][1]["content"])
-    assert list(view) == ["lanes", "location_rules", "posting"]
+    assert list(view) == ["posting"]
+
+
+def test_lanes_and_location_rules_are_not_sent() -> None:
+    config = {
+        "search": {
+            "lanes": [{"name": "example_lane", "priority": 1, "titles": ["Example Analyst"]}],
+            "location_rules": {"onsite_hybrid": ["Example Town"], "remote": ["Exampleland"]},
+        }
+    }
+    body = scoring._request_body(posting(), config, _RESUME)
+    text = body.decode()
+    for word in ("example_lane", "Example Analyst", "Exampleland", "Example Town", "lanes"):
+        assert word not in text
+    assert "location_rules" not in text
+    view = json.loads(json.loads(body)["messages"][1]["content"])
+    assert list(view) == ["resume", "posting"]
+
+
+def test_the_prompt_defines_main_function() -> None:
+    prompt = scoring.SYSTEM_PROMPT
+    assert 'met, "no" or "partly", judged only against the resume.' in prompt
+    assert "main_function: true only when the qualification is doing the role's main job" in prompt
+    assert "never for a tool, a degree, a certification" in prompt
 
 
 # --- experience only from roles and skills (Batch Q) ----------------------------------------
@@ -1047,6 +1112,16 @@ def test_the_term_guard_reads_only_tools_and_skills_outside_the_summary() -> Non
     advanced = requirement("Advanced proficiency", type="skill", core=True)
     result = _resumed(retail, finance, advanced)
     assert [gap["kind"] for gap in json.loads(result.gaps)] == ["core", "core", "core"]
+
+
+def test_the_prompt_lists_every_gap_type_and_what_it_covers() -> None:
+    assert tuple(scoring.GAP_TYPE_GUIDE) == scoring.GAP_TYPES  # the schema's enum, in order
+    prompt = scoring.SYSTEM_PROMPT
+    assert "one of the listed types" not in prompt
+    for name, covers in scoring.GAP_TYPE_GUIDE.items():
+        assert f"{name} ({covers})" in prompt
+    assert "licence (a licence, permit or security clearance the candidate must hold)" in prompt
+    assert "seniority (" not in prompt  # set in code, never by the model
 
 
 def test_the_prompt_states_the_general_experience_rule() -> None:

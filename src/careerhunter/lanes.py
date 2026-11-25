@@ -53,7 +53,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from careerhunter import db, search_store
-from careerhunter.config import LANE_GROUPS, max_posting_age_days, off_lane_min_fit
+from careerhunter.config import LANE_GROUPS, SECTORS, max_posting_age_days, off_lane_min_fit
 from careerhunter.enums import FIT_LEVELS
 from careerhunter.filters import has_phrase, too_old
 from careerhunter.search_store import PendingAlert
@@ -175,8 +175,18 @@ def alert_order(pending: list[PendingAlert], doc: Mapping[str, Any]) -> list[Ord
         else:
             group, priority, label = GROUPS.index(lane.group), lane.priority, _LABELS[lane.group]
         key = (group, -rank, priority, alert.first_seen, alert.posting_id)
+        label = _with_sector(label, alert.sector)
         keyed.append((key, Ordered(alert.posting_id, f"Lane: {alert.lane}{label}", group)))
     return [ordered for _, ordered in sorted(keyed, key=lambda pair: pair[0])]
+
+
+def _with_sector(label: str, sector: str | None) -> str:
+    """The lane's group label with the sector its score was raised for (Q11, ADR-032):
+    " (stopgap)" becomes " (stopgap, security vendor)"; a primary lane, " (MSSP)"."""
+    words = SECTORS.get(sector) if sector is not None else None
+    if words is None:
+        return label
+    return f"{label[:-1]}, {words})" if label else f" ({words})"
 
 
 @dataclass(frozen=True)

@@ -497,7 +497,7 @@ def test_watch_sends_the_criteria_or_holds_scoring(
 
     def run(*_args: object, **kwargs: Any) -> list[str]:
         seen["problem"] = kwargs["criteria_problem"]
-        kwargs["scorer"](object())
+        kwargs["scorer"](PostingText("Example Co", "Example Analyst", "Example City"))
         return []
 
     def local_score(posting: object, config: object, **kwargs: Any) -> Score:

@@ -31,7 +31,7 @@ def test_pragmas(fresh: sqlite3.Connection) -> None:
 
 def test_each_track_is_contiguous_and_checksummed(fresh: sqlite3.Connection, track: str) -> None:
     migrations = db.load_migrations(track)
-    expected = {"search": list(range(1, 38)), "ei_record": [1, 2, 3, 4, 5]}[track]
+    expected = {"search": list(range(1, 39)), "ei_record": [1, 2, 3, 4, 5]}[track]
     assert [m.version for m in migrations] == expected
     assert db.schema_version(fresh) == db.latest_version(track) == expected[-1]
     recorded = [
@@ -1546,7 +1546,7 @@ def test_search_0037_keeps_rows_and_adds_a_null_region(tmp_path: Path) -> None:
         )
         companies = [tuple(r) for r in conn.execute("SELECT * FROM companies")]
         candidates = [tuple(r) for r in conn.execute("SELECT * FROM discovery_candidates")]
-        assert db.migrate(conn, "search") == [37]
+        assert db.migrate(conn, "search", search[:37]) == [37]
         after = [tuple(r) for r in conn.execute("SELECT * FROM companies")]
         assert [row[: len(companies[0])] for row in after] == companies
         after = [tuple(r) for r in conn.execute("SELECT * FROM discovery_candidates")]
@@ -1580,5 +1580,40 @@ def test_search_0037_allows_eu_only_on_lever(tmp_path: Path, table: str) -> None
                 conn.execute(insert, (f"https://example.com/{n}", ats, region))
         conn.execute(insert, ("https://example.com/ok", "lever", "eu"))
         conn.execute(insert, ("https://example.com/none", "greenhouse", None))
+    finally:
+        conn.close()
+
+
+# --- search 0038: the draws behind a voted scoring call ------------------------------------
+
+
+def test_search_0038_keeps_score_calls_and_adds_null_draw_columns(tmp_path: Path) -> None:
+    search = db.load_migrations("search")
+    conn = db.connect(tmp_path / "search.db")
+    try:
+        db.migrate(conn, "search", search[:37])
+        conn.execute("INSERT INTO watch_runs (started_at) VALUES ('2026-11-01T08:00:00Z')")
+        conn.execute(
+            "INSERT INTO companies (name, ats_type, ats_slug, source) "
+            "VALUES ('Example Robotics', 'lever', 'examplerobotics', 'manual')"
+        )
+        conn.execute(
+            "INSERT INTO postings (company_id, title, first_seen, source) "
+            "VALUES (1, 'Coordinator', '2026-11-01', 'watcher')"
+        )
+        conn.execute(
+            "INSERT INTO score_calls (run_id, posting_id, started_at, finished_at, duration_ms, "
+            "outcome) VALUES (1, 1, '2026-11-01T08:00:00Z', '2026-11-01T08:02:00Z', 120000, "
+            "'scored')"
+        )
+        before = [tuple(r) for r in conn.execute("SELECT * FROM score_calls")]
+        assert db.migrate(conn, "search") == [38]
+        after = [tuple(r) for r in conn.execute("SELECT * FROM score_calls")]
+        assert [row[: len(before[0])] for row in after] == before
+        assert after[0][len(before[0]) :] == (None, None)
+        for bad in ("draw_calls = 0", "draw_calls = 7", "longest_draw_ms = -1"):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(f"UPDATE score_calls SET {bad}")  # noqa: S608
+        conn.execute("UPDATE score_calls SET draw_calls = 3, longest_draw_ms = 95000")
     finally:
         conn.close()

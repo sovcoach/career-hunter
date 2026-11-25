@@ -1,4 +1,5 @@
-"""Scoring with the resume, and re-scoring when it changes (ADR-023).
+"""Scoring with the resume, and re-scoring what `careerhunter rescore` queued (ADR-023).
+A new resume applies only to postings scored after it (batch R2).
 
 Boards, postings, resumes and model replies here are all made up. A fake clock drives
 the run budget; no socket is opened and nothing sleeps.
@@ -101,6 +102,12 @@ def row(conn: sqlite3.Connection, title: str) -> sqlite3.Row:
     return found
 
 
+def queue(conn: sqlite3.Connection, *names: str) -> None:
+    """Queue these postings for a re-score, as `careerhunter rescore` does."""
+    with db.transaction(conn):
+        search_store.mark_for_rescore(conn, [int(row(conn, name)["id"]) for name in names])
+
+
 def titles(scorer: Recorder) -> list[str]:
     return [text.title for text in scorer.calls]
 
@@ -166,13 +173,35 @@ def test_an_unusable_resume_holds_all_scoring(search: sqlite3.Connection) -> Non
     assert lines[-1] == "watch: 1 boards fetched, 0 failed, 0 left"
 
 
-# --- re-scoring on a resume change ---------------------------------------------------------------
+# --- re-scoring what is queued, and a new resume ---
+
+
+def test_a_new_resume_queues_no_re_scores(search: sqlite3.Connection) -> None:
+    seed(search, "examplerobotics", ("r1", "Coordinator"), resume=OLD)
+    before = row(search, "Coordinator")
+    scorer = Recorder()
+    boards = {
+        board("examplerobotics"): lever("examplerobotics", ("r1", "Coordinator"), ("r2", "Planner"))
+    }
+    run(search, boards, ("examplerobotics",), scorer=scorer, resume=NEW)
+    assert titles(scorer) == ["Planner"]  # only the new posting, scored with the new resume
+    after = row(search, "Coordinator")
+    assert (after["llm_output"], after["scored_resume_sha256"]) == (
+        before["llm_output"],
+        OLD.sha256,
+    )
+    assert row(search, "Planner")["scored_resume_sha256"] == NEW.sha256
+    run(search, boards, ("examplerobotics",), scorer=scorer, resume=NEW)
+    assert titles(scorer) == [
+        "Planner"
+    ]  # and not on a later run either------------------------------------------------------------
 
 
 def test_a_stored_posting_on_a_fetched_board_is_re_scored_after_the_boards_with_its_description(
     search: sqlite3.Connection,
 ) -> None:
     seed(search, "examplerobotics", ("r1", "Coordinator"), resume=OLD)
+    queue(search, "Coordinator")
     events: list[str] = []
     scorer = Recorder(events)
     boards = {
@@ -205,9 +234,10 @@ def test_a_stored_posting_on_a_fetched_board_is_re_scored_after_the_boards_with_
 
 
 def test_passes_go_never_scored_then_queued_then_stored_fields(search: sqlite3.Connection) -> None:
-    # Stored with the old resume: one stays on a fetched board, one is gone from its list
+    # Stored, then queued: one stays on a fetched board, one is gone from its list
     # and is read again on its own before it is re-scored (ADR-027).
     seed(search, "examplerobotics", ("r1", "Listed"), ("r2", "Delisted"), resume=OLD)
+    queue(search, "Listed", "Delisted")
     # Stored but never scored.
     run(
         search,
@@ -238,6 +268,7 @@ def test_a_re_score_whose_posting_left_its_board_is_skipped_as_gone(
     search: sqlite3.Connection,
 ) -> None:
     seed(search, "examplerobotics", ("r1", "Listed"), ("r2", "Delisted"), resume=OLD)
+    queue(search, "Listed", "Delisted")
     single = "https://api.lever.co/v0/postings/examplerobotics/r2?mode=json"
     boards = {
         board("examplerobotics"): lever("examplerobotics", ("r1", "Listed")),
@@ -265,6 +296,8 @@ def test_skipped_and_applied_postings_keep_their_score(search: sqlite3.Connectio
             "date_precision, method) VALUES (?, ?, ?, 'exact', 'company_site')",
             ("c" * 32, int(row(search, "Applied")["id"]), DAY),
         )
+    queue(search, "Skipped", "Applied", "Open")
+    before = row(search, "Skipped")["llm_output"], row(search, "Applied")["llm_output"]
     scorer = Recorder()
     run(
         search,
@@ -277,9 +310,8 @@ def test_skipped_and_applied_postings_keep_their_score(search: sqlite3.Connectio
         scorer=scorer,
         resume=NEW,
     )
-    assert titles(scorer) == ["Open"]
-    assert row(search, "Skipped")["scored_resume_sha256"] == OLD.sha256
-    assert row(search, "Applied")["scored_resume_sha256"] == OLD.sha256
+    assert titles(scorer) == ["Open"]  # queued, but a skip or an application keeps its score
+    assert (row(search, "Skipped")["llm_output"], row(search, "Applied")["llm_output"]) == before
 
 
 def test_an_alerted_posting_is_re_scored_and_not_alerted_again(search: sqlite3.Connection) -> None:
@@ -287,6 +319,7 @@ def test_an_alerted_posting_is_re_scored_and_not_alerted_again(search: sqlite3.C
     posting_id = int(row(search, "Coordinator")["id"])
     with db.transaction(search):
         search_store.mark_alerted(search, posting_id, "2026-11-01T09:00:00Z")
+    queue(search, "Coordinator")
     scorer = Recorder()
     scorer.replies["Coordinator"] = Score(llm_output='{"gaps":[]}', gaps="[]", tier="medium")
     run(
@@ -303,10 +336,11 @@ def test_an_alerted_posting_is_re_scored_and_not_alerted_again(search: sqlite3.C
 
 
 @pytest.mark.parametrize("failure", ["unparseable", "unreachable"])
-def test_a_failed_re_score_keeps_the_old_score_and_hash(
+def test_a_failed_re_score_keeps_the_old_score_and_stays_queued(
     search: sqlite3.Connection, failure: str
 ) -> None:
     seed(search, "examplerobotics", ("r1", "Coordinator"), resume=OLD)
+    queue(search, "Coordinator")
     before = row(search, "Coordinator")
     scorer = Recorder()
     scorer.replies["Coordinator"] = (
@@ -324,7 +358,7 @@ def test_a_failed_re_score_keeps_the_old_score_and_hash(
     assert (after["llm_output"], after["gaps"], after["scored_resume_sha256"]) == (
         before["llm_output"],
         before["gaps"],
-        OLD.sha256,
+        None,  # still queued
     )
     reason = "unparseable reply" if failure == "unparseable" else "model unreachable"
     assert (
@@ -343,6 +377,7 @@ def test_later_boards_are_fetched_while_re_scores_wait(search: sqlite3.Connectio
     slugs = ("examplea", "exampleb", "examplec")
     for slug in slugs:
         seed(search, slug, (f"{slug}1", f"Role {slug}"), resume=OLD)
+    queue(search, *(f"Role {slug}" for slug in slugs))
     clock = FakeClock()
     boards = {board(slug): lever(slug, (f"{slug}1", f"Role {slug}")) for slug in slugs}
     events: list[str] = []
@@ -377,6 +412,7 @@ def test_a_budget_cut_leaves_re_scores_for_the_next_run_uncounted(
     slugs = ("examplea", "exampleb", "examplec", "exampled")
     for slug in slugs:
         seed(search, slug, (f"{slug}1", f"Role {slug}"), resume=OLD)
+    queue(search, *(f"Role {slug}" for slug in slugs))
     clock = FakeClock()
     boards = {board(slug): lever(slug, (f"{slug}1", f"Role {slug}")) for slug in slugs}
     scorer = Recorder()
@@ -395,8 +431,8 @@ def test_a_budget_cut_leaves_re_scores_for_the_next_run_uncounted(
     # call may take, so no third call starts: the budget would cut it short.
     assert len(scorer.calls) == 2
     assert "watch: scoring: run budget reached; 2 postings left for the next run" in lines
-    hashes = sorted(row(search, f"Role {s}")["scored_resume_sha256"] for s in slugs)
-    assert hashes.count(OLD.sha256) == 2 and hashes.count(NEW.sha256) == 2
+    hashes = [row(search, f"Role {s}")["scored_resume_sha256"] for s in slugs]
+    assert hashes.count(None) == 2 and hashes.count(NEW.sha256) == 2  # two still queued
     assert lines[-1] == "watch: 4 boards fetched, 0 failed, 0 left"
 
 
@@ -460,6 +496,7 @@ def test_never_scored_postings_go_before_re_scores_and_the_rest_is_not_counted(
     search: sqlite3.Connection,
 ) -> None:
     seed(search, "examplea", ("a1", "Scored"), resume=OLD)
+    queue(search, "Scored")
     run(search, {board("exampleb"): lever("exampleb", ("b1", "Waiting"))}, ("exampleb",))
     clock = FakeClock()
     scorer = Recorder()
@@ -475,7 +512,7 @@ def test_never_scored_postings_go_before_re_scores_and_the_rest_is_not_counted(
     )
     assert titles(scorer) == ["Waiting"]
     assert "watch: scoring: run budget reached; 1 postings left for the next run" in lines
-    assert row(search, "Scored")["scored_resume_sha256"] == OLD.sha256
+    assert row(search, "Scored")["scored_resume_sha256"] is None  # still queued
     assert lines[-1] == "watch: 0 boards fetched, 0 failed, 0 left"
 
 
@@ -483,6 +520,7 @@ def test_a_model_that_goes_down_stops_the_passes_and_counts_what_is_left(
     search: sqlite3.Connection,
 ) -> None:
     seed(search, "examplea", ("a1", "One"), ("a2", "Two"), ("a3", "Three"), resume=OLD)
+    queue(search, "One", "Two", "Three")
     scorer = Recorder()
     scorer.replies["One"] = ScoreError("the local model could not be reached")
     lines = w.run(search, [], today=DAY, fetcher=OnBoard({}), scorer=scorer, resume=NEW)

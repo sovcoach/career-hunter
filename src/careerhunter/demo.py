@@ -195,7 +195,8 @@ def model_transport(_url: str, payload: bytes, **_kw: object) -> tuple[int, byte
     items = [
         {
             "name": gap["name"],
-            "kind": "required",
+            # a minor gap is answered as preferred: a required certificate is always core
+            "kind": "required" if gap["kind"] == "core" else "preferred",
             "met": "no",
             "years": 0,
             "core": gap["kind"] == "core",

@@ -827,12 +827,25 @@ def record_score_call(
     finished_at: str,
     duration_ms: int,
     outcome: str,
+    *,
+    draw_calls: int | None = None,
+    longest_draw_ms: int | None = None,
 ) -> None:
-    """One scoring call's timing (search migration 0026). No prompt, reply or text."""
+    """One scoring call's timing (search migration 0026). No prompt, reply or text. A
+    voted call also records its draws sent and its longest single draw (0038)."""
     conn.execute(
         "INSERT INTO score_calls (run_id, posting_id, started_at, finished_at, duration_ms, "
-        "outcome) VALUES (?, ?, ?, ?, ?, ?)",
-        (run_id, posting_id, started_at, finished_at, max(0, duration_ms), outcome),
+        "outcome, draw_calls, longest_draw_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            run_id,
+            posting_id,
+            started_at,
+            finished_at,
+            max(0, duration_ms),
+            outcome,
+            draw_calls,
+            None if longest_draw_ms is None else max(0, longest_draw_ms),
+        ),
     )
 
 
@@ -844,15 +857,25 @@ class ScoreCallStats:
     answered_ms: tuple[int, ...]
     not_answered: int
     timed_out: int = 0
+    # The longest single draw of an answered call: a voted call's longest draw (a
+    # replaced one included), or a one-draw call's duration. What
+    # scoring.timeout_seconds limits (search migration 0038).
+    longest_draw_ms: int | None = None
 
 
 def score_call_stats(conn: sqlite3.Connection, since: str) -> ScoreCallStats:
     rows = conn.execute(
-        "SELECT duration_ms, outcome FROM score_calls WHERE started_at >= ?", (since,)
+        "SELECT duration_ms, outcome, longest_draw_ms FROM score_calls WHERE started_at >= ?",
+        (since,),
     ).fetchall()
     answered = tuple(sorted(int(r[0]) for r in rows if r[1] in ANSWERED_OUTCOMES))
     timed_out = sum(1 for r in rows if r[1] == "timeout")
-    return ScoreCallStats(answered, len(rows) - len(answered) - timed_out, timed_out)
+    draws = [
+        int(r[2]) if r[2] is not None else int(r[0]) for r in rows if r[1] in ANSWERED_OUTCOMES
+    ]
+    return ScoreCallStats(
+        answered, len(rows) - len(answered) - timed_out, timed_out, max(draws, default=None)
+    )
 
 
 @dataclass(frozen=True)
@@ -927,6 +950,7 @@ class PendingAlert:
     run_id: int | None = None  # the watch run that scored it (search migration 0011)
     run_finished: bool = False  # that run has finished its watch_runs row
     run_started_at: str | None = None
+    sector: str | None = None  # Q11 (ADR-032): the sector its score was raised for
 
 
 def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
@@ -942,7 +966,9 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
     rows = conn.execute(
         """
         SELECT p.id, p.company_id, p.title, p.fit, p.lane, p.lane_checked, p.first_seen,
-               p.score_run_id, r.finished_at, r.started_at
+               p.score_run_id, r.finished_at, r.started_at,
+               CASE WHEN json_valid(p.scout_metadata)
+                    THEN json_extract(p.scout_metadata, '$.sector') END AS sector
         FROM postings p LEFT JOIN watch_runs r ON r.id = p.score_run_id
         WHERE p.source IN ('watcher', 'discovery')
           AND p.llm_output IS NOT NULL
@@ -974,9 +1000,17 @@ def pending_alerts(conn: sqlite3.Connection) -> list[PendingAlert]:
             run_id=None if row["score_run_id"] is None else int(row["score_run_id"]),
             run_finished=row["finished_at"] is not None,
             run_started_at=None if row["started_at"] is None else str(row["started_at"]),
+            sector=row["sector"] if isinstance(row["sector"], str) else None,
         )
         for row in rows
     ]
+
+
+def _kind_counts(row: sqlite3.Row) -> dict[str, int | None]:
+    """The core and minor counts, or None for both when any stored gap has no kind."""
+    if row["core_count"] is None or row["minor_count"] is None or row["loose_count"]:
+        return {"core_count": None, "minor_count": None}
+    return {"core_count": int(row["core_count"]), "minor_count": int(row["minor_count"])}
 
 
 @dataclass(frozen=True)
@@ -994,26 +1028,50 @@ class DigestFields:
     key_requirements: tuple[str, ...]
     referral: bool = False
     also: tuple[str, ...] = ()  # the requisitions of the same role posted again (Batch R)
+    # The core and minor gaps, exempt types left out (R2); None, None when a stored gap
+    # has no kind (scored before 0.10.0) or the gaps are not a JSON list.
+    core_count: int | None = None
+    minor_count: int | None = None
+    work_model: str | None = None  # the board's, when it gave one
 
 
-def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[int, DigestFields]:
+def digest_fields(
+    conn: sqlite3.Connection, posting_ids: Sequence[int], exempt_types: Sequence[str] = ()
+) -> dict[int, DigestFields]:
     """The digest fields of these postings, by id. A posting no longer stored is absent.
 
-    The gap count is read from the stored gap list in SQL, so the gap names themselves
-    never leave the database here.
+    The gap counts are read from the stored gap list in SQL, so the gap names themselves
+    never leave the database here. The core and minor counts leave out gaps whose type
+    is in `exempt_types`, as the tier does.
     """
     found: dict[int, DigestFields] = {}
+    exempt = json.dumps([str(item) for item in exempt_types])
     for posting_id in posting_ids:
         row = conn.execute(
             """
             SELECT p.id, c.name AS company, p.title, p.location, p.url, p.schedule, p.fit,
                    CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array'
                         THEN json_array_length(p.gaps) END AS gap_count,
-                   p.key_requirements, p.referral
+                   CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array' THEN (
+                        SELECT COALESCE(SUM(json_extract(g.value, '$.kind') = 'core'
+                               AND COALESCE(json_extract(g.value, '$.type'), '')
+                                   NOT IN (SELECT e.value FROM json_each(:exempt) e)), 0)
+                        FROM json_each(p.gaps) g WHERE g.type = 'object') END AS core_count,
+                   CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array' THEN (
+                        SELECT COALESCE(SUM(json_extract(g.value, '$.kind') = 'minor'
+                               AND COALESCE(json_extract(g.value, '$.type'), '')
+                                   NOT IN (SELECT e.value FROM json_each(:exempt) e)), 0)
+                        FROM json_each(p.gaps) g WHERE g.type = 'object') END AS minor_count,
+                   CASE WHEN json_valid(p.gaps) AND json_type(p.gaps) = 'array' THEN (
+                        SELECT COUNT(*) FROM json_each(p.gaps) g
+                        WHERE g.type != 'object' OR NOT EXISTS (
+                            SELECT 1 FROM json_each(g.value) k
+                            WHERE g.type = 'object' AND k.key = 'kind')) END AS loose_count,
+                   p.key_requirements, p.referral, p.work_model
             FROM postings p JOIN companies c ON c.id = p.company_id
-            WHERE p.id = ?
+            WHERE p.id = :posting_id
             """,
-            (posting_id,),
+            {"exempt": exempt, "posting_id": posting_id},
         ).fetchone()
         if row is None:
             continue
@@ -1029,6 +1087,8 @@ def digest_fields(conn: sqlite3.Connection, posting_ids: Sequence[int]) -> dict[
             key_requirements=_requirements(row["key_requirements"]),
             referral=bool(row["referral"]),
             also=_also(conn, posting_id),
+            **_kind_counts(row),
+            work_model=None if row["work_model"] is None else str(row["work_model"]),
         )
     return found
 
