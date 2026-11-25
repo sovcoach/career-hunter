@@ -7,6 +7,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-25
+
 ### Added
 - **`scoring.voting`**, off by default. When `true`, each posting is scored by up to three draws with fixed seeds (the `scoring.sampling` seed, then 20261122 and 20261123) that vote on whether it alerts: two that agree settle it, otherwise the majority decides, and the first draw that matches the majority is stored with its own gaps, tier and veto. A draw that doesn't parse or times out is replaced once by the next spare seed (20261124 on), and the watch log names each replaced draw; the posting fails as before only when the replacement fails too. Any other failure fails the posting at once, with no replacement. No extra draw starts once the run has less than `scoring.timeout_seconds` left: the posting waits for the next run. Scoring takes about 2.3 calls a posting. Off, the request and the result are unchanged (ADR-031).
 
@@ -26,6 +28,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - **`doctor`'s `scoring calls` line with voting** compares the longest single draw with `scoring.timeout_seconds`, not the whole voted call, and shows it when it differs (`longest draw N s`). Search migration 0038 adds `draw_calls` and `longest_draw_ms` to `score_calls`; existing rows keep NULL. `search.db` goes to 38 (ADR-031).
 - **A gap listed twice counts once** when the two names differ only in case, surrounding whitespace or trailing punctuation (`.`, `,`, `;`, `:`, `!`, `?`, `…`), as in "CompTIA A+ certification" and "compTIA A+ certification.". Before, each counted as a core gap, which could exclude the posting. A trailing `+` or `#` still counts, so "A+" and "A", or "C#" and "C", stay two gaps.
+
+### Upgrading
+- `search.db` moves from schema version 37 to 38; the EI record stays at 5. No config change is needed: voting is off and the sampling values are unchanged until you set them. See "Upgrading from 0.11.1 to 0.12.0" in `docs/SETUP.md`. Its release checkout uses `v0.12.0`.
 
 ## [0.11.1] - 2026-11-21
 
@@ -396,7 +401,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions CI: lint, type check, tests with an 85% coverage floor, and a full-history gitleaks scan with a checksum-pinned binary.
 - Documentation: README, SETUP, ARCHITECTURE, DECISIONS, SECURITY and CONTRIBUTING, plus issue and PR templates.
 
-[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/sovcoach/career-hunter/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/sovcoach/career-hunter/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/sovcoach/career-hunter/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/sovcoach/career-hunter/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/sovcoach/career-hunter/compare/v0.9.0...v0.10.0
