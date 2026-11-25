@@ -104,10 +104,10 @@ pre-commit installed at .git/hooks/pre-commit
 
 The background services (Step 10c) must run from a **release checkout**: a second folder that holds one release tag and nothing else. `uv sync` installs career-hunter so that it runs whatever source is in its folder, and `careerhunter` applies any new database migration it finds there the next time it opens `search.db`. If the services ran from the folder above and you checked out an unreleased branch there, a running service could apply that branch's migration to your real `search.db`; once applied, a migration can't be changed, and every restart (a crash, a reboot) would run whatever branch was checked out.
 
-Make the release checkout next to the first one. This guide uses the tag `v0.11.1`; use the latest release tag:
+Make the release checkout next to the first one. This guide uses the tag `v0.12.0`; use the latest release tag:
 
 ```bash
-cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.11.1
+cd ~/Projects/career-hunter && git worktree add ../career-hunter-release v0.12.0
 ```
 
 ```bash
@@ -944,6 +944,31 @@ Upgrade the release checkout only, one release tag at a time, in this order. The
    The output is the two `installed …` lines in Step 10c. Run `doctor` once more to see the services running.
 
 If something goes wrong before step 6 finishes, nothing in the data folder has changed yet. If it goes wrong after, stop the services, put the dated copy back (the `.db` files and anything else you changed), and move the release checkout back to the old tag.
+
+## Upgrading from 0.11.1 to 0.12.0
+
+Follow the nine steps above with the tag `v0.12.0` (`git checkout v0.12.0` in the release checkout, then `uv sync --locked`). These steps differ:
+
+- **Step 3, then a snapshot and a copy of your config:** right before you migrate, take a read-only snapshot with the new release and check it. Use a folder that exists, on an encrypted volume, outside the data folder and outside any git checkout:
+
+  ```bash
+  cd ~/Projects/career-hunter-release && uv run careerhunter db snapshot --to /Volumes/ExampleDrive/Snapshots
+  ```
+
+  Every database line must say `integrity ok`. Then copy `config.yaml` and your criteria file into a folder of their own beside that snapshot, owner-only. 0.11.1 refuses `scoring.sampling` and `scoring.voting` and can't read a `met:` rule, so going back to 0.11.1 needs these copies as well as the databases.
+- **Step 4: no config change is needed.** `scoring.sampling` keeps the old sampling values when it is unset, and `scoring.voting` is off. To use either of them, a watchlist `sector` or a `met:` rule, add it after `migrate` and before the second `doctor` (see "How a posting is scored" and "Your scoring criteria"). Turning voting on costs 2 to 3 scoring calls a posting, so a watch run scores fewer postings.
+- **Step 6:** `migrate` applies search migration 0038. The EI records are unchanged:
+
+  ```text
+  search.db: applied [38]; schema version 38
+  ei_record_2026-27.db: applied nothing; schema version 5
+  EI claim 2026-27 (from 2026-08-02)
+  ```
+
+- **Step 7: nothing to import.** A new resume no longer queues re-scores, and neither the upgrade nor a config change re-scores anything: postings already scored keep their scores, and the new rules apply to postings scored after the upgrade. `careerhunter rescore` still queues chosen postings.
+- **Step 8:** `doctor` shows `search.db       OK  schema version 38`.
+
+If something goes wrong after `migrate`, stop the services, put back the snapshot's `search.db` (move the failed one and any `search.db-wal` and `search.db-shm` beside it aside first), put back the copies of `config.yaml` and the criteria file, move the release checkout back to `v0.11.1`, `uv sync --locked`, and run `doctor`: it should show schema version 37.
 
 ## Upgrading from 0.10.0 to 0.11.0
 
