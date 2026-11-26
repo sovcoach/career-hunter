@@ -40,6 +40,7 @@ Either way, delete the branch on GitHub and locally once the pull request shows 
 - Run each guarded git command (`add`, `commit`, `push`, `rm`, `tag`, `merge`, `rebase`, `reset`) as a command of its own. Chain nothing before or after it with `;`, `&&`, `||` or `|`. The ask rules in `.claude/settings.json` match the whole command, so a chained command can run without the prompt it should get (ADR-011).
 - No attribution lines anywhere: no `Co-Authored-By` trailers and no "generated with" footers in commits, tags, PRs, issues or release notes.
 - Commit messages and command text must not contain the push guard's override variable or the hook-skipping options. The deny rules refuse any command that does, even inside a message.
+- If a permission rule or prompt refuses a command, stop and report which command was refused and by what: the named rule, or the prompt. Never reword the command, reorder its flags or send it another way to get past the refusal.
 
 ## Data
 
