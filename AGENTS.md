@@ -14,7 +14,7 @@ These rules apply to every AI agent session in this repo, Claude Code or otherwi
   4. Anything touches the real data folder, or any push, PR or issue post.
   5. You're stuck on the same failure after two honest attempts.
 - These hold in every plan:
-  - Format with `uv run ruff format` only, never `make format`, which also runs `ruff check --fix`.
+  - Format with `uv run ruff format`. The pre-commit hook `ruff-isort` also sorts imports as a hook autofix (`ruff check --select I --fix`, import order only). Never run a general `ruff check --fix` or `make format`, which runs it.
   - `CAREERHUNTER_DATA_DIR` comes from the bot's LaunchAgent plist (`org.careerhunter.bot.plist`, read with PlistBuddy) and is never printed. Set it on each check command and on each `git commit`.
   - Run each guarded git command on its own (see "Git commands").
   - The full checks pass fresh before every commit.

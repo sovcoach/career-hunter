@@ -17,6 +17,11 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.1
     hooks:
+      # Import sorting only; run it alone with: pre-commit run ruff-isort --all-files
+      - id: ruff-check
+        alias: ruff-isort
+        name: ruff import sort
+        args: [--select, I, --fix]
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
