@@ -60,13 +60,18 @@
       "Bash(gh api:*)",
       "Bash(gh pr merge:*)",
       "Bash(gh repo edit:*)",
-      "Bash(gh release:*)"
+      "Bash(gh release:*)",
+      "Bash(rm:*)"
     ],
     "deny": [
       "Bash(rm -rf:*)",
       "Bash(rm -fr:*)",
       "Bash(rm -r -f:*)",
       "Bash(rm -f -r:*)",
+      "Bash(rm -Rf:*)",
+      "Bash(rm -fR:*)",
+      "Bash(rm -R -f:*)",
+      "Bash(rm -f -R:*)",
       "Bash(sudo:*)",
       "Bash(docker run:*)",
       "Bash(git push --force:*)",

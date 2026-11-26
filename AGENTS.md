@@ -14,7 +14,7 @@ These rules apply to every AI agent session in this repo, Claude Code or otherwi
   4. Anything touches the real data folder, or any push, PR or issue post.
   5. You're stuck on the same failure after two honest attempts.
 - These hold in every plan:
-  - Format with `uv run ruff format` only, never `make format`, which also runs `ruff check --fix`.
+  - Format with `uv run ruff format`. Import sorting and other lint fixes come from the existing `ruff-check` pre-commit hook (`ruff check --fix`, with `I` selected in `pyproject.toml`) and count as hook autofixes. Never run `ruff check --fix` or `make format` by hand.
   - `CAREERHUNTER_DATA_DIR` comes from the bot's LaunchAgent plist (`org.careerhunter.bot.plist`, read with PlistBuddy) and is never printed. Set it on each check command and on each `git commit`.
   - Run each guarded git command on its own (see "Git commands").
   - The full checks pass fresh before every commit.
@@ -40,6 +40,7 @@ Either way, delete the branch on GitHub and locally once the pull request shows 
 - Run each guarded git command (`add`, `commit`, `push`, `rm`, `tag`, `merge`, `rebase`, `reset`) as a command of its own. Chain nothing before or after it with `;`, `&&`, `||` or `|`. The ask rules in `.claude/settings.json` match the whole command, so a chained command can run without the prompt it should get (ADR-011).
 - No attribution lines anywhere: no `Co-Authored-By` trailers and no "generated with" footers in commits, tags, PRs, issues or release notes.
 - Commit messages and command text must not contain the push guard's override variable or the hook-skipping options. The deny rules refuse any command that does, even inside a message.
+- If a permission rule or prompt refuses a command, stop and report which command was refused and by what: the named rule, or the prompt. Never reword the command, reorder its flags or send it another way to get past the refusal.
 
 ## Data
 
