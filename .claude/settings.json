@@ -61,9 +61,7 @@
       "Bash(gh pr merge:*)",
       "Bash(gh repo edit:*)",
       "Bash(gh release:*)",
-      "Bash(rm -r:*)",
-      "Bash(rm -R:*)",
-      "Bash(rm --recursive:*)"
+      "Bash(rm:*)"
     ],
     "deny": [
       "Bash(rm -rf:*)",
